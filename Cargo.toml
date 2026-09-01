@@ -1,8 +1,6 @@
 [workspace]
 members = [
-  "crates/conduit-domain",
-  "crates/conduit-crypto",
-  "crates/conduit-protocol",
+  "crates/*",
 ]
 resolver = "2"
 

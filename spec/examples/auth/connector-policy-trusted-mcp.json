@@ -1,0 +1,51 @@
+{
+  "schemaVersion": 1,
+  "kind": "connector_policy",
+  "id": "cpol_chatgpt_full_01",
+  "principalId": "prin_owner_01",
+  "clientId": "https://client.example/chatgpt/conduit",
+  "revision": 1,
+  "status": "active",
+  "deviceSelector": {
+    "mode": "ids",
+    "ids": [
+      "dev_sahur_pc_01",
+      "dev_ubuntu_server_01"
+    ]
+  },
+  "projectSelector": {
+    "mode": "all"
+  },
+  "allowedOperations": [
+    "project.read",
+    "session.read",
+    "board.read",
+    "board.write",
+    "assignment.create",
+    "run.read",
+    "run.start",
+    "run.control",
+    "command.start",
+    "runtime.create",
+    "runtime.control",
+    "logs.summary.read",
+    "logs.normalized.read",
+    "artifact.read",
+    "artifact.upload",
+    "approval.resolve"
+  ],
+  "allowedRuntimes": [
+    "native",
+    "restricted_native",
+    "container",
+    "vm"
+  ],
+  "maxAccessScope": "full_device",
+  "mostPermissiveApprovalMode": "never",
+  "requiredApprovalRiskClasses": [],
+  "allowRawContent": false,
+  "allowArtifactUpload": true,
+  "rateLimitProfileId": "rate_trusted_mcp_01",
+  "createdAt": "2026-09-01T00:00:00Z",
+  "updatedAt": "2026-09-01T00:00:00Z"
+}

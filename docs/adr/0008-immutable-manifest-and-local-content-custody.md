@@ -127,6 +127,13 @@ write failure is retried from the journal. Expiry produces one same-ID decline;
 a late receipt cannot create a second response. The local approval journal
 enforces one durable row per operation/provider-request ID pair.
 
+If the Agent exits or its protocol terminally fails while approval custody is
+outstanding, the Node atomically marks pending, requested, and resolved approval
+rows `abandoned` and advances either `running` or `waiting_approval` to
+`finishing`. Only then is the durable operation terminal written and the Agent
+removed from memory. Same-poll approval observations for a terminalizing Agent
+are never projected, and late receipts for abandoned rows fail closed.
+
 The approval controller epoch is the generation of the Agent controller, not
 the Device WebSocket connection epoch. Ordinary reconnect increments only the
 transport epoch and does not invalidate a pending approval. Replacing the Agent

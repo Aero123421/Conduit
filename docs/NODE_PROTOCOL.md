@@ -549,6 +549,12 @@ The local approval journal has one durable row per operation/provider-request
 ID pair. A different approval commitment cannot create a second row for an ID
 that was already pending, resolved, or applied.
 
+Agent finalization is also one local transaction: every outstanding
+`pending`, `requested`, or `resolved` approval becomes `abandoned` while a
+`running` or `waiting_approval` operation moves to `finishing`. Late approval
+receipts cannot resolve or apply an abandoned row. An approval first observed in
+the same poll that terminalizes its Agent is not projected to the Control Plane.
+
 The approval request commitment includes the sorted effective required-risk set
 computed by the Device. DeviceRoom verifies that it contains the immutable
 operation snapshot. This permits a Connector-bound risk minimum to require a

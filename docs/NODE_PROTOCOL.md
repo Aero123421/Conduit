@@ -545,6 +545,10 @@ non-attachable restart path creates a new operation/run rather than replacing a
 same-run controller. A future attach implementation must durably increment this
 generation before accepting receipts for the replacement controller.
 
+The local approval journal has one durable row per operation/provider-request
+ID pair. A different approval commitment cannot create a second row for an ID
+that was already pending, resolved, or applied.
+
 The approval request commitment includes the sorted effective required-risk set
 computed by the Device. DeviceRoom verifies that it contains the immutable
 operation snapshot. This permits a Connector-bound risk minimum to require a
@@ -553,10 +557,14 @@ Device or caller to remove a Cloud minimum.
 
 If the connection is lost before the receipt is received, the run remains
 `waiting_approval` unless a prior approval already covers the exact operation.
-Only one Codex approval is pending per Agent. An exact or changed duplicate of
-an outstanding provider request ID is ignored with a visible Adapter error while
-the original commitment remains pending; no second terminal JSON-RPC response
-is emitted for that ID. When the deadline expires, the Node durably
+Only one Codex approval is pending per Agent. An outstanding duplicate is
+ignored while the original commitment remains pending. After settlement, the
+Adapter retains a bounded, non-evicting process-lifetime tombstone keyed by the
+normalized provider request ID, method, and canonical parameters digest. An
+exact duplicate replays the identical recorded response bytes; a changed
+commitment receives no second terminal JSON-RPC response and emits a visible
+Adapter error. Exhausting the tombstone bound terminally fails the Adapter
+instead of evicting an ID or leaving the operation running. When the deadline expires, the Node durably
 journals and writes one same-ID decline, resumes the operation, and rejects late
 receipts without sending a second provider response.
 
@@ -579,8 +587,10 @@ without its tool-call identity, is cancelled. A missing typed bridge returns
 offered `allow_once` option but not a reusable option. A typed pending request is
 bound to method, session, tool call, canonical parameters digest, and expiry.
 Pi extension dialog requests preserve their request ID in
-`extension_ui_response`; without a typed bridge they are cancelled. Duplicate
-outstanding ACP or Pi request IDs do not receive a second terminal response.
+`extension_ui_response`; without a typed bridge they are cancelled. ACP and Pi
+share the same process-lifetime terminal tombstone rule as Codex. Exact
+duplicates replay identical response bytes; changed commitments do not receive
+a contradictory second response.
 Pi `agent_end` remains nonterminal even when `willRetry` is false;
 `agent_settled` is the terminal event after retries and queued follow-ups are
 drained.

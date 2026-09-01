@@ -89,24 +89,36 @@ turn ID. Every method in the locally generated `ServerRequest` union receives
 either its typed response or a correlated fail-closed response; unknown methods
 receive a same-ID method-not-found response.
 
+Provider request IDs are process-scoped across approval and fail-closed request
+categories. After a terminal response, the Adapter retains a bounded,
+non-evicting tombstone containing the normalized ID, method, canonical
+parameters digest, and exact response bytes. Exact duplicate requests replay
+those bytes. Reusing a settled ID with another commitment produces a visible
+Adapter error without a contradictory second response. Capacity exhaustion
+terminally fails the Adapter rather than evicting an ID.
+
 The effective Access Scope is translated into an explicit Codex sandbox policy
 at thread and turn start. Read-only becomes `readOnly`; Restricted Native,
 Container, and VM use `externalSandbox` because the Node enforces the boundary;
 selected/workspace Native access uses `workspaceWrite`; and configured Full
 User or Full Device Native access uses `dangerFullAccess`. Approval Policy is a
-separate parameter. `never` is pre-authorized, `always` uses Codex `untrusted`,
-and outside-scope or risk-class modes conservatively use `on-request`. Until a
-typed risk-class set is present in the immutable operation snapshot, the latter
-does not claim selective risk-class pre-authorization.
+separate parameter. Empty-risk `never` is pre-authorized, `always` uses Codex
+`untrusted`, and outside-scope or risk-class modes conservatively use
+`on-request`. A non-empty immutable or Device-local required-risk set forces
+provider callbacks to remain observable. The current conservative classifier
+can pre-authorize only a known effect whose class is disjoint from that set;
+unknown effects prompt.
 
-Only one interactive Codex approval may be pending for an Agent. A concurrent
-request receives an immediate correlated decline. The Node transactionally
+Only one interactive Codex approval may be pending for an Agent. A duplicate
+pending ID does not receive a second terminal response; another fresh ID is
+declined and tombstoned. The Node transactionally
 journals the request commitment and `waiting_approval` transition before it can
 queue the transport frame. The frame has a deterministic message ID; re-queue
 after a crash is idempotent. Resolution is journaled as the exact provider
 response before child I/O, then marked applied after the write succeeds. A
 write failure is retried from the journal. Expiry produces one same-ID decline;
-a late receipt cannot create a second response.
+a late receipt cannot create a second response. The local approval journal
+enforces one durable row per operation/provider-request ID pair.
 
 The approval controller epoch is the generation of the Agent controller, not
 the Device WebSocket connection epoch. Ordinary reconnect increments only the

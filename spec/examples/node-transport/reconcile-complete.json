@@ -1,0 +1,26 @@
+{
+  "schemaVersion": 1,
+  "protocol": "conduit.node/1",
+  "type": "reconcile.complete",
+  "messageId": "msg_reconcomp01",
+  "connectionId": "conn_example0001",
+  "connectionEpoch": 7,
+  "sequence": 3,
+  "sentAt": "2026-09-01T09:00:09Z",
+  "payload": {
+    "core": {
+      "reconciliationId": "recon_example0001",
+      "replayedThroughRecordSeq": 43,
+      "reportedOperationIds": ["op_example0001"],
+      "unresolved": [],
+      "completedAt": "2026-09-01T09:00:09Z"
+    },
+    "completionDigest": "8abfecb5f2ba86af3fef98af9afb756a9767edd603d210d39ed9afb39137883c",
+    "deviceSignature": {
+      "keyId": "dkey_example0001",
+      "algorithm": "Ed25519",
+      "signedDigest": "8abfecb5f2ba86af3fef98af9afb756a9767edd603d210d39ed9afb39137883c",
+      "signature": "h9j2-ppKTiAR162VzXgednyqbsfW9Hx2byTIjL0RZgo5venrS7G9lHASZCFSMhGW16RcP3G5wJ8PPeGi6hurAw"
+    }
+  }
+}

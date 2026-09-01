@@ -16,8 +16,8 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     io::Read,
-    os::unix::process::CommandExt,
-    path::PathBuf,
+    os::unix::{fs::FileTypeExt, process::CommandExt},
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::{Duration, Instant},
 };
@@ -219,6 +219,24 @@ pub trait RuntimeProvider: Send + Sync {
     fn snapshot(&self, handle: &RuntimeHandle, name: &str)
     -> Result<SnapshotReceipt, RuntimeError>;
     fn collect(&self, handle: &RuntimeHandle) -> Result<CollectionReceipt, RuntimeError>;
+    fn archive(
+        &self,
+        _handle: &RuntimeHandle,
+        _target: &Path,
+    ) -> Result<SnapshotReceipt, RuntimeError> {
+        Err(RuntimeError::CapabilityUnavailable(
+            "runtime archive".into(),
+        ))
+    }
+    fn restore(
+        &self,
+        _archive: &Path,
+        _request: &RuntimeRequest,
+    ) -> Result<PreparedRuntime, RuntimeError> {
+        Err(RuntimeError::CapabilityUnavailable(
+            "runtime archive restore".into(),
+        ))
+    }
     fn destroy(
         &self,
         handle: &RuntimeHandle,
@@ -295,12 +313,19 @@ pub(crate) fn validate_request(
         }
         let s = canonical.to_string_lossy();
         let guest = w.guest_path.to_string_lossy();
+        let metadata = std::fs::metadata(&canonical)?;
+        if !metadata.is_dir() || metadata.file_type().is_socket() {
+            return Err(RuntimeError::Invalid(
+                "workspace host path must be a directory".into(),
+            ));
+        }
         if s.contains([',', '\n', '\r', '\0']) || guest.contains([',', '\n', '\r', '\0']) {
             return Err(RuntimeError::Invalid(
                 "workspace mount path contains a provider delimiter".into(),
             ));
         }
-        if s == "/" || s == std::env::var("HOME").unwrap_or_default() {
+        let user_home = std::env::var_os("HOME").and_then(|path| std::fs::canonicalize(path).ok());
+        if canonical == Path::new("/") || user_home.as_ref() == Some(&canonical) {
             return Err(RuntimeError::Invalid(
                 "broad host mounts are forbidden".into(),
             ));

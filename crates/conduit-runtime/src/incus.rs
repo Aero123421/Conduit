@@ -1,6 +1,7 @@
 use crate::*;
 use serde_json::Value;
-use std::{process::Command, time::Duration};
+use sha2::{Digest, Sha256};
+use std::{io::Read, os::unix::fs::PermissionsExt, path::Path, process::Command, time::Duration};
 
 /// Incus/KVM adapter. Every lifecycle call uses a fixed verb and typed fields.
 /// Global networks, pools and host disks are intentionally outside this API.
@@ -100,11 +101,31 @@ impl RuntimeProvider for IncusProvider {
                     reason_code: "versioned_guest_agent_unavailable".into(),
                     detail: "no tracked guest-agent execution contract is installed".into(),
                 },
+                CapabilityEvidence {
+                    capability: "archive_restore".into(),
+                    state: if live && kvm {
+                        CapabilityState::Effective
+                    } else {
+                        CapabilityState::Unavailable
+                    },
+                    source: "incus_export_import_adapter".into(),
+                    reason_code: if !live {
+                        "incus_unreachable"
+                    } else if !kvm {
+                        "kvm_unavailable"
+                    } else {
+                        "typed_vm_archive_adapter"
+                    }
+                    .into(),
+                    detail: "stopped VM export and import use Device-selected absolute paths"
+                        .into(),
+                },
             ],
         })
     }
     fn prepare(&self, r: &RuntimeRequest) -> Result<PreparedRuntime, RuntimeError> {
         validate_request(r, RuntimeKind::Vm, &["incus_kvm", "incus.kvm"])?;
+        validate_vm_request(r, true)?;
         if self.probe()?.capabilities[0].state != CapabilityState::Effective {
             return Err(RuntimeError::CapabilityUnavailable(
                 "Incus KVM prerequisites".into(),
@@ -119,9 +140,6 @@ impl RuntimeProvider for IncusProvider {
             .image
             .as_deref()
             .ok_or_else(|| RuntimeError::Invalid("VM image required".into()))?;
-        if image.len() > 512 {
-            return Err(RuntimeError::Invalid("image reference too long".into()));
-        }
         let name = Self::name(&r.runtime_id);
         if let Ok(v) = self.inspect_json(&name) {
             let (id, d, _) = Self::metadata(&v);
@@ -157,11 +175,6 @@ impl RuntimeProvider for IncusProvider {
         }
         if r.network == NetworkMode::Offline {
             a.extend(["-c".into(), "security.secureboot=true".into()])
-        }
-        if !r.workspaces.is_empty() {
-            return Err(RuntimeError::CapabilityUnavailable(
-                "verified VM workspace attachment mechanism".into(),
-            ));
         }
         let o = self.run(&a, Duration::from_secs(180))?;
         if !o.status.success() {
@@ -241,7 +254,13 @@ impl RuntimeProvider for IncusProvider {
         h: &RuntimeHandle,
         s: RuntimeSignal,
     ) -> Result<RuntimeStateReceipt, RuntimeError> {
-        self.inspect(h)?;
+        let current = self.inspect(h)?;
+        match (s, current.state) {
+            (RuntimeSignal::GracefulStop | RuntimeSignal::ForceStop, RuntimeState::Stopped)
+            | (RuntimeSignal::Pause, RuntimeState::Paused)
+            | (RuntimeSignal::Resume, RuntimeState::Running) => return Ok(current),
+            _ => {}
+        }
         let args = match s {
             RuntimeSignal::GracefulStop => {
                 vec!["stop".into(), h.object_id.clone(), "--timeout=30".into()]
@@ -282,12 +301,200 @@ impl RuntimeProvider for IncusProvider {
             h.runtime_id
         )))
     }
+    fn archive(&self, h: &RuntimeHandle, target: &Path) -> Result<SnapshotReceipt, RuntimeError> {
+        let state = self.inspect(h)?.state;
+        if !matches!(state, RuntimeState::Stopped | RuntimeState::Prepared) {
+            return Err(RuntimeError::Invalid(
+                "Incus VM must stop before a consistent archive".into(),
+            ));
+        }
+        validate_new_archive_target(target)?;
+        let output = self.run(
+            &[
+                "export".into(),
+                h.object_id.clone(),
+                target.to_string_lossy().into_owned(),
+            ],
+            Duration::from_secs(1800),
+        )?;
+        if !output.status.success() {
+            return Err(RuntimeError::Provider {
+                code: "incus_archive_failed".into(),
+            });
+        }
+        std::fs::set_permissions(target, std::fs::Permissions::from_mode(0o600))?;
+        let bytes = std::fs::metadata(target)?.len();
+        let digest = digest_file(target)?;
+        Ok(SnapshotReceipt {
+            runtime_id: h.runtime_id.clone(),
+            snapshot_id: format!("snap_{}", &digest[..16]),
+            digest,
+            bytes: Some(bytes),
+        })
+    }
+    fn restore(
+        &self,
+        archive: &Path,
+        request: &RuntimeRequest,
+    ) -> Result<PreparedRuntime, RuntimeError> {
+        validate_request(request, RuntimeKind::Vm, &["incus_kvm", "incus.kvm"])?;
+        validate_vm_request(request, false)?;
+        validate_existing_archive(archive)?;
+        if self.probe()?.capabilities[0].state != CapabilityState::Effective {
+            return Err(RuntimeError::CapabilityUnavailable(
+                "Incus KVM prerequisites".into(),
+            ));
+        }
+        let name = Self::name(&request.runtime_id);
+        match self.inspect_json(&name) {
+            Ok(existing) => {
+                let (runtime_id, spec_digest, status) = Self::metadata(&existing);
+                if runtime_id != Some(request.runtime_id.as_str())
+                    || spec_digest != Some(request.spec_digest.as_str())
+                {
+                    return Err(RuntimeError::IdentityMismatch);
+                }
+                if has_forbidden_host_device(&existing)
+                    || request.network == NetworkMode::Offline && has_network_device(&existing)
+                {
+                    return Err(RuntimeError::IdentityMismatch);
+                }
+                return Ok(PreparedRuntime {
+                    runtime_id: request.runtime_id.clone(),
+                    provider_id: self.provider_id().into(),
+                    spec_digest: request.spec_digest.clone(),
+                    object_id: name,
+                    state: match status {
+                        Some("Running") => RuntimeState::Running,
+                        Some("Frozen") => RuntimeState::Paused,
+                        Some("Stopped") => RuntimeState::Prepared,
+                        _ => RuntimeState::Uncertain,
+                    },
+                    evidence: vec![archive_restore_evidence()],
+                });
+            }
+            Err(RuntimeError::NotFound) => {}
+            Err(error) => return Err(error),
+        }
+        let output = self.run(
+            &[
+                "import".into(),
+                archive.to_string_lossy().into_owned(),
+                name.clone(),
+            ],
+            Duration::from_secs(1800),
+        )?;
+        if !output.status.success() {
+            return Err(RuntimeError::Provider {
+                code: "incus_restore_failed".into(),
+            });
+        }
+        let imported = self.inspect_json(&name)?;
+        if has_forbidden_host_device(&imported) {
+            let _ = self.run(
+                &["delete".into(), name.clone(), "--force".into()],
+                Duration::from_secs(120),
+            );
+            return Err(RuntimeError::Invalid(
+                "restored VM contains a forbidden host device projection".into(),
+            ));
+        }
+        let configure = (|| {
+            let mut settings = vec![
+                (
+                    "user.conduit.runtime-id".to_owned(),
+                    request.runtime_id.clone(),
+                ),
+                (
+                    "user.conduit.spec-digest".to_owned(),
+                    request.spec_digest.clone(),
+                ),
+                ("user.conduit.run-id".to_owned(), request.run_id.clone()),
+            ];
+            if let Some(cpu) = request.resources.cpu {
+                settings.push(("limits.cpu".into(), (cpu.ceil() as u64).to_string()));
+            }
+            if let Some(memory) = request.resources.memory_bytes {
+                settings.push(("limits.memory".into(), memory.to_string()));
+            }
+            for (key, value) in settings {
+                let output = self.run(
+                    &["config".into(), "set".into(), name.clone(), key, value],
+                    Duration::from_secs(30),
+                )?;
+                if !output.status.success() {
+                    return Err(RuntimeError::Provider {
+                        code: "incus_restore_metadata_failed".into(),
+                    });
+                }
+            }
+            if request.network == NetworkMode::Offline {
+                let removed = self.run(
+                    &[
+                        "config".into(),
+                        "device".into(),
+                        "remove".into(),
+                        name.clone(),
+                        "eth0".into(),
+                    ],
+                    Duration::from_secs(30),
+                )?;
+                if !removed.status.success() {
+                    let inspected = self.inspect_json(&name)?;
+                    if has_network_device(&inspected) {
+                        return Err(RuntimeError::Provider {
+                            code: "incus_restore_offline_network_not_enforced".into(),
+                        });
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = configure {
+            let _ = self.run(
+                &["delete".into(), name.clone(), "--force".into()],
+                Duration::from_secs(120),
+            );
+            return Err(error);
+        }
+        let restored = self.inspect_json(&name)?;
+        let (runtime_id, spec_digest, status) = Self::metadata(&restored);
+        if runtime_id != Some(request.runtime_id.as_str())
+            || spec_digest != Some(request.spec_digest.as_str())
+            || !matches!(status, Some("Stopped"))
+        {
+            return Err(RuntimeError::IdentityMismatch);
+        }
+        Ok(PreparedRuntime {
+            runtime_id: request.runtime_id.clone(),
+            provider_id: self.provider_id().into(),
+            spec_digest: request.spec_digest.clone(),
+            object_id: name,
+            state: RuntimeState::Prepared,
+            evidence: vec![archive_restore_evidence()],
+        })
+    }
     fn destroy(
         &self,
         h: &RuntimeHandle,
         r: &DestroyRequest,
     ) -> Result<DestroyReceipt, RuntimeError> {
-        self.inspect(h)?;
+        let state = match self.inspect(h) {
+            Ok(receipt) => receipt.state,
+            Err(RuntimeError::NotFound) => {
+                return Ok(DestroyReceipt {
+                    runtime_id: h.runtime_id.clone(),
+                    destroyed: true,
+                    evidence: "Incus VM was already absent".into(),
+                });
+            }
+            Err(error) => return Err(error),
+        };
+        if matches!(state, RuntimeState::Running | RuntimeState::Paused) {
+            return Err(RuntimeError::Invalid(
+                "running Incus VM cannot be destroyed".into(),
+            ));
+        }
         if !r.custody_complete && !r.discard_authorized {
             return Err(RuntimeError::Invalid("collection receipt required".into()));
         }
@@ -337,83 +544,143 @@ impl RuntimeProvider for IncusProvider {
     }
 }
 
-impl IncusProvider {
-    pub fn archive(
-        &self,
-        h: &RuntimeHandle,
-        target: &std::path::Path,
-    ) -> Result<SnapshotReceipt, RuntimeError> {
-        if !target.is_absolute() {
-            return Err(RuntimeError::Invalid(
-                "archive target must be absolute".into(),
+fn validate_new_archive_target(target: &Path) -> Result<(), RuntimeError> {
+    if !target.is_absolute()
+        || target.exists()
+        || target.to_str().is_none_or(|value| value.len() > 4_096)
+    {
+        return Err(RuntimeError::Invalid(
+            "archive target must be a new absolute path".into(),
+        ));
+    }
+    let parent = target
+        .parent()
+        .ok_or_else(|| RuntimeError::Invalid("archive target has no parent".into()))?;
+    if std::fs::canonicalize(parent)? != parent {
+        return Err(RuntimeError::Invalid(
+            "archive target parent must be canonical".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn archive_restore_evidence() -> CapabilityEvidence {
+    CapabilityEvidence {
+        capability: "archive_restore".into(),
+        state: CapabilityState::Effective,
+        source: "incus_import_and_metadata_inspection".into(),
+        reason_code: "restored_vm_identity_verified".into(),
+        detail: "Incus imported a stopped VM and the Device verified rewritten identity".into(),
+    }
+}
+
+fn validate_vm_request(request: &RuntimeRequest, image_required: bool) -> Result<(), RuntimeError> {
+    if image_required && request.image.is_none() {
+        return Err(RuntimeError::Invalid("VM image required".into()));
+    }
+    if let Some(image) = request.image.as_deref()
+        && (image.is_empty()
+            || image.len() > 512
+            || image.starts_with('-')
+            || image
+                .bytes()
+                .any(|byte| byte == 0 || byte == b'\n' || byte == b'\r'))
+    {
+        return Err(RuntimeError::Invalid("invalid VM image reference".into()));
+    }
+    if request
+        .resources
+        .cpu
+        .is_some_and(|cpu| !cpu.is_finite() || cpu <= 0.0)
+        || request.resources.memory_bytes == Some(0)
+    {
+        return Err(RuntimeError::Invalid("invalid VM resource limit".into()));
+    }
+    if request.resources.pid_limit.is_some() {
+        return Err(RuntimeError::CapabilityUnavailable(
+            "verified VM guest PID limit".into(),
+        ));
+    }
+    if request.resources.storage_bytes.is_some() {
+        return Err(RuntimeError::CapabilityUnavailable(
+            "verified restored VM storage resize".into(),
+        ));
+    }
+    if !request.workspaces.is_empty() {
+        return Err(RuntimeError::CapabilityUnavailable(
+            "verified VM workspace attachment mechanism".into(),
+        ));
+    }
+    match request.network {
+        NetworkMode::Open | NetworkMode::Offline => {}
+        NetworkMode::Restricted => {
+            return Err(RuntimeError::CapabilityUnavailable(
+                "complete restricted VM egress enforcement".into(),
             ));
         }
-        let o = self.run(
-            &[
-                "export".into(),
-                h.object_id.clone(),
-                target.to_string_lossy().into_owned(),
-            ],
-            Duration::from_secs(1800),
-        )?;
-        if !o.status.success() {
-            return Err(RuntimeError::Provider {
-                code: "incus_archive_failed".into(),
-            });
+        NetworkMode::LanExplicit => {
+            return Err(RuntimeError::CapabilityUnavailable(
+                "explicit VM LAN destination enforcement".into(),
+            ));
         }
-        let bytes = std::fs::metadata(target)?.len();
-        let digest = digest_bytes(&std::fs::read(target)?);
-        Ok(SnapshotReceipt {
-            runtime_id: h.runtime_id.clone(),
-            snapshot_id: format!("snap_{}", &digest[..16]),
-            digest,
-            bytes: Some(bytes),
-        })
     }
-    pub fn restore(
-        &self,
-        archive: &std::path::Path,
-        runtime_id: &str,
-        spec_digest: &str,
-    ) -> Result<PreparedRuntime, RuntimeError> {
-        if !archive.is_file() {
-            return Err(RuntimeError::Invalid("archive file missing".into()));
-        }
-        let name = Self::name(runtime_id);
-        let o = self.run(
-            &[
-                "import".into(),
-                archive.to_string_lossy().into_owned(),
-                name.clone(),
-            ],
-            Duration::from_secs(1800),
-        )?;
-        if !o.status.success() {
-            return Err(RuntimeError::Provider {
-                code: "incus_restore_failed".into(),
-            });
-        }
-        let set = |key: &str, value: &str| {
-            self.run(
-                &[
-                    "config".into(),
-                    "set".into(),
-                    name.clone(),
-                    key.into(),
-                    value.into(),
-                ],
-                Duration::from_secs(30),
-            )
-        };
-        set("user.conduit.runtime-id", runtime_id)?;
-        set("user.conduit.spec-digest", spec_digest)?;
-        Ok(PreparedRuntime {
-            runtime_id: runtime_id.into(),
-            provider_id: self.provider_id().into(),
-            spec_digest: spec_digest.into(),
-            object_id: name,
-            state: RuntimeState::Prepared,
-            evidence: vec![],
+    Ok(())
+}
+
+fn has_network_device(value: &Value) -> bool {
+    ["devices", "expanded_devices"].iter().any(|field| {
+        value[*field].as_object().is_some_and(|devices| {
+            devices.values().any(|device| {
+                matches!(
+                    device["type"].as_str(),
+                    Some("nic") | Some("proxy") | Some("infiniband")
+                )
+            })
         })
+    })
+}
+
+fn has_forbidden_host_device(value: &Value) -> bool {
+    ["devices", "expanded_devices"].iter().any(|field| {
+        value[*field].as_object().is_some_and(|devices| {
+            devices.values().any(|device| {
+                let device_type = device["type"].as_str().unwrap_or_default();
+                let source = device["source"].as_str().unwrap_or_default();
+                matches!(
+                    device_type,
+                    "proxy" | "unix-char" | "unix-block" | "gpu" | "usb" | "pci"
+                ) || (device_type == "disk" && source.starts_with('/'))
+                    || source.contains("docker.sock")
+                    || source.contains("podman.sock")
+                    || source.contains("incus") && source.contains("socket")
+            })
+        })
+    })
+}
+
+fn validate_existing_archive(archive: &Path) -> Result<(), RuntimeError> {
+    if !archive.is_absolute()
+        || !archive.is_file()
+        || archive.to_str().is_none_or(|value| value.len() > 4_096)
+        || std::fs::canonicalize(archive)? != archive
+    {
+        return Err(RuntimeError::Invalid(
+            "archive must be a canonical absolute regular file".into(),
+        ));
     }
+    Ok(())
+}
+
+fn digest_file(path: &Path) -> Result<String, RuntimeError> {
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let count = file.read(&mut buffer)?;
+        if count == 0 {
+            break;
+        }
+        digest.update(&buffer[..count]);
+    }
+    Ok(hex::encode(digest.finalize()))
 }

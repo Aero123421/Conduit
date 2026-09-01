@@ -12,13 +12,18 @@ The first-release identity, owner bootstrap, passkey recovery, device enrollment
 
 Library selection, D1 migrations, endpoint implementation, and interoperability receipts remain implementation work. They must not change the identity separation or connector-ceiling contract without a new ADR.
 
+### Node transport and reconciliation
+
+The handshake messages, connection epoch, frame and durable-record sequences, signed operation offer, node admission journal, Durable Object ingress acknowledgement, reconnect reconciliation, offline behavior, retention invariant, and failure outcomes are fixed in:
+
+- `docs/NODE_TRANSPORT.md`
+- `docs/adr/0007-durable-node-journal-and-reconciliation.md`
+- `spec/schemas/node-transport-v1.schema.json`
+- `spec/examples/node-transport/`
+
+Rust/TypeScript types, D1 and Durable Object migrations, WebSocket handlers, SQLite node journal, fake-peer conformance tests, and live receipts remain implementation work.
+
 ## Blocks the first executable vertical slice
-
-### Node transport and reconciliation protocol
-
-Define handshake message encoding, sequence numbers, operation admission, event replay, local journal format, and reconnect reconciliation.
-
-Device identity, enrollment, challenge authentication, connection epochs, key rotation, and revocation are already defined by the authorization contract. The transport work must cover control-plane disconnect, node restart, duplicate admission, late terminal result, and device clock skew.
 
 ### Collaboration-session baseline and change-set acceptance
 
@@ -38,6 +43,8 @@ The domain rules are fixed; exact Git commands and branch naming remain open.
 
 Choose the Rust traits and process boundaries for native, restricted-native, container, and VM providers. Decide which operations belong in `conduit-node`, a privileged helper, and a guest agent.
 
+The Node transport now requires stable `executionId` lookup and an explicit `unknown` launch outcome. The provider interface must preserve those rules.
+
 ### Codex adapter import boundary
 
 Identify what can be ported from OwnMesh and what must be rewritten. Prompt acceptance, continuation, cancellation, normalized events, credential handling, and protocol-version evidence need explicit tests.
@@ -45,6 +52,8 @@ Identify what can be ported from OwnMesh and what must be rewritten. Prompt acce
 ### Trace schema version 1
 
 Freeze the first run manifest and event envelope before the Codex vertical slice. Decide local chunk format, compression, cursors, content redaction, and event commitments sent to Cloudflare.
+
+`conduit.node/1` already defines transport ordering, payload references, evidence level, and bounded `run.event` carriage. The Trace schema defines the event body.
 
 ## Does not block the first vertical slice
 

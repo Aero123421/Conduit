@@ -191,6 +191,73 @@ def validate_canonical_fixture(failures: list[str]) -> int:
     return len(cases)
 
 
+def validate_timestamp_fixture(failures: list[str]) -> int:
+    path = FIXTURE_DIR / "utc-timestamp-v1.json"
+    try:
+        fixture = load_json(path)
+    except ValueError as exc:
+        failures.append(str(exc))
+        return 0
+
+    if not isinstance(fixture, dict) or set(fixture) != {
+        "fixtureVersion",
+        "contract",
+        "cases",
+    }:
+        failures.append(f"{path.relative_to(ROOT)}: unexpected fixture fields")
+        return 0
+    if fixture["fixtureVersion"] != 1:
+        failures.append(f"{path.relative_to(ROOT)}: fixtureVersion must be 1")
+    if fixture["contract"] != "preserve_valid_utc_rfc3339_wire_text":
+        failures.append(f"{path.relative_to(ROOT)}: unexpected timestamp contract")
+
+    cases = fixture["cases"]
+    if not isinstance(cases, list) or not cases:
+        failures.append(f"{path.relative_to(ROOT)}: cases must be a non-empty array")
+        return 0
+
+    required_inputs = {
+        "2026-09-01T12:00:00.000Z",
+        "2026-09-01T12:00:00.120Z",
+        "2026-09-01T12:00:00.123456789Z",
+    }
+    observed_inputs: set[str] = set()
+    names: set[str] = set()
+    for index, case in enumerate(cases):
+        label = f"{path.relative_to(ROOT)} $.cases[{index}]"
+        if not isinstance(case, dict) or set(case) != {
+            "name",
+            "input",
+            "expectedWireText",
+        }:
+            failures.append(f"{label}: unexpected timestamp case fields")
+            continue
+
+        name = case["name"]
+        value = case["input"]
+        expected = case["expectedWireText"]
+        if not isinstance(name, str) or not name or name in names:
+            failures.append(f"{label}.name: must be non-empty and unique")
+        else:
+            names.add(name)
+        if not isinstance(value, str) or not isinstance(expected, str):
+            failures.append(f"{label}: input and expectedWireText must be strings")
+            continue
+        observed_inputs.add(value)
+        if value != expected:
+            failures.append(f"{label}: expectedWireText must preserve input exactly")
+        if validate_utc_timestamp(value) is not None:
+            failures.append(f"{label}.input: must be valid UTC RFC 3339 text")
+
+    missing = required_inputs - observed_inputs
+    if missing:
+        failures.append(
+            f"{path.relative_to(ROOT)}: missing required timestamp cases: "
+            f"{', '.join(sorted(missing))}"
+        )
+    return len(cases)
+
+
 def validate_invalid_fixtures(
     schemas: dict[str, Any], registry: Registry, failures: list[str]
 ) -> int:
@@ -367,6 +434,7 @@ def main() -> int:
             failures.extend(format_error(path, error) for error in errors)
 
     canonical_case_count = validate_canonical_fixture(failures)
+    timestamp_case_count = validate_timestamp_fixture(failures)
     invalid_fixture_count = validate_invalid_fixtures(schemas, registry, failures)
 
     if failures:
@@ -378,8 +446,9 @@ def main() -> int:
     print(
         f"Validated {len(schemas)} schemas and "
         f"{sum(len(list((EXAMPLE_DIR / name).glob('*.json'))) for name in EXAMPLE_SCHEMAS)} "
-        f"examples, {canonical_case_count} canonical JSON cases, and "
-        f"{invalid_fixture_count} invalid fixtures."
+        f"examples, {canonical_case_count} canonical JSON cases, "
+        f"{timestamp_case_count} timestamp cases, and {invalid_fixture_count} "
+        "invalid fixtures."
     )
     return 0
 

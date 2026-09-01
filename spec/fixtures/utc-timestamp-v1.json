@@ -1,0 +1,21 @@
+{
+  "fixtureVersion": 1,
+  "contract": "preserve_valid_utc_rfc3339_wire_text",
+  "cases": [
+    {
+      "name": "zero_milliseconds",
+      "input": "2026-09-01T12:00:00.000Z",
+      "expectedWireText": "2026-09-01T12:00:00.000Z"
+    },
+    {
+      "name": "fraction_with_trailing_zero",
+      "input": "2026-09-01T12:00:00.120Z",
+      "expectedWireText": "2026-09-01T12:00:00.120Z"
+    },
+    {
+      "name": "nanosecond_precision",
+      "input": "2026-09-01T12:00:00.123456789Z",
+      "expectedWireText": "2026-09-01T12:00:00.123456789Z"
+    }
+  ]
+}

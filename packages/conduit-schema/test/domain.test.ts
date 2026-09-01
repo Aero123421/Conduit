@@ -1,3 +1,6 @@
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+
 import { describe, expect, it } from "vitest";
 
 import {
@@ -11,6 +14,18 @@ import {
   parseU64Decimal,
   parseUtcTimestamp,
 } from "../src/index.ts";
+
+const repositoryRoot = fileURLToPath(new URL("../../../", import.meta.url));
+
+interface TimestampFixture {
+  fixtureVersion: 1;
+  contract: "preserve_valid_utc_rfc3339_wire_text";
+  cases: Array<{
+    name: string;
+    input: string;
+    expectedWireText: string;
+  }>;
+}
 
 describe("domain values", () => {
   it("validates prefixed IDs", () => {
@@ -47,6 +62,24 @@ describe("domain values", () => {
     expect(() => parseUtcTimestamp("2026-09-01T21:00:00+09:00")).toThrow();
     expect(() => parseUtcTimestamp("2026-02-30T00:00:00Z")).toThrow();
     expect(() => parseUtcTimestamp("2026-09-01T24:00:00Z")).toThrow();
+  });
+
+  it("preserves the shared UTC timestamp wire text fixture", async () => {
+    const path = `${repositoryRoot}/spec/fixtures/utc-timestamp-v1.json`;
+    const fixture = JSON.parse(
+      await readFile(path, "utf8"),
+    ) as TimestampFixture;
+
+    expect(fixture.fixtureVersion).toBe(1);
+    expect(fixture.contract).toBe("preserve_valid_utc_rfc3339_wire_text");
+    expect(fixture.cases).toHaveLength(3);
+    for (const testCase of fixture.cases) {
+      const timestamp = parseUtcTimestamp(testCase.input);
+      expect(timestamp, testCase.name).toBe(testCase.expectedWireText);
+      expect(JSON.stringify(timestamp), testCase.name).toBe(
+        JSON.stringify(testCase.expectedWireText),
+      );
+    }
   });
 });
 

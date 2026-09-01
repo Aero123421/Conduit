@@ -5,11 +5,14 @@ import { describe, expect, expectTypeOf, it } from "vitest";
 
 import {
   isWireSchemaId,
+  MAX_NODE_PROTOCOL_DOCUMENT_BYTES,
   parseWireDocument,
+  parseWireDocumentText,
   schemaIds,
   validateJsonSchemaDocument,
   validateWireDocument,
   WireValidationError,
+  WireDocumentDecodeError,
   type NodeV1WireDocument,
   type WireSchemaId,
 } from "../src/index.ts";
@@ -97,6 +100,69 @@ describe("schema-derived wire documents", () => {
     expectTypeOf<
       Extract<NodeV1WireDocument, { type: "unknown.frame" }>
     >().toEqualTypeOf<never>();
+  });
+
+  it("decodes Node text only after enforcing its UTF-8 byte limit", async () => {
+    const path = `${repositoryRoot}/spec/examples/node-protocol/operation-offer.json`;
+    const text = await readFile(path, "utf8");
+    const parsed = parseWireDocumentText(schemaIds.nodeV1, text);
+    expect(parsed.type).toBe("operation.offer");
+    const parsedBytes = parseWireDocumentText(
+      schemaIds.nodeV1,
+      new TextEncoder().encode(text),
+    );
+    expect(parsedBytes.type).toBe("operation.offer");
+
+    const exactlyAtLimit = new Uint8Array(
+      MAX_NODE_PROTOCOL_DOCUMENT_BYTES,
+    ).fill(0x20);
+    expectDocumentDecodeError(
+      () => parseWireDocumentText(schemaIds.nodeV1, exactlyAtLimit),
+      "malformed_json",
+      MAX_NODE_PROTOCOL_DOCUMENT_BYTES,
+    );
+
+    const oversizedBytes = new Uint8Array(
+      MAX_NODE_PROTOCOL_DOCUMENT_BYTES + 1,
+    );
+    expectDocumentDecodeError(
+      () => parseWireDocumentText(schemaIds.nodeV1, oversizedBytes),
+      "document_too_large",
+      MAX_NODE_PROTOCOL_DOCUMENT_BYTES + 1,
+    );
+
+    const oversizedUnicode = `"${"界".repeat(21_846)}"`;
+    expect(oversizedUnicode.length).toBeLessThan(
+      MAX_NODE_PROTOCOL_DOCUMENT_BYTES,
+    );
+    expectDocumentDecodeError(
+      () => parseWireDocumentText(schemaIds.nodeV1, oversizedUnicode),
+      "document_too_large",
+      new TextEncoder().encode(oversizedUnicode).byteLength,
+    );
+  });
+
+  it("reports malformed UTF-8 JSON without copying document content", () => {
+    const secretMarker = `PRIVATE_DOCUMENT_${"x".repeat(1_000)}`;
+    try {
+      parseWireDocumentText(
+        schemaIds.nodeV1,
+        `{"secret":"${secretMarker}"`,
+      );
+      throw new Error("malformed JSON unexpectedly parsed");
+    } catch (error) {
+      expect(error).toBeInstanceOf(WireDocumentDecodeError);
+      const decodeError = error as WireDocumentDecodeError;
+      expect(decodeError.code).toBe("malformed_json");
+      expect(String(decodeError)).not.toContain(secretMarker);
+    }
+
+    expectDocumentDecodeError(
+      () =>
+        parseWireDocumentText(schemaIds.nodeV1, new Uint8Array([0xff])),
+      "malformed_json",
+      1,
+    );
   });
 });
 
@@ -220,4 +286,20 @@ function assertInvalidFixture(
 
 async function readJson(path: string): Promise<unknown> {
   return JSON.parse(await readFile(path, "utf8")) as unknown;
+}
+
+function expectDocumentDecodeError(
+  parse: () => unknown,
+  code: "document_too_large" | "malformed_json",
+  actualBytes: number,
+): void {
+  try {
+    parse();
+    throw new Error(`${code} document unexpectedly parsed`);
+  } catch (error) {
+    expect(error).toBeInstanceOf(WireDocumentDecodeError);
+    const decodeError = error as WireDocumentDecodeError;
+    expect(decodeError.code).toBe(code);
+    expect(decodeError.actualBytes).toBe(actualBytes);
+  }
 }

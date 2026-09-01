@@ -80,6 +80,11 @@ export type WireDocument = WireDocumentMap[WireSchemaId];
 export type WireDocumentFor<SchemaId extends WireSchemaId> =
   WireDocumentMap[SchemaId];
 export type WireValidationLayer = "schema" | "domain";
+export type WireDocumentDecodeErrorCode =
+  | "document_too_large"
+  | "malformed_json";
+
+export const MAX_NODE_PROTOCOL_DOCUMENT_BYTES = 65_536;
 
 const MAX_VALIDATION_ISSUES = 16;
 const MAX_VALIDATION_PATH_BYTES = 512;
@@ -120,6 +125,31 @@ export class WireValidationError extends TypeError {
     this.schemaId = schemaId;
     this.layer = layer;
     this.issues = issues;
+  }
+}
+
+export class WireDocumentDecodeError extends TypeError {
+  readonly schemaId: WireSchemaId;
+  readonly code: WireDocumentDecodeErrorCode;
+  readonly maxBytes: number | undefined;
+  readonly actualBytes: number;
+
+  constructor(
+    schemaId: WireSchemaId,
+    code: WireDocumentDecodeErrorCode,
+    actualBytes: number,
+    maxBytes?: number,
+  ) {
+    super(
+      code === "document_too_large"
+        ? `${schemaId} document is ${actualBytes} bytes; maximum is ${maxBytes}`
+        : `${schemaId} document is not valid UTF-8 JSON`,
+    );
+    this.name = "WireDocumentDecodeError";
+    this.schemaId = schemaId;
+    this.code = code;
+    this.maxBytes = maxBytes;
+    this.actualBytes = actualBytes;
   }
 }
 
@@ -176,6 +206,45 @@ export function parseWireDocument<SchemaId extends WireSchemaId>(
 
   return value as WireDocumentFor<SchemaId>;
 }
+
+/**
+ * Enforces the encoded transport limit before UTF-8 and JSON decoding, then
+ * performs the same schema and domain validation as `parseWireDocument`.
+ */
+export function parseWireDocumentText<SchemaId extends WireSchemaId>(
+  schemaId: SchemaId,
+  document: string | Uint8Array,
+): WireDocumentFor<SchemaId> {
+  const encoded =
+    typeof document === "string" ? new TextEncoder().encode(document) : document;
+  const actualBytes = encoded.byteLength;
+  const maxBytes = maxDocumentBytes[schemaId];
+  if (maxBytes !== undefined && actualBytes > maxBytes) {
+    throw new WireDocumentDecodeError(
+      schemaId,
+      "document_too_large",
+      actualBytes,
+      maxBytes,
+    );
+  }
+
+  let text: string;
+  let value: unknown;
+  try {
+    text =
+      typeof document === "string"
+        ? document
+        : new TextDecoder("utf-8", { fatal: true }).decode(document);
+    value = JSON.parse(text) as unknown;
+  } catch {
+    throw new WireDocumentDecodeError(schemaId, "malformed_json", actualBytes);
+  }
+  return parseWireDocument(schemaId, value);
+}
+
+const maxDocumentBytes: Partial<Record<WireSchemaId, number>> = {
+  [schemaIds.nodeV1]: MAX_NODE_PROTOCOL_DOCUMENT_BYTES,
+};
 
 function compileValidators(
   withDomainFormats: boolean,

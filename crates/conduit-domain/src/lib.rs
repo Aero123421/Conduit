@@ -317,10 +317,7 @@ impl UtcTimestamp {
         if parsed.offset() != time::UtcOffset::UTC {
             return Err(DomainValueError::InvalidUtcTimestamp);
         }
-        let normalized = parsed
-            .format(&Rfc3339)
-            .map_err(|_| DomainValueError::InvalidUtcTimestamp)?;
-        Ok(Self(normalized))
+        Ok(Self(value))
     }
 
     pub fn as_str(&self) -> &str {
@@ -382,7 +379,27 @@ impl fmt::Debug for SecretString {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, path::Path};
+
+    use serde::Deserialize;
+
     use super::*;
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TimestampFixture {
+        fixture_version: u8,
+        contract: String,
+        cases: Vec<TimestampCase>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct TimestampCase {
+        name: String,
+        input: String,
+        expected_wire_text: String,
+    }
 
     #[test]
     fn validates_prefixed_ids() {
@@ -431,6 +448,32 @@ mod tests {
             "2026-09-01T12:00:00Z"
         );
         assert!(UtcTimestamp::parse("2026-09-01T21:00:00+09:00").is_err());
+    }
+
+    #[test]
+    fn preserves_shared_utc_timestamp_wire_text_fixture() {
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let path = workspace_root.join("spec/fixtures/utc-timestamp-v1.json");
+        let fixture: TimestampFixture = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
+
+        assert_eq!(fixture.fixture_version, 1);
+        assert_eq!(fixture.contract, "preserve_valid_utc_rfc3339_wire_text");
+        assert!(!fixture.cases.is_empty());
+        for case in fixture.cases {
+            let timestamp = UtcTimestamp::parse(&case.input)
+                .unwrap_or_else(|error| panic!("{}: {error}", case.name));
+            assert_eq!(timestamp.as_str(), case.expected_wire_text, "{}", case.name);
+            assert_eq!(
+                serde_json::to_string(&timestamp).unwrap(),
+                serde_json::to_string(&case.expected_wire_text).unwrap(),
+                "{}",
+                case.name
+            );
+        }
     }
 
     #[test]

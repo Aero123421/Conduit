@@ -1,14 +1,49 @@
-use std::collections::VecDeque;
+use std::{
+    collections::{BTreeMap, VecDeque},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 
 use crate::types::{
     AdapterError, AdapterEvent, AdapterEventKind, AdapterKind, AdapterOperation, AdapterState,
-    ApprovalBridgeOwnership, ApprovalContext, EffectiveApprovalPolicy, LaunchRequest,
-    MAX_PROTOCOL_FRAME_BYTES, ProtocolFrame, validate_launch_request,
+    ApprovalBridgeOwnership, ApprovalContext, EffectiveAccessScope, EffectiveApprovalPolicy,
+    EffectiveSandboxPolicy, LaunchRequest, MAX_PROTOCOL_FRAME_BYTES, ProtocolFrame,
+    validate_launch_request,
 };
 
 const MAX_REPLAY_EVENTS: usize = 4_096;
+const MAX_PENDING_CODEX_REQUESTS: usize = 64;
+const MAX_PENDING_CODEX_APPROVALS: usize = 1;
+const CODEX_APPROVAL_TTL_MS: u64 = 5 * 60 * 1_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexResponseKind {
+    Initialize,
+    ThreadStart,
+    ThreadResume,
+    TurnStart,
+    TurnSteer,
+    TurnInterrupt,
+    ThreadRead,
+    ModelList,
+    ThreadArchive,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCodexRequest {
+    method: &'static str,
+    response: CodexResponseKind,
+}
+
+#[derive(Debug, Clone)]
+struct PendingCodexApproval {
+    request_id: Value,
+    method: &'static str,
+    params_digest: String,
+    expires_at_unix_ms: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Phase {
@@ -43,10 +78,16 @@ pub struct ProtocolDriver {
     state: AdapterState,
     prompt: Option<String>,
     cwd: String,
+    model: Option<String>,
+    effort: Option<String>,
     requested_session_id: Option<String>,
     native_session_id: Option<String>,
     active_turn_id: Option<String>,
     next_request_id: u64,
+    pending_codex: BTreeMap<u64, PendingCodexRequest>,
+    pending_codex_approvals: BTreeMap<String, PendingCodexApproval>,
+    effective_access_scope: EffectiveAccessScope,
+    effective_sandbox_policy: EffectiveSandboxPolicy,
     approval_context: ApprovalContext,
     pending_acp_permission: Option<PendingAcpPermission>,
     pending_pi_dialog: Option<PendingPiDialog>,
@@ -63,6 +104,22 @@ impl ProtocolDriver {
         request: &LaunchRequest,
         approval_context: ApprovalContext,
     ) -> Result<Self, AdapterError> {
+        Self::new_with_authority_context(
+            kind,
+            request,
+            EffectiveAccessScope::ReadOnly,
+            EffectiveSandboxPolicy::ReadOnly,
+            approval_context,
+        )
+    }
+
+    pub fn new_with_authority_context(
+        kind: AdapterKind,
+        request: &LaunchRequest,
+        effective_access_scope: EffectiveAccessScope,
+        effective_sandbox_policy: EffectiveSandboxPolicy,
+        approval_context: ApprovalContext,
+    ) -> Result<Self, AdapterError> {
         validate_launch_request(request)?;
         let phase = match kind {
             AdapterKind::Codex => Phase::CodexInitialize,
@@ -76,10 +133,16 @@ impl ProtocolDriver {
             state: AdapterState::Starting,
             prompt: request.prompt.clone(),
             cwd: request.cwd.to_string_lossy().into_owned(),
+            model: request.model.clone(),
+            effort: request.effort.clone(),
             requested_session_id: request.native_session_id.clone(),
             native_session_id: None,
             active_turn_id: None,
             next_request_id: 1,
+            pending_codex: BTreeMap::new(),
+            pending_codex_approvals: BTreeMap::new(),
+            effective_access_scope,
+            effective_sandbox_policy,
             approval_context,
             pending_acp_permission: None,
             pending_pi_dialog: None,
@@ -89,12 +152,13 @@ impl ProtocolDriver {
 
     pub fn start(&mut self) -> Result<Vec<ProtocolFrame>, AdapterError> {
         match self.phase {
-            Phase::CodexInitialize => Ok(vec![self.request(
+            Phase::CodexInitialize => Ok(vec![self.codex_request(
                 "initialize",
                 json!({
                     "clientInfo": {"name": "conduit", "title": "Conduit", "version": env!("CARGO_PKG_VERSION")},
                     "capabilities": {"experimentalApi": true}
                 }),
+                CodexResponseKind::Initialize,
             )?]),
             Phase::AcpInitialize => Ok(vec![self.json_rpc_request(
                 "initialize",
@@ -153,6 +217,14 @@ impl ProtocolDriver {
         self.approval_context
     }
 
+    pub const fn effective_access_scope(&self) -> EffectiveAccessScope {
+        self.effective_access_scope
+    }
+
+    pub const fn effective_sandbox_policy(&self) -> EffectiveSandboxPolicy {
+        self.effective_sandbox_policy
+    }
+
     pub fn native_session_id(&self) -> Option<&str> {
         self.native_session_id
             .as_deref()
@@ -209,10 +281,10 @@ impl ProtocolDriver {
         allow: bool,
     ) -> Result<ProtocolFrame, AdapterError> {
         match self.kind {
-            AdapterKind::Codex => ProtocolFrame::json(&json!({
-                "id": request_id,
-                "result": {"decision": if allow { "accept" } else { "decline" }}
-            })),
+            AdapterKind::Codex => Err(AdapterError::UnexpectedResponse {
+                phase: "codex_server_request",
+                reason: "Codex approval requires method, parameters digest, and expiry commitment",
+            }),
             AdapterKind::OpenCode => {
                 let pending =
                     self.pending_acp_permission
@@ -260,9 +332,94 @@ impl ProtocolDriver {
             _ => Err(AdapterError::UnsupportedOperation {
                 adapter: self.kind,
                 operation: AdapterOperation::Send,
-                reason: "adapter has no correlated approval response protocol",
+                reason: "adapter has no typed correlated approval response protocol",
             }),
         }
+    }
+
+    pub fn resolve_codex_approval(
+        &mut self,
+        request_id: &Value,
+        method: &str,
+        params_digest: &str,
+        allow: bool,
+        now_unix_ms: u64,
+    ) -> Result<ProtocolFrame, AdapterError> {
+        if self.kind != AdapterKind::Codex {
+            return Err(AdapterError::UnsupportedOperation {
+                adapter: self.kind,
+                operation: AdapterOperation::Send,
+                reason: "commitment-bound Codex approval used for a different adapter",
+            });
+        }
+        let key = server_request_key(request_id).ok_or(AdapterError::UnexpectedResponse {
+            phase: "codex_server_request",
+            reason: "approval response id has an unsupported JSON-RPC type",
+        })?;
+        let pending =
+            self.pending_codex_approvals
+                .get(&key)
+                .ok_or(AdapterError::UnexpectedResponse {
+                    phase: "codex_server_request",
+                    reason: "approval response id is not outstanding",
+                })?;
+        if pending.method != method || pending.params_digest != params_digest {
+            return Err(AdapterError::UnexpectedResponse {
+                phase: "codex_server_request",
+                reason: "approval response commitment does not match the pending request",
+            });
+        }
+        if pending.expires_at_unix_ms < now_unix_ms {
+            return Err(AdapterError::UnexpectedResponse {
+                phase: "codex_server_request",
+                reason: "approval response expired",
+            });
+        }
+        let pending = self.pending_codex_approvals.remove(&key).expect("checked");
+        self.state = AdapterState::Working;
+        codex_approval_response(pending.method, &pending.request_id, allow)
+    }
+
+    pub fn expire_codex_approvals(
+        &mut self,
+        now_unix_ms: u64,
+    ) -> Result<(Vec<ProtocolFrame>, Vec<AdapterEvent>), AdapterError> {
+        if self.kind != AdapterKind::Codex {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let expired = self
+            .pending_codex_approvals
+            .iter()
+            .filter(|(_, pending)| pending.expires_at_unix_ms <= now_unix_ms)
+            .map(|(key, _)| key.clone())
+            .collect::<Vec<_>>();
+        let mut frames = Vec::with_capacity(expired.len());
+        let mut events = Vec::with_capacity(expired.len());
+        for key in expired {
+            let pending = self.pending_codex_approvals.remove(&key).expect("selected");
+            frames.push(codex_approval_response(
+                pending.method,
+                &pending.request_id,
+                false,
+            )?);
+            events.push(AdapterEvent::bounded(
+                AdapterEventKind::AdapterError,
+                pending.method,
+                self.native_session_id(),
+                Some(&request_id_text(&pending.request_id)),
+                Some("commitment-bound approval expired and was denied"),
+                Some(json!({
+                    "providerRequestId": pending.request_id,
+                    "method": pending.method,
+                    "parametersDigest": pending.params_digest,
+                    "approvalExpired": true
+                })),
+            ));
+        }
+        if self.pending_codex_approvals.is_empty() && !frames.is_empty() {
+            self.state = AdapterState::Working;
+        }
+        Ok((frames, events))
     }
 
     fn on_codex(
@@ -273,17 +430,111 @@ impl ProtocolDriver {
             if let Some(request_id) = value.get("id") {
                 let correlation_id = request_id_text(request_id);
                 if is_codex_approval_method(method) {
-                    // Conduit does not advertise a synchronous approval callback
-                    // capability to app-server yet.  Explicitly decline instead of
-                    // leaving a server-initiated request pending indefinitely.
-                    let frame = codex_approval_decline(method, request_id)?;
+                    let params = value.get("params").cloned().unwrap_or_else(|| json!({}));
+                    let params_digest = canonical_digest(&params)?;
+                    if self.approval_context.effective_policy == EffectiveApprovalPolicy::Never {
+                        let frame = codex_approval_response(method, request_id, true)?;
+                        let event = AdapterEvent::bounded(
+                            AdapterEventKind::ApprovalRequest,
+                            method,
+                            self.native_session_id(),
+                            Some(&correlation_id),
+                            Some("pre-authorized by the effective Conduit Approval Policy"),
+                            Some(json!({
+                                "providerRequestId": request_id,
+                                "method": method,
+                                "parametersDigest": params_digest,
+                                "decision": "approved",
+                                "preAuthorized": true
+                            })),
+                        );
+                        return Ok((vec![frame], vec![event]));
+                    }
+                    if self.approval_context.bridge == ApprovalBridgeOwnership::Typed {
+                        let Some(key) = server_request_key(request_id) else {
+                            let frame = codex_approval_response(method, request_id, false)?;
+                            return Ok((
+                                vec![frame],
+                                vec![AdapterEvent::bounded(
+                                    AdapterEventKind::AdapterError,
+                                    method,
+                                    self.native_session_id(),
+                                    Some(&correlation_id),
+                                    Some("unsupported JSON-RPC approval id type was denied"),
+                                    None,
+                                )],
+                            ));
+                        };
+                        if self.pending_codex_approvals.len() >= MAX_PENDING_CODEX_APPROVALS {
+                            let frame = codex_approval_response(method, request_id, false)?;
+                            return Ok((
+                                vec![frame],
+                                vec![AdapterEvent::bounded(
+                                    AdapterEventKind::AdapterError,
+                                    method,
+                                    self.native_session_id(),
+                                    Some(&correlation_id),
+                                    Some("bounded approval map is full; request was denied"),
+                                    None,
+                                )],
+                            ));
+                        }
+                        if self.pending_codex_approvals.contains_key(&key) {
+                            let frame = codex_approval_response(method, request_id, false)?;
+                            return Ok((
+                                vec![frame],
+                                vec![AdapterEvent::bounded(
+                                    AdapterEventKind::AdapterError,
+                                    method,
+                                    self.native_session_id(),
+                                    Some(&correlation_id),
+                                    Some("duplicate outstanding server request id was denied"),
+                                    None,
+                                )],
+                            ));
+                        }
+                        let expires_at_unix_ms = unix_ms().saturating_add(CODEX_APPROVAL_TTL_MS);
+                        self.pending_codex_approvals.insert(
+                            key,
+                            PendingCodexApproval {
+                                request_id: request_id.clone(),
+                                method: codex_approval_method(method).expect("matched"),
+                                params_digest: params_digest.clone(),
+                                expires_at_unix_ms,
+                            },
+                        );
+                        self.state = AdapterState::WaitingApproval;
+                        let event = AdapterEvent::bounded(
+                            AdapterEventKind::ApprovalRequest,
+                            method,
+                            self.native_session_id(),
+                            Some(&correlation_id),
+                            Some("waiting for a commitment-bound Conduit Approval"),
+                            Some(json!({
+                                "providerRequestId": request_id,
+                                "method": method,
+                                "parametersDigest": params_digest,
+                                "argumentsSummary": codex_approval_summary(method, &params, &params_digest),
+                                "expiresAtUnixMs": expires_at_unix_ms,
+                                "preAuthorized": false
+                            })),
+                        );
+                        return Ok((Vec::new(), vec![event]));
+                    }
+                    let frame = codex_approval_response(method, request_id, false)?;
                     let event = AdapterEvent::bounded(
                         AdapterEventKind::ApprovalRequest,
                         method,
                         self.native_session_id(),
                         Some(&correlation_id),
-                        Some("declined because the Conduit approval bridge is not advertised"),
-                        value.get("params").cloned(),
+                        Some("declined because the typed Conduit approval bridge is unavailable"),
+                        Some(json!({
+                            "providerRequestId": request_id,
+                            "method": method,
+                            "parametersDigest": params_digest,
+                            "decision": "denied",
+                            "preAuthorized": false
+                        })),
                     );
                     return Ok((vec![frame], vec![event]));
                 }
@@ -306,80 +557,176 @@ impl ProtocolDriver {
             }
             return Ok((Vec::new(), self.normalize_codex_notification(method, value)));
         }
+        self.on_codex_response(value)
+    }
+
+    fn on_codex_response(
+        &mut self,
+        value: &Value,
+    ) -> Result<(Vec<ProtocolFrame>, Vec<AdapterEvent>), AdapterError> {
+        let id = value.get("id").and_then(Value::as_u64);
+        let correlation = value.get("id").map(request_id_text);
+        let Some(id) = id else {
+            return Ok((
+                Vec::new(),
+                vec![self.codex_response_error(
+                    correlation.as_deref(),
+                    "response id was absent or was not the numeric client request id type",
+                )],
+            ));
+        };
+        let Some(pending) = self.pending_codex.remove(&id) else {
+            return Ok((
+                Vec::new(),
+                vec![self.codex_response_error(
+                    correlation.as_deref(),
+                    "response id is not outstanding (wrong id or duplicate response)",
+                )],
+            ));
+        };
+
         if value.get("error").is_some() {
-            self.state = AdapterState::Failed;
+            if matches!(
+                pending.response,
+                CodexResponseKind::Initialize
+                    | CodexResponseKind::ThreadStart
+                    | CodexResponseKind::ThreadResume
+                    | CodexResponseKind::TurnStart
+            ) {
+                self.state = AdapterState::Failed;
+            }
             return Ok((
                 Vec::new(),
                 vec![AdapterEvent::bounded(
                     AdapterEventKind::Error,
-                    "json_rpc_error",
+                    pending.method,
                     self.native_session_id(),
-                    value.get("id").map(request_id_text).as_deref(),
+                    correlation.as_deref(),
                     value.pointer("/error/message").and_then(Value::as_str),
-                    None,
+                    value.get("error").cloned(),
                 )],
             ));
         }
-        let id = value.get("id").map(request_id_text);
-        match self.phase {
-            Phase::CodexInitialize if id.as_deref() == Some("1") => {
-                require_result(value, self.phase_name())?;
+        let result = match value.get("result") {
+            Some(result) => result,
+            None => {
+                return Ok((
+                    Vec::new(),
+                    vec![self.codex_response_error(
+                        correlation.as_deref(),
+                        "correlated response omitted result",
+                    )],
+                ));
+            }
+        };
+
+        match pending.response {
+            CodexResponseKind::Initialize => {
+                if !result.is_object() {
+                    return Ok((
+                        Vec::new(),
+                        vec![self.codex_response_error(
+                            correlation.as_deref(),
+                            "initialize result was not an object",
+                        )],
+                    ));
+                }
                 self.phase = Phase::CodexThread;
-                let params = self.requested_session_id.as_ref().map_or_else(
-                    || json!({"cwd": self.cwd}),
-                    |session_id| json!({"threadId": session_id, "cwd": self.cwd, "excludeTurns": true}),
+                let (method, response, mut params) = self.requested_session_id.as_ref().map_or_else(
+                    || {
+                        (
+                            "thread/start",
+                            CodexResponseKind::ThreadStart,
+                            json!({"cwd": self.cwd}),
+                        )
+                    },
+                    |session_id| {
+                        (
+                            "thread/resume",
+                            CodexResponseKind::ThreadResume,
+                            json!({"threadId": session_id, "cwd": self.cwd, "excludeTurns": true}),
+                        )
+                    },
                 );
-                let method = if self.requested_session_id.is_some() {
-                    "thread/resume"
-                } else {
-                    "thread/start"
-                };
+                params["approvalPolicy"] = Value::String(self.codex_approval_policy().to_owned());
+                params["sandbox"] = Value::String(self.codex_sandbox_mode().to_owned());
+                params["approvalsReviewer"] = Value::String("user".to_owned());
+                if let Some(model) = &self.model {
+                    params["model"] = Value::String(model.clone());
+                }
                 Ok((
                     vec![
                         ProtocolFrame::json(&json!({"method": "initialized"}))?,
-                        self.request(method, params)?,
+                        self.codex_request(method, params, response)?,
                     ],
                     Vec::new(),
                 ))
             }
-            Phase::CodexThread if id.as_deref() == Some("2") => {
-                let session_id = value
-                    .pointer("/result/thread/id")
-                    .and_then(Value::as_str)
-                    .ok_or(AdapterError::UnexpectedResponse {
-                        phase: self.phase_name(),
-                        reason: "thread response omitted result.thread.id",
-                    })?
-                    .to_owned();
+            CodexResponseKind::ThreadStart | CodexResponseKind::ThreadResume => {
+                let Some(session_id) = result.pointer("/thread/id").and_then(Value::as_str) else {
+                    return Ok((
+                        Vec::new(),
+                        vec![self.codex_response_error(
+                            correlation.as_deref(),
+                            "thread response omitted result.thread.id",
+                        )],
+                    ));
+                };
+                if matches!(pending.response, CodexResponseKind::ThreadResume)
+                    && self.requested_session_id.as_deref() != Some(session_id)
+                {
+                    return Ok((
+                        Vec::new(),
+                        vec![self.codex_response_error(
+                            correlation.as_deref(),
+                            "thread/resume returned a different thread id",
+                        )],
+                    ));
+                }
+                let session_id = session_id.to_owned();
                 self.native_session_id = Some(session_id.clone());
                 self.state = AdapterState::Ready;
-                let session_event = AdapterEvent::bounded(
+                let event = AdapterEvent::bounded(
                     AdapterEventKind::Session,
-                    "thread/ready",
+                    pending.method,
                     Some(&session_id),
-                    None,
+                    correlation.as_deref(),
                     None,
                     None,
                 );
-                if let Some(prompt) = self.prompt.clone() {
+                if let Some(prompt) = self.prompt.take() {
                     self.phase = Phase::CodexTurn;
                     self.state = AdapterState::Starting;
-                    let frame = self.codex_turn(&prompt)?;
-                    Ok((vec![frame], vec![session_event]))
+                    Ok((vec![self.codex_turn(&prompt)?], vec![event]))
                 } else {
                     self.phase = Phase::Ready;
-                    Ok((Vec::new(), vec![session_event]))
+                    Ok((Vec::new(), vec![event]))
                 }
             }
-            Phase::CodexTurn if id.as_deref() == Some("3") => {
-                let turn_id = value
-                    .pointer("/result/turn/id")
-                    .and_then(Value::as_str)
-                    .ok_or(AdapterError::UnexpectedResponse {
-                        phase: self.phase_name(),
-                        reason: "turn response omitted result.turn.id",
-                    })?
-                    .to_owned();
+            CodexResponseKind::TurnStart => {
+                let Some(turn_id) = result.pointer("/turn/id").and_then(Value::as_str) else {
+                    return Ok((
+                        Vec::new(),
+                        vec![self.codex_response_error(
+                            correlation.as_deref(),
+                            "turn response omitted result.turn.id",
+                        )],
+                    ));
+                };
+                if self
+                    .active_turn_id
+                    .as_deref()
+                    .is_some_and(|active| active != turn_id)
+                {
+                    return Ok((
+                        Vec::new(),
+                        vec![self.codex_response_error(
+                            correlation.as_deref(),
+                            "turn/start response conflicts with the correlated turn/started notification",
+                        )],
+                    ));
+                }
+                let turn_id = turn_id.to_owned();
                 self.active_turn_id = Some(turn_id.clone());
                 self.phase = Phase::Active;
                 self.state = AdapterState::Working;
@@ -387,26 +734,158 @@ impl ProtocolDriver {
                     Vec::new(),
                     vec![AdapterEvent::bounded(
                         AdapterEventKind::PromptAccepted,
-                        "turn/start",
+                        pending.method,
                         self.native_session_id(),
                         Some(&turn_id),
                         None,
+                        Some(json!({"requestId": id})),
+                    )],
+                ))
+            }
+            CodexResponseKind::TurnSteer => {
+                let Some(turn_id) = result.get("turnId").and_then(Value::as_str) else {
+                    return Ok((
+                        Vec::new(),
+                        vec![self.codex_response_error(
+                            correlation.as_deref(),
+                            "turn/steer response omitted result.turnId",
+                        )],
+                    ));
+                };
+                if self.active_turn_id.as_deref() != Some(turn_id) {
+                    return Ok((
+                        Vec::new(),
+                        vec![self.codex_response_error(
+                            correlation.as_deref(),
+                            "turn/steer response did not match the active turn",
+                        )],
+                    ));
+                }
+                Ok((
+                    Vec::new(),
+                    vec![AdapterEvent::bounded(
+                        AdapterEventKind::PromptAccepted,
+                        pending.method,
+                        self.native_session_id(),
+                        Some(turn_id),
+                        None,
+                        Some(json!({"requestId": id})),
+                    )],
+                ))
+            }
+            CodexResponseKind::TurnInterrupt => {
+                if !result.is_object() {
+                    return Ok((
+                        Vec::new(),
+                        vec![self.codex_response_error(
+                            correlation.as_deref(),
+                            "turn/interrupt result was not an object",
+                        )],
+                    ));
+                }
+                Ok((
+                    Vec::new(),
+                    vec![AdapterEvent::bounded(
+                        AdapterEventKind::State,
+                        pending.method,
+                        self.native_session_id(),
+                        self.active_turn_id.as_deref(),
+                        Some("interrupt accepted; terminal state awaits turn/completed"),
+                        Some(json!({"requestId": id})),
+                    )],
+                ))
+            }
+            CodexResponseKind::ThreadRead => {
+                let Some(thread_id) = result.pointer("/thread/id").and_then(Value::as_str) else {
+                    return Ok((
+                        Vec::new(),
+                        vec![self.codex_response_error(
+                            correlation.as_deref(),
+                            "thread/read response omitted result.thread.id",
+                        )],
+                    ));
+                };
+                if self.native_session_id() != Some(thread_id) {
+                    return Ok((
+                        Vec::new(),
+                        vec![self.codex_response_error(
+                            correlation.as_deref(),
+                            "thread/read response was for a different thread",
+                        )],
+                    ));
+                }
+                Ok((
+                    Vec::new(),
+                    vec![AdapterEvent::bounded(
+                        AdapterEventKind::State,
+                        pending.method,
+                        Some(thread_id),
+                        correlation.as_deref(),
+                        None,
+                        Some(json!({"threadId": thread_id})),
+                    )],
+                ))
+            }
+            CodexResponseKind::ModelList => {
+                let Some(models) = result.get("data").and_then(Value::as_array) else {
+                    return Ok((
+                        Vec::new(),
+                        vec![self.codex_response_error(
+                            correlation.as_deref(),
+                            "model/list response omitted result.data",
+                        )],
+                    ));
+                };
+                Ok((
+                    Vec::new(),
+                    vec![AdapterEvent::bounded(
+                        AdapterEventKind::State,
+                        pending.method,
+                        self.native_session_id(),
+                        correlation.as_deref(),
+                        Some("model list received"),
+                        Some(
+                            json!({"count": models.len(), "nextCursor": result.get("nextCursor")}),
+                        ),
+                    )],
+                ))
+            }
+            CodexResponseKind::ThreadArchive => {
+                if !result.is_object() {
+                    return Ok((
+                        Vec::new(),
+                        vec![self.codex_response_error(
+                            correlation.as_deref(),
+                            "thread/archive result was not an object",
+                        )],
+                    ));
+                }
+                self.phase = Phase::Terminal;
+                self.state = AdapterState::Completed;
+                Ok((
+                    Vec::new(),
+                    vec![AdapterEvent::bounded(
+                        AdapterEventKind::Completed,
+                        pending.method,
+                        self.native_session_id(),
+                        correlation.as_deref(),
+                        Some("thread archived"),
                         None,
                     )],
                 ))
             }
-            _ => Ok((
-                Vec::new(),
-                vec![AdapterEvent::bounded(
-                    AdapterEventKind::AdapterError,
-                    "unexpected_response",
-                    self.native_session_id(),
-                    id.as_deref(),
-                    Some("response did not match the active Codex request"),
-                    None,
-                )],
-            )),
         }
+    }
+
+    fn codex_response_error(&self, correlation_id: Option<&str>, reason: &str) -> AdapterEvent {
+        AdapterEvent::bounded(
+            AdapterEventKind::AdapterError,
+            "unexpected_response",
+            self.native_session_id(),
+            correlation_id,
+            Some(reason),
+            None,
+        )
     }
 
     fn normalize_codex_notification(&mut self, method: &str, value: &Value) -> Vec<AdapterEvent> {
@@ -416,8 +895,20 @@ impl ProtocolDriver {
                 let turn_id = params
                     .and_then(|params| params.pointer("/turn/id"))
                     .and_then(Value::as_str);
+                if self
+                    .active_turn_id
+                    .as_deref()
+                    .zip(turn_id)
+                    .is_some_and(|(active, observed)| active != observed)
+                {
+                    return vec![self.codex_response_error(
+                        turn_id,
+                        "stale turn/started notification did not match the active turn",
+                    )];
+                }
                 if let Some(turn_id) = turn_id {
-                    self.active_turn_id = Some(turn_id.to_owned());
+                    self.active_turn_id
+                        .get_or_insert_with(|| turn_id.to_owned());
                 }
                 self.state = AdapterState::Working;
                 AdapterEvent::bounded(
@@ -433,6 +924,12 @@ impl ProtocolDriver {
                 let turn_id = params
                     .and_then(|params| params.pointer("/turn/id"))
                     .and_then(Value::as_str);
+                if self.active_turn_id.as_deref() != turn_id || turn_id.is_none() {
+                    return vec![self.codex_response_error(
+                        turn_id,
+                        "stale or duplicate turn/completed notification did not match the active turn",
+                    )];
+                }
                 self.active_turn_id = None;
                 self.phase = Phase::Ready;
                 self.state = AdapterState::Completed;
@@ -1158,7 +1655,12 @@ impl ProtocolDriver {
             .to_owned();
         match operation {
             AdapterOperation::Send | AdapterOperation::FollowUp => {
-                if self.active_turn_id.is_some() {
+                if self.active_turn_id.is_some()
+                    || self
+                        .pending_codex
+                        .values()
+                        .any(|pending| pending.response == CodexResponseKind::TurnStart)
+                {
                     return Err(AdapterError::UnexpectedResponse {
                         phase: self.phase_name(),
                         reason: "a turn is active; use steer or wait for completion",
@@ -1176,13 +1678,14 @@ impl ProtocolDriver {
                             phase: self.phase_name(),
                             reason: "Codex turn/steer requires an active turn",
                         })?;
-                Ok(vec![self.request_with_id(
+                Ok(vec![self.codex_request(
                     "turn/steer",
                     json!({
                         "threadId": session_id,
                         "expectedTurnId": turn_id,
                         "input": [{"type": "text", "text": text.unwrap_or_default()}]
                     }),
+                    CodexResponseKind::TurnSteer,
                 )?])
             }
             AdapterOperation::Cancel => {
@@ -1193,25 +1696,27 @@ impl ProtocolDriver {
                             phase: self.phase_name(),
                             reason: "Codex turn/interrupt requires an active turn",
                         })?;
-                Ok(vec![self.request_with_id(
+                Ok(vec![self.codex_request(
                     "turn/interrupt",
                     json!({"threadId": session_id, "turnId": turn_id}),
+                    CodexResponseKind::TurnInterrupt,
                 )?])
             }
-            AdapterOperation::State => Ok(vec![self.request_with_id(
+            AdapterOperation::State => Ok(vec![self.codex_request(
                 "thread/read",
                 json!({"threadId": session_id, "includeTurns": false}),
+                CodexResponseKind::ThreadRead,
             )?]),
-            AdapterOperation::ModelDiscovery => Ok(vec![
-                self.request_with_id("model/list", json!({"limit": 100}))?,
-            ]),
-            AdapterOperation::Close => {
-                self.phase = Phase::Terminal;
-                Ok(vec![self.request_with_id(
-                    "thread/archive",
-                    json!({"threadId": session_id}),
-                )?])
-            }
+            AdapterOperation::ModelDiscovery => Ok(vec![self.codex_request(
+                "model/list",
+                json!({"limit": 100}),
+                CodexResponseKind::ModelList,
+            )?]),
+            AdapterOperation::Close => Ok(vec![self.codex_request(
+                "thread/archive",
+                json!({"threadId": session_id}),
+                CodexResponseKind::ThreadArchive,
+            )?]),
             _ => Err(AdapterError::UnsupportedOperation {
                 adapter: self.kind,
                 operation,
@@ -1292,20 +1797,57 @@ impl ProtocolDriver {
                 reason: "Codex thread ID is unavailable",
             })?
             .to_owned();
-        let id = if self.next_request_id <= 3 {
-            self.next_request_id = 4;
-            3
-        } else {
-            self.take_request_id()
-        };
-        ProtocolFrame::json(&json!({
-            "id": id,
-            "method": "turn/start",
-            "params": {
-                "threadId": session_id,
-                "input": [{"type": "text", "text": prompt}]
+        let mut params = json!({
+            "threadId": session_id,
+            "input": [{"type": "text", "text": prompt}],
+            "approvalPolicy": self.codex_approval_policy(),
+            "approvalsReviewer": "user",
+            "sandboxPolicy": self.codex_turn_sandbox_policy(),
+        });
+        if let Some(model) = &self.model {
+            params["model"] = Value::String(model.clone());
+        }
+        if let Some(effort) = &self.effort {
+            params["effort"] = Value::String(effort.clone());
+        }
+        self.codex_request("turn/start", params, CodexResponseKind::TurnStart)
+    }
+
+    const fn codex_approval_policy(&self) -> &'static str {
+        match self.approval_context.effective_policy {
+            EffectiveApprovalPolicy::Never => "never",
+            EffectiveApprovalPolicy::Always => "untrusted",
+            EffectiveApprovalPolicy::OutsideScope | EffectiveApprovalPolicy::RiskClasses => {
+                "on-request"
             }
-        }))
+        }
+    }
+
+    const fn codex_sandbox_mode(&self) -> &'static str {
+        match self.effective_sandbox_policy {
+            EffectiveSandboxPolicy::ReadOnly => "read-only",
+            EffectiveSandboxPolicy::WorkspaceWrite => "workspace-write",
+            EffectiveSandboxPolicy::External | EffectiveSandboxPolicy::DangerFullAccess => {
+                "danger-full-access"
+            }
+        }
+    }
+
+    fn codex_turn_sandbox_policy(&self) -> Value {
+        match self.effective_sandbox_policy {
+            EffectiveSandboxPolicy::ReadOnly => json!({"type":"readOnly","networkAccess":false}),
+            EffectiveSandboxPolicy::External => {
+                json!({"type":"externalSandbox","networkAccess":"restricted"})
+            }
+            EffectiveSandboxPolicy::WorkspaceWrite => json!({
+                "type":"workspaceWrite",
+                "writableRoots":[self.cwd],
+                "networkAccess":false,
+                "excludeTmpdirEnvVar":true,
+                "excludeSlashTmp":true
+            }),
+            EffectiveSandboxPolicy::DangerFullAccess => json!({"type":"dangerFullAccess"}),
+        }
     }
 
     fn acp_prompt(&mut self, prompt: &str) -> Result<ProtocolFrame, AdapterError> {
@@ -1343,17 +1885,23 @@ impl ProtocolDriver {
         ProtocolFrame::json(&value)
     }
 
-    fn request(&mut self, method: &str, params: Value) -> Result<ProtocolFrame, AdapterError> {
-        let id = self.take_request_id();
-        ProtocolFrame::json(&json!({"id": id, "method": method, "params": params}))
-    }
-
-    fn request_with_id(
+    fn codex_request(
         &mut self,
-        method: &str,
+        method: &'static str,
         params: Value,
+        response: CodexResponseKind,
     ) -> Result<ProtocolFrame, AdapterError> {
-        self.request(method, params)
+        if self.pending_codex.len() >= MAX_PENDING_CODEX_REQUESTS {
+            return Err(AdapterError::UnexpectedResponse {
+                phase: "codex_pending_requests",
+                reason: "bounded Codex pending request map is full",
+            });
+        }
+        let id = self.take_request_id();
+        let frame = ProtocolFrame::json(&json!({"id": id, "method": method, "params": params}))?;
+        self.pending_codex
+            .insert(id, PendingCodexRequest { method, response });
+        Ok(frame)
     }
 
     fn json_rpc_request(
@@ -1498,7 +2046,7 @@ fn pi_tool_result_text(value: &Value) -> Option<&str> {
     })
 }
 
-const CODEX_SERVER_REQUEST_METHODS: [&str; 10] = [
+const CODEX_SERVER_REQUEST_METHODS: [&str; 11] = [
     "item/commandExecution/requestApproval",
     "item/fileChange/requestApproval",
     "item/tool/requestUserInput",
@@ -1507,6 +2055,7 @@ const CODEX_SERVER_REQUEST_METHODS: [&str; 10] = [
     "item/tool/call",
     "account/chatgptAuthTokens/refresh",
     "attestation/generate",
+    "currentTime/read",
     "applyPatchApproval",
     "execCommandApproval",
 ];
@@ -1525,18 +2074,38 @@ fn is_codex_approval_method(method: &str) -> bool {
     )
 }
 
-fn codex_approval_decline(method: &str, id: &Value) -> Result<ProtocolFrame, AdapterError> {
+fn codex_approval_method(method: &str) -> Option<&'static str> {
+    match method {
+        "item/commandExecution/requestApproval" => Some("item/commandExecution/requestApproval"),
+        "item/fileChange/requestApproval" => Some("item/fileChange/requestApproval"),
+        "applyPatchApproval" => Some("applyPatchApproval"),
+        "execCommandApproval" => Some("execCommandApproval"),
+        _ => None,
+    }
+}
+
+fn codex_approval_response(
+    method: &str,
+    id: &Value,
+    allow: bool,
+) -> Result<ProtocolFrame, AdapterError> {
     let result = match method {
         "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
-            json!({"decision": "decline"})
+            json!({"decision": if allow { "accept" } else { "decline" }})
         }
-        "applyPatchApproval" | "execCommandApproval" => json!({
-            "decision": {
-                "denied": {
-                    "rejection": "Conduit did not advertise a synchronous approval bridge"
-                }
+        "applyPatchApproval" | "execCommandApproval" => {
+            if allow {
+                json!({"decision": "approved"})
+            } else {
+                json!({
+                    "decision": {
+                        "denied": {
+                            "rejection": "Conduit denied the commitment-bound approval request"
+                        }
+                    }
+                })
             }
-        }),
+        }
         _ => {
             return Err(AdapterError::UnexpectedResponse {
                 phase: "codex_server_request",
@@ -1545,6 +2114,80 @@ fn codex_approval_decline(method: &str, id: &Value) -> Result<ProtocolFrame, Ada
         }
     };
     ProtocolFrame::json(&json!({"id": id, "result": result}))
+}
+
+fn server_request_key(id: &Value) -> Option<String> {
+    match id {
+        Value::String(value) => Some(format!("s:{value}")),
+        Value::Number(value) if value.as_i64().is_some() || value.as_u64().is_some() => {
+            Some(format!("n:{value}"))
+        }
+        _ => None,
+    }
+}
+
+fn canonical_digest(value: &Value) -> Result<String, AdapterError> {
+    Ok(hex::encode(Sha256::digest(serde_jcs::to_vec(value)?)))
+}
+
+fn codex_approval_summary(method: &str, params: &Value, params_digest: &str) -> Value {
+    match method {
+        "item/commandExecution/requestApproval" | "execCommandApproval" => {
+            let command = params
+                .get("command")
+                .map(|value| match value {
+                    Value::String(value) => value.clone(),
+                    Value::Array(values) => values
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    _ => String::new(),
+                })
+                .unwrap_or_default();
+            let tokens = command.split_whitespace().collect::<Vec<_>>();
+            let executable_label = tokens
+                .first()
+                .map(|token| {
+                    token
+                        .trim_matches(['\'', '"'])
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or("command")
+                })
+                .map(|value| crate::types::bound_utf8(value, 128))
+                .unwrap_or_else(|| "command".to_owned());
+            json!({
+                "effect": "command_execution",
+                "executableLabel": executable_label,
+                "argumentCount": tokens.len().saturating_sub(1),
+                "deviceOnlyDetails": true,
+                "parametersDigest": params_digest
+            })
+        }
+        "item/fileChange/requestApproval" | "applyPatchApproval" => {
+            let change_count = params
+                .get("changes")
+                .and_then(Value::as_array)
+                .map_or(1, Vec::len);
+            json!({
+                "effect": "file_change",
+                "changeCount": change_count,
+                "deviceOnlyDetails": true,
+                "parametersDigest": params_digest
+            })
+        }
+        _ => json!({"effect":"unsupported","parametersDigest":params_digest}),
+    }
+}
+
+fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn codex_fail_closed_response(
@@ -1648,12 +2291,382 @@ mod tests {
             value.pointer("/params/expectedTurnId"),
             Some(&json!("turn-1"))
         );
+        let response = serde_json::to_vec(&json!({
+            "id": value["id"], "result": {"turnId": "turn-1"}
+        }))
+        .unwrap();
+        let (_, events) = driver
+            .on_record(&[response.as_slice(), b"\n"].concat())
+            .unwrap();
+        assert_eq!(events[0].vendor_type, "turn/steer");
+        assert_eq!(events[0].kind, AdapterEventKind::PromptAccepted);
+    }
+
+    fn ready_codex_driver() -> ProtocolDriver {
+        let mut driver = ProtocolDriver::new(AdapterKind::Codex, &request()).unwrap();
+        driver.start().unwrap();
+        driver.on_record(b"{\"id\":1,\"result\":{}}\n").unwrap();
+        driver
+            .on_record(b"{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-1\"}}}\n")
+            .unwrap();
+        driver
+            .on_record(b"{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-1\"}}}\n")
+            .unwrap();
+        driver
+    }
+
+    #[test]
+    fn codex_correlates_out_of_order_read_and_model_responses() {
+        let mut driver = ready_codex_driver();
+        let state: Value = serde_json::from_slice(
+            &driver
+                .command(AdapterOperation::State, None)
+                .unwrap()
+                .remove(0)
+                .0,
+        )
+        .unwrap();
+        let models: Value = serde_json::from_slice(
+            &driver
+                .command(AdapterOperation::ModelDiscovery, None)
+                .unwrap()
+                .remove(0)
+                .0,
+        )
+        .unwrap();
+        let model_response = serde_json::to_vec(&json!({
+            "id": models["id"],
+            "result": {"data": [{"id": "gpt-5"}], "nextCursor": null}
+        }))
+        .unwrap();
+        let (_, events) = driver
+            .on_record(&[model_response.as_slice(), b"\n"].concat())
+            .unwrap();
+        assert_eq!(events[0].vendor_type, "model/list");
+        let state_response = serde_json::to_vec(&json!({
+            "id": state["id"],
+            "result": {"thread": {"id": "thread-1"}}
+        }))
+        .unwrap();
+        let (_, events) = driver
+            .on_record(&[state_response.as_slice(), b"\n"].concat())
+            .unwrap();
+        assert_eq!(events[0].vendor_type, "thread/read");
+    }
+
+    #[test]
+    fn codex_wrong_and_duplicate_ids_never_consume_an_outstanding_request() {
+        let mut driver = ready_codex_driver();
+        let request: Value = serde_json::from_slice(
+            &driver
+                .command(AdapterOperation::State, None)
+                .unwrap()
+                .remove(0)
+                .0,
+        )
+        .unwrap();
+        let (_, wrong) = driver
+            .on_record(b"{\"id\":9999,\"result\":{\"thread\":{\"id\":\"thread-1\"}}}\n")
+            .unwrap();
+        assert_eq!(wrong[0].kind, AdapterEventKind::AdapterError);
+
+        let response = serde_json::to_vec(&json!({
+            "id": request["id"],
+            "result": {"thread": {"id": "thread-1"}}
+        }))
+        .unwrap();
+        let record = [response.as_slice(), b"\n"].concat();
+        let (_, first) = driver.on_record(&record).unwrap();
+        assert_eq!(first[0].vendor_type, "thread/read");
+        let (_, duplicate) = driver.on_record(&record).unwrap();
+        assert_eq!(duplicate[0].kind, AdapterEventKind::AdapterError);
+        assert_eq!(duplicate[0].vendor_type, "unexpected_response");
+    }
+
+    #[test]
+    fn codex_interrupt_and_steer_responses_are_bound_to_the_active_turn() {
+        let mut driver = ready_codex_driver();
+        let steer: Value = serde_json::from_slice(
+            &driver
+                .command(AdapterOperation::Steer, Some("constraint"))
+                .unwrap()
+                .remove(0)
+                .0,
+        )
+        .unwrap();
+        let interrupt: Value = serde_json::from_slice(
+            &driver
+                .command(AdapterOperation::Cancel, None)
+                .unwrap()
+                .remove(0)
+                .0,
+        )
+        .unwrap();
+        let interrupt_response = serde_json::to_vec(&json!({
+            "id": interrupt["id"], "result": {}
+        }))
+        .unwrap();
+        let (_, events) = driver
+            .on_record(&[interrupt_response.as_slice(), b"\n"].concat())
+            .unwrap();
+        assert_eq!(events[0].vendor_type, "turn/interrupt");
+
+        let wrong_turn = serde_json::to_vec(&json!({
+            "id": steer["id"], "result": {"turnId": "turn-other"}
+        }))
+        .unwrap();
+        let (_, events) = driver
+            .on_record(&[wrong_turn.as_slice(), b"\n"].concat())
+            .unwrap();
+        assert_eq!(events[0].kind, AdapterEventKind::AdapterError);
+        assert_eq!(driver.native_session_id(), Some("thread-1"));
+    }
+
+    #[test]
+    fn codex_supports_a_fresh_follow_up_turn_after_completion() {
+        let mut driver = ready_codex_driver();
+        driver
+            .on_record(b"{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn-1\",\"status\":{\"type\":\"completed\"}}}}\n")
+            .unwrap();
+        assert_eq!(driver.state(), AdapterState::Completed);
+        let request: Value = serde_json::from_slice(
+            &driver
+                .command(AdapterOperation::FollowUp, Some("second turn"))
+                .unwrap()
+                .remove(0)
+                .0,
+        )
+        .unwrap();
+        let response = serde_json::to_vec(&json!({
+            "id": request["id"], "result": {"turn": {"id": "turn-2"}}
+        }))
+        .unwrap();
+        let (_, events) = driver
+            .on_record(&[response.as_slice(), b"\n"].concat())
+            .unwrap();
+        assert_eq!(events[0].kind, AdapterEventKind::PromptAccepted);
+        assert_eq!(events[0].correlation_id.as_deref(), Some("turn-2"));
+        assert_eq!(driver.state(), AdapterState::Working);
+        driver
+            .on_record(b"{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn-2\",\"status\":{\"type\":\"completed\"}}}}\n")
+            .unwrap();
+        assert_eq!(driver.state(), AdapterState::Completed);
+    }
+
+    #[test]
+    fn codex_rejects_parallel_turn_start_and_stale_turn_notifications() {
+        let mut driver = ready_codex_driver();
+        let (_, events) = driver
+            .on_record(
+                b"{\"method\":\"turn/started\",\"params\":{\"turn\":{\"id\":\"stale-turn\"}}}\n",
+            )
+            .unwrap();
+        assert_eq!(events[0].kind, AdapterEventKind::AdapterError);
+        let (_, events) = driver
+            .on_record(b"{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"stale-turn\",\"status\":{\"type\":\"completed\"}}}}\n")
+            .unwrap();
+        assert_eq!(events[0].kind, AdapterEventKind::AdapterError);
+        assert_eq!(driver.state(), AdapterState::Working);
+
+        driver
+            .on_record(b"{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn-1\",\"status\":{\"type\":\"completed\"}}}}\n")
+            .unwrap();
+        driver
+            .command(AdapterOperation::FollowUp, Some("first"))
+            .unwrap();
+        assert!(
+            driver
+                .command(AdapterOperation::FollowUp, Some("parallel"))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn codex_effective_authority_is_sent_on_thread_and_turn_start() {
+        let context = ApprovalContext {
+            effective_policy: EffectiveApprovalPolicy::OutsideScope,
+            bridge: ApprovalBridgeOwnership::Typed,
+        };
+        let mut driver = ProtocolDriver::new_with_authority_context(
+            AdapterKind::Codex,
+            &request(),
+            EffectiveAccessScope::ProjectFull,
+            EffectiveSandboxPolicy::External,
+            context,
+        )
+        .unwrap();
+        driver.start().unwrap();
+        let (frames, _) = driver.on_record(b"{\"id\":1,\"result\":{}}\n").unwrap();
+        let thread: Value = serde_json::from_slice(&frames[1].0).unwrap();
+        assert_eq!(
+            thread.pointer("/params/approvalPolicy"),
+            Some(&json!("on-request"))
+        );
+        assert_eq!(
+            thread.pointer("/params/sandbox"),
+            Some(&json!("danger-full-access"))
+        );
+        let (frames, _) = driver
+            .on_record(b"{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-1\"}}}\n")
+            .unwrap();
+        let turn: Value = serde_json::from_slice(&frames[0].0).unwrap();
+        assert_eq!(
+            turn.pointer("/params/approvalPolicy"),
+            Some(&json!("on-request"))
+        );
+        assert_eq!(
+            turn.pointer("/params/sandboxPolicy/type"),
+            Some(&json!("externalSandbox"))
+        );
+    }
+
+    #[test]
+    fn codex_typed_approval_rejects_wrong_commitment_and_settles_same_id() {
+        let context = ApprovalContext {
+            effective_policy: EffectiveApprovalPolicy::Always,
+            bridge: ApprovalBridgeOwnership::Typed,
+        };
+        let mut driver = ProtocolDriver::new_with_authority_context(
+            AdapterKind::Codex,
+            &request(),
+            EffectiveAccessScope::ReadOnly,
+            EffectiveSandboxPolicy::ReadOnly,
+            context,
+        )
+        .unwrap();
+        let (frames, events) = driver
+            .on_record(b"{\"id\":\"approval-7\",\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"command\":\"pwd\"}}\n")
+            .unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(driver.state(), AdapterState::WaitingApproval);
+        let digest = events[0]
+            .data
+            .as_ref()
+            .and_then(|data| data.get("parametersDigest"))
+            .and_then(Value::as_str)
+            .unwrap();
+        let expires = events[0]
+            .data
+            .as_ref()
+            .and_then(|data| data.get("expiresAtUnixMs"))
+            .and_then(Value::as_u64)
+            .unwrap();
+        let (second_frames, second_events) = driver
+            .on_record(b"{\"id\":\"approval-8\",\"method\":\"item/fileChange/requestApproval\",\"params\":{\"changes\":[]}}\n")
+            .unwrap();
+        let second: Value = serde_json::from_slice(&second_frames[0].0).unwrap();
+        assert_eq!(second["id"], json!("approval-8"));
+        assert_eq!(second.pointer("/result/decision"), Some(&json!("decline")));
+        assert_eq!(second_events[0].kind, AdapterEventKind::AdapterError);
+        assert_eq!(driver.state(), AdapterState::WaitingApproval);
+        assert!(
+            driver
+                .resolve_codex_approval(
+                    &json!("approval-7"),
+                    "item/commandExecution/requestApproval",
+                    &"0".repeat(64),
+                    true,
+                    expires - 1,
+                )
+                .is_err()
+        );
+        let frame = driver
+            .resolve_codex_approval(
+                &json!("approval-7"),
+                "item/commandExecution/requestApproval",
+                digest,
+                true,
+                expires - 1,
+            )
+            .unwrap();
+        let response: Value = serde_json::from_slice(&frame.0).unwrap();
+        assert_eq!(response["id"], json!("approval-7"));
+        assert_eq!(response.pointer("/result/decision"), Some(&json!("accept")));
+        assert!(
+            driver
+                .resolve_codex_approval(
+                    &json!("approval-7"),
+                    "item/commandExecution/requestApproval",
+                    digest,
+                    true,
+                    expires - 1,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn codex_typed_approval_expires_with_one_correlated_decline() {
+        let context = ApprovalContext {
+            effective_policy: EffectiveApprovalPolicy::Always,
+            bridge: ApprovalBridgeOwnership::Typed,
+        };
+        let mut driver = ProtocolDriver::new_with_authority_context(
+            AdapterKind::Codex,
+            &request(),
+            EffectiveAccessScope::ReadOnly,
+            EffectiveSandboxPolicy::ReadOnly,
+            context,
+        )
+        .unwrap();
+        let (_, events) = driver
+            .on_record(b"{\"id\":-7,\"method\":\"item/fileChange/requestApproval\",\"params\":{\"changes\":[]}}\n")
+            .unwrap();
+        let expires = events[0].data.as_ref().unwrap()["expiresAtUnixMs"]
+            .as_u64()
+            .unwrap();
+        let (frames, events) = driver.expire_codex_approvals(expires).unwrap();
+        assert_eq!(frames.len(), 1);
+        let response: Value = serde_json::from_slice(&frames[0].0).unwrap();
+        assert_eq!(response["id"], json!(-7));
+        assert_eq!(
+            response.pointer("/result/decision"),
+            Some(&json!("decline"))
+        );
+        assert_eq!(
+            events[0].data.as_ref().unwrap()["approvalExpired"],
+            json!(true)
+        );
+        assert!(
+            driver
+                .expire_codex_approvals(expires + 1)
+                .unwrap()
+                .0
+                .is_empty()
+        );
+        assert!(
+            driver
+                .resolve_codex_approval(
+                    &json!(-7),
+                    "item/fileChange/requestApproval",
+                    events[0].data.as_ref().unwrap()["parametersDigest"]
+                        .as_str()
+                        .unwrap(),
+                    true,
+                    expires,
+                )
+                .is_err()
+        );
     }
 
     #[test]
     fn codex_current_server_request_union_always_receives_a_correlated_response() {
         let mut driver = ProtocolDriver::new(AdapterKind::Codex, &request()).unwrap();
-        for (index, method) in CODEX_SERVER_REQUEST_METHODS.into_iter().enumerate() {
+        let generated: Value = serde_json::from_slice(include_bytes!(
+            "../tests/fixtures/codex-app-server-v2-server-request-methods.json"
+        ))
+        .unwrap();
+        let methods = generated["methods"].as_array().unwrap();
+        assert_eq!(methods.len(), 11, "generated ServerRequest union changed");
+        for (index, method) in methods
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .enumerate()
+        {
+            assert!(
+                is_codex_server_request(method),
+                "generated method {method} is not classified"
+            );
             let id = format!("server-{index}");
             let record = serde_json::to_vec(&json!({
                 "id": id,

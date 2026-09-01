@@ -10,6 +10,183 @@ use thiserror::Error;
 
 pub const FEATURE_REGISTRY_VERSION: u16 = 1;
 pub const CONFIG_SCHEMA_VERSION: u16 = 1;
+pub const MAX_CONFIG_BYTES: usize = 256 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProductFeature {
+    ControlPlane,
+    NodeTransport,
+    NativeRuntime,
+    RestrictedNativeRuntime,
+    ContainerRuntime,
+    IncusVmRuntime,
+    WorkspaceChangeSet,
+    AgentAdapters,
+    CollaborationContext,
+    McpGateway,
+    ObservabilityEvaluation,
+    CliOperations,
+}
+
+pub const PRODUCT_FEATURES_V1: [ProductFeature; 12] = [
+    ProductFeature::ControlPlane,
+    ProductFeature::NodeTransport,
+    ProductFeature::NativeRuntime,
+    ProductFeature::RestrictedNativeRuntime,
+    ProductFeature::ContainerRuntime,
+    ProductFeature::IncusVmRuntime,
+    ProductFeature::WorkspaceChangeSet,
+    ProductFeature::AgentAdapters,
+    ProductFeature::CollaborationContext,
+    ProductFeature::McpGateway,
+    ProductFeature::ObservabilityEvaluation,
+    ProductFeature::CliOperations,
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalDefaultDecision {
+    Deny,
+    Ask,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct NodeConfig {
+    pub display_name: String,
+    pub frame_max_bytes: usize,
+    pub reconnect_min_ms: u64,
+    pub reconnect_max_ms: u64,
+}
+
+impl Default for NodeConfig {
+    fn default() -> Self {
+        Self {
+            display_name: "linux-device".to_owned(),
+            frame_max_bytes: 65_536,
+            reconnect_min_ms: 500,
+            reconnect_max_ms: 30_000,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct LocalPolicyConfig {
+    pub default: LocalDefaultDecision,
+}
+
+impl Default for LocalPolicyConfig {
+    fn default() -> Self {
+        Self {
+            default: LocalDefaultDecision::Deny,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AppConfig {
+    pub schema_version: u16,
+    pub control_plane_url: String,
+    pub log_level: LogLevel,
+    pub node: NodeConfig,
+    pub local_policy: LocalPolicyConfig,
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        Self {
+            schema_version: CONFIG_SCHEMA_VERSION,
+            control_plane_url: "http://127.0.0.1:8787".to_owned(),
+            log_level: LogLevel::Info,
+            node: NodeConfig::default(),
+            local_policy: LocalPolicyConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ConfigError {
+    #[error("configuration is {actual} bytes; maximum is {maximum}")]
+    TooLarge { actual: usize, maximum: usize },
+    #[error("configuration is not valid TOML: {0}")]
+    InvalidToml(String),
+    #[error("unsupported configuration schema version {0}")]
+    UnsupportedVersion(u16),
+    #[error("control_plane_url must be HTTPS, or HTTP on loopback for development")]
+    InsecureControlPlane,
+    #[error("node display_name must be 1 to 128 visible bytes")]
+    InvalidDisplayName,
+    #[error("node frame_max_bytes must be between 4,096 and 65,536")]
+    InvalidFrameLimit,
+    #[error("node reconnect bounds are invalid")]
+    InvalidReconnectBounds,
+}
+
+impl AppConfig {
+    pub fn from_toml(bytes: &[u8]) -> Result<Self, ConfigError> {
+        if bytes.len() > MAX_CONFIG_BYTES {
+            return Err(ConfigError::TooLarge {
+                actual: bytes.len(),
+                maximum: MAX_CONFIG_BYTES,
+            });
+        }
+        let text = std::str::from_utf8(bytes)
+            .map_err(|error| ConfigError::InvalidToml(error.to_string()))?;
+        let config: Self =
+            toml::from_str(text).map_err(|error| ConfigError::InvalidToml(error.to_string()))?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.schema_version != CONFIG_SCHEMA_VERSION {
+            return Err(ConfigError::UnsupportedVersion(self.schema_version));
+        }
+        if !valid_control_plane_url(&self.control_plane_url) {
+            return Err(ConfigError::InsecureControlPlane);
+        }
+        if self.node.display_name.is_empty()
+            || self.node.display_name.len() > 128
+            || self.node.display_name.chars().any(char::is_control)
+        {
+            return Err(ConfigError::InvalidDisplayName);
+        }
+        if !(4_096..=65_536).contains(&self.node.frame_max_bytes) {
+            return Err(ConfigError::InvalidFrameLimit);
+        }
+        if self.node.reconnect_min_ms == 0
+            || self.node.reconnect_max_ms < self.node.reconnect_min_ms
+            || self.node.reconnect_max_ms > 300_000
+        {
+            return Err(ConfigError::InvalidReconnectBounds);
+        }
+        Ok(())
+    }
+}
+
+fn valid_control_plane_url(value: &str) -> bool {
+    if value.starts_with("https://") {
+        return value.len() > "https://".len()
+            && !value.contains('@')
+            && !value.chars().any(char::is_control);
+    }
+    ["http://127.0.0.1", "http://localhost", "http://[::1]"]
+        .iter()
+        .any(|origin| value == *origin || value.starts_with(&format!("{origin}:")))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -218,5 +395,37 @@ mod tests {
                 variable: "XDG_STATE_HOME"
             })
         );
+    }
+
+    #[test]
+    fn config_defaults_are_explicit_and_fail_closed() {
+        let config = AppConfig::from_toml(b"").unwrap();
+        assert_eq!(config.schema_version, CONFIG_SCHEMA_VERSION);
+        assert_eq!(config.node.frame_max_bytes, 65_536);
+        assert_eq!(config.local_policy.default, LocalDefaultDecision::Deny);
+    }
+
+    #[test]
+    fn config_rejects_unknown_fields_and_insecure_remote_origins() {
+        assert!(matches!(
+            AppConfig::from_toml(b"unknown = true"),
+            Err(ConfigError::InvalidToml(_))
+        ));
+        assert_eq!(
+            AppConfig::from_toml(b"control_plane_url = 'http://example.com'"),
+            Err(ConfigError::InsecureControlPlane)
+        );
+    }
+
+    #[test]
+    fn feature_registry_is_versioned_and_unique() {
+        assert_eq!(FEATURE_REGISTRY_VERSION, 1);
+        let mut names = PRODUCT_FEATURES_V1
+            .iter()
+            .map(|feature| format!("{feature:?}"))
+            .collect::<Vec<_>>();
+        names.sort();
+        names.dedup();
+        assert_eq!(names.len(), PRODUCT_FEATURES_V1.len());
     }
 }

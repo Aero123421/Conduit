@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 serde.workspace = true
 thiserror.workspace = true
+toml = "1.1.4"
 
 [dev-dependencies]
 serde_json.workspace = true

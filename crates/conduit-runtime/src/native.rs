@@ -126,7 +126,7 @@ impl ProcessSupervisor {
         self.save(&r)?;
         Ok(PreparedRuntime {
             runtime_id: request.runtime_id.clone(),
-            provider_id: "native".into(),
+            provider_id: provider_id.into(),
             spec_digest: request.spec_digest.clone(),
             object_id: request.runtime_id.clone(),
             state: RuntimeState::Prepared,
@@ -282,6 +282,64 @@ impl ProcessSupervisor {
         }
         self.start_waiter(record.runtime_id.clone(), child, launch.timeout_ms);
         self.receipt(record)
+    }
+
+    /// Adopts a process group that was spawned with its protocol input still
+    /// withheld. Persisting this receipt before initialization prevents an
+    /// Agent process from becoming anonymous if the Node exits after spawn.
+    pub fn adopt_external(
+        &self,
+        prepared: &PreparedRuntime,
+        launch: &LaunchPlan,
+        pid: u32,
+    ) -> Result<RuntimeStateReceipt, RuntimeError> {
+        let mut record = self.load(&prepared.runtime_id)?;
+        if record.spec_digest != prepared.spec_digest
+            || record.provider_id != prepared.provider_id
+            || record.state != RuntimeState::Prepared
+            || record.pid.is_some()
+        {
+            return Err(RuntimeError::IdentityMismatch);
+        }
+        if !launch.executable.is_absolute() || !launch.executable.is_file() {
+            return Err(RuntimeError::Invalid(
+                "executable identity must be an absolute regular file".into(),
+            ));
+        }
+        let birth = process_birth(pid).ok_or_else(|| {
+            RuntimeError::Uncertain("spawned process birth identity unavailable".into())
+        })?;
+        record.pid = Some(pid);
+        record.birth = Some(birth);
+        record.executable = launch.executable.clone();
+        record.state = RuntimeState::Running;
+        record.started_unix_ms = Some(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+        );
+        record.timeout_ms = launch.timeout_ms;
+        self.save(&record)?;
+        self.receipt(record)
+    }
+
+    pub fn mark_external_stopped(
+        &self,
+        runtime_id: &str,
+        exit_code: Option<i32>,
+    ) -> Result<(), RuntimeError> {
+        let mut record = self.load(runtime_id)?;
+        if let Some(pid) = record.pid
+            && process_birth(pid) == record.birth
+        {
+            return Err(RuntimeError::Uncertain(
+                "external process is still live while recording stop".into(),
+            ));
+        }
+        record.state = RuntimeState::Stopped;
+        record.exit_code = exit_code;
+        self.save(&record)
     }
     fn start_waiter(&self, id: String, child: Arc<Mutex<Child>>, timeout: Option<u64>) {
         let this = self.clone();
@@ -469,6 +527,11 @@ impl RuntimeProvider for NativeProvider {
     }
     fn prepare(&self, r: &RuntimeRequest) -> Result<PreparedRuntime, RuntimeError> {
         validate_request(r, RuntimeKind::Native, &["native", "native.linux"])?;
+        if r.workspaces.iter().any(|workspace| workspace.read_only) {
+            return Err(RuntimeError::CapabilityUnavailable(
+                "native provider cannot enforce a read-only mount; select an effective restricted/container/VM provider".into(),
+            ));
+        }
         self.supervisor
             .reserve(r, self.provider_id(), PathBuf::new(), false)
     }
@@ -484,7 +547,11 @@ impl RuntimeProvider for NativeProvider {
             return Err(RuntimeError::IdentityMismatch);
         }
         let r = self.supervisor.inspect(&h.runtime_id)?;
-        if r.handle.spec_digest != h.spec_digest {
+        if r.handle.spec_digest != h.spec_digest
+            || h.process_identity
+                .as_ref()
+                .is_some_and(|expected| r.handle.process_identity.as_ref() != Some(expected))
+        {
             return Err(RuntimeError::IdentityMismatch);
         }
         Ok(r)
@@ -497,6 +564,7 @@ impl RuntimeProvider for NativeProvider {
         if h.provider_id != self.provider_id() || h.object_id != "native-supervisor" {
             return Err(RuntimeError::IdentityMismatch);
         }
+        self.inspect(h)?;
         self.supervisor.signal(&h.runtime_id, s)
     }
     fn snapshot(&self, _: &RuntimeHandle, _: &str) -> Result<SnapshotReceipt, RuntimeError> {
@@ -677,7 +745,7 @@ mod tests {
             provider_id: "native".into(),
             spec_digest: "11".repeat(32),
             object_id: "native-supervisor".into(),
-            process_identity: Some("pid:missing".into()),
+            process_identity: Some(format!("pid:{}:birth:1", u32::MAX)),
         };
         let p = NativeProvider::new(s);
         let r = p
@@ -687,5 +755,23 @@ mod tests {
             }])
             .unwrap();
         assert_eq!(r[0].state, RuntimeState::Lost);
+    }
+
+    #[test]
+    fn rejects_read_only_workspace_when_mount_enforcement_is_unavailable() {
+        let d = tempdir().unwrap();
+        let p = NativeProvider::new(ProcessSupervisor::open(d.path()).unwrap());
+        let mut request = req();
+        request.workspaces.push(WorkspaceAttachment {
+            host_path: d.path().into(),
+            guest_path: PathBuf::from("/workspace/source"),
+            read_only: true,
+        });
+
+        assert!(matches!(
+            p.prepare(&request),
+            Err(RuntimeError::CapabilityUnavailable(message))
+                if message.contains("cannot enforce a read-only mount")
+        ));
     }
 }

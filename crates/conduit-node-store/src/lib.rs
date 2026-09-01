@@ -721,6 +721,16 @@ impl NodeStore {
         Ok(())
     }
 
+    pub fn inbound_applied_through(&self, direction: Direction) -> Result<u64, StoreError> {
+        self.conn()?
+            .query_row(
+                "SELECT CASE WHEN EXISTS(SELECT 1 FROM transport_inbox WHERE direction=?1 AND application_state<>'applied') THEN (SELECT MIN(sequence)-1 FROM transport_inbox WHERE direction=?1 AND application_state<>'applied') ELSE (SELECT received_through FROM transport_positions WHERE direction=?1) END",
+                [direction.as_str()],
+                |row| row.get(0),
+            )
+            .map_err(map_sql)
+    }
+
     pub fn ack_outbound(&self, direction: Direction, through: u64) -> Result<usize, StoreError> {
         let conn = self.conn()?;
         let sent_max: u64 = conn
@@ -1165,10 +1175,18 @@ mod tests {
             ReceiveResult::Applied
         );
         assert_eq!(
+            s.inbound_applied_through(Direction::ControlToNode).unwrap(),
+            0
+        );
+        assert_eq!(
             s.receive(Direction::ControlToNode, &one).unwrap(),
             ReceiveResult::DuplicatePending
         );
         s.mark_inbound_applied(Direction::ControlToNode, 1).unwrap();
+        assert_eq!(
+            s.inbound_applied_through(Direction::ControlToNode).unwrap(),
+            1
+        );
         assert_eq!(
             s.receive(Direction::ControlToNode, &one).unwrap(),
             ReceiveResult::Duplicate

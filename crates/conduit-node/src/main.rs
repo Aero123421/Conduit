@@ -122,8 +122,11 @@ fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let supervisor = ProcessSupervisor::open(opts.data.join("supervisor"))?;
     let native: Arc<dyn RuntimeProvider> = Arc::new(NativeProvider::new(supervisor.clone()));
-    let restricted: Arc<dyn RuntimeProvider> =
-        Arc::new(RestrictedNativeProvider::new(supervisor, true, false));
+    let restricted: Arc<dyn RuntimeProvider> = Arc::new(RestrictedNativeProvider::new(
+        supervisor.clone(),
+        true,
+        false,
+    ));
     let docker: Arc<dyn RuntimeProvider> =
         Arc::new(ContainerProvider::new(ContainerBackend::Docker));
     let podman: Arc<dyn RuntimeProvider> =
@@ -150,6 +153,7 @@ fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             boot,
             config,
             local.clone(),
+            supervisor.clone(),
         )?;
         std::thread::spawn(move || service.run_forever());
     }

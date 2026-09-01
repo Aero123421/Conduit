@@ -11,8 +11,8 @@ use conduit_adapters::{
 use conduit_domain::Sha256Digest;
 use conduit_node_store::{DeviceIdentity, Direction, OperationState, ReceiveResult, StoreError};
 use conduit_runtime::{
-    IoMode, LaunchPlan, NetworkMode, ResourceLimits, RuntimeHandle, RuntimeKind, RuntimeRequest,
-    RuntimeState,
+    IoMode, LaunchPlan, NetworkMode, ProcessSupervisor, ResourceLimits, RuntimeHandle, RuntimeKind,
+    RuntimeRequest, RuntimeState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -267,9 +267,15 @@ struct AgentActive {
     operation_id: String,
     run_id: String,
     request_digest: String,
+    runtime_id: String,
     child: AdapterChild,
     driver: ProtocolDriver,
     event_sequence: u64,
+}
+
+struct PendingReconciliation {
+    id: String,
+    control_applied_through: u64,
 }
 
 pub struct NodeService {
@@ -282,9 +288,11 @@ pub struct NodeService {
     profiles: HashMap<String, LaunchProfile>,
     local_policy: LocalPolicy,
     local: Arc<LocalServices>,
+    supervisor: ProcessSupervisor,
     message_counter: u64,
     active: HashMap<String, Active>,
     agents: HashMap<String, AgentActive>,
+    pending_reconciliation: Option<PendingReconciliation>,
 }
 impl NodeService {
     #[allow(clippy::too_many_arguments)]
@@ -297,6 +305,7 @@ impl NodeService {
         node_boot_id: String,
         config: NodePolicyConfig,
         local: Arc<LocalServices>,
+        supervisor: ProcessSupervisor,
     ) -> Result<Self, ServiceError> {
         if !device_id.starts_with("dev_")
             || capability_digest.len() != 64
@@ -351,9 +360,11 @@ impl NodeService {
             profiles: config.profiles,
             local_policy: config.local_policy,
             local,
+            supervisor,
             message_counter,
             active,
             agents: HashMap::new(),
+            pending_reconciliation: None,
         })
     }
     fn message_id(&mut self) -> String {
@@ -489,7 +500,7 @@ impl NodeService {
             }
             "transport.error" => {}
             "reconcile.plan" => {
-                if let Err(error) = self.reconcile(client, &frame.payload) {
+                if let Err(error) = self.reconcile(client, &frame.payload, seq) {
                     match error {
                         ServiceError::Unavailable(reason) => {
                             let payload = json!({"code":"capability_unavailable","retryable":false,"details":{"messageType":"reconcile.plan","reason":reason}});
@@ -507,7 +518,11 @@ impl NodeService {
                 }
             }
             "operation.offer" => {
-                if !client.session.remote_work_allowed() {
+                let requested_replay = self
+                    .pending_reconciliation
+                    .as_ref()
+                    .is_some_and(|pending| seq <= pending.control_applied_through);
+                if !client.session.remote_work_allowed() && !requested_replay {
                     return Err(ServiceError::Unavailable("reconciliation_required".into()));
                 }
                 if let Err(error) = self.offer(client, &frame.payload) {
@@ -547,6 +562,7 @@ impl NodeService {
         self.node
             .store()
             .mark_inbound_applied(Direction::ControlToNode, seq)?;
+        self.maybe_complete_reconciliation(client)?;
         if frame.kind != "transport.ack" {
             let ack = json!({"direction":"control_to_node","throughSequence":seq.to_string()});
             let ack_id = self.message_id();
@@ -613,7 +629,12 @@ impl NodeService {
         )?;
         Ok(())
     }
-    fn reconcile(&mut self, client: &mut WssClient, payload: &Value) -> Result<(), ServiceError> {
+    fn reconcile(
+        &mut self,
+        client: &mut WssClient,
+        payload: &Value,
+        plan_sequence: u64,
+    ) -> Result<(), ServiceError> {
         let id = payload["reconciliationId"]
             .as_str()
             .ok_or(TransportError::Malformed)?;
@@ -632,13 +653,25 @@ impl NodeService {
                 .ok_or(TransportError::Malformed)?;
             client.replay_range(from, through)?;
         }
+        let mut control_applied_through = plan_sequence;
         for range in payload["controlReplay"]
             .as_array()
             .ok_or(TransportError::Malformed)?
         {
-            let from = range["from"].as_str().ok_or(TransportError::Malformed)?;
-            let _through = range["through"].as_str().ok_or(TransportError::Malformed)?;
-            let request = json!({"direction":"control_to_node","expectedSequence":from});
+            let from = range["from"]
+                .as_str()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or(TransportError::Malformed)?;
+            let through = range["through"]
+                .as_str()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or(TransportError::Malformed)?;
+            if from == 0 || through < from {
+                return Err(TransportError::Malformed.into());
+            }
+            control_applied_through = control_applied_through.max(through);
+            let request =
+                json!({"direction":"control_to_node","expectedSequence":from.to_string()});
             let message_id = self.message_id();
             client.session.queue_outbound(
                 &message_id,
@@ -731,13 +764,39 @@ impl NodeService {
                 .map(Vec::as_slice)
                 .unwrap_or_default(),
         )?;
-        client.session.complete_plan(id)?;
-        let p = self.node.store().transport_positions()?;
-        let response = json!({"reconciliationId":id,"lastControlSequenceApplied":p.control_received_through.to_string(),"lastNodeSequenceAcknowledged":p.node_acknowledged_through.to_string(),"unresolvedRunIds":[]});
-        let msg = self.message_id();
+        self.pending_reconciliation = Some(PendingReconciliation {
+            id: id.to_owned(),
+            control_applied_through,
+        });
+        Ok(())
+    }
+
+    fn maybe_complete_reconciliation(
+        &mut self,
+        client: &mut WssClient,
+    ) -> Result<(), ServiceError> {
+        let Some(pending) = self.pending_reconciliation.as_ref() else {
+            return Ok(());
+        };
+        if self
+            .node
+            .store()
+            .inbound_applied_through(Direction::ControlToNode)?
+            < pending.control_applied_through
+        {
+            return Ok(());
+        }
+        let pending = self
+            .pending_reconciliation
+            .take()
+            .expect("pending reconciliation was checked");
+        client.session.complete_plan(&pending.id)?;
+        let positions = self.node.store().transport_positions()?;
+        let response = json!({"reconciliationId":pending.id,"lastControlSequenceApplied":self.node.store().inbound_applied_through(Direction::ControlToNode)?.to_string(),"lastNodeSequenceAcknowledged":positions.node_acknowledged_through.to_string(),"unresolvedRunIds":[]});
+        let message_id = self.message_id();
         client
             .session
-            .queue_outbound(&msg, "reconcile.complete", None, response, 0)?;
+            .queue_outbound(&message_id, "reconcile.complete", None, response, 0)?;
         Ok(())
     }
     fn offer(&mut self, client: &mut WssClient, payload: &Value) -> Result<(), ServiceError> {
@@ -820,6 +879,11 @@ impl NodeService {
                 source.attachment(guest)
             })
             .collect::<Vec<_>>();
+        if is_agent && workspaces.iter().any(|workspace| workspace.read_only) {
+            return Err(ServiceError::Unavailable(
+                "adapter_native_read_only_workspace_unavailable".into(),
+            ));
+        }
         let (launch, agent_launch) = if is_agent {
             let kind = parse_adapter(profile_id)?;
             let cwd = prepared_sources
@@ -994,7 +1058,27 @@ impl NodeService {
                     None,
                     None,
                 )?;
-                let child = match AdapterChild::spawn(&spec) {
+                let prepared = match self.supervisor.reserve(
+                    &offer.runtime,
+                    "native",
+                    spec.executable.clone(),
+                    false,
+                ) {
+                    Ok(prepared) => prepared,
+                    Err(error) => {
+                        self.node.store().transition_operation(
+                            &op.idempotency_key,
+                            OperationState::Starting,
+                            OperationState::Failed,
+                            Some(&runtime_id),
+                            None,
+                            Some(error.to_string().as_bytes()),
+                        )?;
+                        self.queue_start_failure(client, &op, &error.to_string())?;
+                        return Ok(());
+                    }
+                };
+                let mut child = match AdapterChild::spawn_uninitialized(&spec) {
                     Ok(child) => child,
                     Err(error) => {
                         self.node.store().transition_operation(
@@ -1009,7 +1093,45 @@ impl NodeService {
                         return Ok(());
                     }
                 };
-                let process_identity = format!("adapter-pid:{}", child.id());
+                let custody =
+                    match self
+                        .supervisor
+                        .adopt_external(&prepared, &offer.launch, child.id())
+                    {
+                        Ok(receipt) => receipt,
+                        Err(error) => {
+                            let _ = child.terminate();
+                            self.node.store().transition_operation(
+                                &op.idempotency_key,
+                                OperationState::Starting,
+                                OperationState::Failed,
+                                Some(&runtime_id),
+                                None,
+                                Some(error.to_string().as_bytes()),
+                            )?;
+                            self.queue_start_failure(client, &op, &error.to_string())?;
+                            return Ok(());
+                        }
+                    };
+                if let Err(error) = child.initialize(&spec) {
+                    let status = child.terminate().ok();
+                    let _ = self
+                        .supervisor
+                        .mark_external_stopped(&runtime_id, status.and_then(|value| value.code()));
+                    self.node.store().transition_operation(
+                        &op.idempotency_key,
+                        OperationState::Starting,
+                        OperationState::Failed,
+                        Some(&runtime_id),
+                        custody.handle.process_identity.as_deref(),
+                        Some(error.to_string().as_bytes()),
+                    )?;
+                    self.queue_start_failure(client, &op, &error.to_string())?;
+                    return Ok(());
+                }
+                let process_identity = custody.handle.process_identity.ok_or_else(|| {
+                    ServiceError::Unavailable("adapter_process_identity_unavailable".into())
+                })?;
                 self.node.store().transition_operation(
                     &op.idempotency_key,
                     OperationState::Starting,
@@ -1034,6 +1156,7 @@ impl NodeService {
                         operation_id: op.operation_id,
                         run_id,
                         request_digest: op.payload_digest,
+                        runtime_id,
                         child,
                         driver,
                         event_sequence: 0,
@@ -1245,6 +1368,7 @@ impl NodeService {
             state: OperationState,
             reason: Option<String>,
             last_sequence: u64,
+            exit_code: Option<i32>,
         }
         let ids = self.agents.keys().cloned().collect::<Vec<_>>();
         let mut events = Vec::new();
@@ -1331,6 +1455,7 @@ impl NodeService {
                     state,
                     reason,
                     last_sequence: agent.event_sequence,
+                    exit_code: exit.code(),
                 });
             }
         }
@@ -1381,6 +1506,11 @@ impl NodeService {
             )?;
         }
         for pending in terminals {
+            if let Some(agent) = self.agents.get(&pending.id) {
+                self.supervisor
+                    .mark_external_stopped(&agent.runtime_id, pending.exit_code)
+                    .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+            }
             self.finish_agent(
                 client,
                 &pending.id,
@@ -1537,9 +1667,12 @@ impl NodeService {
                 active.journal_state,
             )
         } else if let Some(mut agent) = self.agents.remove(operation_id) {
-            agent
+            let status = agent
                 .child
                 .terminate()
+                .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+            self.supervisor
+                .mark_external_stopped(&agent.runtime_id, status.code())
                 .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
             (
                 agent.key,

@@ -34,6 +34,18 @@ enum AdapterReadError {
 
 impl AdapterChild {
     pub fn spawn(spec: &LaunchSpec) -> Result<Self, AdapterError> {
+        let mut adapter = Self::spawn_uninitialized(spec)?;
+        if let Err(error) = adapter.initialize(spec) {
+            let _ = adapter.terminate();
+            return Err(error);
+        }
+        Ok(adapter)
+    }
+
+    /// Spawns the structured adapter process without admitting any protocol
+    /// work. The Node uses this boundary to persist the exact PID/birth/PGID
+    /// identity before a prompt or resume frame can have an effect.
+    pub fn spawn_uninitialized(spec: &LaunchSpec) -> Result<Self, AdapterError> {
         let mut command = Command::new(&spec.executable);
         command
             .args(&spec.args)
@@ -82,20 +94,23 @@ impl AdapterChild {
                 }
             }
         });
-        let mut adapter = Self {
+        Ok(Self {
             child,
             stdin: Some(stdin),
             records,
             stdout_drain: Some(stdout_drain),
             stderr_drain: Some(stderr_drain),
-        };
+        })
+    }
+
+    pub fn initialize(&mut self, spec: &LaunchSpec) -> Result<(), AdapterError> {
         for frame in &spec.initial_frames {
-            adapter.write(frame)?;
+            self.write(frame)?;
         }
         if matches!(spec.protocol, crate::AdapterProtocol::ClaudeStreamJson) {
-            adapter.close_stdin();
+            self.close_stdin();
         }
-        Ok(adapter)
+        Ok(())
     }
 
     pub fn id(&self) -> u32 {

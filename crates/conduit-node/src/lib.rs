@@ -352,29 +352,6 @@ impl Node {
                 })
                 .as_deref()
                 == Some("agent.run.start");
-            if is_agent {
-                let terminal = if operation.state == OperationState::Running {
-                    OperationState::RecoveryRequired
-                } else {
-                    OperationState::Uncertain
-                };
-                let evidence = serde_jcs::to_vec(&serde_json::json!({
-                    "operationId": operation.operation_id,
-                    "runId": request.run_id,
-                    "state": terminal,
-                    "reasonCode": "adapter_process_restart_recovery_required"
-                }))
-                .map_err(|error| NodeError::Rejected(error.to_string()))?;
-                self.store.transition_operation(
-                    &operation.idempotency_key,
-                    operation.state,
-                    terminal,
-                    Some(&request.runtime_id),
-                    None,
-                    Some(&evidence),
-                )?;
-                continue;
-            }
             let handle = RuntimeHandle {
                 runtime_id: request.runtime_id.clone(),
                 provider_id: admission.provider_id.clone(),
@@ -388,6 +365,51 @@ impl Node {
                 },
                 process_identity: operation.process_identity.clone(),
             };
+            if is_agent {
+                let provider = self
+                    .providers
+                    .get(&admission.provider_id)
+                    .ok_or_else(|| NodeError::Rejected("runtime_provider_unavailable".into()))?;
+                let observed = provider.inspect(&handle);
+                let mut reason = "adapter_process_restart_not_live";
+                if let Ok(receipt) = &observed
+                    && matches!(
+                        receipt.state,
+                        RuntimeState::Running | RuntimeState::Paused | RuntimeState::Stopping
+                    )
+                {
+                    provider
+                        .signal(&receipt.handle, conduit_runtime::RuntimeSignal::ForceStop)
+                        .map_err(|error| NodeError::Runtime(error.to_string()))?;
+                    reason = "adapter_process_fenced_after_node_restart";
+                } else if matches!(
+                    observed,
+                    Err(RuntimeError::IdentityMismatch | RuntimeError::Uncertain(_))
+                ) {
+                    reason = "adapter_process_identity_ambiguous";
+                }
+                let terminal = if operation.state == OperationState::Running {
+                    OperationState::RecoveryRequired
+                } else {
+                    OperationState::Uncertain
+                };
+                let evidence = serde_jcs::to_vec(&serde_json::json!({
+                    "operationId": operation.operation_id,
+                    "runId": request.run_id,
+                    "state": terminal,
+                    "reasonCode": reason
+                }))
+                .map_err(|error| NodeError::Rejected(error.to_string()))?;
+                self.store.transition_operation(
+                    &operation.idempotency_key,
+                    operation.state,
+                    terminal,
+                    Some(&request.runtime_id),
+                    None,
+                    Some(&evidence),
+                )?;
+                continue;
+            }
             let provider = self
                 .providers
                 .get(&admission.provider_id)

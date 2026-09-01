@@ -1,0 +1,39 @@
+{
+  "protocol": "conduit.node/1",
+  "messageId": "nmsg_reconcile_summary_01",
+  "deviceId": "dev_sahur_pc_01",
+  "connectionEpoch": "43",
+  "direction": "node_to_control",
+  "sequence": "919",
+  "type": "reconcile.summary",
+  "correlationId": "rec_sahur_boot_01",
+  "payloadDigest": "b6f0479d0f5ec7bd4d07a619234e1dfdaf45a8c3b9906c297db161a18008af12",
+  "payload": {
+    "nodeBootId": "boot-2026-09-01T09-12-00Z-01",
+    "journalGeneration": "7",
+    "capabilityDigest": "6f53b5ae35f7d3ba9cf11cf61a9e05d2867e17b1d3d4598337c76655a8973ca0",
+    "lastControlSequenceApplied": "101",
+    "lastNodeSequenceAcknowledged": "918",
+    "lastNodeSequenceRetained": "700",
+    "runs": [
+      {
+        "runId": "run_codex_builder_01",
+        "operationId": "op_assignment_start_01",
+        "state": "running",
+        "requestDigest": "c5f3a151c4e62fa4566f322ec121874195e6af736dddb87ce6b5c2159a163c17",
+        "runtimeHandleDigest": "dd607f6dd9ff584fe12009d013924c447d708551d44c1e004d817d0c37ffeb53",
+        "lastEventSequence": "84"
+      }
+    ],
+    "retainedEventRanges": [
+      {
+        "runId": "run_codex_builder_01",
+        "fromSequence": "1",
+        "throughSequence": "84"
+      }
+    ],
+    "unresolvedCount": 0,
+    "truncated": false,
+    "storageHealth": "healthy"
+  }
+}

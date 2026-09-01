@@ -424,6 +424,7 @@
         "adapterId",
         "accessScope",
         "approvalMode",
+        "effectiveRequiredApprovalRiskClasses",
         "controllerEpoch",
         "localPolicyRevision",
         "issuedAt",
@@ -450,6 +451,12 @@
         "adapterId": { "type": "string", "minLength": 1, "maxLength": 64 },
         "accessScope": { "$ref": "#/$defs/AccessScope" },
         "approvalMode": { "$ref": "#/$defs/ApprovalMode" },
+        "effectiveRequiredApprovalRiskClasses": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/RiskClass" }
+        },
         "controllerEpoch": { "$ref": "#/$defs/U64Decimal" },
         "localPolicyRevision": { "type": "integer", "minimum": 1 },
         "issuedAt": { "$ref": "#/$defs/Timestamp" },

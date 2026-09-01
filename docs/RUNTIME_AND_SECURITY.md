@@ -68,7 +68,7 @@ Approval policy is evaluated independently from Access Scope.
 - `risk_classes`: ask for configured risk classes
 - `never`: do not ask for operations already inside effective authority
 
-The immutable operation envelope carries the authoritative `requiredApprovalRiskClasses` snapshot. For a Connector this list comes only from the grant-bound Connector Policy revision, never from operation arguments. A non-empty list is a minimum approval requirement even when the requested mode is `never`. If `risk_classes` is selected with an empty authoritative list, all defined risk classes are required so the mode cannot degrade into implicit no-approval behavior.
+The immutable operation envelope carries the authoritative `requiredApprovalRiskClasses` snapshot. For a Connector this list comes only from the grant-bound Connector Policy revision, never from operation arguments. A non-empty list is a minimum approval requirement even when the requested mode is `never`. If `risk_classes` is selected with an empty authoritative list, all defined risk classes are required so the mode cannot degrade into implicit no-approval behavior. The Device rejects unknown or duplicate snapshot values, unions the snapshot with Device-local required classes, and commits that effective set into any provider approval request. The Control Plane verifies that the effective request still contains every immutable class.
 
 `full_user + never` and `full_device + never` are valid.
 
@@ -248,10 +248,14 @@ Agent Adapters receive Access Scope and Approval Policy as separate effective
 settings. For Codex, read-only maps to `readOnly`; Restricted Native, Container,
 and VM map to `externalSandbox`; selected/workspace Native access maps to
 `workspaceWrite`; and configured Full User or Full Device Native access maps to
-`dangerFullAccess`. `never` pre-authorizes provider approval requests, `always`
-uses the provider's untrusted mode, and outside-scope or risk-class policies use
-a conservative request boundary. Risk-class-selective pre-authorization is not
-claimed until the selected classes are part of the immutable policy snapshot.
+`dangerFullAccess`. `always` uses the provider's untrusted mode, and
+outside-scope or risk-class policies use a conservative request boundary.
+`never` pre-authorizes only when the effective required-risk set is empty or a
+known provider request classification is disjoint from that set. Codex file
+change/apply-patch requests are currently classified as `destructive_delete`;
+unclassified command requests prompt whenever the effective set is non-empty.
+The provider receives `on-request` rather than `never` whenever a non-empty set
+must remain observable to Conduit's typed approval bridge.
 
 Cloud-visible approval arguments are bounded, provider-specific summaries.
 Exact argv, canonical local paths, and credentials remain Device-local. The

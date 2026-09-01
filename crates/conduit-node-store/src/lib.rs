@@ -26,7 +26,7 @@ use thiserror::Error;
 pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 pub const MAX_FRAME_BYTES: usize = 65_536;
 pub const MAX_EVENT_BYTES: usize = 60_000;
-const STORE_SCHEMA_VERSION: u32 = 5;
+const STORE_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -243,6 +243,7 @@ pub struct AgentApprovalRecord {
     pub request_payload: Option<Vec<u8>>,
     pub state: String,
     pub resolution: Option<Vec<u8>>,
+    pub resolution_authority: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -631,38 +632,29 @@ impl NodeStore {
         &self,
         approval_id: &str,
         resolution: &[u8],
+        resolution_authority: &[u8],
     ) -> Result<(), StoreError> {
         if resolution.len() > MAX_EVENT_BYTES {
             return Err(StoreError::TooLarge {
                 limit: MAX_EVENT_BYTES,
             });
         }
-        let conn = self.conn()?;
-        let changed = conn.execute(
-            "UPDATE agent_approval_journal SET state='resolved',resolution=?1,updated_at=unixepoch() WHERE approval_id=?2 AND state IN ('pending','requested')",
-            params![resolution, approval_id],
-        ).map_err(map_sql)?;
-        if changed != 1 {
-            let current = query_agent_approval(&conn, approval_id)?.ok_or(StoreError::NotFound)?;
-            if current.resolution.as_deref() != Some(resolution) {
-                return Err(StoreError::IdempotencyConflict);
-            }
+        if resolution_authority.is_empty() || resolution_authority.len() > 256 {
+            return Err(StoreError::Invalid(
+                "approval resolution authority must contain 1..=256 bytes".into(),
+            ));
         }
-        Ok(())
-    }
-
-    pub fn mark_agent_approval_applied(&self, approval_id: &str) -> Result<(), StoreError> {
         let conn = self.conn()?;
         let changed = conn.execute(
-            "UPDATE agent_approval_journal SET state='applied',updated_at=unixepoch() WHERE approval_id=?1 AND state='resolved'",
-            [approval_id],
+            "UPDATE agent_approval_journal SET state='resolved',resolution=?1,resolution_authority=?2,updated_at=unixepoch() WHERE approval_id=?3 AND state IN ('pending','requested')",
+            params![resolution, resolution_authority, approval_id],
         ).map_err(map_sql)?;
         if changed != 1 {
             let current = query_agent_approval(&conn, approval_id)?.ok_or(StoreError::NotFound)?;
-            if current.state != "applied" {
-                return Err(StoreError::Invalid(
-                    "approval resolution is not journaled".into(),
-                ));
+            if current.resolution.as_deref() != Some(resolution)
+                || current.resolution_authority.as_deref() != Some(resolution_authority)
+            {
+                return Err(StoreError::IdempotencyConflict);
             }
         }
         Ok(())
@@ -672,7 +664,6 @@ impl NodeStore {
         &self,
         approval_id: &str,
         idempotency_key: &str,
-        receipt: &[u8],
     ) -> Result<(), StoreError> {
         let mut conn = self.conn()?;
         let tx = conn
@@ -682,6 +673,9 @@ impl NodeStore {
         if approval.idempotency_key != idempotency_key {
             return Err(StoreError::IdempotencyConflict);
         }
+        let authority = approval.resolution_authority.as_deref().ok_or_else(|| {
+            StoreError::Corrupt("resolved approval lacks authority binding".into())
+        })?;
         let operation = query_operation(&tx, idempotency_key)?.ok_or(StoreError::NotFound)?;
         match (approval.state.as_str(), operation.state) {
             ("resolved", OperationState::WaitingApproval) => {
@@ -692,7 +686,7 @@ impl NodeStore {
                 .map_err(map_sql)?;
                 tx.execute(
                     "UPDATE operations SET state='running',receipt=?1,updated_at=unixepoch() WHERE idempotency_key=?2 AND state='waiting_approval'",
-                    params![receipt, idempotency_key],
+                    params![authority, idempotency_key],
                 )
                 .map_err(map_sql)?;
             }
@@ -1358,7 +1352,7 @@ fn query_agent_approval(
     approval_id: &str,
 ) -> Result<Option<AgentApprovalRecord>, StoreError> {
     conn.query_row(
-        "SELECT approval_id,idempotency_key,operation_digest,provider_request_id,method,parameters_digest,expires_at_unix_ms,request_payload,state,resolution FROM agent_approval_journal WHERE approval_id=?1 LIMIT 1",
+        "SELECT approval_id,idempotency_key,operation_digest,provider_request_id,method,parameters_digest,expires_at_unix_ms,request_payload,state,resolution,resolution_authority FROM agent_approval_journal WHERE approval_id=?1 LIMIT 1",
         [approval_id],
         |row| Ok(AgentApprovalRecord {
             approval_id: row.get(0)?,
@@ -1371,6 +1365,7 @@ fn query_agent_approval(
             request_payload: row.get(7)?,
             state: row.get(8)?,
             resolution: row.get(9)?,
+            resolution_authority: row.get(10)?,
         }),
     )
     .optional()
@@ -1429,16 +1424,25 @@ CREATE TABLE agent_approval_journal(
  request_payload BLOB,
  state TEXT NOT NULL CHECK(state IN ('pending','requested','resolved','applied')),
  resolution BLOB,
+ resolution_authority BLOB,
  created_at INTEGER NOT NULL DEFAULT(unixepoch()),
  updated_at INTEGER NOT NULL DEFAULT(unixepoch()),
  CHECK(length(operation_digest)=64), CHECK(length(parameters_digest)=64),
  CHECK(length(provider_request_id)<=512), CHECK(length(method)<=128),
  CHECK(request_payload IS NULL OR length(request_payload)<=60000),
- CHECK(resolution IS NULL OR length(resolution)<=60000));
+ CHECK(resolution IS NULL OR length(resolution)<=60000),
+ CHECK(resolution_authority IS NULL OR (length(resolution_authority)>=1 AND length(resolution_authority)<=256)));
 INSERT INTO agent_approval_journal(approval_id,idempotency_key,operation_digest,provider_request_id,method,parameters_digest,expires_at_unix_ms,state,resolution,created_at,updated_at)
  SELECT approval_id,idempotency_key,operation_digest,provider_request_id,method,parameters_digest,expires_at_unix_ms,CASE WHEN state='pending' THEN 'requested' ELSE state END,resolution,created_at,updated_at FROM agent_approval_journal_v4;
 DROP TABLE agent_approval_journal_v4;
 COMMIT;"#,
+        )
+        .map_err(map_sql)?;
+    }
+    if version == 5 {
+        conn.execute(
+            "ALTER TABLE agent_approval_journal ADD COLUMN resolution_authority BLOB",
+            [],
         )
         .map_err(map_sql)?;
     }
@@ -1479,13 +1483,16 @@ CREATE TABLE IF NOT EXISTS agent_approval_journal(
  request_payload BLOB,
  state TEXT NOT NULL CHECK(state IN ('pending','requested','resolved','applied')),
  resolution BLOB,
+ resolution_authority BLOB,
  created_at INTEGER NOT NULL DEFAULT(unixepoch()),
  updated_at INTEGER NOT NULL DEFAULT(unixepoch()),
  CHECK(length(operation_digest)=64), CHECK(length(parameters_digest)=64),
  CHECK(length(provider_request_id)<=512), CHECK(length(method)<=128),
- CHECK(request_payload IS NULL OR length(request_payload)<=60000), CHECK(resolution IS NULL OR length(resolution)<=60000));
+ CHECK(request_payload IS NULL OR length(request_payload)<=60000),
+ CHECK(resolution IS NULL OR length(resolution)<=60000),
+ CHECK(resolution_authority IS NULL OR (length(resolution_authority)>=1 AND length(resolution_authority)<=256)));
 CREATE INDEX IF NOT EXISTS agent_approval_pending_idx ON agent_approval_journal(state,expires_at_unix_ms);
-INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6);
 COMMIT;"#).map_err(map_sql)
 }
 
@@ -1632,11 +1639,27 @@ mod tests {
             .mark_agent_approval_requested("appr_xapproval01")
             .unwrap();
         store
-            .record_agent_approval_resolution("appr_xapproval01", b"provider-frame\n")
+            .record_agent_approval_resolution(
+                "appr_xapproval01",
+                b"provider-frame\n",
+                b"receipt-digest-a",
+            )
             .unwrap();
         store
-            .record_agent_approval_resolution("appr_xapproval01", b"provider-frame\n")
+            .record_agent_approval_resolution(
+                "appr_xapproval01",
+                b"provider-frame\n",
+                b"receipt-digest-a",
+            )
             .unwrap();
+        assert!(matches!(
+            store.record_agent_approval_resolution(
+                "appr_xapproval01",
+                b"provider-frame\n",
+                b"receipt-digest-b",
+            ),
+            Err(StoreError::IdempotencyConflict)
+        ));
         drop(store);
         let reopened = NodeStore::open(directory.path()).unwrap();
         let pending = reopened
@@ -1648,19 +1671,15 @@ mod tests {
             pending[0].resolution.as_deref(),
             Some(b"provider-frame\n".as_slice())
         );
+        assert_eq!(
+            pending[0].resolution_authority.as_deref(),
+            Some(b"receipt-digest-a".as_slice())
+        );
         reopened
-            .mark_agent_approval_applied_and_resume(
-                "appr_xapproval01",
-                "approval-idempotency-key",
-                b"approval-applied",
-            )
+            .mark_agent_approval_applied_and_resume("appr_xapproval01", "approval-idempotency-key")
             .unwrap();
         reopened
-            .mark_agent_approval_applied_and_resume(
-                "appr_xapproval01",
-                "approval-idempotency-key",
-                b"approval-applied",
-            )
+            .mark_agent_approval_applied_and_resume("appr_xapproval01", "approval-idempotency-key")
             .unwrap();
         assert_eq!(
             reopened
@@ -1669,6 +1688,32 @@ mod tests {
                 .unwrap()
                 .state,
             OperationState::Running
+        );
+        assert_eq!(
+            reopened
+                .operation("approval-idempotency-key")
+                .unwrap()
+                .unwrap()
+                .receipt
+                .as_deref(),
+            Some(b"receipt-digest-a".as_slice())
+        );
+        assert!(matches!(
+            reopened.record_agent_approval_resolution(
+                "appr_xapproval01",
+                b"opposite-provider-frame\n",
+                b"receipt-digest-b",
+            ),
+            Err(StoreError::IdempotencyConflict)
+        ));
+        assert_eq!(
+            reopened
+                .operation("approval-idempotency-key")
+                .unwrap()
+                .unwrap()
+                .receipt
+                .as_deref(),
+            Some(b"receipt-digest-a".as_slice())
         );
         assert!(
             reopened

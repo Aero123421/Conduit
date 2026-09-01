@@ -15,6 +15,10 @@ Every immutable operation envelope carries `requiredApprovalRiskClasses`. For an
 
 The owner first-party policy snapshots an empty list for approval modes other than `risk_classes`. If `risk_classes` is selected and the authoritative list is empty, the Control Plane snapshots all defined risk classes; an empty configuration must not silently turn that mode into `never`. A Connector's non-empty required list is retained for every approval mode, including `never`, because a requested mode cannot remove a grant-bound minimum approval requirement.
 
+At Agent launch the Device validates the immutable snapshot, rejects unknown or duplicate classes, and unions it with any Device-local required classes. That effective set is passed to the Adapter and included in the commitment-bound `operation.approval_request`. The Control Plane requires the request set to contain every immutable class before creating an Approval row. `never` may therefore create an approval request only when the effective required set is non-empty; an empty-set `never` run remains explicitly pre-authorized.
+
+The current Codex classifier identifies file-change/apply-patch requests as `destructive_delete`. Command requests are intentionally unclassified and therefore prompt when any effective required class exists. A known request whose classification is disjoint from the effective set may be pre-authorized. This is a conservative enforcement floor, not a claim that every provider effect has complete semantic classification.
+
 ## Reasons
 
 - a VM can safely grant root inside the guest without granting host access
@@ -32,6 +36,7 @@ The owner first-party policy snapshots an empty list for approval modes other th
 - unavailable elevation or provider capability is reported as unavailable, not silently simulated
 - approval receipts bind one exact operation or explicit bounded reuse scope
 - operation retries retain the exact policy revision and required-risk snapshot that was committed at admission
+- Device-local required classes can tighten but never remove the immutable Connector minimum
 - changing a Connector Policy affects newly authorized operations and requires grant reauthorization; it does not rewrite existing operation envelopes
 
 ## Rejected alternatives

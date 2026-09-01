@@ -78,7 +78,10 @@ fn pi_retry_queue_and_tool_error_remain_visible_until_agent_settles() {
         )
         .unwrap();
     assert_eq!(tool_events[0].kind, AdapterEventKind::ToolResult);
-    assert_eq!(tool_events[0].correlation_id.as_deref(), Some("tool-error-1"));
+    assert_eq!(
+        tool_events[0].correlation_id.as_deref(),
+        Some("tool-error-1")
+    );
     assert_eq!(tool_events[0].text.as_deref(), Some("fixture tool error"));
     assert_eq!(
         tool_events[0]
@@ -101,8 +104,6 @@ fn pi_retry_queue_and_tool_error_remain_visible_until_agent_settles() {
         .on_record(b"{\"type\":\"agent_end\",\"messages\":[],\"willRetry\":true}\n")
         .unwrap();
     assert_eq!(driver.state(), AdapterState::Working);
-    driver
-        .on_record(b"{\"type\":\"agent_settled\"}\n")
-        .unwrap();
+    driver.on_record(b"{\"type\":\"agent_settled\"}\n").unwrap();
     assert_eq!(driver.state(), AdapterState::Completed);
 }

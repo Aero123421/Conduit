@@ -109,6 +109,13 @@ describe.sequential("control-plane contracts", () => {
     expect(counts).toEqual({ messages: 2, mentions: 1, assignments: 1 });
     const mcp = await exports.default.fetch(new Request("https://conduit.example.com/mcp", { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params: {} }) }));
     expect(mcp.status).toBe(401);
+    const stream = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/sessions/csess_board_contract/stream", {
+      headers: { authorization: `Bearer ${token}`, upgrade: "websocket" },
+    }));
+    expect(stream.status).toBe(101);
+    expect(stream.webSocket).not.toBeNull();
+    stream.webSocket!.accept();
+    stream.webSocket!.close(1000, "test_complete");
   });
 
   it("completes the schema-defined Device handshake with a signed node transcript", async () => {
@@ -158,13 +165,101 @@ describe.sequential("control-plane contracts", () => {
     const completeAck = parseWireDocumentText(schemaIds.nodeV1, await nextMessage());
     expect(completeAck).toMatchObject({ type: "transport.ack", direction: "control_to_node", sequence: "3", payload: { throughSequence: "2" } });
     await sendNodeFrame(3, "transport.ack", { direction: "control_to_node", throughSequence: "3" });
+    const approvalOperationId = "op_handshake_approval01";
+    const approvalRunId = "run_handshake_approval01";
+    const approvalRequestDigest = "e".repeat(64);
+    const approvalIssuedAt = new Date();
+    const approvalExpiresAt = new Date(approvalIssuedAt.getTime() + 120_000);
+    const operationRequest = {
+      accessScope: "project_full",
+      approvalMode: "never",
+      requiredApprovalRiskClasses: ["destructive_delete"],
+      arguments: { adapterId: "codex" },
+    };
+    await env.DB.batch([
+      env.DB.prepare("INSERT OR IGNORE INTO owner_principals(id,display_name,status,created_at,updated_at) VALUES ('prin_handshake_approval','Handshake Approval','active',?1,?1)").bind(now),
+      env.DB.prepare("INSERT INTO runs(id,device_id,runtime_kind,access_scope,approval_mode,state,created_at,updated_at) VALUES (?1,?2,'restricted_native','project_full','never','running',?3,?3)").bind(approvalRunId, deviceId, now),
+      env.DB.prepare("INSERT INTO operation_journal(id,idempotency_key,actor_principal_id,client_id,device_id,run_id,connector_policy_id,connector_policy_revision,capability,payload_digest,request_json,state,expires_at,created_at,updated_at) VALUES (?1,'handshake-approval-operation-key01','prin_handshake_approval','conduit.test',?2,?3,'cpol_owner_first_party_v1',1,'agent.start',?4,?5,'claimed',?6,?7,?7)")
+        .bind(approvalOperationId, deviceId, approvalRunId, approvalRequestDigest, canonicalJson(operationRequest), approvalExpiresAt.toISOString(), now),
+    ]);
+    const approvalCommitment = {
+      domain: "conduit.agent-approval.v1",
+      operationId: approvalOperationId,
+      runId: approvalRunId,
+      requestDigest: approvalRequestDigest,
+      providerRequestId: 71,
+      method: "item/fileChange/requestApproval",
+      parametersDigest: "f".repeat(64),
+      argumentsSummary: { paths: ["README.md"] },
+      approvalExpiresAtUnixMs: approvalExpiresAt.getTime(),
+      adapterId: "codex",
+      accessScope: "project_full",
+      approvalMode: "never",
+      effectiveRequiredApprovalRiskClasses: ["destructive_delete"],
+      controllerEpoch: "1",
+      localPolicyRevision: 1,
+    };
+    const approvalPayload = {
+      approvalId: "appr_handshake_approval01",
+      operationId: approvalOperationId,
+      runId: approvalRunId,
+      requesterPrincipalId: "prin_handshake_approval",
+      clientId: "conduit.test",
+      deviceId,
+      operationDigest: await sha256Hex(canonicalJson(approvalCommitment)),
+      providerRequestId: 71,
+      method: "item/fileChange/requestApproval",
+      parametersDigest: "f".repeat(64),
+      argumentsSummary: { paths: ["README.md"] },
+      adapterId: "codex",
+      accessScope: "project_full",
+      approvalMode: "never",
+      effectiveRequiredApprovalRiskClasses: ["destructive_delete"],
+      controllerEpoch: "1",
+      localPolicyRevision: 1,
+      issuedAt: approvalIssuedAt.toISOString(),
+      expiresAt: approvalExpiresAt.toISOString(),
+      validForMs: 120_000,
+    };
+    const approvalAckPending = nextMessage();
+    await sendNodeFrame(4, "operation.approval_request", approvalPayload, approvalOperationId);
+    await expect(approvalAckPending.then((message) => parseWireDocumentText(schemaIds.nodeV1, message))).resolves.toMatchObject({
+      type: "transport.ack",
+      payload: { direction: "node_to_control", throughSequence: "4" },
+    });
+    const projectedApproval = await env.DB.prepare("SELECT commitment_digest,normalized_arguments_json FROM approvals WHERE id=?1").bind(approvalPayload.approvalId).first<{ commitment_digest: string; normalized_arguments_json: string }>();
+    expect(projectedApproval?.commitment_digest).toBe(approvalPayload.operationDigest);
+    expect(JSON.parse(projectedApproval!.normalized_arguments_json)).toMatchObject({
+      approvalMode: "never",
+      effectiveRequiredApprovalRiskClasses: ["destructive_delete"],
+    });
+    const weakenedCommitment = {
+      ...approvalCommitment,
+      effectiveRequiredApprovalRiskClasses: [],
+    };
+    const weakenedPayload = {
+      ...approvalPayload,
+      approvalId: "appr_handshake_approval02",
+      effectiveRequiredApprovalRiskClasses: [],
+      operationDigest: await sha256Hex(canonicalJson(weakenedCommitment)),
+    };
+    const weakenedAckPending = nextMessage();
+    await sendNodeFrame(5, "operation.approval_request", weakenedPayload, approvalOperationId);
+    await expect(weakenedAckPending.then((message) => parseWireDocumentText(schemaIds.nodeV1, message))).resolves.toMatchObject({
+      type: "transport.ack",
+      payload: { direction: "node_to_control", throughSequence: "5" },
+    });
+    expect(await env.DB.prepare("SELECT COUNT(*) AS count FROM approvals WHERE id=?1").bind(weakenedPayload.approvalId).first<{ count: number }>()).toEqual({ count: 0 });
+    const projectionDenial = await env.DB.prepare("SELECT metadata_json FROM security_events WHERE event_type='agent_approval.invalid_request' AND device_id=?1 ORDER BY created_at DESC LIMIT 1").bind(deviceId).first<{ metadata_json: string }>();
+    expect(JSON.parse(projectionDenial!.metadata_json)).toMatchObject({ approvalId: weakenedPayload.approvalId, operationId: approvalOperationId, reason: "approval request authority differs from immutable operation" });
+    await sendNodeFrame(6, "transport.ack", { direction: "control_to_node", throughSequence: "5" });
     await new Promise((resolve) => setTimeout(resolve, 20));
     const transportState = await runInDurableObject(env.DEVICE_ROOMS.getByName(deviceId), (_instance, state) => ({
       outbound: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_frames").one().count,
       acknowledged: state.storage.sql.exec<{ acknowledged_sequence: number }>("SELECT acknowledged_sequence FROM transport_positions WHERE direction='control_to_node'").one().acknowledged_sequence,
       reconciliation: state.storage.sql.exec<{ reconciliation_state: string }>("SELECT reconciliation_state FROM connection_state WHERE singleton=1").one().reconciliation_state,
     }));
-    expect(transportState).toEqual({ outbound: 0, acknowledged: 3, reconciliation: "complete" });
+    expect(transportState).toEqual({ outbound: 0, acknowledged: 5, reconciliation: "complete" });
     socket.close(1000, "test_complete");
   });
 

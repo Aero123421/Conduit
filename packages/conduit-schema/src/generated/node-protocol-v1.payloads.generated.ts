@@ -298,6 +298,10 @@ export interface OperationApprovalRequestPayload {
   adapterId: string;
   accessScope: AccessScope;
   approvalMode: ApprovalMode;
+  /**
+   * @maxItems 32
+   */
+  effectiveRequiredApprovalRiskClasses: RiskClass[];
   controllerEpoch: U64Decimal;
   localPolicyRevision: number;
   issuedAt: Timestamp;

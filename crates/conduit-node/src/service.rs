@@ -6,8 +6,9 @@ use crate::{
 };
 use conduit_adapters::{
     AdapterCatalog, AdapterChild, AdapterEvent, AdapterEventKind, AdapterKind, AdapterOperation,
-    AdapterState, ApprovalBridgeOwnership, ApprovalContext, EffectiveAccessScope,
-    EffectiveApprovalPolicy, EffectiveSandboxPolicy, LaunchRequest, ProtocolDriver,
+    AdapterState, ApprovalBridgeOwnership, ApprovalContext, ApprovalRiskClassSet,
+    EffectiveAccessScope, EffectiveApprovalPolicy, EffectiveSandboxPolicy, LaunchRequest,
+    ProtocolDriver,
 };
 use conduit_domain::{DeviceId, Sha256Digest};
 use conduit_node_store::{DeviceIdentity, Direction, OperationState, ReceiveResult, StoreError};
@@ -19,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, BTreeSet, HashMap},
     fs,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
@@ -70,6 +71,8 @@ pub struct LocalPolicy {
     pub access_scopes: Vec<String>,
     #[serde(default)]
     pub approval_modes: Vec<String>,
+    #[serde(default)]
+    pub required_approval_risk_classes: Vec<String>,
     #[serde(default)]
     pub launch_profiles: Vec<String>,
     pub max_cpu: Option<f64>,
@@ -199,7 +202,7 @@ struct WireRuntime {
     network_mode: Option<String>,
 }
 #[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WireOperation {
     schema_version: u32,
     operation_id: String,
@@ -209,6 +212,10 @@ struct WireOperation {
     #[serde(default = "default_client_id")]
     client_id: String,
     device_id: String,
+    #[serde(rename = "projectId")]
+    _project_id: Option<String>,
+    #[serde(rename = "sessionId")]
+    _session_id: Option<String>,
     assignment_id: Option<String>,
     run_id: Option<String>,
     capability: String,
@@ -216,6 +223,9 @@ struct WireOperation {
     runtime: WireRuntime,
     access_scope: String,
     approval_mode: String,
+    required_approval_risk_classes: Vec<String>,
+    #[serde(rename = "connectorPolicyId")]
+    _connector_policy_id: String,
     connector_policy_revision: u64,
     arguments: Value,
     payload_digest: String,
@@ -295,6 +305,7 @@ struct AgentActive {
     client_id: String,
     access_scope: String,
     approval_mode: String,
+    effective_required_approval_risk_classes: Vec<String>,
     local_policy_revision: u64,
     controller_epoch: u64,
     event_sequence: u64,
@@ -310,6 +321,7 @@ struct PendingAgentApproval {
     client_id: String,
     access_scope: String,
     approval_mode: String,
+    effective_required_approval_risk_classes: Vec<String>,
     local_policy_revision: u64,
     controller_epoch: u64,
     provider_request_id: Value,
@@ -714,10 +726,21 @@ impl NodeService {
                 "approval_controller_epoch_mismatch".into(),
             ));
         }
+        let receipt_authority = receipt.receipt_digest.as_bytes();
         if journal.state == "applied" {
+            if journal.resolution_authority.as_deref() != Some(receipt_authority) {
+                return Err(ServiceError::Unavailable(
+                    "approval_receipt_conflict".into(),
+                ));
+            }
             return Ok(());
         }
         if journal.state == "resolved" {
+            if journal.resolution_authority.as_deref() != Some(receipt_authority) {
+                return Err(ServiceError::Unavailable(
+                    "approval_receipt_conflict".into(),
+                ));
+            }
             let frame =
                 conduit_adapters::ProtocolFrame(journal.resolution.ok_or_else(|| {
                     ServiceError::Unavailable("approval_response_missing".into())
@@ -726,11 +749,9 @@ impl NodeService {
                 .child
                 .write(&frame)
                 .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
-            self.node.store().mark_agent_approval_applied_and_resume(
-                &receipt.approval_id,
-                &agent.key,
-                receipt.receipt_digest.as_bytes(),
-            )?;
+            self.node
+                .store()
+                .mark_agent_approval_applied_and_resume(&receipt.approval_id, &agent.key)?;
             return Ok(());
         }
         let request_id: Value = serde_json::from_slice(&journal.provider_request_id)
@@ -753,18 +774,18 @@ impl NodeService {
                 .approval_response(&request_id, allow)
                 .map_err(|error| ServiceError::Unavailable(adapter_reason(&error)))?
         };
-        self.node
-            .store()
-            .record_agent_approval_resolution(&receipt.approval_id, &frame.0)?;
+        self.node.store().record_agent_approval_resolution(
+            &receipt.approval_id,
+            &frame.0,
+            receipt_authority,
+        )?;
         agent
             .child
             .write(&frame)
             .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
-        self.node.store().mark_agent_approval_applied_and_resume(
-            &receipt.approval_id,
-            &agent.key,
-            receipt.receipt_digest.as_bytes(),
-        )?;
+        self.node
+            .store()
+            .mark_agent_approval_applied_and_resume(&receipt.approval_id, &agent.key)?;
         Ok(())
     }
     fn reject_offer(
@@ -1076,7 +1097,7 @@ impl NodeService {
                 source.attachment(guest)
             })
             .collect::<Vec<_>>();
-        let (launch, agent_launch) = if is_agent {
+        let (launch, agent_launch, effective_required_approval_risk_classes) = if is_agent {
             let kind = parse_adapter(profile_id)?;
             let cwd = workspaces
                 .first()
@@ -1119,6 +1140,11 @@ impl NodeService {
                 )
                 .then(|| self.local.agent_session_dir(&run_id)),
             };
+            let (required_risk_classes, effective_required_approval_risk_classes) =
+                effective_approval_risk_classes(
+                    &op.required_approval_risk_classes,
+                    &self.local_policy.required_approval_risk_classes,
+                )?;
             let approval_context = ApprovalContext {
                 effective_policy: EffectiveApprovalPolicy::try_from(op.approval_mode.as_str())
                     .map_err(|error| ServiceError::Unavailable(adapter_reason(&error)))?,
@@ -1127,6 +1153,7 @@ impl NodeService {
                 } else {
                     ApprovalBridgeOwnership::Unavailable
                 },
+                required_risk_classes,
             };
             let access_scope = EffectiveAccessScope::try_from(op.access_scope.as_str())
                 .map_err(|error| ServiceError::Unavailable(adapter_reason(&error)))?;
@@ -1171,7 +1198,11 @@ impl NodeService {
                 io_mode: IoMode::Pipes,
                 timeout_ms: op.arguments.get("timeoutMs").and_then(Value::as_u64),
             };
-            (launch, Some((spec, driver, kind)))
+            (
+                launch,
+                Some((spec, driver, kind)),
+                effective_required_approval_risk_classes,
+            )
         } else {
             let profile = self
                 .profiles
@@ -1205,6 +1236,7 @@ impl NodeService {
                     timeout_ms: profile.timeout_ms,
                 },
                 None,
+                Vec::new(),
             )
         };
         let spec_digest = hex::encode(Sha256::digest(
@@ -1373,6 +1405,8 @@ impl NodeService {
                             client_id: op.client_id,
                             access_scope: op.access_scope,
                             approval_mode: op.approval_mode,
+                            effective_required_approval_risk_classes:
+                                effective_required_approval_risk_classes.clone(),
                             local_policy_revision: self.local_policy.revision,
                             controller_epoch: 1,
                             event_sequence: 0,
@@ -1497,6 +1531,7 @@ impl NodeService {
                         client_id: op.client_id,
                         access_scope: op.access_scope,
                         approval_mode: op.approval_mode,
+                        effective_required_approval_risk_classes,
                         local_policy_revision: self.local_policy.revision,
                         controller_epoch: 1,
                         event_sequence: 0,
@@ -1750,11 +1785,9 @@ impl NodeService {
                     .child
                     .write(&frame)
                     .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
-                self.node.store().mark_agent_approval_applied_and_resume(
-                    &journal.approval_id,
-                    &agent.key,
-                    b"approval_response_replayed",
-                )?;
+                self.node
+                    .store()
+                    .mark_agent_approval_applied_and_resume(&journal.approval_id, &agent.key)?;
             }
             let (expired_frames, expired_events) = agent
                 .driver
@@ -1773,18 +1806,19 @@ impl NodeService {
                     .store()
                     .agent_approval_for_provider_request(&agent.key, &encoded_id)?
                     .ok_or_else(|| ServiceError::Unavailable("approval_request_unknown".into()))?;
-                self.node
-                    .store()
-                    .record_agent_approval_resolution(&journal.approval_id, &frame.0)?;
+                let timeout_authority = format!("local_timeout:{}", journal.expires_at_unix_ms);
+                self.node.store().record_agent_approval_resolution(
+                    &journal.approval_id,
+                    &frame.0,
+                    timeout_authority.as_bytes(),
+                )?;
                 agent
                     .child
                     .write(&frame)
                     .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
-                self.node.store().mark_agent_approval_applied_and_resume(
-                    &journal.approval_id,
-                    &agent.key,
-                    b"approval_expired",
-                )?;
+                self.node
+                    .store()
+                    .mark_agent_approval_applied_and_resume(&journal.approval_id, &agent.key)?;
                 agent.event_sequence = agent.event_sequence.saturating_add(1);
                 events.push(PendingEvent {
                     key: agent.key.clone(),
@@ -1860,6 +1894,9 @@ impl NodeService {
                                     client_id: agent.client_id.clone(),
                                     access_scope: agent.access_scope.clone(),
                                     approval_mode: agent.approval_mode.clone(),
+                                    effective_required_approval_risk_classes: agent
+                                        .effective_required_approval_risk_classes
+                                        .clone(),
                                     local_policy_revision: agent.local_policy_revision,
                                     controller_epoch: agent.controller_epoch,
                                     provider_request_id,
@@ -2015,6 +2052,7 @@ impl NodeService {
             "adapterId": pending.adapter_kind.as_str(),
             "accessScope": pending.access_scope,
             "approvalMode": pending.approval_mode,
+            "effectiveRequiredApprovalRiskClasses": pending.effective_required_approval_risk_classes,
             "controllerEpoch": controller_epoch.to_string(),
             "localPolicyRevision": pending.local_policy_revision,
         });
@@ -2042,6 +2080,7 @@ impl NodeService {
             "adapterId": pending.adapter_kind.as_str(),
             "accessScope": pending.access_scope,
             "approvalMode": pending.approval_mode,
+            "effectiveRequiredApprovalRiskClasses": pending.effective_required_approval_risk_classes,
             "controllerEpoch": controller_epoch.to_string(),
             "localPolicyRevision": pending.local_policy_revision,
             "issuedAt": issued_at,
@@ -2694,6 +2733,37 @@ fn approval_request_window_at(
     ))
 }
 
+fn effective_approval_risk_classes(
+    operation: &[String],
+    local: &[String],
+) -> Result<(ApprovalRiskClassSet, Vec<String>), ServiceError> {
+    let mut names = BTreeSet::new();
+    let mut classes = ApprovalRiskClassSet::EMPTY;
+    for source in [operation, local] {
+        let mut source_names = BTreeSet::new();
+        for name in source {
+            if !source_names.insert(name.as_str()) {
+                return Err(ServiceError::Unavailable(
+                    "approval_risk_class_duplicate".into(),
+                ));
+            }
+        }
+    }
+    for name in operation.iter().chain(local) {
+        let class = ApprovalRiskClassSet::from_name(name)
+            .ok_or_else(|| ServiceError::Unavailable("approval_risk_class_invalid".into()))?;
+        if names.insert(name.clone()) {
+            classes = classes.union(class);
+        }
+    }
+    if names.len() > 10 {
+        return Err(ServiceError::Unavailable(
+            "approval_risk_class_limit_exceeded".into(),
+        ));
+    }
+    Ok((classes, names.into_iter().collect()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2732,6 +2802,7 @@ mod tests {
             },
             "accessScope": "project_full",
             "approvalMode": "always",
+            "requiredApprovalRiskClasses": [],
             "connectorPolicyId": "cpol_service_replay01",
             "connectorPolicyRevision": 1,
             "arguments": {"launchProfileId": "unused-expired-profile"},
@@ -2760,6 +2831,8 @@ mod tests {
             },
             "accessScope": scope,
             "approvalMode": approval,
+            "requiredApprovalRiskClasses": [],
+            "connectorPolicyId": "cpol_policy_0001",
             "connectorPolicyRevision": 99,
             "arguments": {"launchProfileId":"safe"},
             "payloadDigest": "11".repeat(32),
@@ -2776,6 +2849,7 @@ mod tests {
             providers: vec!["native".into()],
             access_scopes: vec!["project_full".into(), "full_device".into()],
             approval_modes: vec!["never".into()],
+            required_approval_risk_classes: vec![],
             launch_profiles: vec!["safe".into()],
             max_cpu: Some(4.0),
             max_memory_bytes: Some(1024 * 1024),
@@ -2800,6 +2874,30 @@ mod tests {
                 .evaluate(&operation("full_device", "never", 1.0), "safe")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn approval_risk_snapshots_are_validated_and_union_with_local_policy() {
+        let (classes, names) = effective_approval_risk_classes(
+            &["destructive_delete".into()],
+            &["lan_access".into(), "destructive_delete".into()],
+        )
+        .unwrap();
+        assert!(classes.intersects(ApprovalRiskClassSet::DESTRUCTIVE_DELETE));
+        assert!(classes.intersects(ApprovalRiskClassSet::LAN_ACCESS));
+        assert_eq!(names, vec!["destructive_delete", "lan_access"]);
+
+        assert!(matches!(
+            effective_approval_risk_classes(
+                &["secret_access".into(), "secret_access".into()],
+                &[]
+            ),
+            Err(ServiceError::Unavailable(reason)) if reason == "approval_risk_class_duplicate"
+        ));
+        assert!(matches!(
+            effective_approval_risk_classes(&["not_a_risk".into()], &[]),
+            Err(ServiceError::Unavailable(reason)) if reason == "approval_risk_class_invalid"
+        ));
     }
 
     #[test]
@@ -2854,6 +2952,7 @@ mod tests {
                     providers: vec![],
                     access_scopes: vec![],
                     approval_modes: vec![],
+                    required_approval_risk_classes: vec![],
                     launch_profiles: vec![],
                     max_cpu: None,
                     max_memory_bytes: None,
@@ -3063,6 +3162,8 @@ mod tests {
             "runtime": {"kind":"restricted_native","providerId":"restricted_native","configurationRevision":1},
             "accessScope": "read_only",
             "approvalMode": "always",
+            "requiredApprovalRiskClasses": [],
+            "connectorPolicyId": "cpol_reviewer_0001",
             "connectorPolicyRevision": 99,
             "arguments": {"adapterId":"agy","role":"reviewer"},
             "payloadDigest": "11".repeat(32),

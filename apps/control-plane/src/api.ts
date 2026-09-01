@@ -291,7 +291,9 @@ export async function handleApi(request: Request, env: ControlPlaneEnv, path: st
   if (request.method === "GET" && stream?.[1] !== undefined && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
     const auth = await actorFor(request, env, false);
     await authorizeResource(request, env, auth.actor, auth.connector, "sessions", false, new URL(request.url), undefined, await resolveResourceAuthority(env.DB, "sessions", stream[1]));
-    return env.BOARD_ROOMS.getByName(stream[1]).fetch(request);
+    const roomUrl = new URL(request.url);
+    roomUrl.pathname = path;
+    return env.BOARD_ROOMS.getByName(stream[1]).fetch(new Request(roomUrl, request));
   }
   const runEvents = path.match(/^\/v1\/runs\/([^/]+)\/events$/);
   if (request.method === "GET" && runEvents?.[1] !== undefined) {

@@ -575,7 +575,7 @@ mod tests {
         }
     }
     fn operation_offer_envelope(seq: u64) -> Envelope {
-        let payload = serde_json::json!({"operation":{"schemaVersion":1,"operationId":format!("op_replay_{seq:08}"),"idempotencyKey":format!("replay-operation-key-{seq:08}"),"actorPrincipalId":"prin_replay_0001","clientId":"conduit.test","deviceId":"dev_12345678","capability":"command.start","sourceRevisions":[],"runtime":{"kind":"native","providerId":"native.linux","configurationRevision":1},"accessScope":"full_user","approvalMode":"never","connectorPolicyId":"cpol_replay_0001","connectorPolicyRevision":1,"arguments":{"argv":["true"]},"payloadDigest":"11".repeat(32),"issuedAt":"2026-09-01T00:00:00Z","expiresAt":"2026-09-01T00:05:00Z","validForMs":300000}});
+        let payload = serde_json::json!({"operation":{"schemaVersion":1,"operationId":format!("op_replay_{seq:08}"),"idempotencyKey":format!("replay-operation-key-{seq:08}"),"actorPrincipalId":"prin_replay_0001","clientId":"conduit.test","deviceId":"dev_12345678","capability":"command.start","sourceRevisions":[],"runtime":{"kind":"native","providerId":"native.linux","configurationRevision":1},"accessScope":"full_user","approvalMode":"never","requiredApprovalRiskClasses":[],"connectorPolicyId":"cpol_replay_0001","connectorPolicyRevision":1,"arguments":{"argv":["true"]},"payloadDigest":"11".repeat(32),"issuedAt":"2026-09-01T00:00:00Z","expiresAt":"2026-09-01T00:05:00Z","validForMs":300000}});
         Envelope {
             protocol: PROTOCOL.into(),
             message_id: format!("cmsg_offer_{seq:08}"),

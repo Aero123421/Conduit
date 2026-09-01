@@ -361,8 +361,19 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
         .bind(request.operationId)
         .first<{ id: string; payload_digest: string; actor_principal_id: string; client_id: string; device_id: string; run_id: string | null; request_json: string }>();
       if (operation === null || operation.device_id !== frame.deviceId || operation.device_id !== request.deviceId || operation.run_id !== request.runId || operation.actor_principal_id !== request.requesterPrincipalId || operation.client_id !== request.clientId) throw new TypeError("approval request target does not match operation custody");
-      const operationRequest = JSON.parse(operation.request_json) as { accessScope?: unknown; approvalMode?: unknown; arguments?: { adapterId?: unknown } };
-      if (operationRequest.accessScope !== request.accessScope || operationRequest.approvalMode !== request.approvalMode || operationRequest.arguments?.adapterId !== request.adapterId || request.approvalMode === "never") throw new TypeError("approval request authority differs from immutable operation");
+      const operationRequest = JSON.parse(operation.request_json) as { accessScope?: unknown; approvalMode?: unknown; requiredApprovalRiskClasses?: unknown; arguments?: { adapterId?: unknown } };
+      const immutableRiskClasses = Array.isArray(operationRequest.requiredApprovalRiskClasses)
+        ? operationRequest.requiredApprovalRiskClasses.filter((value): value is string => typeof value === "string")
+        : [];
+      const effectiveRiskClasses = request.effectiveRequiredApprovalRiskClasses;
+      if (
+        operationRequest.accessScope !== request.accessScope
+        || operationRequest.approvalMode !== request.approvalMode
+        || operationRequest.arguments?.adapterId !== request.adapterId
+        || immutableRiskClasses.length !== (operationRequest.requiredApprovalRiskClasses as unknown[])?.length
+        || immutableRiskClasses.some((riskClass) => !effectiveRiskClasses.includes(riskClass as (typeof effectiveRiskClasses)[number]))
+        || (request.approvalMode === "never" && effectiveRiskClasses.length === 0)
+      ) throw new TypeError("approval request authority differs from immutable operation");
       const expected = await sha256Hex(canonicalJson({
         domain: "conduit.agent-approval.v1",
         operationId: request.operationId,
@@ -376,11 +387,12 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
         adapterId: request.adapterId,
         accessScope: request.accessScope,
         approvalMode: request.approvalMode,
+        effectiveRequiredApprovalRiskClasses: request.effectiveRequiredApprovalRiskClasses,
         controllerEpoch: request.controllerEpoch,
         localPolicyRevision: request.localPolicyRevision,
       }));
       if (expected !== request.operationDigest) throw new TypeError("approval request commitment mismatch");
-      const normalized = canonicalJson({ providerRequestId: request.providerRequestId, method: request.method, parametersDigest: request.parametersDigest, argumentsSummary: request.argumentsSummary, adapterId: request.adapterId, accessScope: request.accessScope, approvalMode: request.approvalMode });
+      const normalized = canonicalJson({ providerRequestId: request.providerRequestId, method: request.method, parametersDigest: request.parametersDigest, argumentsSummary: request.argumentsSummary, adapterId: request.adapterId, accessScope: request.accessScope, approvalMode: request.approvalMode, effectiveRequiredApprovalRiskClasses: request.effectiveRequiredApprovalRiskClasses });
       const revisions = canonicalJson({ controllerEpoch: request.controllerEpoch, localPolicyRevision: request.localPolicyRevision });
       await this.env.DB.prepare("INSERT OR IGNORE INTO approvals(id,operation_id,requester_principal_id,client_id,device_id,run_id,commitment_digest,operation_type,normalized_arguments_json,revisions_json,expires_at,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)")
         .bind(request.approvalId, request.operationId, request.requesterPrincipalId, request.clientId, request.deviceId, request.runId, request.operationDigest, request.method, normalized, revisions, request.expiresAt, request.issuedAt).run();

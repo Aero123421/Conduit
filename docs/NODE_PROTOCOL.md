@@ -533,8 +533,11 @@ outbox state `offered` means the frame is durably held by DeviceRoom; it is not
 evidence that the Node wrote the response to the provider.
 
 The Node verifies the receipt commitment and deadline, journals the exact
-provider response before child I/O, and marks it applied only after a successful
-write. A failed write is retried from the journal. A receipt for another digest,
+provider response and the authoritative Cloud receipt digest before child I/O,
+and marks it applied only after a successful write. A failed write is retried
+from that same journal binding; replay cannot replace the receipt digest with a
+local marker. A duplicate or late receipt with another decision or digest is
+rejected both before and after provider application. A receipt for another digest,
 revision, deadline, or controller epoch is rejected. The controller epoch is an
 Agent-controller generation and is independent of the WebSocket connection
 epoch; reconnect alone does not invalidate a pending approval. The current
@@ -542,10 +545,18 @@ non-attachable restart path creates a new operation/run rather than replacing a
 same-run controller. A future attach implementation must durably increment this
 generation before accepting receipts for the replacement controller.
 
+The approval request commitment includes the sorted effective required-risk set
+computed by the Device. DeviceRoom verifies that it contains the immutable
+operation snapshot. This permits a Connector-bound risk minimum to require a
+prompt even when the requested approval mode is `never`, without allowing the
+Device or caller to remove a Cloud minimum.
+
 If the connection is lost before the receipt is received, the run remains
 `waiting_approval` unless a prior approval already covers the exact operation.
-Only one Codex approval is pending per Agent; a second provider request receives
-an immediate same-ID decline. When the deadline expires, the Node durably
+Only one Codex approval is pending per Agent. An exact or changed duplicate of
+an outstanding provider request ID is ignored with a visible Adapter error while
+the original commitment remains pending; no second terminal JSON-RPC response
+is emitted for that ID. When the deadline expires, the Node durably
 journals and writes one same-ID decline, resumes the operation, and rejects late
 receipts without sending a second provider response.
 
@@ -554,19 +565,23 @@ receipts without sending a second provider response.
 An Agent Adapter must answer every provider-initiated request that carries an ID. A supported approval request is bridged to the typed approval flow or receives a correlated explicit decline. A request for an unadvertised capability, including host-managed authentication refresh, client attestation, dynamic tools, or user input, receives a correlated fail-closed protocol error. Unknown request methods receive a correlated method-not-found error and a bounded visible Adapter error event. No provider request is left pending merely because Conduit does not implement it.
 
 Codex client requests are held in a bounded request-ID map that also records the
-method and expected response shape. Wrong IDs, duplicate responses, and stale
-turn notifications cannot consume or mutate another turn. The test fixture is
+method and expected response shape. Wrong IDs, duplicate responses, malformed
+exact-ID responses, notification-before-response ordering, and stale turn
+notifications cannot consume or resurrect another turn. The test fixture is
 derived from the locally generated Codex app-server `ServerRequest` union,
 including `currentTime/read`, so adding a union member without a response fails
 conformance.
 
 ACP permission responses preserve the JSON-RPC request ID and use the
-versioned nested outcome shape. A missing typed bridge returns
+versioned nested outcome shape. A request for another session, or a request
+without its tool-call identity, is cancelled. A missing typed bridge returns
 `{ "outcome": { "outcome": "cancelled" } }`; effective `never` may select an
-offered `allow_once` option but not a reusable option. Pi extension dialog
-requests preserve their request ID in `extension_ui_response`; without a typed
-bridge, or when a second dialog arrives while one is pending, the response is
-`cancelled`. Pi `agent_end` remains nonterminal even when `willRetry` is false;
+offered `allow_once` option but not a reusable option. A typed pending request is
+bound to method, session, tool call, canonical parameters digest, and expiry.
+Pi extension dialog requests preserve their request ID in
+`extension_ui_response`; without a typed bridge they are cancelled. Duplicate
+outstanding ACP or Pi request IDs do not receive a second terminal response.
+Pi `agent_end` remains nonterminal even when `willRetry` is false;
 `agent_settled` is the terminal event after retries and queued follow-ups are
 drained.
 

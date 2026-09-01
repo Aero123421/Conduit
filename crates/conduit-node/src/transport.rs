@@ -55,6 +55,8 @@ struct Challenge {
     kind: String,
     connection_id: String,
     server_nonce: String,
+    server_time: String,
+    expires_in_ms: u64,
     selected_protocol: String,
 }
 #[derive(Debug, Serialize)]
@@ -305,7 +307,13 @@ impl WssClient {
         if challenge.kind != "device.challenge" || challenge.selected_protocol != PROTOCOL {
             return Err(TransportError::ProtocolUnsupported);
         }
-        let transcript=serde_jcs::to_vec(&serde_json::json!({"clientNonce":URL_SAFE_NO_PAD.encode(nonce),"connectionId":challenge.connection_id,"deviceId":device_id,"keyId":identity.key_id(),"protocol":PROTOCOL,"serverNonce":challenge.server_nonce})).map_err(|_|TransportError::Malformed)?;
+        if !(1_000..=300_000).contains(&challenge.expires_in_ms)
+            || challenge.server_time.len() > 64
+            || !challenge.server_time.ends_with('Z')
+        {
+            return Err(TransportError::Malformed);
+        }
+        let transcript=serde_jcs::to_vec(&serde_json::json!({"domain":"conduit.device-auth.v1","origin":url.origin().ascii_serialization(),"clientNonce":URL_SAFE_NO_PAD.encode(nonce),"connectionId":challenge.connection_id,"deviceId":device_id,"keyId":identity.key_id(),"protocol":PROTOCOL,"serverNonce":challenge.server_nonce,"serverTime":challenge.server_time})).map_err(|_|TransportError::Malformed)?;
         let proof = Proof {
             kind: "device.proof",
             connection_id: &challenge.connection_id,
@@ -359,11 +367,11 @@ use tungstenite::client::IntoClientRequest;
 fn set_timeouts(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
     match socket.get_mut() {
         MaybeTlsStream::Plain(s) => {
-            let _ = s.set_read_timeout(Some(Duration::from_secs(45)));
+            let _ = s.set_read_timeout(Some(Duration::from_secs(15)));
             let _ = s.set_write_timeout(Some(Duration::from_secs(15)));
         }
         MaybeTlsStream::Rustls(s) => {
-            let _ = s.get_mut().set_read_timeout(Some(Duration::from_secs(45)));
+            let _ = s.get_mut().set_read_timeout(Some(Duration::from_secs(15)));
             let _ = s.get_mut().set_write_timeout(Some(Duration::from_secs(15)));
         }
         _ => {}

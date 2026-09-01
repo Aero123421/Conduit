@@ -57,11 +57,11 @@ pub struct IpcServer {
 impl IpcServer {
     pub fn bind(path: impl AsRef<Path>) -> Result<Self, IpcError> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            if !parent.exists() {
-                fs::create_dir_all(parent)?;
-                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
-            }
+        if let Some(parent) = path.parent()
+            && !parent.exists()
+        {
+            fs::create_dir_all(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
         }
         if let Ok(meta) = fs::symlink_metadata(&path) {
             if !meta.file_type().is_socket() {

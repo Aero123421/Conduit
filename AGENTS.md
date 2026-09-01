@@ -10,8 +10,10 @@ The repository is defining the product model and the first Linux vertical slice.
 - `docs/CONTROL_PLANE.md`: Cloudflare and device responsibilities
 - `docs/SOURCES_AND_WORKSPACES.md`: folders, repositories, locations, and run workspaces
 - `docs/RUNTIME_AND_SECURITY.md`: runtime providers, access, approvals, and credentials
+- `docs/AUTHORIZATION.md`: owner, browser, OAuth client, device, enrollment, connector ceiling, and rate-limit contracts
 - `docs/OBSERVABILITY.md`: run manifests, events, logs, and evaluations
 - `docs/MVP.md`: implementation order and acceptance criteria
+- `spec/schemas/`: machine-checkable protocol and durable-record schemas
 
 Do not introduce a second meaning for `Project`, `Session`, `Assignment`, `Run`, `Source`, or `Location`.
 
@@ -28,6 +30,8 @@ Do not introduce a second meaning for `Project`, `Session`, `Assignment`, `Run`,
 - A device may continue an admitted run while disconnected and must reconcile on reconnect.
 - Agent claims are not verification. Tests, diffs, artifacts, and receipts are recorded separately.
 - Hidden model reasoning is never required for observability.
+- Browser sessions, OAuth grants, device keys, local IPC identities, and agent-provider credentials remain separate.
+- An MCP client cannot raise its own connector ceiling.
 
 ## Implementation rules
 
@@ -39,6 +43,8 @@ Do not introduce a second meaning for `Project`, `Session`, `Assignment`, `Run`,
 - Unknown provider events remain visible as bounded adapter errors; do not silently discard them.
 - Raw logs and content capture are opt-in, bounded, redactable, and independently permissioned.
 - Keep Linux behavior complete before claiming equivalent Windows or macOS support.
+- Require fresh passkey authentication before broadening device, connector, raw-log, credential, or full-access authority.
+- Do not accept OAuth bearer tokens as device credentials or browser cookies at the MCP protected resource.
 
 ## Documentation style
 

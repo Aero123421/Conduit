@@ -1,0 +1,58 @@
+openapi: 3.1.0
+info:
+  title: Conduit Control Plane
+  version: 0.1.0
+servers:
+  - url: https://conduit.example.com
+paths:
+  /api/v1/projects:
+    get:
+      operationId: listProjects
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.read] }]
+      responses: { "200": { description: Bounded project page }, "401": { $ref: "#/components/responses/AuthRequired" } }
+    post:
+      operationId: createProject
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.config.write] }]
+      responses: { "201": { description: Project committed }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/operations:
+    post:
+      operationId: createOperation
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      security: [{ oauthConnector: [conduit.run.start] }]
+      responses: { "202": { description: Operation intent persisted and offered }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/device-enrollments:
+    post:
+      operationId: createDeviceEnrollment
+      security: []
+      responses: { "201": { description: Pending enrollment and one-time device code } }
+  /api/v1/device-enrollments/poll:
+    post:
+      operationId: pollDeviceEnrollment
+      security: []
+      responses: { "200": { description: Terminal enrollment receipt }, "202": { description: Owner decision pending } }
+  /api/v1/connector-policies/{policyId}:
+    patch:
+      operationId: updateConnectorPolicy
+      parameters:
+        - { name: policyId, in: path, required: true, schema: { type: string, maxLength: 128 } }
+        - { $ref: "#/components/parameters/IfMatch" }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      security: [{ ownerSession: [] }]
+      responses: { "200": { description: Policy revision committed }, "409": { $ref: "#/components/responses/Conflict" } }
+  /mcp:
+    post:
+      operationId: streamableHttpMcp
+      security: [{ oauthConnector: [] }]
+      responses: { "200": { description: Stateless MCP Streamable HTTP response }, "401": { $ref: "#/components/responses/AuthRequired" } }
+components:
+  parameters:
+    IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 16, maxLength: 256 } }
+    IfMatch: { name: If-Match, in: header, required: true, schema: { type: string, pattern: '^"[1-9][0-9]*"$' } }
+  securitySchemes:
+    ownerCli: { type: http, scheme: bearer, description: Passkey-issued conduit_owner_ token; never valid at MCP }
+    ownerSession: { type: apiKey, in: cookie, name: __Host-conduit_session }
+    oauthConnector: { type: oauth2, flows: { authorizationCode: { authorizationUrl: /authorize, tokenUrl: /oauth/token, scopes: { conduit.read: Read metadata, conduit.config.write: Change shared configuration, conduit.run.start: Start admitted work } } } }
+  responses:
+    AuthRequired: { description: Authentication required }
+    Conflict: { description: Revision, digest, or idempotency conflict }

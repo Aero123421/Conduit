@@ -1,0 +1,92 @@
+{
+  "schemaVersion": 1,
+  "kind": "runtime_capability_receipt",
+  "providerId": "incus.kvm",
+  "providerVersion": "6.12",
+  "runtimeKind": "vm",
+  "hostDigest": "1f81d7bce8e8dc0d35c812647fdb827bb2d8ebc0aaedb5819063e2ffd6bab873",
+  "capabilities": [
+    {
+      "capabilityId": "isolation.vm_boundary",
+      "state": "effective",
+      "evidenceLevel": "explicit",
+      "evidenceSource": "incus instance type and KVM device observation",
+      "observedAt": "2026-09-01T11:10:00Z",
+      "details": {
+        "instanceType": "virtual-machine",
+        "kvmAvailable": true
+      }
+    },
+    {
+      "capabilityId": "execution.guest_exec",
+      "state": "effective",
+      "evidenceLevel": "explicit",
+      "evidenceSource": "incus-agent exec probe",
+      "observedAt": "2026-09-01T11:10:01Z",
+      "details": {
+        "mechanism": "incus-agent"
+      }
+    },
+    {
+      "capabilityId": "workspace.read_only_mount",
+      "state": "effective",
+      "evidenceLevel": "observed",
+      "evidenceSource": "test mount and guest write denial",
+      "observedAt": "2026-09-01T11:10:02Z",
+      "details": {
+        "mechanism": "virtiofs"
+      }
+    },
+    {
+      "capabilityId": "privilege.guest_root",
+      "state": "effective",
+      "evidenceLevel": "explicit",
+      "evidenceSource": "guest exec identity probe",
+      "observedAt": "2026-09-01T11:10:03Z",
+      "details": {
+        "uid": 0
+      }
+    },
+    {
+      "capabilityId": "resource.cpu_limit",
+      "state": "effective",
+      "evidenceLevel": "explicit",
+      "evidenceSource": "Incus instance configuration",
+      "observedAt": "2026-09-01T11:10:04Z"
+    },
+    {
+      "capabilityId": "resource.memory_limit",
+      "state": "effective",
+      "evidenceLevel": "explicit",
+      "evidenceSource": "Incus instance configuration and guest observation",
+      "observedAt": "2026-09-01T11:10:04Z"
+    },
+    {
+      "capabilityId": "lifecycle.snapshot",
+      "state": "supported",
+      "evidenceLevel": "explicit",
+      "evidenceSource": "Incus API capability and storage driver probe",
+      "observedAt": "2026-09-01T11:10:05Z",
+      "details": {
+        "storageDriver": "zfs"
+      }
+    },
+    {
+      "capabilityId": "network.restricted_egress",
+      "state": "degraded",
+      "evidenceLevel": "observed",
+      "evidenceSource": "DNS allowlist configured without complete IP-layer enforcement",
+      "observedAt": "2026-09-01T11:10:06Z",
+      "reasonCode": "dns_filter_not_complete_egress_control"
+    },
+    {
+      "capabilityId": "security.host_control_socket_absent",
+      "state": "effective",
+      "evidenceLevel": "observed",
+      "evidenceSource": "guest device and mount enumeration",
+      "observedAt": "2026-09-01T11:10:07Z"
+    }
+  ],
+  "receiptDigest": "1b3b381c5138164a2d2b5d159944d080b31638f6be6f50942fb7730dcb7eb71c",
+  "observedAt": "2026-09-01T11:10:07Z"
+}

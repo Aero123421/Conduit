@@ -156,10 +156,14 @@ pub struct EventDraft {
     pub event_type: String,
     pub source_component: String,
     pub observed_at: UtcTimestamp,
+    #[serde(rename = "monotonicNanos")]
     pub monotonic_ns: Option<U64Decimal>,
     pub boot_id: String,
     pub correlation_id: String,
     pub parent_event_id: Option<EventId>,
+    pub trace_id: Option<String>,
+    pub span_id: Option<String>,
+    pub parent_span_id: Option<String>,
     pub evidence_level: EvidenceLevel,
     pub sensitivity: Sensitivity,
     pub retention: RetentionClass,
@@ -169,19 +173,28 @@ pub struct EventDraft {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct NormalizedEvent {
+    pub schema_version: u8,
+    pub kind: String,
     pub event_id: EventId,
     pub run_id: AnyRunId,
     pub device_id: DeviceId,
     pub sequence: U64Decimal,
     pub event_type: String,
+    #[serde(rename = "source")]
     pub source_component: String,
     pub observed_at: UtcTimestamp,
+    #[serde(rename = "monotonicNanos")]
     pub monotonic_ns: Option<U64Decimal>,
+    #[serde(rename = "nodeBootId")]
     pub boot_id: String,
     pub correlation_id: String,
     pub parent_event_id: Option<EventId>,
+    pub trace_id: Option<String>,
+    pub span_id: Option<String>,
+    pub parent_span_id: Option<String>,
     pub evidence_level: EvidenceLevel,
     pub sensitivity: Sensitivity,
+    #[serde(rename = "retentionClass")]
     pub retention: RetentionClass,
     pub payload: serde_json::Value,
     pub payload_digest: Sha256Digest,

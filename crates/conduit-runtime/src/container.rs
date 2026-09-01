@@ -1610,12 +1610,14 @@ mod tests {
         let script = root.join("docker-fake");
         fs::write(&script, r##"#!/bin/sh
 set -eu
-root=$(dirname "$0")
+case "${1:-}" in
+  --version) printf '%s\n' 'Docker fake 1.0'; exit 0 ;;
+  info) exit 0 ;;
+esac
+root=${0%/*}
 printf '%s\n' '---' >> "$root/argv"
 printf '%s\n' "$@" >> "$root/argv"
 case "${1:-}" in
-  --version) printf '%s\n' 'Docker fake 1.0' ;;
-  info) exit 0 ;;
   image)
     case "${2:-}" in
       inspect)

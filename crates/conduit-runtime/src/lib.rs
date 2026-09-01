@@ -362,6 +362,9 @@ pub(crate) fn command_output(
     mut command: Command,
     timeout: Duration,
 ) -> Result<std::process::Output, RuntimeError> {
+    const TEXT_FILE_BUSY_RETRIES: usize = 20;
+    const TEXT_FILE_BUSY_RETRY_DELAY: Duration = Duration::from_millis(10);
+
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     unsafe {
         command.pre_exec(|| {
@@ -371,7 +374,20 @@ pub(crate) fn command_output(
             Ok(())
         });
     }
-    let mut child = command.spawn()?;
+    let mut text_file_busy_retries = 0;
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY)
+                    && text_file_busy_retries < TEXT_FILE_BUSY_RETRIES =>
+            {
+                text_file_busy_retries += 1;
+                std::thread::sleep(TEXT_FILE_BUSY_RETRY_DELAY);
+            }
+            Err(error) => return Err(RuntimeError::Io(error)),
+        }
+    };
     let pid = child.id() as i32;
     let mut stdout = child
         .stdout
@@ -476,6 +492,31 @@ mod contract_tests {
             Err(RuntimeError::Provider { code }) if code == "provider_timeout_killed"
         ));
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn provider_spawn_retries_transient_text_file_busy() {
+        use std::io::Write;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let directory = tempdir().unwrap();
+        let executable = directory.path().join("provider-fake");
+        std::fs::write(&executable, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let mut writer = std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_CLOEXEC)
+            .open(&executable)
+            .unwrap();
+        writer.flush().unwrap();
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(25));
+            drop(writer);
+        });
+
+        let output = command_output(Command::new(&executable), Duration::from_secs(1)).unwrap();
+        release.join().unwrap();
+        assert!(output.status.success());
     }
 
     #[test]

@@ -1,4 +1,4 @@
-# Open decisions
+# Resolved contracts and remaining product decisions
 
 ## Resolved contracts
 
@@ -10,7 +10,10 @@ The first-release identity, owner bootstrap, Passkey recovery, Device enrollment
 - `docs/adr/0006-separate-identities-and-server-side-connector-ceilings.md`
 - `spec/schemas/auth-v1.schema.json`
 
-Library selection, D1 migrations, endpoint implementation, and interoperability receipts remain implementation work. They must not change the identity separation or Connector-ceiling contract without a new ADR.
+The Linux control plane implements these contracts with D1 migrations,
+passkey/CSRF browser sessions, owner CLI tokens, Device Ed25519 identity, OAuth
+2.1 + PKCE, immutable Connector Policy revisions and exact limiter receipts.
+Changing the identity separation or Connector ceiling still requires a new ADR.
 
 ### Node transport and reconciliation
 
@@ -20,7 +23,10 @@ The handshake, persistent sequence model, operation admission, Device-local jour
 - `docs/adr/0007-durable-device-outbox-inbox-and-reconciliation.md`
 - `spec/schemas/node-protocol-v1.schema.json`
 
-The first implementation still needs concrete SQLite table layouts, compaction limits, Rust types, canonical JSON, and Cloudflare test harnesses. These choices must preserve the distinction between transport custody, operation admission, Runtime start, and terminal completion.
+The Linux Node and Worker implement the SQLite journal, bounded frames, JCS
+digests, ACK/replay, connection epochs, event gaps and summary/plan/complete
+reconciliation. Fault tests preserve the distinction between transport custody,
+operation admission, Runtime start and terminal completion.
 
 ### Run Manifest and trace format
 
@@ -31,7 +37,10 @@ The immutable Run Manifest, Context Snapshot, normalized Event, evidence levels,
 - `docs/adr/0008-immutable-manifest-and-local-content-custody.md`
 - `spec/schemas/trace-v1.schema.json`
 
-The Node protocol validates `event.batch` entries against Trace v1. Concrete SQLite migrations, raw-record binary encoding, Zstandard library selection, redaction implementation, and export code remain implementation work.
+The Node protocol validates `event.batch` entries against Trace v1. The
+Device-local store implements authenticated redaction, chained segments,
+bounded cursors, partial recovery and OpenTelemetry export. Upload and retention
+remain explicit policy decisions rather than an implicit cloud copy.
 
 ### Runtime Provider
 
@@ -42,13 +51,17 @@ The Native, Restricted Native, Container, and VM Provider boundary; lifecycle; d
 - `docs/adr/0009-runtime-provider-and-local-privilege-boundaries.md`
 - `spec/schemas/runtime-v1.schema.json`
 
-The first implementation still needs concrete Rust traits, the Linux Native supervisor, fake Providers, a Runtime Broker IPC, a Credential Broker, and storage reservation code. The Container and VM backends do not block the Native vertical slice.
+The Linux implementation provides the shared Rust trait, Native supervisor,
+Restricted Native controls, Docker/Podman and Incus providers, encrypted
+Credential Broker and quota/custody-aware storage. Capability receipts remain
+truthful: a missing daemon, KVM, guest agent or enforcement mechanism is
+reported as unavailable rather than simulated.
 
-## Blocks the first executable vertical slice
+## Resolved implementation choices
 
 ### Collaboration Session baseline and Change Set acceptance
 
-Define exact Git branch and worktree behavior for:
+The workspace implementation fixes exact Git branch and worktree behavior for:
 
 - first Run in a Session
 - proposed Change Set
@@ -58,11 +71,15 @@ Define exact Git branch and worktree behavior for:
 - multi-Source integration
 - Direct-mode divergence
 
-The domain rules are fixed; exact Git commands and branch naming remain open.
+The accepted conventions are versioned in workspace receipts and protected by
+repository identity, lease and compare-and-swap tests.
 
 ### Codex Adapter import boundary
 
-Identify what can be ported from OwnMesh and what must be rewritten. Prompt acceptance, continuation, cancellation, normalized Events, credential handling, and protocol-version evidence need explicit tests.
+The adapter boundary was rewritten around Conduit domain types. Prompt
+acceptance, continuation, cancellation, normalized Events, credential handling
+and protocol-version evidence have structured fixtures; live paid inference is
+an explicit operator action.
 
 ## Does not block the first vertical slice
 
@@ -72,11 +89,14 @@ D1 is the expected first store. Repository and service boundaries should allow a
 
 ### Container backend
 
-Docker and Podman remain candidates behind Runtime v1. Native and fake Providers can be implemented first.
+Docker and Podman implement Runtime v1 behind the same typed provider boundary.
+Daemon-backed conformance remains a host-specific live check.
 
 ### VM backend details
 
-Incus with KVM/QEMU is the first Linux VM candidate. Storage driver, image-building workflow, Incus Project mapping, and Guest Agent transport can be decided before the VM vertical slice.
+Incus with KVM/QEMU is the Linux VM provider. The selected image, storage
+driver, Incus Project and guest transport are deployment configuration and are
+recorded in capability/runtime receipts.
 
 ### Windows and macOS compute Providers
 

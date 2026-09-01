@@ -488,6 +488,7 @@ describe.sequential("control-plane contracts", () => {
     expect(loginHtml).toContain("id=passkey-sign-in");
     expect(loginHtml).toContain("/api/v1/auth/browser.js");
     expect(login.headers.get("content-security-policy")).toContain("script-src 'self'");
+    expect(login.headers.get("content-security-policy")).toContain("connect-src 'self'");
     const script = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/auth/browser.js"));
     expect(script.status).toBe(200);
     expect(await script.text()).toContain("navigator.credentials.get");
@@ -502,6 +503,7 @@ describe.sequential("control-plane contracts", () => {
     const stepUp = await exports.default.fetch(new Request(request, { headers: { cookie: `__Host-conduit_session=${staleSession}; __Host-conduit_csrf=${staleCsrf}` } }));
     expect(stepUp.status).toBe(200);
     expect(await stepUp.text()).toContain("id=oauth-step-up");
+    expect(stepUp.headers.get("content-security-policy")).toContain("connect-src 'self'");
   });
 
   it("denies cross-Project MCP reads and conflicting create bindings using stored ownership", async () => {

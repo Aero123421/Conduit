@@ -304,7 +304,7 @@ export async function renderAuthPage(request: Request, env: ControlPlaneEnv): Pr
   const body = owner === null
     ? "<h1>Set up Conduit</h1><p>Use a WebAuthn-capable client to call the versioned setup ceremony endpoints.</p>"
     : `<h1>Conduit sign in</h1><p>Authenticate with your passkey to continue.</p><button id=passkey-sign-in type=button data-return-to="${returnPath.replace(/[&<>"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[char] ?? char)}">Sign in with passkey</button><p id=auth-status role=status aria-live=polite></p><script src=/api/v1/auth/browser.js defer></script>`;
-  return new Response(`<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Conduit authentication</title><body>${body}</body></html>`, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; script-src 'self'; form-action 'self'; frame-ancestors 'none'", "permissions-policy": "publickey-credentials-get=(self)" } });
+  return new Response(`<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Conduit authentication</title><body>${body}</body></html>`, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; script-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'", "permissions-policy": "publickey-credentials-get=(self)" } });
 }
 
 const BROWSER_AUTH_SCRIPT = `(() => {

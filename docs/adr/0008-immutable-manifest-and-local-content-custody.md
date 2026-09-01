@@ -89,6 +89,11 @@ turn ID. Every method in the locally generated `ServerRequest` union receives
 either its typed response or a correlated fail-closed response; unknown methods
 receive a same-ID method-not-found response.
 
+A notification may complete a Codex turn before the correlated `turn/start`
+response arrives. The pending request retains that completed turn ID until the
+response is consumed. An exact delayed response is observational only and
+cannot resurrect the turn; a mismatched response terminally fails correlation.
+
 Provider request IDs are process-scoped across approval and fail-closed request
 categories. After a terminal response, the Adapter retains a bounded,
 non-evicting tombstone containing the normalized ID, method, canonical

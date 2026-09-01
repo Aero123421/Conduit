@@ -40,6 +40,7 @@ enum CodexResponseKind {
 struct PendingCodexRequest {
     method: &'static str,
     response: CodexResponseKind,
+    completed_turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -860,6 +861,30 @@ impl ProtocolDriver {
                         )],
                     ));
                 };
+                if let Some(completed_turn_id) = pending.completed_turn_id.as_deref() {
+                    if completed_turn_id != turn_id {
+                        return Ok((
+                            Vec::new(),
+                            vec![self.codex_correlated_response_error(
+                                correlation.as_deref(),
+                                "delayed turn/start response did not match the completed turn notification",
+                            )],
+                        ));
+                    }
+                    return Ok((
+                        Vec::new(),
+                        vec![AdapterEvent::bounded(
+                            AdapterEventKind::State,
+                            pending.method,
+                            self.native_session_id(),
+                            Some(turn_id),
+                            Some(
+                                "delayed correlated turn/start response consumed after turn completion",
+                            ),
+                            Some(json!({"requestId": id, "turnAlreadyCompleted": true})),
+                        )],
+                    ));
+                }
                 if self
                     .active_turn_id
                     .as_deref()
@@ -1098,8 +1123,13 @@ impl ProtocolDriver {
                     )];
                 }
                 self.active_turn_id = None;
-                self.pending_codex
-                    .retain(|_, pending| pending.response != CodexResponseKind::TurnStart);
+                for pending in self
+                    .pending_codex
+                    .values_mut()
+                    .filter(|pending| pending.response == CodexResponseKind::TurnStart)
+                {
+                    pending.completed_turn_id = Some(turn_id.expect("validated").to_owned());
+                }
                 self.phase = Phase::Ready;
                 self.state = AdapterState::Completed;
                 AdapterEvent::bounded(
@@ -2260,8 +2290,14 @@ impl ProtocolDriver {
         }
         let id = self.take_request_id();
         let frame = ProtocolFrame::json(&json!({"id": id, "method": method, "params": params}))?;
-        self.pending_codex
-            .insert(id, PendingCodexRequest { method, response });
+        self.pending_codex.insert(
+            id,
+            PendingCodexRequest {
+                method,
+                response,
+                completed_turn_id: None,
+            },
+        );
         Ok(frame)
     }
 
@@ -2989,7 +3025,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_delayed_turn_start_response_cannot_resurrect_completed_turn() {
+    fn codex_delayed_turn_start_response_is_consumed_without_resurrecting_completed_turn() {
         let mut driver = ready_codex_driver();
         driver
             .on_record(b"{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn-1\",\"status\":{\"type\":\"completed\"}}}}\n")
@@ -3016,9 +3052,44 @@ mod tests {
         let (_, events) = driver
             .on_record(&[delayed.as_slice(), b"\n"].concat())
             .unwrap();
-        assert_eq!(events[0].kind, AdapterEventKind::AdapterError);
+        assert_eq!(events[0].kind, AdapterEventKind::State);
+        assert_eq!(
+            events[0].data.as_ref().unwrap()["turnAlreadyCompleted"],
+            true
+        );
         assert_eq!(driver.state(), AdapterState::Completed);
         assert!(driver.active_turn_id.is_none());
+        assert!(driver.pending_codex.is_empty());
+
+        let mut mismatched = ready_codex_driver();
+        mismatched
+            .on_record(b"{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn-1\",\"status\":{\"type\":\"completed\"}}}}\n")
+            .unwrap();
+        let request: Value = serde_json::from_slice(
+            &mismatched
+                .command(AdapterOperation::FollowUp, Some("second turn"))
+                .unwrap()
+                .remove(0)
+                .0,
+        )
+        .unwrap();
+        mismatched
+            .on_record(b"{\"method\":\"turn/started\",\"params\":{\"turn\":{\"id\":\"turn-2\"}}}\n")
+            .unwrap();
+        mismatched
+            .on_record(b"{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn-2\",\"status\":{\"type\":\"completed\"}}}}\n")
+            .unwrap();
+        let delayed = serde_json::to_vec(&json!({
+            "id": request["id"],
+            "result": {"turn": {"id": "different-turn"}}
+        }))
+        .unwrap();
+        let (_, events) = mismatched
+            .on_record(&[delayed.as_slice(), b"\n"].concat())
+            .unwrap();
+        assert_eq!(events[0].kind, AdapterEventKind::AdapterError);
+        assert_eq!(mismatched.state(), AdapterState::Failed);
+        assert_eq!(mismatched.phase, Phase::Terminal);
     }
 
     #[test]

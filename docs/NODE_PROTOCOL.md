@@ -576,7 +576,11 @@ An Agent Adapter must answer every provider-initiated request that carries an ID
 Codex client requests are held in a bounded request-ID map that also records the
 method and expected response shape. Wrong IDs, duplicate responses, malformed
 exact-ID responses, notification-before-response ordering, and stale turn
-notifications cannot consume or resurrect another turn. The test fixture is
+notifications cannot consume or resurrect another turn. If `turn/started` and
+`turn/completed` arrive before the matching `turn/start` response, the pending
+request retains the completed turn ID: an exact delayed response is consumed
+without resurrection, while a different turn ID terminally fails correlation.
+The test fixture is
 derived from the locally generated Codex app-server `ServerRequest` union,
 including `currentTime/read`, so adding a union member without a response fails
 conformance.

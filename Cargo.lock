@@ -302,6 +302,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "conduit-collaboration"
+version = "0.1.0"
+dependencies = [
+ "conduit-crypto",
+ "conduit-domain",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "conduit-core"
 version = "0.1.0"
 dependencies = [
@@ -335,6 +346,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "conduit-observability"
+version = "0.1.0"
+dependencies = [
+ "conduit-crypto",
+ "conduit-domain",
+ "serde",
+ "serde_json",
+ "sha2",
+ "thiserror",
+]
+
+[[package]]
 name = "conduit-protocol"
 version = "0.1.0"
 dependencies = [
@@ -342,6 +365,18 @@ dependencies = [
  "jsonschema",
  "serde",
  "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "conduit-workspace"
+version = "0.1.0"
+dependencies = [
+ "conduit-crypto",
+ "conduit-domain",
+ "serde",
+ "serde_json",
+ "sha2",
  "thiserror",
 ]
 

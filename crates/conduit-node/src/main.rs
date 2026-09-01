@@ -1,6 +1,8 @@
 use conduit_node::{
     Node,
-    ipc::{IpcHandler, IpcRequest, IpcServer},
+    ipc::IpcServer,
+    local::LocalServices,
+    local_ipc::LocalIpcService,
     service::{NodeService, load_launch_profiles},
 };
 use conduit_node_store::{CredentialStore, DeviceIdentity, NodeStore};
@@ -8,31 +10,11 @@ use conduit_runtime::{
     ContainerBackend, ContainerProvider, IncusProvider, NativeProvider, ProcessSupervisor,
     RestrictedNativeProvider, RuntimeProvider,
 };
-use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-
-struct ServiceHandler {
-    providers: Vec<Arc<dyn RuntimeProvider>>,
-    store: NodeStore,
-    identity: Arc<DeviceIdentity>,
-    _node: Arc<Node>,
-}
-impl IpcHandler for ServiceHandler {
-    fn handle(&self, r: &IpcRequest) -> Result<Value, String> {
-        match r.method.as_str(){
-  "health"=>{self.store.integrity_check().map_err(|e|e.to_string())?;Ok(json!({"status":"ready","keyId":self.identity.key_id(),"connectionEpoch":self.store.connection_epoch().map_err(|e|e.to_string())?.to_string()}))},
-  "doctor"|"device.doctor"=>Ok(Value::Array(self.providers.iter().map(|p|p.probe().map(|v|serde_json::to_value(v).unwrap_or_else(|_|json!({"providerId":p.provider_id(),"error":"receipt_encoding_failed"}))).unwrap_or_else(|e|json!({"providerId":p.provider_id(),"capabilities":[],"error":e.to_string()}))).collect())),
-  "device.enroll"|"device.rotate_key"|"project.add_location"|"agent.probe"|
-  "runtime.list"|"runtime.show"|"runtime.start"|"runtime.stop"|"runtime.pause"|"runtime.resume"|"runtime.snapshot"|"runtime.archive"|"runtime.restore"|"runtime.destroy"|
-  "logs.search"|"logs.show"|"logs.export"|"storage.list"|"storage.show"|"storage.configure"|"storage.pin"|"storage.unpin"|"storage.move"|"storage.restore"|
-  "backup.create"|"backup.verify"|"backup.restore"=>Err(format!("capability_unavailable:{}",r.method)),
-  _=>Err("method_unknown".into())}
-    }
-}
 
 struct Options {
     data: PathBuf,
@@ -127,6 +109,12 @@ fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     let identity = Arc::new(DeviceIdentity::load_or_create(
         opts.data.join("identity/device.ed25519"),
     )?);
+    let cursor_key: [u8; 32] =
+        Sha256::digest(identity.sign(b"conduit.trace.cursor.v1").as_bytes()).into();
+    let local = Arc::new(LocalServices::open(
+        opts.data.join("local-services"),
+        cursor_key,
+    )?);
     let _credentials = CredentialStore::open(
         store.clone(),
         opts.data.join("credentials/master.dek"),
@@ -161,16 +149,19 @@ fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             capability_digest,
             boot,
             config,
+            local.clone(),
         )?;
         std::thread::spawn(move || service.run_forever());
     }
     let server = IpcServer::bind(opts.socket)?;
-    server.serve(Arc::new(ServiceHandler {
+    server.serve(Arc::new(LocalIpcService::new(
         providers,
-        store,
+        store.clone(),
         identity,
-        _node: node,
-    }))?;
+        node,
+        local,
+        opts.data,
+    )?))?;
     Ok(())
 }
 fn fs_text(path: impl AsRef<Path>) -> Option<String> {

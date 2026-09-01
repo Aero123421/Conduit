@@ -2,6 +2,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     os::unix::process::CommandExt,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::mpsc::{self, Receiver, TryRecvError, TrySendError},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -19,8 +20,16 @@ use crate::{
 pub struct AdapterChild {
     child: Child,
     stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
+    records: Receiver<Result<Vec<u8>, AdapterReadError>>,
+    stdout_drain: Option<JoinHandle<()>>,
     stderr_drain: Option<JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+enum AdapterReadError {
+    Io(std::io::Error),
+    InvalidFrame,
+    FrameTooLarge(usize),
 }
 
 impl AdapterChild {
@@ -45,10 +54,39 @@ impl AdapterChild {
                 }
             }
         });
+        let (records_tx, records) = mpsc::sync_channel(128);
+        let stdout_drain = thread::spawn(move || {
+            let mut stdout = BufReader::new(stdout);
+            loop {
+                let record = read_record_from(&mut stdout).map_err(|error| match error {
+                    AdapterError::Process(error) => AdapterReadError::Io(error),
+                    AdapterError::InvalidFrame => AdapterReadError::InvalidFrame,
+                    AdapterError::FrameTooLarge { actual, .. } => {
+                        AdapterReadError::FrameTooLarge(actual)
+                    }
+                    _ => AdapterReadError::InvalidFrame,
+                });
+                let terminal = matches!(record, Ok(None) | Err(_));
+                match record {
+                    Ok(Some(record)) => match records_tx.try_send(Ok(record)) {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_) | TrySendError::Disconnected(_)) => break,
+                    },
+                    Ok(None) => break,
+                    Err(error) => {
+                        let _ = records_tx.try_send(Err(error));
+                    }
+                }
+                if terminal {
+                    break;
+                }
+            }
+        });
         let mut adapter = Self {
             child,
             stdin: Some(stdin),
-            stdout: BufReader::new(stdout),
+            records,
+            stdout_drain: Some(stdout_drain),
             stderr_drain: Some(stderr_drain),
         };
         for frame in &spec.initial_frames {
@@ -86,31 +124,16 @@ impl AdapterChild {
     /// Reads exactly one strict LF-framed record without allowing an unbounded
     /// allocation. A trailing CR is retained for the protocol decoder.
     pub fn read_record(&mut self) -> Result<Option<Vec<u8>>, AdapterError> {
-        let mut record = Vec::with_capacity(4_096);
-        loop {
-            let available = self.stdout.fill_buf()?;
-            if available.is_empty() {
-                return if record.is_empty() {
-                    Ok(None)
-                } else {
-                    Err(AdapterError::InvalidFrame)
-                };
-            }
-            let take = available
-                .iter()
-                .position(|byte| *byte == b'\n')
-                .map_or(available.len(), |index| index + 1);
-            if record.len().saturating_add(take) > MAX_PROTOCOL_FRAME_BYTES {
-                return Err(AdapterError::FrameTooLarge {
-                    actual: record.len().saturating_add(take),
-                    maximum: MAX_PROTOCOL_FRAME_BYTES,
-                });
-            }
-            record.extend_from_slice(&available[..take]);
-            self.stdout.consume(take);
-            if record.ends_with(b"\n") {
-                return Ok(Some(record));
-            }
+        self.records.recv().map_or(Ok(None), map_record)
+    }
+
+    /// Polls one already-framed protocol record without blocking the node
+    /// transport loop. `None` means no record is currently ready; process exit
+    /// remains observable through `try_wait`.
+    pub fn try_read_record(&mut self) -> Result<Option<Vec<u8>>, AdapterError> {
+        match self.records.try_recv() {
+            Ok(record) => map_record(record),
+            Err(TryRecvError::Empty | TryRecvError::Disconnected) => Ok(None),
         }
     }
 
@@ -146,9 +169,53 @@ impl AdapterChild {
     }
 
     fn join_stderr(&mut self) {
+        if let Some(thread) = self.stdout_drain.take() {
+            let _ = thread.join();
+        }
         if let Some(thread) = self.stderr_drain.take() {
             let _ = thread.join();
         }
+    }
+}
+
+fn read_record_from(stdout: &mut BufReader<ChildStdout>) -> Result<Option<Vec<u8>>, AdapterError> {
+    let mut record = Vec::with_capacity(4_096);
+    loop {
+        let available = stdout.fill_buf()?;
+        if available.is_empty() {
+            return if record.is_empty() {
+                Ok(None)
+            } else {
+                Err(AdapterError::InvalidFrame)
+            };
+        }
+        let take = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        if record.len().saturating_add(take) > MAX_PROTOCOL_FRAME_BYTES {
+            return Err(AdapterError::FrameTooLarge {
+                actual: record.len().saturating_add(take),
+                maximum: MAX_PROTOCOL_FRAME_BYTES,
+            });
+        }
+        record.extend_from_slice(&available[..take]);
+        stdout.consume(take);
+        if record.ends_with(b"\n") {
+            return Ok(Some(record));
+        }
+    }
+}
+
+fn map_record(record: Result<Vec<u8>, AdapterReadError>) -> Result<Option<Vec<u8>>, AdapterError> {
+    match record {
+        Ok(record) => Ok(Some(record)),
+        Err(AdapterReadError::Io(error)) => Err(AdapterError::Process(error)),
+        Err(AdapterReadError::InvalidFrame) => Err(AdapterError::InvalidFrame),
+        Err(AdapterReadError::FrameTooLarge(actual)) => Err(AdapterError::FrameTooLarge {
+            actual,
+            maximum: MAX_PROTOCOL_FRAME_BYTES,
+        }),
     }
 }
 

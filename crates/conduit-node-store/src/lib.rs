@@ -442,6 +442,71 @@ impl NodeStore {
             .collect()
     }
 
+    pub fn admissions(&self) -> Result<Vec<AdmissionRecord>, StoreError> {
+        let conn = self.conn()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT o.idempotency_key FROM operations o JOIN operation_admissions a ON a.idempotency_key=o.idempotency_key ORDER BY o.updated_at DESC, o.operation_id",
+            )
+            .map_err(map_sql)?;
+        let keys = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(map_sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sql)?;
+        keys.into_iter()
+            .map(|key| query_admission(&conn, &key)?.ok_or(StoreError::NotFound))
+            .collect()
+    }
+
+    pub fn admission_by_runtime_id(
+        &self,
+        runtime_id: &str,
+    ) -> Result<Option<AdmissionRecord>, StoreError> {
+        let conn = self.conn()?;
+        let key = conn
+            .query_row(
+                "SELECT idempotency_key FROM operations WHERE runtime_id=?1",
+                [runtime_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sql)?;
+        key.map(|key| query_admission(&conn, &key))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub fn backup_database(&self, destination: &Path) -> Result<(), StoreError> {
+        if !destination.is_absolute() || destination.exists() {
+            return Err(StoreError::Invalid(
+                "backup destination must be a new absolute path".into(),
+            ));
+        }
+        let destination = destination
+            .to_str()
+            .ok_or_else(|| StoreError::Invalid("backup path must be UTF-8".into()))?;
+        let escaped = destination.replace('\'', "''");
+        self.conn()?
+            .execute_batch(&format!("VACUUM INTO '{escaped}'"))
+            .map_err(map_sql)
+    }
+
+    pub fn verify_database(path: &Path) -> Result<(), StoreError> {
+        let connection =
+            Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).map_err(map_sql)?;
+        let result: String = connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .map_err(map_sql)?;
+        if result == "ok" {
+            Ok(())
+        } else {
+            Err(StoreError::Corrupt(format!(
+                "backup integrity check failed: {result}"
+            )))
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn record_rejection(
         &self,
@@ -820,6 +885,57 @@ impl NodeStore {
         tx.execute("INSERT INTO run_events(run_id,sequence,event_id,content_digest,payload,priority) VALUES(?1,?2,?3,?4,?5,?6)", params![run_id,seq,event_id,digest,payload,priority]).map_err(map_sql)?;
         tx.commit().map_err(map_sql)?;
         Ok(seq)
+    }
+
+    pub fn append_operation_event(
+        &self,
+        key: &str,
+        run_id: &str,
+        event_id: &str,
+        digest: &str,
+        payload: &[u8],
+        priority: u8,
+    ) -> Result<u64, StoreError> {
+        if payload.len() > MAX_EVENT_BYTES {
+            return Err(StoreError::TooLarge {
+                limit: MAX_EVENT_BYTES,
+            });
+        }
+        validate_digest(digest)?;
+        let mut connection = self.conn()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        let operation_sequence: u64 = transaction
+            .query_row(
+                "SELECT last_event_sequence+1 FROM operations WHERE idempotency_key=?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(map_sql)?
+            .ok_or(StoreError::NotFound)?;
+        let run_sequence: u64 = transaction
+            .query_row(
+                "SELECT COALESCE(MAX(sequence),0)+1 FROM run_events WHERE run_id=?1",
+                [run_id],
+                |row| row.get(0),
+            )
+            .map_err(map_sql)?;
+        if operation_sequence != run_sequence {
+            return Err(StoreError::Corrupt(
+                "operation and Run event sequences diverged".into(),
+            ));
+        }
+        transaction.execute("INSERT INTO run_events(run_id,sequence,event_id,content_digest,payload,priority) VALUES(?1,?2,?3,?4,?5,?6)", params![run_id,run_sequence,event_id,digest,payload,priority]).map_err(map_sql)?;
+        transaction
+            .execute(
+                "UPDATE operations SET last_event_sequence=?2 WHERE idempotency_key=?1",
+                params![key, run_sequence],
+            )
+            .map_err(map_sql)?;
+        transaction.commit().map_err(map_sql)?;
+        Ok(run_sequence)
     }
 
     pub fn event_range(

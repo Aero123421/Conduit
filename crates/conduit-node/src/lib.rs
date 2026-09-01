@@ -2,6 +2,8 @@
 //! orchestration, and authenticated local IPC.
 
 pub mod ipc;
+pub mod local;
+pub mod local_ipc;
 pub mod service;
 pub mod transport;
 
@@ -260,6 +262,77 @@ impl Node {
             .inspect(handle)
             .map_err(|e| NodeError::Runtime(e.to_string()))
     }
+    pub fn signal_runtime(
+        &self,
+        provider_id: &str,
+        handle: &RuntimeHandle,
+        signal: conduit_runtime::RuntimeSignal,
+    ) -> Result<RuntimeStateReceipt, NodeError> {
+        self.providers
+            .get(provider_id)
+            .ok_or_else(|| NodeError::Rejected("runtime_provider_unavailable".into()))?
+            .signal(handle, signal)
+            .map_err(|error| NodeError::Runtime(error.to_string()))
+    }
+
+    pub fn snapshot_runtime(
+        &self,
+        provider_id: &str,
+        handle: &RuntimeHandle,
+        name: &str,
+    ) -> Result<conduit_runtime::SnapshotReceipt, NodeError> {
+        self.providers
+            .get(provider_id)
+            .ok_or_else(|| NodeError::Rejected("runtime_provider_unavailable".into()))?
+            .snapshot(handle, name)
+            .map_err(|error| NodeError::Runtime(error.to_string()))
+    }
+
+    pub fn collect_runtime(
+        &self,
+        provider_id: &str,
+        handle: &RuntimeHandle,
+    ) -> Result<conduit_runtime::CollectionReceipt, NodeError> {
+        self.providers
+            .get(provider_id)
+            .ok_or_else(|| NodeError::Rejected("runtime_provider_unavailable".into()))?
+            .collect(handle)
+            .map_err(|error| NodeError::Runtime(error.to_string()))
+    }
+
+    pub fn destroy_runtime(
+        &self,
+        provider_id: &str,
+        handle: &RuntimeHandle,
+        request: &conduit_runtime::DestroyRequest,
+    ) -> Result<conduit_runtime::DestroyReceipt, NodeError> {
+        self.providers
+            .get(provider_id)
+            .ok_or_else(|| NodeError::Rejected("runtime_provider_unavailable".into()))?
+            .destroy(handle, request)
+            .map_err(|error| NodeError::Runtime(error.to_string()))
+    }
+
+    pub fn runtime_handle(
+        &self,
+        admission: &conduit_node_store::AdmissionRecord,
+    ) -> Result<RuntimeHandle, NodeError> {
+        let request: RuntimeRequest = serde_json::from_slice(&admission.runtime_request)
+            .map_err(|_| NodeError::Rejected("durable_runtime_request_corrupt".into()))?;
+        Ok(RuntimeHandle {
+            runtime_id: request.runtime_id.clone(),
+            provider_id: admission.provider_id.clone(),
+            spec_digest: request.spec_digest,
+            object_id: match admission.provider_id.as_str() {
+                "native" | "restricted_native" => "native-supervisor".into(),
+                "docker" | "podman" | "incus_kvm" => {
+                    format!("conduit-{}", request.runtime_id.trim_start_matches("rt_"))
+                }
+                _ => return Err(NodeError::Rejected("runtime_provider_unavailable".into())),
+            },
+            process_identity: admission.operation.process_identity.clone(),
+        })
+    }
     pub fn recover_nonterminal(&self) -> Result<Vec<RecoveredOperation>, NodeError> {
         let mut recovered = Vec::new();
         for admission in self.store.nonterminal_admissions()? {
@@ -269,6 +342,39 @@ impl Node {
             }
             let request: RuntimeRequest = serde_json::from_slice(&admission.runtime_request)
                 .map_err(|_| NodeError::Rejected("durable_runtime_request_corrupt".into()))?;
+            let is_agent = serde_json::from_slice::<serde_json::Value>(&operation.manifest)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("capability")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .as_deref()
+                == Some("agent.run.start");
+            if is_agent {
+                let terminal = if operation.state == OperationState::Running {
+                    OperationState::RecoveryRequired
+                } else {
+                    OperationState::Uncertain
+                };
+                let evidence = serde_jcs::to_vec(&serde_json::json!({
+                    "operationId": operation.operation_id,
+                    "runId": request.run_id,
+                    "state": terminal,
+                    "reasonCode": "adapter_process_restart_recovery_required"
+                }))
+                .map_err(|error| NodeError::Rejected(error.to_string()))?;
+                self.store.transition_operation(
+                    &operation.idempotency_key,
+                    operation.state,
+                    terminal,
+                    Some(&request.runtime_id),
+                    None,
+                    Some(&evidence),
+                )?;
+                continue;
+            }
             let handle = RuntimeHandle {
                 runtime_id: request.runtime_id.clone(),
                 provider_id: admission.provider_id.clone(),

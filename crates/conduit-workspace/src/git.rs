@@ -711,6 +711,14 @@ impl WorktreeManager {
         Ok(lease)
     }
 
+    /// Returns the durable lease identity reconstructed from the owner-only
+    /// lease journal. Callers must still invoke `reconcile` before reuse.
+    pub fn lease(&self, run_id: &RunId, source_id: &SourceId) -> Option<WorktreeLease> {
+        self.leases
+            .get(&(run_id.clone(), source_id.clone()))
+            .cloned()
+    }
+
     pub fn cleanup(
         &mut self,
         repository: &GitRepository,

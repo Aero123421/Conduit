@@ -25,7 +25,8 @@ impl StorageClass {
         }
     }
 }
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StorageObject {
     pub object_id: String,
     pub class: StorageClass,
@@ -85,6 +86,23 @@ impl StorageManager {
                 |r| r.get(0),
             )
             .map_err(map_sql)
+    }
+    pub fn list(&self) -> Result<Vec<StorageObject>, StoreError> {
+        let connection = self.store.conn()?;
+        let mut statement = connection.prepare("SELECT object_id,class,path,size_bytes,pinned,custody_count,contains_credentials,collected FROM storage_objects ORDER BY object_id").map_err(map_sql)?;
+        statement
+            .query_map([], decode_object)
+            .map_err(map_sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sql)
+    }
+    pub fn get(&self, id: &str) -> Result<StorageObject, StoreError> {
+        self.store
+            .conn()?
+            .query_row("SELECT object_id,class,path,size_bytes,pinned,custody_count,contains_credentials,collected FROM storage_objects WHERE object_id=?1", [id], decode_object)
+            .optional()
+            .map_err(map_sql)?
+            .ok_or(StoreError::NotFound)
     }
     pub fn reserve(&self, object: &StorageObject) -> Result<(), StoreError> {
         validate_object_id(&object.object_id)?;
@@ -192,6 +210,27 @@ impl StorageManager {
         }
         Ok(dest)
     }
+}
+fn decode_object(row: &rusqlite::Row<'_>) -> rusqlite::Result<StorageObject> {
+    let class: String = row.get(1)?;
+    let class = match class.as_str() {
+        "hot" => StorageClass::Hot,
+        "archive" => StorageClass::Archive,
+        "backup" => StorageClass::Backup,
+        "cache" => StorageClass::Cache,
+        _ => return Err(rusqlite::Error::InvalidQuery),
+    };
+    let raw: Vec<u8> = row.get(2)?;
+    Ok(StorageObject {
+        object_id: row.get(0)?,
+        class,
+        path: PathBuf::from(std::ffi::OsString::from_vec(raw)),
+        size_bytes: row.get(3)?,
+        pinned: row.get(4)?,
+        custody_count: row.get(5)?,
+        contains_credentials: row.get(6)?,
+        collected: row.get(7)?,
+    })
 }
 fn validate_object_id(id: &str) -> Result<(), StoreError> {
     let suffix = id

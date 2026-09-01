@@ -26,7 +26,7 @@ use thiserror::Error;
 pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 pub const MAX_FRAME_BYTES: usize = 65_536;
 pub const MAX_EVENT_BYTES: usize = 60_000;
-const STORE_SCHEMA_VERSION: u32 = 6;
+const STORE_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -509,6 +509,20 @@ impl NodeStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sql)?;
+        let existing_approval_id = tx
+            .query_row(
+                "SELECT approval_id FROM agent_approval_journal WHERE idempotency_key=?1 AND provider_request_id=?2 LIMIT 1",
+                params![idempotency_key, provider_request_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sql)?;
+        if existing_approval_id
+            .as_deref()
+            .is_some_and(|existing| existing != approval_id)
+        {
+            return Err(StoreError::IdempotencyConflict);
+        }
         tx.execute(
             "INSERT OR IGNORE INTO agent_approval_journal(approval_id,idempotency_key,operation_digest,provider_request_id,method,parameters_digest,expires_at_unix_ms,request_payload,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending')",
             params![approval_id,idempotency_key,operation_digest,provider_request_id,method,parameters_digest,expires_at_unix_ms,request_payload],
@@ -1492,7 +1506,8 @@ CREATE TABLE IF NOT EXISTS agent_approval_journal(
  CHECK(resolution IS NULL OR length(resolution)<=60000),
  CHECK(resolution_authority IS NULL OR (length(resolution_authority)>=1 AND length(resolution_authority)<=256)));
 CREATE INDEX IF NOT EXISTS agent_approval_pending_idx ON agent_approval_journal(state,expires_at_unix_ms);
-INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6);
+CREATE UNIQUE INDEX IF NOT EXISTS agent_approval_provider_request_unique_idx ON agent_approval_journal(idempotency_key,provider_request_id);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7);
 COMMIT;"#).map_err(map_sql)
 }
 
@@ -1616,6 +1631,19 @@ mod tests {
                 request_payload,
             )
             .unwrap();
+        assert!(matches!(
+            store.record_agent_approval(
+                "appr_xapproval02",
+                "approval-idempotency-key",
+                &digest(4),
+                request_id,
+                "item/commandExecution/requestApproval",
+                &digest(5),
+                2_000_000_000_000,
+                br#"{"approvalId":"appr_xapproval02"}"#,
+            ),
+            Err(StoreError::IdempotencyConflict)
+        ));
         assert_eq!(
             store
                 .operation("approval-idempotency-key")

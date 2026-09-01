@@ -196,28 +196,39 @@ impl ProtocolDriver {
         value: &Value,
     ) -> Result<(Vec<ProtocolFrame>, Vec<AdapterEvent>), AdapterError> {
         if let Some(method) = value.get("method").and_then(Value::as_str) {
-            if value.get("id").is_some() {
-                let event = if is_approval_method(method) {
-                    self.state = AdapterState::WaitingApproval;
-                    AdapterEvent::bounded(
+            if let Some(request_id) = value.get("id") {
+                let correlation_id = request_id_text(request_id);
+                if is_codex_approval_method(method) {
+                    // Conduit does not advertise a synchronous approval callback
+                    // capability to app-server yet.  Explicitly decline instead of
+                    // leaving a server-initiated request pending indefinitely.
+                    let frame = codex_approval_decline(method, request_id)?;
+                    let event = AdapterEvent::bounded(
                         AdapterEventKind::ApprovalRequest,
                         method,
                         self.native_session_id(),
-                        value.get("id").map(request_id_text).as_deref(),
-                        None,
+                        Some(&correlation_id),
+                        Some("declined because the Conduit approval bridge is not advertised"),
                         value.get("params").cloned(),
-                    )
-                } else {
-                    AdapterEvent::bounded(
-                        AdapterEventKind::AdapterError,
-                        method,
-                        self.native_session_id(),
-                        value.get("id").map(request_id_text).as_deref(),
-                        Some("unrecognized Codex server request was not granted authority"),
-                        None,
-                    )
-                };
-                return Ok((Vec::new(), vec![event]));
+                    );
+                    return Ok((vec![frame], vec![event]));
+                }
+
+                let known = is_codex_server_request(method);
+                let frame = codex_fail_closed_response(method, request_id, known)?;
+                let event = AdapterEvent::bounded(
+                    AdapterEventKind::AdapterError,
+                    method,
+                    self.native_session_id(),
+                    Some(&correlation_id),
+                    Some(if known {
+                        "Codex server request capability was not advertised and was denied"
+                    } else {
+                        "unknown Codex server request was denied"
+                    }),
+                    value.get("params").cloned(),
+                );
+                return Ok((vec![frame], vec![event]));
             }
             return Ok((Vec::new(), self.normalize_codex_notification(method, value)));
         }
@@ -1148,10 +1159,76 @@ fn request_id_text(value: &Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
-fn is_approval_method(method: &str) -> bool {
-    method.ends_with("/requestApproval")
-        || method == "permissions/requestApproval"
-        || method == "item/tool/requestUserInput"
+const CODEX_SERVER_REQUEST_METHODS: [&str; 10] = [
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request",
+    "item/permissions/requestApproval",
+    "item/tool/call",
+    "account/chatgptAuthTokens/refresh",
+    "attestation/generate",
+    "applyPatchApproval",
+    "execCommandApproval",
+];
+
+fn is_codex_server_request(method: &str) -> bool {
+    CODEX_SERVER_REQUEST_METHODS.contains(&method)
+}
+
+fn is_codex_approval_method(method: &str) -> bool {
+    matches!(
+        method,
+        "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "applyPatchApproval"
+            | "execCommandApproval"
+    )
+}
+
+fn codex_approval_decline(method: &str, id: &Value) -> Result<ProtocolFrame, AdapterError> {
+    let result = match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            json!({"decision": "decline"})
+        }
+        "applyPatchApproval" | "execCommandApproval" => json!({
+            "decision": {
+                "denied": {
+                    "rejection": "Conduit did not advertise a synchronous approval bridge"
+                }
+            }
+        }),
+        _ => {
+            return Err(AdapterError::UnexpectedResponse {
+                phase: "codex_server_request",
+                reason: "approval response requested for a non-approval method",
+            });
+        }
+    };
+    ProtocolFrame::json(&json!({"id": id, "result": result}))
+}
+
+fn codex_fail_closed_response(
+    method: &str,
+    id: &Value,
+    known: bool,
+) -> Result<ProtocolFrame, AdapterError> {
+    let (code, message) = if known {
+        (
+            -32004,
+            "Codex server request capability was not advertised by Conduit",
+        )
+    } else {
+        (-32601, "Unknown Codex server request")
+    };
+    ProtocolFrame::json(&json!({
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+            "data": {"method": method, "failClosed": true}
+        }
+    }))
 }
 
 #[cfg(test)]
@@ -1221,6 +1298,58 @@ mod tests {
         assert_eq!(
             value.pointer("/params/expectedTurnId"),
             Some(&json!("turn-1"))
+        );
+    }
+
+    #[test]
+    fn codex_current_server_request_union_always_receives_a_correlated_response() {
+        let mut driver = ProtocolDriver::new(AdapterKind::Codex, &request()).unwrap();
+        for (index, method) in CODEX_SERVER_REQUEST_METHODS.into_iter().enumerate() {
+            let id = format!("server-{index}");
+            let record = serde_json::to_vec(&json!({
+                "id": id,
+                "method": method,
+                "params": {}
+            }))
+            .unwrap();
+            let mut record = record;
+            record.push(b'\n');
+            let (frames, events) = driver.on_record(&record).unwrap();
+            assert_eq!(frames.len(), 1, "{method} was left pending");
+            assert_eq!(events.len(), 1);
+            let response: Value = serde_json::from_slice(&frames[0].0).unwrap();
+            assert_eq!(response.get("id"), Some(&json!(id)));
+            if is_codex_approval_method(method) {
+                assert!(response.get("result").is_some(), "{method}");
+                assert_eq!(events[0].kind, AdapterEventKind::ApprovalRequest);
+            } else {
+                assert_eq!(
+                    response.pointer("/error/data/failClosed"),
+                    Some(&json!(true))
+                );
+                assert_eq!(events[0].kind, AdapterEventKind::AdapterError);
+            }
+        }
+    }
+
+    #[test]
+    fn codex_unknown_server_request_is_correlated_and_fail_closed() {
+        let mut driver = ProtocolDriver::new(AdapterKind::Codex, &request()).unwrap();
+        let (frames, events) = driver
+            .on_record(b"{\"id\":9223372036854775807,\"method\":\"future/unsafe\",\"params\":{}}\n")
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        let response: Value = serde_json::from_slice(&frames[0].0).unwrap();
+        assert_eq!(response.get("id"), Some(&json!(9223372036854775807_i64)));
+        assert_eq!(response.pointer("/error/code"), Some(&json!(-32601)));
+        assert_eq!(
+            response.pointer("/error/data/failClosed"),
+            Some(&json!(true))
+        );
+        assert_eq!(events[0].kind, AdapterEventKind::AdapterError);
+        assert_eq!(
+            events[0].correlation_id.as_deref(),
+            Some("9223372036854775807")
         );
     }
 

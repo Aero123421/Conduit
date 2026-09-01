@@ -420,13 +420,29 @@ impl Node {
                 } else {
                     OperationState::Uncertain
                 };
-                let evidence = serde_jcs::to_vec(&serde_json::json!({
+                let mut evidence = serde_json::json!({
                     "operationId": operation.operation_id,
                     "runId": request.run_id,
-                    "state": terminal,
-                    "reasonCode": reason
-                }))
-                .map_err(|error| NodeError::Rejected(error.to_string()))?;
+                    "state": if terminal == OperationState::RecoveryRequired {
+                        "recovery_required"
+                    } else {
+                        "uncertain"
+                    },
+                    "requestDigest": operation.request_digest,
+                    "lastRunEventSequence": operation.last_event_sequence.to_string(),
+                    "reasonCode": reason,
+                    "resultSummary": {
+                        "adapterSession": "unrecoverable",
+                        "automaticReplay": false
+                    },
+                    "observedAt": time::OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .map_err(|error| NodeError::Rejected(error.to_string()))?
+                });
+                let receipt_digest = value_commitment(&evidence)?;
+                evidence["receiptDigest"] = serde_json::Value::String(receipt_digest);
+                let evidence = serde_jcs::to_vec(&evidence)
+                    .map_err(|error| NodeError::Rejected(error.to_string()))?;
                 self.store.transition_operation(
                     &operation.idempotency_key,
                     operation.state,
@@ -561,6 +577,13 @@ fn receipt_commitment(receipt: &AdmissionReceipt) -> Result<String, NodeError> {
     )))
 }
 
+fn value_commitment(value: &serde_json::Value) -> Result<String, NodeError> {
+    use sha2::{Digest, Sha256};
+    Ok(hex::encode(Sha256::digest(
+        serde_jcs::to_vec(value).map_err(|error| NodeError::Rejected(error.to_string()))?,
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -614,6 +637,27 @@ mod tests {
         }
     }
 
+    fn agent_offer(cwd: &std::path::Path) -> OperationOffer {
+        let mut request = offer(cwd);
+        let mut manifest = json!({
+            "operationId": request.operation_id,
+            "capability": "agent.run.start",
+            "runId": request.runtime.run_id,
+            "arguments": {
+                "adapterId": "codex",
+                "nativeSessionId": "thread-restart-01"
+            },
+            "payloadDigest": ""
+        });
+        let mut commitment = manifest.clone();
+        commitment.as_object_mut().unwrap().remove("payloadDigest");
+        let digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&commitment).unwrap()));
+        manifest["payloadDigest"] = serde_json::Value::String(digest.clone());
+        request.request_digest = digest;
+        request.manifest = serde_jcs::to_vec(&manifest).unwrap();
+        request
+    }
+
     #[test]
     fn canonical_operation_commitment_rejects_mutation() {
         let d = tempdir().unwrap();
@@ -652,5 +696,43 @@ mod tests {
         provider
             .signal(&recovered[0].handle, RuntimeSignal::ForceStop)
             .unwrap();
+    }
+
+    #[test]
+    fn restart_with_running_agent_fences_process_and_persists_recovery_required_receipt() {
+        let directory = tempdir().unwrap();
+        let store = NodeStore::open(directory.path().join("store")).unwrap();
+        let supervisor = ProcessSupervisor::open(directory.path().join("supervisor")).unwrap();
+        let provider: Arc<dyn RuntimeProvider> = Arc::new(NativeProvider::new(supervisor));
+        let request = agent_offer(directory.path());
+        let mut first = Node::new(store.clone());
+        first.register_provider(provider.clone());
+        first
+            .admit(&request, "native", "project_full", "never")
+            .unwrap();
+        let started = first.start(&request.idempotency_key).unwrap();
+        assert_eq!(started.state, RuntimeState::Running);
+        drop(first);
+
+        let mut restarted = Node::new(store.clone());
+        restarted.register_provider(provider.clone());
+        assert!(restarted.recover_nonterminal().unwrap().is_empty());
+
+        let recovered = store.operation(&request.idempotency_key).unwrap().unwrap();
+        assert_eq!(recovered.state, OperationState::RecoveryRequired);
+        let receipt: serde_json::Value =
+            serde_json::from_slice(recovered.receipt.as_deref().unwrap()).unwrap();
+        assert_eq!(receipt["operationId"], request.operation_id);
+        assert_eq!(receipt["runId"], request.runtime.run_id);
+        assert_eq!(receipt["requestDigest"], request.request_digest);
+        assert_eq!(receipt["state"], "recovery_required");
+        assert_eq!(receipt["lastRunEventSequence"], "0");
+        assert_eq!(receipt["resultSummary"]["automaticReplay"], false);
+        let digest = receipt["receiptDigest"].as_str().unwrap().to_owned();
+        let mut committed = receipt;
+        committed.as_object_mut().unwrap().remove("receiptDigest");
+        assert_eq!(value_commitment(&committed).unwrap(), digest);
+        let stopped = provider.inspect(&started.handle).unwrap();
+        assert_eq!(stopped.state, RuntimeState::Stopped);
     }
 }

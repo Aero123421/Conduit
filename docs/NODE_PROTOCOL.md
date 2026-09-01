@@ -450,6 +450,8 @@ The node cannot determine whether an external effect started or completed. Examp
 
 The observed state conflicts with a durable terminal or authority record. Examples include a runtime still running after a terminal journal state, a different runtime digest under the same run ID, or an unresolvable controller transition.
 
+An Agent subprocess cannot be resumed merely because its PID is still live. Resume requires an attachable provider I/O channel plus durable Adapter protocol phase, native session identity, active turn correlation, and event cursor. If any of those are unavailable after Node restart, the Node fences the exact recorded process identity and commits a schema-complete `recovery_required` terminal receipt. The receipt binds the original request digest and last durable event sequence and states that automatic replay did not occur.
+
 `lost`, `uncertain`, and `recovery_required` require an explicit recovery action. None automatically create a replacement run.
 
 ## Disconnect behavior
@@ -503,6 +505,10 @@ The approval message binds:
 The node journals the approval receipt before applying it. A receipt for another digest, revision, or controller epoch is rejected.
 
 If the connection is lost before the receipt is received, the run remains `waiting_approval` unless a prior approval already covers the exact operation.
+
+## Agent server-request correlation
+
+An Agent Adapter must answer every provider-initiated request that carries an ID. A supported approval request is bridged to the typed approval flow or receives a correlated explicit decline. A request for an unadvertised capability, including host-managed authentication refresh, client attestation, dynamic tools, or user input, receives a correlated fail-closed protocol error. Unknown request methods receive a correlated method-not-found error and a bounded visible Adapter error event. No provider request is left pending merely because Conduit does not implement it.
 
 ## Cancellation
 

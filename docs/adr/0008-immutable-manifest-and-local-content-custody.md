@@ -66,6 +66,10 @@ Secret plaintext is not written to normalized events. Raw local streams are sepa
 
 Provider-private reasoning is neither requested nor normalized into public messages. A provider event can be suppressed with metadata-only evidence.
 
+### Adapter request custody and restart
+
+Every provider-initiated request with a correlation ID is completed by the Adapter. Approval requests are either bridged to a durable typed Conduit approval or explicitly declined; unadvertised and unknown requests receive correlated fail-closed errors. A Node restart may reattach an Agent only when provider I/O, protocol phase, native session, active turn, and cursor custody are all durable. Otherwise the exact process identity is fenced and a durable `recovery_required` terminal receipt is committed without automatic replay.
+
 ### Local storage
 
 Normalized events and sequence advancement commit transactionally in SQLite. Inline event payloads are bounded. Larger content uses immutable references.
@@ -115,6 +119,8 @@ Rejected because comparison would no longer identify the exact start conditions.
 - Node startup requires a local trace database and Content Object directory.
 - Runtime start depends on successful Manifest persistence.
 - Adapters emit evidence without claiming more certainty than their protocol supports.
+- Provider-initiated requests never remain pending without a correlated response.
+- Non-attachable Agent processes become durable `recovery_required` outcomes after restart and are never silently rerun.
 - Instruction and Skill reports require catalog identities and content digests.
 - The Node protocol Event Batch references `trace-v1.schema.json`.
 - Device storage settings need retention and capacity controls before long-running use.

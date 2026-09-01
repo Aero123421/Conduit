@@ -1,0 +1,57 @@
+{
+  "schemaVersion": 1,
+  "protocol": "conduit.node/1",
+  "type": "record.batch",
+  "messageId": "msg_batch00001",
+  "connectionId": "conn_example0001",
+  "connectionEpoch": 7,
+  "sequence": 1,
+  "sentAt": "2026-09-01T09:00:07Z",
+  "payload": {
+    "firstRecordSeq": 41,
+    "lastRecordSeq": 42,
+    "records": [
+      {
+        "recordContract": "conduit.node-record/1",
+        "recordId": "nrec_example0041",
+        "recordSeq": 41,
+        "recordType": "operation.admission",
+        "createdAt": "2026-09-01T09:00:06Z",
+        "bodySha256": "d3ed76da2b1deb1e4478c0409d1a5f486ef30b23201575a0748716921c4b8291",
+        "body": {
+          "core": {
+            "operationId": "op_example0001",
+            "idempotencyKey": "example-assignment-0001",
+            "payloadDigest": "798daac77f5206a93dcf75c6466bf0361138a67800550505de29b3adefc1641a",
+            "disposition": "admitted",
+            "executionId": "exec_example0001",
+            "observedAt": "2026-09-01T09:00:06Z"
+          },
+          "receiptDigest": "2eac34d5e6656ef4d9502c2c8ca58ddbe0f177f11efd2a4b4622473eeef8ebda",
+          "deviceSignature": {
+            "keyId": "dkey_example0001",
+            "algorithm": "Ed25519",
+            "signedDigest": "2eac34d5e6656ef4d9502c2c8ca58ddbe0f177f11efd2a4b4622473eeef8ebda",
+            "signature": "0PVjNhYeajvaqR0UcDI1USG-9_-R_DJR4N8eK9GZX1bA5kdDCEOjveI6b6uxA2kmRzedT5enbFAnTsh4KzS0Cw"
+          }
+        }
+      },
+      {
+        "recordContract": "conduit.node-record/1",
+        "recordId": "nrec_example0042",
+        "recordSeq": 42,
+        "recordType": "operation.transition",
+        "createdAt": "2026-09-01T09:00:06Z",
+        "bodySha256": "71bb63c0ae40de268c082558a8a3300a2c27a6676e412ce47bb1ed7e71911a70",
+        "body": {
+          "operationId": "op_example0001",
+          "executionId": "exec_example0001",
+          "fromState": "admitted",
+          "toState": "launching",
+          "observedAt": "2026-09-01T09:00:06Z",
+          "providerKind": "native"
+        }
+      }
+    ]
+  }
+}

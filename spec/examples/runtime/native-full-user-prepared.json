@@ -1,0 +1,82 @@
+{
+  "schemaVersion": 1,
+  "kind": "prepared_runtime_receipt",
+  "runtimeId": "rt_native_codex_01",
+  "runId": "run_conduit_codex_01",
+  "runtimeKind": "native",
+  "providerId": "native.linux",
+  "providerVersion": "0.1.0-dev",
+  "specDigest": "e429a8529208d78604dc8eaa4c6937135ee8aa9ad20cf4eb0fed49371981d987",
+  "providerObjectId": "systemd-user:conduit-run-rt-native-codex-01",
+  "providerObjectIdentityDigest": "839044899ba03e3f29e245dbbce60781dcd0d35c487366705193691bb2d8c09f",
+  "generation": "1",
+  "state": "prepared",
+  "capabilityReceiptDigest": "9c8b7a6412a36e40b1a573a90c51932b32f351e8c253e522b51535845fa2ad06",
+  "workspaceAttachments": [
+    {
+      "sourceId": "src_conduit_repo_01",
+      "locationId": "loc_sahur_conduit_01",
+      "workspaceMode": "worktree",
+      "mechanism": "direct",
+      "access": "read_write",
+      "effective": true,
+      "contentDigest": "905920194c03bc39bccda1ed69e153f25593379b000000000000000000000000",
+      "consistency": "live"
+    }
+  ],
+  "credentialProjections": [
+    {
+      "profileId": "cred_codex_personal_01",
+      "revision": 2,
+      "adapterId": "codex",
+      "projectionType": "native_host",
+      "targetReference": "codex-host-login",
+      "access": "read_write",
+      "lifetime": "run",
+      "persistChanges": true,
+      "state": "effective",
+      "evidenceLevel": "explicit"
+    }
+  ],
+  "resources": {
+    "cpu": {
+      "requested": 4,
+      "reserved": 0,
+      "hardLimit": 4,
+      "unit": "logical_cpu",
+      "state": "effective"
+    },
+    "memoryBytes": {
+      "requested": 8589934592,
+      "reserved": 0,
+      "hardLimit": 8589934592,
+      "unit": "bytes",
+      "state": "effective"
+    },
+    "pidLimit": {
+      "requested": 512,
+      "reserved": 0,
+      "hardLimit": 512,
+      "unit": "processes",
+      "state": "effective"
+    },
+    "storageBytes": {
+      "requested": 21474836480,
+      "reserved": 21474836480,
+      "unit": "bytes",
+      "state": "effective"
+    },
+    "gpuCount": {
+      "requested": 0,
+      "reserved": 0,
+      "unit": "devices",
+      "state": "effective"
+    }
+  },
+  "warnings": [
+    "Native Runtime has no filesystem, process-namespace, network, Container, or VM isolation.",
+    "Full User + Never Ask grants the agent the signed-in user's ordinary authority."
+  ],
+  "preparedStateDigest": "2c984a4c4a638dfe1f7b6bcc9dc33cb79f6c6c192f293bf383540c8248c0c2df",
+  "preparedAt": "2026-09-01T11:00:04Z"
+}

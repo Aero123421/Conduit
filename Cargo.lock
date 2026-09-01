@@ -294,10 +294,12 @@ dependencies = [
  "clap",
  "conduit-adapters",
  "conduit-core",
+ "hex",
  "reqwest",
  "rustix",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror",
  "uuid",
 ]

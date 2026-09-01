@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::CliError;
 
@@ -91,6 +91,10 @@ pub enum Commands {
         #[command(subcommand)]
         command: ConnectorCommand,
     },
+    Artifact {
+        #[command(subcommand)]
+        command: ArtifactCommand,
+    },
     Storage {
         #[command(subcommand)]
         command: StorageCommand,
@@ -127,9 +131,26 @@ pub struct IdArgs {
     pub id: String,
 }
 
+#[derive(Debug, Args, Clone)]
+pub struct ArtifactUploadArgs {
+    pub id: String,
+    #[arg(long, value_name = "PATH")]
+    pub file: PathBuf,
+    #[arg(long, value_name = "LOWERCASE_SHA256")]
+    pub sha256: String,
+    #[arg(long, default_value = "application/octet-stream")]
+    pub content_type: String,
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
+    SetupOptions(InputArgs),
+    SetupVerify(InputArgs),
+    LoginOptions(InputArgs),
     Register(InputArgs),
+    RegisterOptions(InputArgs),
     Login(InputArgs),
     Logout(MutationArgs),
     Status,
@@ -254,7 +275,16 @@ pub enum ConnectorCommand {
     Pause(MutationArgs),
     Resume(MutationArgs),
     Revoke(MutationArgs),
+    Reauthorize(MutationArgs),
     Policy(MutationArgs),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ArtifactCommand {
+    Create(MutationArgs),
+    List,
+    Show(IdArgs),
+    Upload(ArtifactUploadArgs),
 }
 
 #[derive(Debug, Subcommand)]
@@ -286,13 +316,34 @@ pub(crate) enum Method {
     Get,
     Post,
     Patch,
-    Delete,
+    Put,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AuthRequirement {
+    None,
+    Bearer,
+    OwnerBearer,
+    BrowserSession,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum InputDestination {
+    Body,
+    Query,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct JsonInput {
     pub inline: Option<String>,
     pub file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ArtifactUpload {
+    pub file: PathBuf,
+    pub sha256: String,
+    pub content_type: String,
 }
 
 impl From<InputArgs> for JsonInput {
@@ -311,10 +362,13 @@ pub(crate) struct Invocation {
     pub route: String,
     pub body: Option<Value>,
     pub input: Option<JsonInput>,
+    pub input_destination: InputDestination,
+    pub artifact_upload: Option<ArtifactUpload>,
     pub revision: Option<u64>,
     pub idempotency_key: Option<String>,
     pub effectful: bool,
-    pub auth_required: bool,
+    pub auth: AuthRequirement,
+    pub mirror_idempotency_in_body: bool,
 }
 
 impl Invocation {
@@ -325,10 +379,13 @@ impl Invocation {
             route: route.into(),
             body: None,
             input: None,
+            input_destination: InputDestination::Body,
+            artifact_upload: None,
             revision: None,
             idempotency_key: None,
             effectful: false,
-            auth_required: true,
+            auth: AuthRequirement::Bearer,
+            mirror_idempotency_in_body: false,
         }
     }
 
@@ -337,21 +394,25 @@ impl Invocation {
         route: impl Into<String>,
         args: MutationArgs,
     ) -> Result<Self, CliError> {
-        let mut body = Map::new();
-        if let Some(id) = args.id.as_ref() {
-            validate_segment(id)?;
-            body.insert("targetId".to_owned(), Value::String(id.clone()));
+        if args.id.is_some() {
+            return Err(CliError::Usage(
+                "this canonical collection operation does not accept a positional target ID"
+                    .to_owned(),
+            ));
         }
         Ok(Self {
             target: Target::ControlPlane,
             method,
             route: route.into(),
-            body: Some(Value::Object(body)),
+            body: Some(Value::Object(Map::new())),
             input: Some(args.input.into()),
+            input_destination: InputDestination::Body,
+            artifact_upload: None,
             revision: args.revision,
             idempotency_key: args.idempotency_key,
             effectful: true,
-            auth_required: true,
+            auth: AuthRequirement::Bearer,
+            mirror_idempotency_in_body: false,
         })
     }
 
@@ -362,10 +423,13 @@ impl Invocation {
             route: route.into(),
             body: None,
             input: Some(input.into()),
+            input_destination: InputDestination::Body,
+            artifact_upload: None,
             revision: None,
             idempotency_key: None,
             effectful: method != Method::Get,
-            auth_required: true,
+            auth: AuthRequirement::Bearer,
+            mirror_idempotency_in_body: false,
         }
     }
 
@@ -375,7 +439,22 @@ impl Invocation {
     }
 
     fn public(mut self) -> Self {
-        self.auth_required = false;
+        self.auth = AuthRequirement::None;
+        self
+    }
+
+    fn browser_session(mut self) -> Self {
+        self.auth = AuthRequirement::BrowserSession;
+        self
+    }
+
+    fn owner_bearer(mut self) -> Self {
+        self.auth = AuthRequirement::OwnerBearer;
+        self
+    }
+
+    fn query(mut self) -> Self {
+        self.input_destination = InputDestination::Query;
         self
     }
 }
@@ -397,6 +476,7 @@ impl Commands {
             Self::Logs { command } => logs(command)?,
             Self::Eval { command } => eval(command)?,
             Self::Connector { command } => connector(command)?,
+            Self::Artifact { command } => artifact(command)?,
             Self::Storage { command } => storage(command)?,
             Self::Backup { command } => backup(command)?,
             Self::Doctor => unreachable!("doctor is handled before routing"),
@@ -407,38 +487,49 @@ impl Commands {
 
 fn auth(command: AuthCommand) -> Result<Invocation, CliError> {
     Ok(match command {
+        AuthCommand::SetupOptions(input) => {
+            Invocation::input(Method::Post, "/api/v1/auth/setup/options", input).public()
+        }
+        AuthCommand::SetupVerify(input) => {
+            Invocation::input(Method::Post, "/api/v1/auth/setup/verify", input).public()
+        }
+        AuthCommand::LoginOptions(input) => {
+            Invocation::input(Method::Post, "/api/v1/auth/login/options", input).public()
+        }
         AuthCommand::Register(input) => {
-            Invocation::input(Method::Post, "/api/v1/auth/passkeys/register", input).public()
+            Invocation::input(Method::Post, "/api/v1/auth/passkeys/verify", input)
+                .browser_session()
+        }
+        AuthCommand::RegisterOptions(input) => {
+            Invocation::input(Method::Post, "/api/v1/auth/passkeys/options", input)
+                .browser_session()
         }
         AuthCommand::Login(input) => {
-            Invocation::input(Method::Post, "/api/v1/auth/login", input).public()
+            let mut invocation =
+                Invocation::input(Method::Post, "/api/v1/auth/login/verify", input).public();
+            invocation.body = Some(json!({ "issueCliToken": true }));
+            invocation
         }
-        AuthCommand::Logout(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/auth/logout", args)?
-        }
-        AuthCommand::Status => Invocation::get("/api/v1/auth/status"),
+        AuthCommand::Logout(_) => return Err(CliError::Usage("the control plane has no owner CLI logout endpoint; remove the bounded local token instead".to_owned())),
+        AuthCommand::Status => return Err(CliError::Usage("the control plane has no owner CLI status endpoint".to_owned())),
         AuthCommand::Recover(input) => {
             Invocation::input(Method::Post, "/api/v1/auth/recovery", input).public()
         }
         AuthCommand::RevokePasskey(args) => {
-            Invocation::mutation(Method::Delete, "/api/v1/auth/passkeys/revoke", args)?
+            item_mutation(Method::Post, "/api/v1/auth/passkeys", "/revoke", args)?.browser_session()
         }
     })
 }
 
 fn device(command: DeviceCommand) -> Result<Invocation, CliError> {
     Ok(match command {
-        DeviceCommand::Enroll(args) => {
-            Invocation::mutation(Method::Post, "device.enroll", args)?.node()
-        }
+        DeviceCommand::Enroll(args) => node_mutation(Method::Post, "device.enroll", args)?,
         DeviceCommand::List => Invocation::get("/api/v1/devices"),
         DeviceCommand::Show(args) => Invocation::get(id_route("/api/v1/devices", &args.id)?),
         DeviceCommand::Revoke(args) => {
-            Invocation::mutation(Method::Delete, "/api/v1/devices/revoke", args)?
+            item_mutation(Method::Post, "/api/v1/devices", "/revoke", args)?.browser_session()
         }
-        DeviceCommand::RotateKey(args) => {
-            Invocation::mutation(Method::Post, "device.rotate_key", args)?.node()
-        }
+        DeviceCommand::RotateKey(args) => node_mutation(Method::Post, "device.rotate_key", args)?,
         DeviceCommand::Doctor => Invocation::get("device.doctor").node(),
     })
 }
@@ -451,14 +542,17 @@ fn project(command: ProjectCommand) -> Result<Invocation, CliError> {
         ProjectCommand::List => Invocation::get("/api/v1/projects"),
         ProjectCommand::Show(args) => Invocation::get(id_route("/api/v1/projects", &args.id)?),
         ProjectCommand::AddSource(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/projects/sources", args)?
+            let (id, args) = take_optional_id(args)?;
+            let mut invocation = Invocation::mutation(Method::Post, "/api/v1/sources", args)?;
+            if let Some(project_id) = id {
+                invocation.body = Some(json!({ "project_id": project_id }));
+            }
+            invocation
         }
         ProjectCommand::AddLocation(args) => {
-            Invocation::mutation(Method::Post, "project.add_location", args)?.node()
+            node_mutation(Method::Post, "project.add_location", args)?
         }
-        ProjectCommand::Update(args) => {
-            Invocation::mutation(Method::Patch, "/api/v1/projects", args)?
-        }
+        ProjectCommand::Update(args) => item_mutation(Method::Patch, "/api/v1/projects", "", args)?,
     })
 }
 
@@ -469,36 +563,34 @@ fn session(command: SessionCommand) -> Result<Invocation, CliError> {
         }
         SessionCommand::List => Invocation::get("/api/v1/sessions"),
         SessionCommand::Show(args) => Invocation::get(id_route("/api/v1/sessions", &args.id)?),
-        SessionCommand::Accept(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/sessions/accept", args)?
-        }
+        SessionCommand::Accept(args) => item_mutation(Method::Patch, "/api/v1/sessions", "", args)?,
     })
 }
 
 fn board(command: BoardCommand) -> Result<Invocation, CliError> {
     Ok(match command {
-        BoardCommand::Post(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/board/messages", args)?
-        }
-        BoardCommand::Read(args) => Invocation::get(id_route("/api/v1/board/messages", &args.id)?),
+        BoardCommand::Post(args) => Invocation::mutation(Method::Post, "/api/v1/messages", args)?,
+        BoardCommand::Read(args) => Invocation::get(id_route("/api/v1/messages", &args.id)?),
         BoardCommand::Search(input) => {
-            Invocation::input(Method::Get, "/api/v1/board/search", input)
+            Invocation::input(Method::Get, "/api/v1/messages", input).query()
         }
-        BoardCommand::Edit(args) => {
-            Invocation::mutation(Method::Patch, "/api/v1/board/messages", args)?
-        }
+        BoardCommand::Edit(args) => item_mutation(Method::Patch, "/api/v1/messages", "", args)?,
     })
 }
 
 fn agent(command: AgentCommand) -> Result<Invocation, CliError> {
     Ok(match command {
-        AgentCommand::Add(args) => Invocation::mutation(Method::Post, "/api/v1/agents", args)?,
-        AgentCommand::List => Invocation::get("/api/v1/agents"),
-        AgentCommand::Show(args) => Invocation::get(id_route("/api/v1/agents", &args.id)?),
-        AgentCommand::Remove(args) => Invocation::mutation(Method::Delete, "/api/v1/agents", args)?,
-        AgentCommand::Probe(args) => {
-            Invocation::mutation(Method::Post, "agent.probe", args)?.node()
+        AgentCommand::Add(args) => {
+            Invocation::mutation(Method::Post, "/api/v1/project_agents", args)?
         }
+        AgentCommand::List => Invocation::get("/api/v1/project_agents"),
+        AgentCommand::Show(args) => Invocation::get(id_route("/api/v1/project_agents", &args.id)?),
+        AgentCommand::Remove(args) => {
+            let mut invocation = item_mutation(Method::Patch, "/api/v1/project_agents", "", args)?;
+            invocation.body = Some(json!({ "status": "removed" }));
+            invocation
+        }
+        AgentCommand::Probe(args) => node_mutation(Method::Post, "agent.probe", args)?,
     })
 }
 
@@ -511,13 +603,20 @@ fn assignment(command: AssignmentCommand) -> Result<Invocation, CliError> {
             Invocation::get(id_route("/api/v1/assignments", &args.id)?)
         }
         AssignmentCommand::Cancel(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/assignments/cancel", args)?
+            let mut invocation =
+                item_mutation(Method::Post, "/api/v1/assignments", "/transitions", args)?;
+            require_revision(&invocation, "assignment transition")?;
+            invocation.body = Some(json!({
+                "toState": "cancelled",
+                "reasonCode": "owner_cli_cancel"
+            }));
+            invocation.owner_bearer()
         }
         AssignmentCommand::Input(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/assignments/input", args)?
+            operation("run.input", args, OperationBinding::RequiredAssignment)?
         }
         AssignmentCommand::Steer(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/assignments/steer", args)?
+            operation("run.steer", args, OperationBinding::RequiredAssignment)?
         }
     })
 }
@@ -529,28 +628,18 @@ fn run(command: RunCommand) -> Result<Invocation, CliError> {
         RunCommand::Follow(args) => {
             Invocation::get(format!("/api/v1/runs/{}/events", safe_id(&args.id)?))
         }
-        RunCommand::Pause(args) => Invocation::mutation(Method::Post, "/api/v1/runs/pause", args)?,
-        RunCommand::Resume(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/runs/resume", args)?
-        }
-        RunCommand::Cancel(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/runs/cancel", args)?
-        }
-        RunCommand::Recover(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/runs/recover", args)?
-        }
+        RunCommand::Pause(args) => operation("run.pause", args, OperationBinding::RequiredRun)?,
+        RunCommand::Resume(args) => operation("run.resume", args, OperationBinding::RequiredRun)?,
+        RunCommand::Cancel(args) => operation("run.cancel", args, OperationBinding::RequiredRun)?,
+        RunCommand::Recover(args) => operation("run.recover", args, OperationBinding::RequiredRun)?,
     })
 }
 
 fn quick(command: QuickCommand) -> Result<Invocation, CliError> {
     Ok(match command {
-        QuickCommand::Command(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/quick/command", args)?
-        }
-        QuickCommand::Agent(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/quick/agent", args)?
-        }
-        QuickCommand::Vm(args) => Invocation::mutation(Method::Post, "/api/v1/quick/vm", args)?,
+        QuickCommand::Command(args) => operation("command.start", args, OperationBinding::None)?,
+        QuickCommand::Agent(args) => operation("agent.run.start", args, OperationBinding::None)?,
+        QuickCommand::Vm(args) => operation("runtime.create", args, OperationBinding::None)?,
     })
 }
 
@@ -561,28 +650,28 @@ fn runtime(command: RuntimeCommand) -> Result<Invocation, CliError> {
             Invocation::get(format!("runtime.show/{}", safe_id(&args.id)?)).node()
         }
         RuntimeCommand::Start(args) => {
-            Invocation::mutation(Method::Post, "runtime.start", args)?.node()
+            operation("runtime.create", args, OperationBinding::OptionalRun)?
         }
         RuntimeCommand::Stop(args) => {
-            Invocation::mutation(Method::Post, "runtime.stop", args)?.node()
+            operation("runtime.stop", args, OperationBinding::RequiredRun)?
         }
         RuntimeCommand::Pause(args) => {
-            Invocation::mutation(Method::Post, "runtime.pause", args)?.node()
+            operation("runtime.pause", args, OperationBinding::RequiredRun)?
         }
         RuntimeCommand::Resume(args) => {
-            Invocation::mutation(Method::Post, "runtime.resume", args)?.node()
+            operation("runtime.resume", args, OperationBinding::RequiredRun)?
         }
         RuntimeCommand::Snapshot(args) => {
-            Invocation::mutation(Method::Post, "runtime.snapshot", args)?.node()
+            operation("runtime.snapshot", args, OperationBinding::RequiredRun)?
         }
         RuntimeCommand::Archive(args) => {
-            Invocation::mutation(Method::Post, "runtime.archive", args)?.node()
+            operation("runtime.archive", args, OperationBinding::RequiredRun)?
         }
         RuntimeCommand::Restore(args) => {
-            Invocation::mutation(Method::Post, "runtime.restore", args)?.node()
+            operation("runtime.restore", args, OperationBinding::RequiredRun)?
         }
         RuntimeCommand::Destroy(args) => {
-            Invocation::mutation(Method::Delete, "runtime.destroy", args)?.node()
+            operation("runtime.destroy", args, OperationBinding::RequiredRun)?
         }
     })
 }
@@ -592,8 +681,12 @@ fn task(command: TaskCommand) -> Result<Invocation, CliError> {
         TaskCommand::Create(args) => Invocation::mutation(Method::Post, "/api/v1/tasks", args)?,
         TaskCommand::List => Invocation::get("/api/v1/tasks"),
         TaskCommand::Show(args) => Invocation::get(id_route("/api/v1/tasks", &args.id)?),
-        TaskCommand::Update(args) => Invocation::mutation(Method::Patch, "/api/v1/tasks", args)?,
-        TaskCommand::Link(args) => Invocation::mutation(Method::Post, "/api/v1/tasks/link", args)?,
+        TaskCommand::Update(args) => item_mutation(Method::Patch, "/api/v1/tasks", "", args)?,
+        TaskCommand::Link(_) => {
+            return Err(CliError::Usage(
+                "the canonical control-plane API does not expose Task links yet".to_owned(),
+            ));
+        }
     })
 }
 
@@ -603,20 +696,21 @@ fn logs(command: LogsCommand) -> Result<Invocation, CliError> {
         LogsCommand::Show(args) => {
             Invocation::get(format!("logs.show/{}", safe_id(&args.id)?)).node()
         }
-        LogsCommand::Export(args) => {
-            Invocation::mutation(Method::Post, "logs.export", args)?.node()
-        }
+        LogsCommand::Export(args) => node_mutation(Method::Post, "logs.export", args)?,
     })
 }
 
 fn eval(command: EvalCommand) -> Result<Invocation, CliError> {
     Ok(match command {
-        EvalCommand::Start(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/evaluations", args)?
+        EvalCommand::Start(_) => {
+            return Err(CliError::Usage(
+                "the canonical control-plane API does not expose evaluation creation yet"
+                    .to_owned(),
+            ));
         }
-        EvalCommand::Show(args) => Invocation::get(id_route("/api/v1/evaluations", &args.id)?),
+        EvalCommand::Show(args) => Invocation::get(id_route("/api/v1/evidence", &args.id)?),
         EvalCommand::Compare(input) => {
-            Invocation::input(Method::Get, "/api/v1/evaluations/compare", input)
+            Invocation::input(Method::Get, "/api/v1/evidence", input).query()
         }
     })
 }
@@ -624,21 +718,78 @@ fn eval(command: EvalCommand) -> Result<Invocation, CliError> {
 fn connector(command: ConnectorCommand) -> Result<Invocation, CliError> {
     Ok(match command {
         ConnectorCommand::Create(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/connectors", args)?
+            Invocation::mutation(Method::Post, "/api/v1/connector-policies", args)?
+                .browser_session()
         }
-        ConnectorCommand::List => Invocation::get("/api/v1/connectors"),
-        ConnectorCommand::Show(args) => Invocation::get(id_route("/api/v1/connectors", &args.id)?),
-        ConnectorCommand::Pause(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/connectors/pause", args)?
+        ConnectorCommand::List => {
+            return Err(CliError::Usage(
+                "the canonical control-plane API does not expose OAuth grant listing yet"
+                    .to_owned(),
+            ));
         }
-        ConnectorCommand::Resume(args) => {
-            Invocation::mutation(Method::Post, "/api/v1/connectors/resume", args)?
+        ConnectorCommand::Show(_) => {
+            return Err(CliError::Usage(
+                "the canonical control-plane API does not expose OAuth grant reads yet".to_owned(),
+            ));
         }
-        ConnectorCommand::Revoke(args) => {
-            Invocation::mutation(Method::Delete, "/api/v1/connectors", args)?
-        }
+        ConnectorCommand::Pause(args) => grant_action(args, "pause")?,
+        ConnectorCommand::Resume(args) => grant_action(args, "resume")?,
+        ConnectorCommand::Revoke(args) => grant_action(args, "revoke")?,
+        ConnectorCommand::Reauthorize(args) => grant_action(args, "reauthorize")?,
         ConnectorCommand::Policy(args) => {
-            Invocation::mutation(Method::Patch, "/api/v1/connectors/policy", args)?
+            let invocation = item_mutation(Method::Patch, "/api/v1/connector-policies", "", args)?
+                .browser_session();
+            require_revision(&invocation, "connector policy update")?;
+            invocation
+        }
+    })
+}
+
+fn artifact(command: ArtifactCommand) -> Result<Invocation, CliError> {
+    Ok(match command {
+        ArtifactCommand::Create(args) => {
+            Invocation::mutation(Method::Post, "/api/v1/artifacts", args)?
+        }
+        ArtifactCommand::List => Invocation::get("/api/v1/artifacts"),
+        ArtifactCommand::Show(args) => Invocation::get(id_route("/api/v1/artifacts", &args.id)?),
+        ArtifactCommand::Upload(args) => {
+            validate_segment(&args.id)?;
+            if args.sha256.len() != 64
+                || !args
+                    .sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+            {
+                return Err(CliError::Usage(
+                    "artifact SHA-256 must be 64 lowercase hexadecimal characters".to_owned(),
+                ));
+            }
+            if args.content_type.is_empty()
+                || args.content_type.len() > 256
+                || args.content_type.chars().any(char::is_control)
+            {
+                return Err(CliError::Usage(
+                    "artifact content type is invalid".to_owned(),
+                ));
+            }
+            Invocation {
+                target: Target::ControlPlane,
+                method: Method::Put,
+                route: format!("/api/v1/artifacts/{}/content", args.id),
+                body: None,
+                input: None,
+                input_destination: InputDestination::Body,
+                artifact_upload: Some(ArtifactUpload {
+                    file: args.file,
+                    sha256: args.sha256,
+                    content_type: args.content_type,
+                }),
+                revision: None,
+                idempotency_key: args.idempotency_key,
+                effectful: true,
+                auth: AuthRequirement::Bearer,
+                mirror_idempotency_in_body: false,
+            }
         }
     })
 }
@@ -649,36 +800,137 @@ fn storage(command: StorageCommand) -> Result<Invocation, CliError> {
         StorageCommand::Show(args) => {
             Invocation::get(format!("storage.show/{}", safe_id(&args.id)?)).node()
         }
-        StorageCommand::Configure(args) => {
-            Invocation::mutation(Method::Post, "storage.configure", args)?.node()
-        }
-        StorageCommand::Pin(args) => {
-            Invocation::mutation(Method::Post, "storage.pin", args)?.node()
-        }
-        StorageCommand::Unpin(args) => {
-            Invocation::mutation(Method::Post, "storage.unpin", args)?.node()
-        }
-        StorageCommand::Move(args) => {
-            Invocation::mutation(Method::Post, "storage.move", args)?.node()
-        }
-        StorageCommand::Restore(args) => {
-            Invocation::mutation(Method::Post, "storage.restore", args)?.node()
-        }
+        StorageCommand::Configure(args) => node_mutation(Method::Post, "storage.configure", args)?,
+        StorageCommand::Pin(args) => node_mutation(Method::Post, "storage.pin", args)?,
+        StorageCommand::Unpin(args) => node_mutation(Method::Post, "storage.unpin", args)?,
+        StorageCommand::Move(args) => node_mutation(Method::Post, "storage.move", args)?,
+        StorageCommand::Restore(args) => node_mutation(Method::Post, "storage.restore", args)?,
     })
 }
 
 fn backup(command: BackupCommand) -> Result<Invocation, CliError> {
     Ok(match command {
-        BackupCommand::Create(args) => {
-            Invocation::mutation(Method::Post, "backup.create", args)?.node()
-        }
-        BackupCommand::Verify(args) => {
-            Invocation::mutation(Method::Post, "backup.verify", args)?.node()
-        }
-        BackupCommand::Restore(args) => {
-            Invocation::mutation(Method::Post, "backup.restore", args)?.node()
-        }
+        BackupCommand::Create(args) => node_mutation(Method::Post, "backup.create", args)?,
+        BackupCommand::Verify(args) => node_mutation(Method::Post, "backup.verify", args)?,
+        BackupCommand::Restore(args) => node_mutation(Method::Post, "backup.restore", args)?,
     })
+}
+
+#[derive(Debug, Clone, Copy)]
+enum OperationBinding {
+    None,
+    RequiredAssignment,
+    RequiredRun,
+    OptionalRun,
+}
+
+fn node_mutation(
+    method: Method,
+    route: &str,
+    mut args: MutationArgs,
+) -> Result<Invocation, CliError> {
+    let id = args.id.take();
+    if let Some(id) = id.as_deref() {
+        validate_segment(id)?;
+    }
+    let mut invocation = Invocation::mutation(method, route, args)?.node();
+    if let Some(id) = id {
+        invocation.body = Some(json!({ "targetId": id }));
+    }
+    Ok(invocation)
+}
+
+fn operation(
+    capability: &str,
+    mut args: MutationArgs,
+    binding: OperationBinding,
+) -> Result<Invocation, CliError> {
+    if args.revision.is_some() {
+        return Err(CliError::Usage(
+            "--revision is not an operation If-Match; bind revisions in the typed operation payload"
+                .to_owned(),
+        ));
+    }
+    let id = args.id.take();
+    if let Some(id) = id.as_deref() {
+        validate_segment(id)?;
+    }
+    let mut protected = Map::from_iter([(
+        "capability".to_owned(),
+        Value::String(capability.to_owned()),
+    )]);
+    match binding {
+        OperationBinding::None if id.is_some() => {
+            return Err(CliError::Usage(
+                "this quick operation does not accept a positional target ID".to_owned(),
+            ));
+        }
+        OperationBinding::RequiredAssignment => {
+            protected.insert(
+                "assignmentId".to_owned(),
+                Value::String(required_id(id, "Assignment")?),
+            );
+        }
+        OperationBinding::RequiredRun => {
+            protected.insert("runId".to_owned(), Value::String(required_id(id, "Run")?));
+        }
+        OperationBinding::OptionalRun => {
+            if let Some(id) = id {
+                protected.insert("runId".to_owned(), Value::String(id));
+            }
+        }
+        OperationBinding::None => {}
+    }
+    let mut invocation = Invocation::mutation(Method::Post, "/api/v1/operations", args)?;
+    invocation.body = Some(Value::Object(protected));
+    invocation.mirror_idempotency_in_body = true;
+    Ok(invocation)
+}
+
+fn grant_action(args: MutationArgs, action: &str) -> Result<Invocation, CliError> {
+    Ok(item_mutation(
+        Method::Post,
+        "/api/v1/oauth/grants",
+        &format!("/{action}"),
+        args,
+    )?
+    .browser_session())
+}
+
+fn item_mutation(
+    method: Method,
+    base: &str,
+    suffix: &str,
+    mut args: MutationArgs,
+) -> Result<Invocation, CliError> {
+    let id = required_id(args.id.take(), "target")?;
+    validate_segment(&id)?;
+    let invocation = Invocation::mutation(method, format!("{base}/{id}{suffix}"), args)?;
+    if method == Method::Patch {
+        require_revision(&invocation, "resource update")?;
+    }
+    Ok(invocation)
+}
+
+fn take_optional_id(mut args: MutationArgs) -> Result<(Option<String>, MutationArgs), CliError> {
+    let id = args.id.take();
+    if let Some(id) = id.as_deref() {
+        validate_segment(id)?;
+    }
+    Ok((id, args))
+}
+
+fn required_id(id: Option<String>, kind: &str) -> Result<String, CliError> {
+    id.ok_or_else(|| CliError::Usage(format!("{kind} ID is required")))
+}
+
+fn require_revision(invocation: &Invocation, operation: &str) -> Result<(), CliError> {
+    if invocation.revision.is_none() {
+        return Err(CliError::Usage(format!(
+            "{operation} requires --revision for an exact If-Match target"
+        )));
+    }
+    Ok(())
 }
 
 fn id_route(base: &str, id: &str) -> Result<String, CliError> {
@@ -708,7 +960,7 @@ fn validate_segment(value: &str) -> Result<(), CliError> {
 
 #[cfg(test)]
 mod tests {
-    use clap::CommandFactory;
+    use clap::{CommandFactory, Parser};
 
     use super::*;
 
@@ -745,5 +997,191 @@ mod tests {
     fn path_injection_is_rejected_before_transport() {
         assert!(safe_id("../secret").is_err());
         assert!(safe_id("run_abcdefgh").is_ok());
+    }
+
+    fn invocation(args: &[&str]) -> Invocation {
+        Cli::try_parse_from(args)
+            .unwrap()
+            .command
+            .into_invocation()
+            .unwrap()
+    }
+
+    #[test]
+    fn canonical_resource_routes_never_use_compatibility_aliases() {
+        let cases = [
+            (
+                vec!["conduit", "board", "post"],
+                Method::Post,
+                "/api/v1/messages",
+            ),
+            (
+                vec!["conduit", "project", "add-source", "prj_contract01"],
+                Method::Post,
+                "/api/v1/sources",
+            ),
+            (
+                vec!["conduit", "agent", "list"],
+                Method::Get,
+                "/api/v1/project_agents",
+            ),
+            (
+                vec!["conduit", "agent", "show", "pagent_contract01"],
+                Method::Get,
+                "/api/v1/project_agents/pagent_contract01",
+            ),
+            (
+                vec!["conduit", "artifact", "list"],
+                Method::Get,
+                "/api/v1/artifacts",
+            ),
+        ];
+        for (args, method, route) in cases {
+            let invocation = invocation(&args);
+            assert_eq!(invocation.method, method);
+            assert_eq!(invocation.route, route);
+            assert_eq!(invocation.auth, AuthRequirement::Bearer);
+        }
+        assert_eq!(
+            invocation(&["conduit", "project", "add-source", "prj_contract01"]).body,
+            Some(json!({ "project_id": "prj_contract01" }))
+        );
+    }
+
+    #[test]
+    fn item_mutations_bind_target_in_url_and_revision_in_if_match() {
+        let assignment = invocation(&[
+            "conduit",
+            "assignment",
+            "cancel",
+            "asg_contract01",
+            "--revision",
+            "7",
+        ]);
+        assert_eq!(
+            assignment.route,
+            "/api/v1/assignments/asg_contract01/transitions"
+        );
+        assert_eq!(assignment.revision, Some(7));
+        assert_eq!(assignment.auth, AuthRequirement::OwnerBearer);
+        assert_eq!(
+            assignment.body,
+            Some(json!({
+                "toState": "cancelled",
+                "reasonCode": "owner_cli_cancel"
+            }))
+        );
+        assert!(
+            !assignment
+                .body
+                .as_ref()
+                .unwrap()
+                .as_object()
+                .unwrap()
+                .contains_key("targetId")
+        );
+
+        let policy = invocation(&[
+            "conduit",
+            "connector",
+            "policy",
+            "cpol_contract01",
+            "--revision",
+            "4",
+        ]);
+        assert_eq!(policy.route, "/api/v1/connector-policies/cpol_contract01");
+        assert_eq!(policy.method, Method::Patch);
+        assert_eq!(policy.revision, Some(4));
+        assert_eq!(policy.auth, AuthRequirement::BrowserSession);
+    }
+
+    #[test]
+    fn every_remote_effect_uses_one_typed_operation_contract() {
+        let cases = [
+            (vec!["conduit", "quick", "command"], "command.start", None),
+            (vec!["conduit", "quick", "agent"], "agent.run.start", None),
+            (vec!["conduit", "quick", "vm"], "runtime.create", None),
+            (
+                vec!["conduit", "assignment", "input", "asg_contract01"],
+                "run.input",
+                Some(("assignmentId", "asg_contract01")),
+            ),
+            (
+                vec!["conduit", "assignment", "steer", "asg_contract01"],
+                "run.steer",
+                Some(("assignmentId", "asg_contract01")),
+            ),
+            (
+                vec!["conduit", "run", "pause", "run_contract01"],
+                "run.pause",
+                Some(("runId", "run_contract01")),
+            ),
+            (
+                vec!["conduit", "runtime", "destroy", "run_contract01"],
+                "runtime.destroy",
+                Some(("runId", "run_contract01")),
+            ),
+        ];
+        for (args, capability, binding) in cases {
+            let invocation = invocation(&args);
+            assert_eq!(invocation.route, "/api/v1/operations");
+            assert_eq!(invocation.method, Method::Post);
+            assert!(invocation.mirror_idempotency_in_body);
+            assert_eq!(invocation.body.as_ref().unwrap()["capability"], capability);
+            if let Some((name, id)) = binding {
+                assert_eq!(invocation.body.as_ref().unwrap()[name], id);
+            }
+        }
+    }
+
+    #[test]
+    fn oauth_grant_lifecycle_uses_item_action_routes_and_browser_auth() {
+        for action in ["pause", "resume", "revoke", "reauthorize"] {
+            let invocation = invocation(&["conduit", "connector", action, "grant_contract01"]);
+            assert_eq!(
+                invocation.route,
+                format!("/api/v1/oauth/grants/grant_contract01/{action}")
+            );
+            assert_eq!(invocation.auth, AuthRequirement::BrowserSession);
+        }
+    }
+
+    #[test]
+    fn owner_cli_login_requests_a_bounded_owner_bearer() {
+        let login = invocation(&["conduit", "auth", "login"]);
+        assert_eq!(login.route, "/api/v1/auth/login/verify");
+        assert_eq!(login.auth, AuthRequirement::None);
+        assert_eq!(login.body, Some(json!({ "issueCliToken": true })));
+        assert_eq!(
+            invocation(&["conduit", "project", "list"]).auth,
+            AuthRequirement::Bearer
+        );
+    }
+
+    #[test]
+    fn removed_compatibility_commands_fail_before_transport() {
+        for args in [
+            ["conduit", "auth", "status"].as_slice(),
+            ["conduit", "connector", "list"].as_slice(),
+            ["conduit", "task", "link"].as_slice(),
+            ["conduit", "eval", "start"].as_slice(),
+        ] {
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert!(matches!(
+                cli.command.into_invocation(),
+                Err(CliError::Usage(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn local_node_target_binding_is_unchanged() {
+        let invocation = invocation(&["conduit", "storage", "pin", "store_contract01"]);
+        assert_eq!(invocation.target, Target::Node);
+        assert_eq!(invocation.route, "storage.pin");
+        assert_eq!(
+            invocation.body,
+            Some(json!({ "targetId": "store_contract01" }))
+        );
     }
 }

@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "protocol": "conduit.node/1",
+  "type": "connection.ready",
+  "messageId": "msg_ready00001",
+  "connectionId": "conn_example0001",
+  "connectionEpoch": 7,
+  "sequence": 3,
+  "sentAt": "2026-09-01T09:00:10Z",
+  "payload": {
+    "reconciliationId": "recon_example0001",
+    "acceptedThroughRecordSeq": 43,
+    "readyAt": "2026-09-01T09:00:10Z",
+    "maxOutstandingOffers": 32
+  }
+}

@@ -5,8 +5,9 @@ use conduit_observability::{
 };
 use conduit_runtime::WorkspaceAttachment;
 use conduit_workspace::{
-    DeviceLocationRegistry, GitRepository, LocationRecord, RegistryError, SnapshotPolicy,
-    SourceKind, SourceRecord, WorktreeManager, create_managed_copy, snapshot_folder,
+    DeviceLocationRegistry, FilesystemIdentity, GitRepository, LocationRecord, RegistryError,
+    SnapshotPolicy, SourceKind, SourceRecord, WorktreeManager, create_managed_copy,
+    snapshot_folder,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -39,6 +40,8 @@ pub struct LocalSourceConfig {
     pub source: SourceRecord,
     pub location: LocationRecord,
     pub canonical_path: PathBuf,
+    #[serde(default)]
+    pub filesystem_identity: Option<FilesystemIdentity>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -107,6 +110,7 @@ struct SourceState {
     registry: DeviceLocationRegistry,
     entries: Vec<LocalSourceConfig>,
     worktrees: WorktreeManager,
+    device_id: Option<DeviceId>,
 }
 
 pub struct LocalServices {
@@ -124,7 +128,7 @@ impl LocalServices {
         let root = fs::canonicalize(root)?;
         let registry_path = root.join("sources.json");
         let entries = load_registry(&registry_path)?;
-        let registry = build_registry(&entries)?;
+        let (registry, device_id) = build_registry(&entries)?;
         let worktrees = WorktreeManager::new(root.join("worktrees"))
             .map_err(|error| LocalServiceError::Workspace(error.to_string()))?;
         let trace = TraceStore::open(root.join("traces"), cursor_key)
@@ -136,6 +140,7 @@ impl LocalServices {
                 registry,
                 entries,
                 worktrees,
+                device_id,
             }),
             trace,
         })
@@ -154,17 +159,32 @@ impl LocalServices {
             .lock()
             .map_err(|_| LocalServiceError::Invalid("source registry lock poisoned".into()))?;
         if state
+            .device_id
+            .as_ref()
+            .is_some_and(|device_id| device_id != &entry.location.device_id)
+        {
+            return Err(LocalServiceError::Invalid(
+                "Location belongs to a different Device".into(),
+            ));
+        }
+        if state
             .entries
             .iter()
             .any(|value| value.location.location_id == entry.location.location_id)
         {
             return Err(LocalServiceError::Invalid("location already exists".into()));
         }
-        if !state
+        if let Some(existing) = state
             .entries
             .iter()
-            .any(|value| value.source.source_id == entry.source.source_id)
+            .find(|value| value.source.source_id == entry.source.source_id)
         {
+            if existing.source != entry.source {
+                return Err(LocalServiceError::Invalid(
+                    "Source identity conflicts with existing custody".into(),
+                ));
+            }
+        } else {
             state.registry.register_source(entry.source.clone())?;
         }
         state
@@ -172,8 +192,30 @@ impl LocalServices {
             .register_location(entry.location.clone(), &canonical)?;
         let mut entry = entry;
         entry.canonical_path = canonical;
+        entry.filesystem_identity = Some(filesystem_identity(&entry.canonical_path)?);
+        state
+            .device_id
+            .get_or_insert(entry.location.device_id.clone());
         state.entries.push(entry);
         persist_registry(&self.registry_path, &state.entries)
+    }
+
+    pub fn bind_device(&self, device_id: DeviceId) -> Result<(), LocalServiceError> {
+        let mut state = self
+            .sources
+            .lock()
+            .map_err(|_| LocalServiceError::Invalid("source registry lock poisoned".into()))?;
+        if state
+            .device_id
+            .as_ref()
+            .is_some_and(|existing| existing != &device_id)
+        {
+            return Err(LocalServiceError::Invalid(
+                "Source registry belongs to a different Device".into(),
+            ));
+        }
+        state.device_id = Some(device_id);
+        Ok(())
     }
 
     pub fn locations(&self) -> Result<Vec<LocationRecord>, LocalServiceError> {
@@ -223,6 +265,15 @@ impl LocalServices {
             let resolved = state
                 .registry
                 .resolve(&revision.location_id, revision.location_revision)?;
+            if state
+                .device_id
+                .as_ref()
+                .is_some_and(|device_id| device_id != &resolved.record.device_id)
+            {
+                return Err(LocalServiceError::Invalid(
+                    "Location belongs to a different Device".into(),
+                ));
+            }
             if resolved.record.source_id != revision.source_id {
                 return Err(LocalServiceError::Invalid(
                     "Location does not belong to the requested Source".into(),
@@ -507,16 +558,53 @@ fn prepare_managed(
 
 fn build_registry(
     entries: &[LocalSourceConfig],
-) -> Result<DeviceLocationRegistry, LocalServiceError> {
+) -> Result<(DeviceLocationRegistry, Option<DeviceId>), LocalServiceError> {
     let mut registry = DeviceLocationRegistry::default();
     let mut seen = std::collections::BTreeSet::new();
+    let mut device_id: Option<DeviceId> = None;
     for entry in entries {
+        if device_id
+            .as_ref()
+            .is_some_and(|device_id| device_id != &entry.location.device_id)
+        {
+            return Err(LocalServiceError::Invalid(
+                "Source registry contains Locations for multiple Devices".into(),
+            ));
+        }
+        device_id.get_or_insert(entry.location.device_id.clone());
+        let expected = entry.filesystem_identity.as_ref().ok_or_else(|| {
+            LocalServiceError::Invalid(
+                "Source registry lacks persistent filesystem identity".into(),
+            )
+        })?;
+        let canonical = fs::canonicalize(&entry.canonical_path)?;
+        if canonical != entry.canonical_path || &filesystem_identity(&canonical)? != expected {
+            return Err(LocalServiceError::Invalid(
+                "Location filesystem identity changed while the Node was stopped".into(),
+            ));
+        }
         if seen.insert(entry.source.source_id.clone()) {
             registry.register_source(entry.source.clone())?;
         }
         registry.register_location(entry.location.clone(), &entry.canonical_path)?;
     }
-    Ok(registry)
+    Ok((registry, device_id))
+}
+
+fn filesystem_identity(path: &Path) -> Result<FilesystemIdentity, LocalServiceError> {
+    let metadata = fs::metadata(path)?;
+    let file_type = if metadata.is_dir() {
+        "directory"
+    } else if metadata.is_file() {
+        "file"
+    } else {
+        "other"
+    };
+    Ok(FilesystemIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        file_type: file_type.into(),
+    })
 }
 
 fn load_registry(path: &Path) -> Result<Vec<LocalSourceConfig>, LocalServiceError> {

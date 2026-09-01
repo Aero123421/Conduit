@@ -8,7 +8,7 @@ use conduit_adapters::{
     AdapterCatalog, AdapterChild, AdapterEvent, AdapterEventKind, AdapterKind, AdapterOperation,
     AdapterState, LaunchRequest, ProtocolDriver,
 };
-use conduit_domain::Sha256Digest;
+use conduit_domain::{DeviceId, Sha256Digest};
 use conduit_node_store::{DeviceIdentity, Direction, OperationState, ReceiveResult, StoreError};
 use conduit_runtime::{
     IoMode, LaunchPlan, NetworkMode, ProcessSupervisor, ResourceLimits, RuntimeHandle, RuntimeKind,
@@ -313,6 +313,12 @@ impl NodeService {
         {
             return Err(ServiceError::Config("invalid transport identity".into()));
         }
+        local
+            .bind_device(
+                DeviceId::parse(device_id.clone())
+                    .map_err(|error| ServiceError::Config(error.to_string()))?,
+            )
+            .map_err(|error| ServiceError::Config(error.to_string()))?;
         for admission in node.store().nonterminal_admissions()? {
             let value: Value = serde_json::from_slice(&admission.operation.manifest)
                 .map_err(|_| ServiceError::Config("durable operation manifest corrupt".into()))?;
@@ -418,7 +424,8 @@ impl NodeService {
             runs.extend(self.agents.values().map(|agent| json!({"runId":agent.run_id,"operationId":agent.operation_id,"state":"running","requestDigest":agent.request_digest,"lastEventSequence":agent.event_sequence.to_string()})));
             let retained_event_ranges = self.agents.values().filter(|agent| agent.event_sequence > 0).map(|agent| json!({"runId":agent.run_id,"fromSequence":"1","throughSequence":agent.event_sequence.to_string()})).collect::<Vec<_>>();
             let unresolved = self.active.len() + self.agents.len();
-            let payload = json!({"nodeBootId":self.node_boot_id,"journalGeneration":"3","capabilityDigest":self.capability_digest,"lastControlSequenceApplied":positions.control_received_through.to_string(),"lastNodeSequenceAcknowledged":positions.node_acknowledged_through.to_string(),"lastNodeSequenceRetained":retained,"runs":runs,"retainedEventRanges":retained_event_ranges,"unresolvedCount":unresolved,"truncated":unresolved>256,"storageHealth":"healthy"});
+            let journal_generation = self.node.store().journal_generation()?;
+            let payload = json!({"nodeBootId":self.node_boot_id,"journalGeneration":journal_generation.to_string(),"capabilityDigest":self.capability_digest,"lastControlSequenceApplied":positions.control_received_through.to_string(),"lastNodeSequenceAcknowledged":positions.node_acknowledged_through.to_string(),"lastNodeSequenceRetained":retained,"runs":runs,"retainedEventRanges":retained_event_ranges,"unresolvedCount":unresolved,"truncated":unresolved>256,"storageHealth":"healthy"});
             let id = self.message_id();
             client
                 .session

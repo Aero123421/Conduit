@@ -5,6 +5,7 @@ pub mod ipc;
 pub mod local;
 pub mod local_ipc;
 pub mod service;
+pub mod startup;
 pub mod transport;
 
 use conduit_node_store::{AdmissionResult, NodeStore, OperationState, StoreError};

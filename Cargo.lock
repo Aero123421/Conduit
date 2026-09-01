@@ -413,6 +413,7 @@ dependencies = [
  "conduit-workspace",
  "hex",
  "libc",
+ "rusqlite",
  "serde",
  "serde_jcs",
  "serde_json",

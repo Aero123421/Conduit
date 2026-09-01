@@ -4,8 +4,9 @@ use conduit_node::{
     local::LocalServices,
     local_ipc::LocalIpcService,
     service::{NodeService, load_launch_profiles},
+    startup::{open_store_with_pending_restore, prepare_data_root},
 };
-use conduit_node_store::{CredentialStore, DeviceIdentity, NodeStore};
+use conduit_node_store::{CredentialStore, DeviceIdentity};
 use conduit_runtime::{
     ContainerBackend, ContainerProvider, IncusProvider, NativeProvider, ProcessSupervisor,
     RestrictedNativeProvider, RuntimeProvider,
@@ -105,22 +106,23 @@ fn xdg(primary: &str, fallback: Option<(&str, &str)>) -> PathBuf {
         .unwrap_or_default()
 }
 fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
-    let store = NodeStore::open(&opts.data)?;
+    let data_root = prepare_data_root(&opts.data)?;
     let identity = Arc::new(DeviceIdentity::load_or_create(
-        opts.data.join("identity/device.ed25519"),
+        data_root.join("identity/device.ed25519"),
     )?);
+    let store = open_store_with_pending_restore(&data_root, &identity)?;
     let cursor_key: [u8; 32] =
         Sha256::digest(identity.sign(b"conduit.trace.cursor.v1").as_bytes()).into();
     let local = Arc::new(LocalServices::open(
-        opts.data.join("local-services"),
+        data_root.join("local-services"),
         cursor_key,
     )?);
     let _credentials = CredentialStore::open(
         store.clone(),
-        opts.data.join("credentials/master.dek"),
-        opts.data.join("credentials/projections"),
+        data_root.join("credentials/master.dek"),
+        data_root.join("credentials/projections"),
     )?;
-    let supervisor = ProcessSupervisor::open(opts.data.join("supervisor"))?;
+    let supervisor = ProcessSupervisor::open(data_root.join("supervisor"))?;
     let native: Arc<dyn RuntimeProvider> = Arc::new(NativeProvider::new(supervisor.clone()));
     let restricted: Arc<dyn RuntimeProvider> = Arc::new(RestrictedNativeProvider::new(
         supervisor.clone(),
@@ -164,7 +166,7 @@ fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         identity,
         node,
         local,
-        opts.data,
+        data_root,
     )?))?;
     Ok(())
 }

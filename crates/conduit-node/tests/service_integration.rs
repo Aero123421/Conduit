@@ -93,6 +93,7 @@ fn source_entry(path: &Path, digest: Sha256Digest) -> LocalSourceConfig {
             display_path: "~/fixture".into(),
         },
         canonical_path: path.into(),
+        filesystem_identity: None,
     }
 }
 
@@ -217,6 +218,35 @@ fn source_revision_failures_and_worktree_restart_are_durable() {
     reopened
         .reconcile_worktrees("run_fixture01", &[revision])
         .unwrap();
+}
+
+#[test]
+fn location_identity_and_device_binding_survive_restart() {
+    let directory = tempdir().unwrap();
+    let source_path = directory.path().join("managed");
+    fs::create_dir(&source_path).unwrap();
+    fs::write(source_path.join("value"), "original").unwrap();
+    let root = directory.path().join("local");
+    let local = LocalServices::open(&root, [8; 32]).unwrap();
+    local
+        .bind_device(DeviceId::parse("dev_fixture01").unwrap())
+        .unwrap();
+    let mut entry = source_entry(&source_path, Sha256Digest::from_bytes([9; 32]));
+    entry.source.kind = SourceKind::ManagedFolder;
+    entry.source.repository_identity_digest = None;
+    local.register_location(entry.clone()).unwrap();
+
+    let mut wrong_device = entry;
+    wrong_device.location.location_id = LocationId::parse("loc_fixture02").unwrap();
+    wrong_device.location.device_id = DeviceId::parse("dev_fixture02").unwrap();
+    assert!(local.register_location(wrong_device).is_err());
+    drop(local);
+
+    let replaced = directory.path().join("managed-original");
+    fs::rename(&source_path, &replaced).unwrap();
+    fs::create_dir(&source_path).unwrap();
+    fs::write(source_path.join("value"), "replacement").unwrap();
+    assert!(LocalServices::open(&root, [8; 32]).is_err());
 }
 
 #[test]
@@ -370,7 +400,7 @@ fn ipc_runtime_backup_storage_and_enrollment_services_are_real() {
     let verified = ipc
         .handle(&request(
             "backup.verify",
-            json!({"backupId":backup["backupId"]}),
+            json!({"targetId":backup["backupId"]}),
         ))
         .unwrap();
     assert_eq!(verified["verified"], true);

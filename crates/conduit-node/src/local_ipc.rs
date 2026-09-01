@@ -2,6 +2,11 @@ use crate::{
     Node,
     ipc::{IpcHandler, IpcRequest},
     local::{LocalServices, LocalSourceConfig},
+    startup::{
+        BACKUP_DATABASE_FILE, BackupManifest, VerifiedBackup, activate_storage_configuration,
+        file_digest, stage_database_restore, stage_storage_configuration, valid_backup_id,
+        verify_backup,
+    },
 };
 use conduit_adapters::{AdapterCatalog, AdapterKind};
 use conduit_domain::{DeviceId, LocationId, Sha256Digest, SourceId};
@@ -10,13 +15,13 @@ use conduit_node_store::{
 };
 use conduit_runtime::{DestroyRequest, RuntimeProvider, RuntimeRequest, RuntimeSignal};
 use conduit_workspace::{LocationRecord, SourceKind, SourceRecord};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    io::Write,
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -41,14 +46,16 @@ impl LocalIpcService {
         data_root: impl AsRef<Path>,
     ) -> Result<Self, String> {
         let data_root = fs::canonicalize(data_root).map_err(|error| error.to_string())?;
-        let storage_root = data_root.join("storage");
+        let storage_configuration =
+            activate_storage_configuration(&data_root).map_err(|error| error.to_string())?;
+        let roots = storage_configuration.root_array();
         let storage = StorageManager::new(
             store.clone(),
-            storage_root.join("hot"),
-            storage_root.join("archive"),
-            storage_root.join("backup"),
-            storage_root.join("cache"),
-            [64 << 30, 256 << 30, 256 << 30, 64 << 30],
+            roots[0].clone(),
+            roots[1].clone(),
+            roots[2].clone(),
+            roots[3].clone(),
+            storage_configuration.quota_array(),
         )
         .map_err(|error| error.to_string())?;
         Ok(Self {
@@ -294,6 +301,7 @@ impl LocalIpcService {
                 display_path: input.display_path,
             },
             canonical_path: input.path,
+            filesystem_identity: None,
         };
         let result = serde_json::to_value(&entry.location).map_err(|error| error.to_string())?;
         self.local
@@ -328,13 +336,16 @@ impl LocalIpcService {
     }
 
     fn configure_storage(&self, request: &IpcRequest) -> Result<Value, String> {
-        let bytes = serde_jcs::to_vec(&request.params).map_err(|error| error.to_string())?;
-        if bytes.len() > 64 * 1024 {
-            return Err("storage_configuration_too_large".into());
-        }
-        let path = self.data_root.join("storage/configuration.pending.json");
-        write_owner_only(&path, &bytes)?;
-        Ok(json!({"configurationPath":path,"restartRequired":true}))
+        let (path, configuration) =
+            stage_storage_configuration(&self.data_root, request.params.clone())
+                .map_err(|error| error.to_string())?;
+        Ok(json!({
+            "configurationPath": path,
+            "configuration": configuration,
+            "state": "pending_restart",
+            "applied": false,
+            "restartRequired": true,
+        }))
     }
 
     fn backup_create(&self) -> Result<Value, String> {
@@ -351,27 +362,33 @@ impl LocalIpcService {
         fs::create_dir(&directory).map_err(|error| error.to_string())?;
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
             .map_err(|error| error.to_string())?;
-        let database = directory.join("journal.sqlite3");
+        let database = directory.join(BACKUP_DATABASE_FILE);
         self.store
             .backup_database(&database)
             .map_err(|error| error.to_string())?;
         fs::set_permissions(&database, fs::Permissions::from_mode(0o600))
             .map_err(|error| error.to_string())?;
-        let database_digest = file_digest(&database)?;
+        let database_digest = file_digest(&database).map_err(|error| error.to_string())?;
         let manifest_path = directory.join("manifest.json");
-        let manifest = BackupManifest {
-            backup_id: backup_id.clone(),
-            created_at: now(),
-            database_file: "journal.sqlite3".into(),
-            database_digest: database_digest.clone(),
-            identity_key_id: self.identity.key_id().into(),
-        };
-        let manifest_bytes = serde_jcs::to_vec(&manifest).map_err(|error| error.to_string())?;
-        write_owner_only(&manifest_path, &manifest_bytes)?;
-        let size = fs::metadata(&database)
+        let database_size = fs::metadata(&database)
             .map_err(|error| error.to_string())?
-            .len()
-            + manifest_bytes.len() as u64;
+            .len();
+        let manifest = BackupManifest::signed(
+            &self.identity,
+            backup_id.clone(),
+            now(),
+            database_digest.clone(),
+            database_size,
+            self.store
+                .journal_generation()
+                .map_err(|error| error.to_string())?,
+        )
+        .map_err(|error| error.to_string())?;
+        let manifest_bytes = manifest
+            .canonical_bytes()
+            .map_err(|error| error.to_string())?;
+        write_owner_only(&manifest_path, &manifest_bytes)?;
+        let size = database_size + manifest_bytes.len() as u64;
         self.storage
             .reserve(&StorageObject {
                 object_id: format!("obj_{}", &digest[..24]),
@@ -389,73 +406,46 @@ impl LocalIpcService {
         )
     }
 
-    fn backup_manifest(&self, request: &IpcRequest) -> Result<(PathBuf, BackupManifest), String> {
+    fn backup_manifest(&self, request: &IpcRequest) -> Result<VerifiedBackup, String> {
         let backup_root = fs::canonicalize(self.storage.root(StorageClass::Backup))
             .map_err(|error| error.to_string())?;
+        let backup_id = request.params.get("backupId").and_then(Value::as_str);
+        let target_id = request.params.get("targetId").and_then(Value::as_str);
+        if backup_id
+            .zip(target_id)
+            .is_some_and(|(left, right)| left != right)
+        {
+            return Err("backup_id_conflict".into());
+        }
+        let expected_id = backup_id.or(target_id);
+        if expected_id.is_some_and(|id| !valid_backup_id(id)) {
+            return Err("backup_id_invalid".into());
+        }
         let requested =
             if let Some(path) = request.params.get("manifestPath").and_then(Value::as_str) {
                 PathBuf::from(path)
-            } else if let Some(id) = request.params.get("backupId").and_then(Value::as_str) {
-                if !valid_backup_id(id) {
-                    return Err("backup_id_invalid".into());
-                }
+            } else if let Some(id) = expected_id {
                 backup_root.join(id).join("manifest.json")
             } else {
                 return Err("backup_id_or_manifest_path_required".into());
             };
-        let path = fs::canonicalize(&requested).map_err(|error| error.to_string())?;
-        if !path.starts_with(&backup_root) {
-            return Err("backup_manifest_outside_custody".into());
-        }
-        let metadata = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
-        if !metadata.file_type().is_file()
-            || metadata.uid() != unsafe { libc::geteuid() }
-            || metadata.permissions().mode() & 0o077 != 0
-        {
-            return Err("backup_manifest_not_owner_only".into());
-        }
-        let manifest: BackupManifest =
-            serde_json::from_slice(&fs::read(&path).map_err(|error| error.to_string())?)
-                .map_err(|error| error.to_string())?;
-        if !valid_backup_id(&manifest.backup_id) {
-            return Err("backup_manifest_invalid".into());
-        }
-        Ok((path, manifest))
+        verify_backup(&self.identity, &backup_root, &requested, expected_id)
+            .map_err(|error| error.to_string())
     }
 
     fn backup_verify(&self, request: &IpcRequest) -> Result<Value, String> {
-        let (manifest_path, manifest) = self.backup_manifest(request)?;
-        let database = manifest_path
-            .parent()
-            .ok_or_else(|| "backup_manifest_invalid".to_owned())?
-            .join(&manifest.database_file);
-        let actual = file_digest(&database)?;
-        if actual != manifest.database_digest {
-            return Err("backup_digest_mismatch".into());
-        }
-        NodeStore::verify_database(&database).map_err(|error| error.to_string())?;
+        let backup = self.backup_manifest(request)?;
         Ok(
-            json!({"backupId":manifest.backup_id,"manifestPath":manifest_path,"verified":true,"databaseDigest":actual}),
+            json!({"backupId":backup.manifest.backup_id,"manifestPath":backup.manifest_path,"verified":true,"databaseDigest":backup.manifest.database_digest,"databaseSize":backup.manifest.database_size,"journalGeneration":backup.manifest.journal_generation}),
         )
     }
 
     fn backup_restore(&self, request: &IpcRequest) -> Result<Value, String> {
-        self.backup_verify(request)?;
-        let (manifest_path, manifest) = self.backup_manifest(request)?;
-        let database = manifest_path
-            .parent()
-            .unwrap()
-            .join(&manifest.database_file);
+        let backup = self.backup_manifest(request)?;
+        stage_database_restore(&self.data_root, &backup).map_err(|error| error.to_string())?;
         let pending = self.data_root.join("restore-pending.sqlite3");
-        let temporary = self
-            .data_root
-            .join(format!(".restore-{}.tmp", std::process::id()));
-        fs::copy(&database, &temporary).map_err(|error| error.to_string())?;
-        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))
-            .map_err(|error| error.to_string())?;
-        fs::rename(&temporary, &pending).map_err(|error| error.to_string())?;
         Ok(
-            json!({"backupId":manifest.backup_id,"stagedPath":pending,"restartRequired":true,"custodyVerified":true}),
+            json!({"backupId":backup.manifest.backup_id,"stagedPath":pending,"state":"pending_restart","applied":false,"restartRequired":true,"custodyVerified":true}),
         )
     }
 
@@ -569,40 +559,6 @@ impl IpcHandler for LocalIpcService {
             _ => Err("method_unknown".into()),
         }
     }
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct BackupManifest {
-    backup_id: String,
-    created_at: String,
-    database_file: String,
-    database_digest: String,
-    identity_key_id: String,
-}
-
-fn valid_backup_id(value: &str) -> bool {
-    value.strip_prefix("backup_").is_some_and(|suffix| {
-        suffix.len() >= 8
-            && suffix.len() <= 128
-            && suffix
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    })
-}
-
-fn file_digest(path: &Path) -> Result<String, String> {
-    let mut file = fs::File::open(path).map_err(|error| error.to_string())?;
-    let mut digest = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file.read(&mut buffer).map_err(|error| error.to_string())?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buffer[..read]);
-    }
-    Ok(hex::encode(digest.finalize()))
 }
 
 fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), String> {

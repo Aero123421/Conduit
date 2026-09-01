@@ -344,6 +344,42 @@ impl NodeStore {
         integrity(&conn)
     }
 
+    pub fn journal_generation(&self) -> Result<u64, StoreError> {
+        self.conn()?
+            .query_row(
+                "SELECT value FROM metadata WHERE key='journal_generation'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(map_sql)?
+            .parse()
+            .map_err(|_| StoreError::Corrupt("invalid journal generation".into()))
+    }
+
+    pub fn advance_journal_generation(&self) -> Result<u64, StoreError> {
+        let mut conn = self.conn()?;
+        let tx = conn.transaction().map_err(map_sql)?;
+        let current = tx
+            .query_row(
+                "SELECT value FROM metadata WHERE key='journal_generation'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(map_sql)?
+            .parse::<u64>()
+            .map_err(|_| StoreError::Corrupt("invalid journal generation".into()))?;
+        let next = current
+            .checked_add(1)
+            .ok_or_else(|| StoreError::Corrupt("journal generation exhausted".into()))?;
+        tx.execute(
+            "UPDATE metadata SET value=?1 WHERE key='journal_generation'",
+            [next.to_string()],
+        )
+        .map_err(map_sql)?;
+        tx.commit().map_err(map_sql)?;
+        Ok(next)
+    }
+
     pub fn reserve_operation(
         &self,
         operation_id: &str,

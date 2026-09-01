@@ -33,10 +33,25 @@ revision is retained in the immutable offer but never substitutes for this local
 decision. `full_user` or `full_device` combined with `never` requires a separate
 explicit local-policy opt-in.
 
-The initial CLI intentionally has no enrollment or provider-setup mutation.
 Docker, Podman, Incus, KVM, bubblewrap, and systemd user scopes are diagnosed
 but never installed or globally configured by the network-facing service.
-Agent protocol adapters and opaque Location/workspace resolution are not linked
-in this crate revision. `agent.run.start` and offers with unresolved Source
-revisions therefore receive durable `operation.admission` rejections rather
-than being passed to a generic executable.
+Enrollment and key rotation produce signed Device-local requests; external
+confirmation remains a separate prerequisite.
+
+Locations are registered over the owner-authenticated local socket and their
+canonical paths are retained only in the mode-0600 Device-local Source
+registry. Remote Source revisions are revalidated against that registry on
+every use. Git read-only/direct/worktree modes and bounded managed copies
+produce durable custody records before Runtime start. Worktree leases are
+locked and journaled so restart reconciliation cannot silently create a second
+writer.
+
+`agent.run.start` selects only a structured `conduit-adapters` profile. The
+adapter ID must also appear in the Device-local policy `launchProfiles`
+allowlist. The first Linux slice supports agent adapters in the native Provider;
+other requested Providers fail closed instead of weakening isolation. Visible
+normalized adapter events are committed to the Device-local trace store and
+event journal. Hidden reasoning, raw stderr, and credentials are not captured.
+Input, follow-up, steer, cancel, and launch-time native-session resume use typed
+adapter operations and fail closed when the selected protocol does not support
+the requested control.

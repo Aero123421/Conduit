@@ -22,6 +22,11 @@ jobs:
           toolchain: 1.92.0
           components: rustfmt,clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install Restricted Native test dependency
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes bubblewrap
+          bwrap --unshare-user --unshare-pid --ro-bind / / -- /bin/true
       - run: cargo fmt --all --check
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
       - run: cargo test --locked --workspace --all-targets

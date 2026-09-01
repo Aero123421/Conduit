@@ -1,0 +1,14 @@
+{
+  "schemaVersion": 1,
+  "protocol": "conduit.node/1",
+  "type": "device.challenge",
+  "messageId": "msg_challenge01",
+  "payload": {
+    "connectionId": "conn_example0001",
+    "serverNonce": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+    "selectedProtocolVersion": "conduit.node/1",
+    "serverTime": "2026-09-01T09:00:00Z",
+    "expiresInMs": 60000,
+    "controlPlaneKeyId": "cpkey_example0001"
+  }
+}

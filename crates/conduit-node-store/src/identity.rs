@@ -4,7 +4,7 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::Path,
 };
 use zeroize::Zeroizing;
@@ -32,7 +32,10 @@ impl DeviceIdentity {
         }
         let seed = if path.exists() {
             let meta = fs::symlink_metadata(path)?;
-            if !meta.file_type().is_file() || meta.permissions().mode() & 0o077 != 0 {
+            if !meta.file_type().is_file()
+                || meta.uid() != unsafe { libc::geteuid() }
+                || meta.permissions().mode() & 0o777 != 0o600
+            {
                 return Err(StoreError::Invalid(
                     "device key must be a regular mode-0600 file".into(),
                 ));
@@ -83,12 +86,6 @@ impl DeviceIdentity {
     }
     pub fn verifying_key(&self) -> VerifyingKey {
         self.signing.verifying_key()
-    }
-    pub(crate) fn credential_key(&self) -> [u8; 32] {
-        let mut h = Sha256::new();
-        h.update(b"conduit.device-credential-key.v1\n");
-        h.update(self.signing.to_bytes());
-        h.finalize().into()
     }
 }
 

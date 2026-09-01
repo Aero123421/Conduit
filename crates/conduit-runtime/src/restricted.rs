@@ -103,7 +103,11 @@ impl RuntimeProvider for RestrictedNativeProvider {
         })
     }
     fn prepare(&self, r: &RuntimeRequest) -> Result<PreparedRuntime, RuntimeError> {
-        validate_request(r, RuntimeKind::RestrictedNative)?;
+        validate_request(
+            r,
+            RuntimeKind::RestrictedNative,
+            &["restricted_native", "restricted-native.linux"],
+        )?;
         let p = self.probe()?;
         let b = p
             .capabilities
@@ -125,8 +129,9 @@ impl RuntimeProvider for RestrictedNativeProvider {
                 "required systemd scope".into(),
             ));
         }
-        let mut out = self.supervisor.reserve(r, PathBuf::new(), false)?;
-        out.provider_id = self.provider_id().into();
+        let mut out = self
+            .supervisor
+            .reserve(r, self.provider_id(), PathBuf::new(), false)?;
         out.evidence = p.capabilities;
         Ok(out)
     }
@@ -135,6 +140,9 @@ impl RuntimeProvider for RestrictedNativeProvider {
         p: &PreparedRuntime,
         l: &LaunchPlan,
     ) -> Result<RuntimeStateReceipt, RuntimeError> {
+        if p.provider_id != self.provider_id() {
+            return Err(RuntimeError::IdentityMismatch);
+        }
         let b = Self::bwrap_effective();
         let s = Self::systemd_effective();
         if self.require_filesystem && !b {
@@ -196,8 +204,11 @@ impl RuntimeProvider for RestrictedNativeProvider {
         Ok(r)
     }
     fn inspect(&self, h: &RuntimeHandle) -> Result<RuntimeStateReceipt, RuntimeError> {
+        if h.provider_id != self.provider_id() || h.object_id != "native-supervisor" {
+            return Err(RuntimeError::IdentityMismatch);
+        }
         let mut r = self.supervisor.inspect(&h.runtime_id)?;
-        if r.handle.spec_digest != h.spec_digest {
+        if r.handle.spec_digest != h.spec_digest || r.handle.provider_id != self.provider_id() {
             return Err(RuntimeError::IdentityMismatch);
         }
         r.handle.provider_id = self.provider_id().into();
@@ -208,6 +219,9 @@ impl RuntimeProvider for RestrictedNativeProvider {
         h: &RuntimeHandle,
         s: RuntimeSignal,
     ) -> Result<RuntimeStateReceipt, RuntimeError> {
+        if h.provider_id != self.provider_id() || h.object_id != "native-supervisor" {
+            return Err(RuntimeError::IdentityMismatch);
+        }
         let mut r = self.supervisor.signal(&h.runtime_id, s)?;
         r.handle.provider_id = self.provider_id().into();
         Ok(r)
@@ -218,6 +232,7 @@ impl RuntimeProvider for RestrictedNativeProvider {
         ))
     }
     fn collect(&self, h: &RuntimeHandle) -> Result<CollectionReceipt, RuntimeError> {
+        self.inspect(h)?;
         let native = NativeProvider::new(self.supervisor.clone());
         native.collect(&RuntimeHandle {
             provider_id: "native".into(),
@@ -229,6 +244,7 @@ impl RuntimeProvider for RestrictedNativeProvider {
         h: &RuntimeHandle,
         r: &DestroyRequest,
     ) -> Result<DestroyReceipt, RuntimeError> {
+        self.inspect(h)?;
         let native = NativeProvider::new(self.supervisor.clone());
         native.destroy(
             &RuntimeHandle {
@@ -242,7 +258,23 @@ impl RuntimeProvider for RestrictedNativeProvider {
         &self,
         records: &[ExpectedRuntime],
     ) -> Result<Vec<ReconciliationReceipt>, RuntimeError> {
-        let native = NativeProvider::new(self.supervisor.clone());
-        native.reconcile(records)
+        records
+            .iter()
+            .map(|expected| match self.inspect(&expected.handle) {
+                Ok(receipt) => Ok(ReconciliationReceipt {
+                    runtime_id: expected.handle.runtime_id.clone(),
+                    state: receipt.state,
+                    reason_code: "restricted_identity_observed".into(),
+                    observed_identity: receipt.handle.process_identity,
+                }),
+                Err(RuntimeError::NotFound) => Ok(ReconciliationReceipt {
+                    runtime_id: expected.handle.runtime_id.clone(),
+                    state: RuntimeState::Lost,
+                    reason_code: "runtime_absent".into(),
+                    observed_identity: None,
+                }),
+                Err(error) => Err(error),
+            })
+            .collect()
     }
 }

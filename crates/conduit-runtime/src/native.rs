@@ -12,13 +12,17 @@ use std::{
     },
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
+    sync::atomic::{AtomicU64, Ordering},
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+static NEXT_RECORD_TEMP: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct SupervisorRecord {
     runtime_id: String,
+    #[serde(default = "native_provider")]
+    provider_id: String,
     spec_digest: String,
     pid: Option<u32>,
     birth: Option<u64>,
@@ -28,6 +32,9 @@ struct SupervisorRecord {
     started_unix_ms: Option<u128>,
     timeout_ms: Option<u64>,
     pty: bool,
+}
+fn native_provider() -> String {
+    "native".into()
 }
 
 #[derive(Clone)]
@@ -66,7 +73,11 @@ impl ProcessSupervisor {
     fn save(&self, r: &SupervisorRecord) -> Result<(), RuntimeError> {
         let b = serde_json::to_vec(r).map_err(|e| RuntimeError::Record(e.to_string()))?;
         let p = self.path(&r.runtime_id);
-        let tmp = p.with_extension(format!("tmp-{}", std::process::id()));
+        let tmp = p.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            NEXT_RECORD_TEMP.fetch_add(1, Ordering::Relaxed)
+        ));
         {
             let mut f = std::fs::OpenOptions::new()
                 .write(true)
@@ -82,16 +93,17 @@ impl ProcessSupervisor {
     pub fn reserve(
         &self,
         request: &RuntimeRequest,
+        provider_id: &str,
         executable: PathBuf,
         pty: bool,
     ) -> Result<PreparedRuntime, RuntimeError> {
         if let Ok(existing) = self.load(&request.runtime_id) {
-            if existing.spec_digest != request.spec_digest {
+            if existing.spec_digest != request.spec_digest || existing.provider_id != provider_id {
                 return Err(RuntimeError::IdentityMismatch);
             }
             return Ok(PreparedRuntime {
                 runtime_id: request.runtime_id.clone(),
-                provider_id: "native".into(),
+                provider_id: provider_id.into(),
                 spec_digest: request.spec_digest.clone(),
                 object_id: request.runtime_id.clone(),
                 state: existing.state,
@@ -100,6 +112,7 @@ impl ProcessSupervisor {
         }
         let r = SupervisorRecord {
             runtime_id: request.runtime_id.clone(),
+            provider_id: provider_id.into(),
             spec_digest: request.spec_digest.clone(),
             pid: None,
             birth: None,
@@ -128,6 +141,9 @@ impl ProcessSupervisor {
     ) -> Result<RuntimeStateReceipt, RuntimeError> {
         let mut record = self.load(&prepared.runtime_id)?;
         if record.spec_digest != prepared.spec_digest {
+            return Err(RuntimeError::IdentityMismatch);
+        }
+        if record.provider_id != prepared.provider_id {
             return Err(RuntimeError::IdentityMismatch);
         }
         if let Some(pid) = record.pid
@@ -221,6 +237,7 @@ impl ProcessSupervisor {
             RuntimeError::Uncertain("spawned process birth identity unavailable".into())
         })?;
         record.pid = Some(pid);
+        record.executable = launch.executable.clone();
         record.birth = Some(birth);
         record.state = RuntimeState::Running;
         record.started_unix_ms = Some(
@@ -237,6 +254,7 @@ impl ProcessSupervisor {
             .map_err(|_| RuntimeError::Record("live map poisoned".into()))?
             .insert(record.runtime_id.clone(), child.clone());
         if let Some(master) = pty_master {
+            let mut reader = master.try_clone()?;
             let master = Arc::new(Mutex::new(master));
             self.pty_masters
                 .lock()
@@ -252,9 +270,9 @@ impl ProcessSupervisor {
                     .ok();
                 let mut buf = [0u8; 8192];
                 loop {
-                    let n = match master.lock().ok().and_then(|mut f| f.read(&mut buf).ok()) {
-                        Some(0) | None => break,
-                        Some(n) => n,
+                    let n = match reader.read(&mut buf) {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => n,
                     };
                     if let Some(ref mut f) = out {
                         let _ = f.write_all(&buf[..n]);
@@ -294,6 +312,9 @@ impl ProcessSupervisor {
                         unsafe {
                             libc::kill(-(pid as i32), libc::SIGKILL);
                         }
+                    }
+                    if let Ok(mut child) = child.lock() {
+                        let _ = child.wait();
                     }
                     if let Ok(mut r) = this.load(&id) {
                         r.state = RuntimeState::Stopped;
@@ -385,7 +406,7 @@ impl ProcessSupervisor {
         Ok(RuntimeStateReceipt {
             handle: RuntimeHandle {
                 runtime_id: r.runtime_id,
-                provider_id: "native".into(),
+                provider_id: r.provider_id,
                 spec_digest: r.spec_digest,
                 object_id: "native-supervisor".into(),
                 process_identity: identity,
@@ -447,8 +468,9 @@ impl RuntimeProvider for NativeProvider {
         })
     }
     fn prepare(&self, r: &RuntimeRequest) -> Result<PreparedRuntime, RuntimeError> {
-        validate_request(r, RuntimeKind::Native)?;
-        self.supervisor.reserve(r, PathBuf::new(), false)
+        validate_request(r, RuntimeKind::Native, &["native", "native.linux"])?;
+        self.supervisor
+            .reserve(r, self.provider_id(), PathBuf::new(), false)
     }
     fn start(
         &self,
@@ -458,7 +480,7 @@ impl RuntimeProvider for NativeProvider {
         self.supervisor.spawn(p, l, |_| Ok(()))
     }
     fn inspect(&self, h: &RuntimeHandle) -> Result<RuntimeStateReceipt, RuntimeError> {
-        if h.provider_id != "native" {
+        if h.provider_id != "native" || h.object_id != "native-supervisor" {
             return Err(RuntimeError::IdentityMismatch);
         }
         let r = self.supervisor.inspect(&h.runtime_id)?;
@@ -472,6 +494,9 @@ impl RuntimeProvider for NativeProvider {
         h: &RuntimeHandle,
         s: RuntimeSignal,
     ) -> Result<RuntimeStateReceipt, RuntimeError> {
+        if h.provider_id != self.provider_id() || h.object_id != "native-supervisor" {
+            return Err(RuntimeError::IdentityMismatch);
+        }
         self.supervisor.signal(&h.runtime_id, s)
     }
     fn snapshot(&self, _: &RuntimeHandle, _: &str) -> Result<SnapshotReceipt, RuntimeError> {
@@ -480,16 +505,30 @@ impl RuntimeProvider for NativeProvider {
         ))
     }
     fn collect(&self, h: &RuntimeHandle) -> Result<CollectionReceipt, RuntimeError> {
+        if h.provider_id != self.provider_id() || h.object_id != "native-supervisor" {
+            return Err(RuntimeError::IdentityMismatch);
+        }
         let p = self
             .supervisor
             .root
             .join(format!("{}.stream", h.runtime_id));
-        let b = fs::read(&p).unwrap_or_default();
+        let mut file = File::open(&p)?;
+        file.metadata()?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let count = file.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+        }
+        let digest = hex::encode(digest.finalize());
         Ok(CollectionReceipt {
             runtime_id: h.runtime_id.clone(),
-            collection_id: format!("collect_{}", &digest_bytes(&b)[..16]),
+            collection_id: format!("collect_{}", &digest[..16]),
             custody_complete: true,
-            digest: digest_bytes(&b),
+            digest,
         })
     }
     fn destroy(
@@ -497,6 +536,9 @@ impl RuntimeProvider for NativeProvider {
         h: &RuntimeHandle,
         r: &DestroyRequest,
     ) -> Result<DestroyReceipt, RuntimeError> {
+        if h.provider_id != self.provider_id() || h.object_id != "native-supervisor" {
+            return Err(RuntimeError::IdentityMismatch);
+        }
         let state = self.inspect(h)?.state;
         if matches!(
             state,
@@ -556,6 +598,7 @@ mod tests {
             runtime_id: "rt_12345678".into(),
             run_id: "run_12345678".into(),
             kind: RuntimeKind::Native,
+            provider_selector: "native".into(),
             spec_digest: "11".repeat(32),
             image: None,
             resources: ResourceLimits {
@@ -617,6 +660,7 @@ mod tests {
         let s = ProcessSupervisor::open(d.path()).unwrap();
         s.save(&SupervisorRecord {
             runtime_id: "rt_12345678".into(),
+            provider_id: "native".into(),
             spec_digest: "11".repeat(32),
             pid: Some(u32::MAX),
             birth: Some(1),

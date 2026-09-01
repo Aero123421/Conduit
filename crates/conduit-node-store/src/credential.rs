@@ -1,4 +1,4 @@
-use crate::{DeviceIdentity, NodeStore, StoreError, map_sql};
+use crate::{NodeStore, StoreError, map_sql};
 use chacha20poly1305::{
     XChaCha20Poly1305, XNonce,
     aead::{Aead, KeyInit, Payload},
@@ -7,7 +7,7 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
-    os::unix::fs::OpenOptionsExt,
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
 use zeroize::Zeroizing;
@@ -51,6 +51,7 @@ pub struct CredentialProjection {
     pub path: Option<PathBuf>,
     pub environment_key: Option<String>,
     secret: Option<Zeroizing<Vec<u8>>>,
+    remove_on_drop: bool,
 }
 impl std::fmt::Debug for CredentialProjection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -66,18 +67,71 @@ impl CredentialProjection {
         self.secret.as_deref().map(|v| v.as_slice())
     }
 }
+impl Drop for CredentialProjection {
+    fn drop(&mut self) {
+        if self.remove_on_drop
+            && let Some(path) = &self.path
+        {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
 
 pub struct CredentialStore {
     store: NodeStore,
-    key: [u8; 32],
+    key: Zeroizing<[u8; 32]>,
+    projection_root: PathBuf,
 }
 type EncryptedCredentialRow = (Vec<u8>, Vec<u8>, Vec<u8>, String);
 impl CredentialStore {
-    pub fn new(store: NodeStore, identity: &DeviceIdentity) -> Self {
-        Self {
-            store,
-            key: identity.credential_key(),
+    pub fn open(
+        store: NodeStore,
+        key_path: impl AsRef<Path>,
+        projection_root: impl AsRef<Path>,
+    ) -> Result<Self, StoreError> {
+        const MAGIC: &[u8; 8] = b"CREDDEK1";
+        let key_path = key_path.as_ref();
+        if let Some(parent) = key_path.parent() {
+            fs::create_dir_all(parent)?;
+            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?
         }
+        let key = if key_path.exists() {
+            let meta = fs::symlink_metadata(key_path)?;
+            if !meta.file_type().is_file()
+                || meta.uid() != unsafe { libc::geteuid() }
+                || meta.permissions().mode() & 0o777 != 0o600
+            {
+                return Err(StoreError::Invalid(
+                    "credential DEK must be a regular mode-0600 file".into(),
+                ));
+            }
+            let bytes = Zeroizing::new(fs::read(key_path)?);
+            if bytes.len() != 40 || &bytes[..8] != MAGIC {
+                return Err(StoreError::Corrupt("credential DEK version invalid".into()));
+            }
+            let mut k = [0u8; 32];
+            k.copy_from_slice(&bytes[8..]);
+            k
+        } else {
+            let mut k = [0u8; 32];
+            getrandom::fill(&mut k).map_err(|_| StoreError::Crypto)?;
+            let mut o = fs::OpenOptions::new();
+            o.write(true).create_new(true).mode(0o600);
+            use std::io::Write;
+            let mut f = o.open(key_path)?;
+            f.write_all(MAGIC)?;
+            f.write_all(&k)?;
+            f.sync_all()?;
+            k
+        };
+        let projection_root = projection_root.as_ref().to_path_buf();
+        fs::create_dir_all(&projection_root)?;
+        fs::set_permissions(&projection_root, fs::Permissions::from_mode(0o700))?;
+        Ok(Self {
+            store,
+            key: Zeroizing::new(key),
+            projection_root,
+        })
     }
     pub fn put(&self, metadata: &CredentialMetadata, secret: &[u8]) -> Result<(), StoreError> {
         if secret.len() > 1024 * 1024 {
@@ -87,7 +141,7 @@ impl CredentialStore {
             serde_json::to_vec(metadata).map_err(|e| StoreError::Invalid(e.to_string()))?;
         let mut nonce = [0u8; 24];
         getrandom::fill(&mut nonce).map_err(|_| StoreError::Crypto)?;
-        let cipher = XChaCha20Poly1305::new((&self.key).into());
+        let cipher = XChaCha20Poly1305::new((&*self.key).into());
         let ciphertext = cipher
             .encrypt(
                 XNonce::from_slice(&nonce),
@@ -97,7 +151,12 @@ impl CredentialStore {
                 },
             )
             .map_err(|_| StoreError::Crypto)?;
-        self.store.conn()?.execute("INSERT INTO credential_profiles(profile_id,revision,adapter_id,kind,nonce,ciphertext,metadata) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(profile_id) DO UPDATE SET revision=excluded.revision,adapter_id=excluded.adapter_id,kind=excluded.kind,nonce=excluded.nonce,ciphertext=excluded.ciphertext,metadata=excluded.metadata WHERE excluded.revision>credential_profiles.revision",params![metadata.profile_id,metadata.revision,metadata.adapter_id,metadata.kind.as_str(),nonce,ciphertext,encoded]).map_err(map_sql)?;
+        let changed = self.store.conn()?.execute("INSERT INTO credential_profiles(profile_id,revision,adapter_id,kind,nonce,ciphertext,metadata) VALUES(?1,?2,?3,?4,?5,?6,?7) ON CONFLICT(profile_id) DO UPDATE SET revision=excluded.revision,adapter_id=excluded.adapter_id,kind=excluded.kind,nonce=excluded.nonce,ciphertext=excluded.ciphertext,metadata=excluded.metadata WHERE excluded.revision>credential_profiles.revision",params![metadata.profile_id,metadata.revision,metadata.adapter_id,metadata.kind.as_str(),nonce,ciphertext,encoded]).map_err(map_sql)?;
+        if changed != 1 {
+            return Err(StoreError::Invalid(
+                "credential revision must increase".into(),
+            ));
+        }
         Ok(())
     }
     fn decrypt(
@@ -117,7 +176,7 @@ impl CredentialStore {
         }
         let metadata = serde_json::from_slice(&encoded)
             .map_err(|_| StoreError::Corrupt("credential metadata invalid".into()))?;
-        let cipher = XChaCha20Poly1305::new((&self.key).into());
+        let cipher = XChaCha20Poly1305::new((&*self.key).into());
         let clear = cipher
             .decrypt(
                 XNonce::from_slice(&nonce),
@@ -144,14 +203,9 @@ impl CredentialStore {
             ));
         }
         match kind {
-            ProjectionKind::NativeHost | ProjectionKind::LoginRequired => {
-                Ok(CredentialProjection {
-                    metadata,
-                    path: None,
-                    environment_key: None,
-                    secret: None,
-                })
-            }
+            ProjectionKind::NativeHost | ProjectionKind::LoginRequired => Err(StoreError::Invalid(
+                "credential projection requires a registered broker".into(),
+            )),
             ProjectionKind::Environment => {
                 let key = env_key
                     .ok_or_else(|| StoreError::Invalid("environment key required".into()))?;
@@ -168,6 +222,7 @@ impl CredentialStore {
                     path: None,
                     environment_key: Some(key.into()),
                     secret: Some(secret),
+                    remove_on_drop: false,
                 })
             }
             ProjectionKind::ReadOnlyFile
@@ -175,8 +230,20 @@ impl CredentialStore {
             | ProjectionKind::GuestVolume => {
                 let path = target
                     .ok_or_else(|| StoreError::Invalid("projection target required".into()))?;
+                if !path.is_absolute() || !path.starts_with(&self.projection_root) {
+                    return Err(StoreError::Invalid(
+                        "credential projection target is outside managed root".into(),
+                    ));
+                }
                 if let Some(p) = path.parent() {
                     fs::create_dir_all(p)?;
+                    let canonical = fs::canonicalize(p)?;
+                    let root = fs::canonicalize(&self.projection_root)?;
+                    if !canonical.starts_with(root) {
+                        return Err(StoreError::Invalid(
+                            "credential projection parent escaped managed root".into(),
+                        ));
+                    }
                 }
                 let mut o = fs::OpenOptions::new();
                 o.write(true).create_new(true).mode(0o400);
@@ -189,6 +256,7 @@ impl CredentialStore {
                     path: Some(path.into()),
                     environment_key: None,
                     secret: None,
+                    remove_on_drop: true,
                 })
             }
             ProjectionKind::AgentSocket => Err(StoreError::Invalid(
@@ -206,8 +274,12 @@ mod tests {
     fn encrypted_at_rest_and_adapter_bound() {
         let d = tempdir().unwrap();
         let store = NodeStore::open(d.path()).unwrap();
-        let id = DeviceIdentity::load_or_create(d.path().join("key")).unwrap();
-        let cs = CredentialStore::new(store.clone(), &id);
+        let cs = CredentialStore::open(
+            store.clone(),
+            d.path().join("credential.dek"),
+            d.path().join("projections"),
+        )
+        .unwrap();
         let m = CredentialMetadata {
             profile_id: "cred_12345678".into(),
             revision: 1,
@@ -238,5 +310,40 @@ mod tests {
             )
             .unwrap();
         assert_eq!(p.secret_bytes(), Some(b"SUPERSECRET".as_slice()));
+    }
+    #[test]
+    fn dek_is_owner_only_and_ephemeral_projection_is_removed() {
+        let d = tempdir().unwrap();
+        let store = NodeStore::open(d.path()).unwrap();
+        let key_path = d.path().join("credential.dek");
+        let projection_root = d.path().join("projections");
+        let cs = CredentialStore::open(store, &key_path, &projection_root).unwrap();
+        let mode = fs::metadata(&key_path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+        let key = fs::read(&key_path).unwrap();
+        assert_eq!(&key[..8], b"CREDDEK1");
+        let metadata = CredentialMetadata {
+            profile_id: "cred_ephemeral_01".into(),
+            revision: 1,
+            adapter_id: "codex".into(),
+            kind: ProjectionKind::EphemeralFile,
+            label: "ephemeral".into(),
+        };
+        cs.put(&metadata, b"TEMPSECRET").unwrap();
+        let target = projection_root.join("run/token");
+        {
+            let projection = cs
+                .project(
+                    &metadata.profile_id,
+                    "codex",
+                    ProjectionKind::EphemeralFile,
+                    Some(&target),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(projection.path.as_deref(), Some(target.as_path()));
+            assert_eq!(fs::read(&target).unwrap(), b"TEMPSECRET");
+        }
+        assert!(!target.exists());
     }
 }

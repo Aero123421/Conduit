@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
@@ -25,6 +26,7 @@ use thiserror::Error;
 pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 pub const MAX_FRAME_BYTES: usize = 65_536;
 pub const MAX_EVENT_BYTES: usize = 60_000;
+const STORE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -207,6 +209,24 @@ pub enum ReserveResult {
     Uncertain(OperationRecord),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionRecord {
+    pub operation: OperationRecord,
+    pub provider_id: String,
+    pub access_scope: String,
+    pub approval_policy: String,
+    pub runtime_request: Vec<u8>,
+    pub launch_plan: Vec<u8>,
+    pub admission_receipt: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AdmissionResult {
+    Admitted(AdmissionRecord),
+    Replay(AdmissionRecord),
+    Uncertain(AdmissionRecord),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Direction {
     ControlToNode,
@@ -233,7 +253,14 @@ pub struct TransportFrame {
 pub enum ReceiveResult {
     Applied,
     Duplicate,
+    DuplicatePending,
     Gap { expected: u64 },
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TransportPositions {
+    pub control_received_through: u64,
+    pub node_sent_through: u64,
+    pub node_acknowledged_through: u64,
 }
 
 #[derive(Clone)]
@@ -246,13 +273,24 @@ impl NodeStore {
     pub fn open(root: impl AsRef<Path>) -> Result<Self, StoreError> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(&root)?;
+        secure_store_root(&root)?;
         let db_path = root.join("node.sqlite3");
+        if db_path.exists() {
+            secure_regular_file(&db_path)?;
+        }
         let conn = Connection::open(&db_path).map_err(map_sql)?;
+        fs::set_permissions(&db_path, fs::Permissions::from_mode(0o600))?;
         conn.busy_timeout(std::time::Duration::from_secs(5))
             .map_err(map_sql)?;
         conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL; PRAGMA foreign_keys=ON; PRAGMA trusted_schema=OFF; PRAGMA wal_autocheckpoint=1000;").map_err(map_sql)?;
         migrate(&conn)?;
         integrity(&conn)?;
+        for suffix in ["node.sqlite3-wal", "node.sqlite3-shm"] {
+            let path = root.join(suffix);
+            if path.exists() {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+            }
+        }
         Ok(Self {
             inner: Arc::new(Mutex::new(conn)),
             root,
@@ -263,6 +301,8 @@ impl NodeStore {
     /// Admission through this handle deterministically returns `ReadOnly`.
     pub fn open_read_only(root: impl AsRef<Path>) -> Result<Self, StoreError> {
         let root = root.as_ref().to_path_buf();
+        secure_store_root(&root)?;
+        secure_regular_file(&root.join("node.sqlite3"))?;
         let conn = Connection::open_with_flags(
             root.join("node.sqlite3"),
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
@@ -327,6 +367,130 @@ impl NodeStore {
             .ok_or_else(|| StoreError::Corrupt("reserved row missing".into()))?;
         tx.commit().map_err(map_sql)?;
         Ok(ReserveResult::Reserved(record))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn admit_operation(
+        &self,
+        operation_id: &str,
+        key: &str,
+        digest: &str,
+        manifest: &[u8],
+        policy_revision: u64,
+        provider_id: &str,
+        access_scope: &str,
+        approval_policy: &str,
+        runtime_request: &[u8],
+        launch_plan: &[u8],
+        admission_receipt: &[u8],
+    ) -> Result<AdmissionResult, StoreError> {
+        for value in [manifest, runtime_request, launch_plan, admission_receipt] {
+            if value.len() > MAX_MANIFEST_BYTES {
+                return Err(StoreError::TooLarge {
+                    limit: MAX_MANIFEST_BYTES,
+                });
+            }
+        }
+        validate_digest(digest)?;
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        if let Some(existing) = query_admission(&tx, key)? {
+            if existing.operation.request_digest != digest {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            tx.commit().map_err(map_sql)?;
+            return Ok(if existing.operation.state == OperationState::Uncertain {
+                AdmissionResult::Uncertain(existing)
+            } else {
+                AdmissionResult::Replay(existing)
+            });
+        }
+        tx.execute("INSERT INTO operations(operation_id,idempotency_key,request_digest,manifest,local_policy_revision,state) VALUES(?1,?2,?3,?4,?5,'admitted')",params![operation_id,key,digest,manifest,policy_revision]).map_err(map_sql)?;
+        tx.execute("INSERT INTO operation_admissions(idempotency_key,provider_id,access_scope,approval_policy,runtime_request,launch_plan,admission_receipt) VALUES(?1,?2,?3,?4,?5,?6,?7)",params![key,provider_id,access_scope,approval_policy,runtime_request,launch_plan,admission_receipt]).map_err(map_sql)?;
+        let result = query_admission(&tx, key)?
+            .ok_or_else(|| StoreError::Corrupt("admission row missing".into()))?;
+        tx.commit().map_err(map_sql)?;
+        Ok(AdmissionResult::Admitted(result))
+    }
+
+    pub fn admission(&self, key: &str) -> Result<Option<AdmissionRecord>, StoreError> {
+        let conn = self.conn()?;
+        query_admission(&conn, key)
+    }
+
+    pub fn nonterminal_admissions(&self) -> Result<Vec<AdmissionRecord>, StoreError> {
+        let conn = self.conn()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT idempotency_key FROM operations WHERE state NOT IN ('completed','failed','cancelled','timed_out','lost','uncertain','recovery_required','rejected','expired') ORDER BY updated_at, operation_id",
+            )
+            .map_err(map_sql)?;
+        let keys = statement
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(map_sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sql)?;
+        drop(statement);
+        keys.into_iter()
+            .map(|key| {
+                query_admission(&conn, &key)?.ok_or_else(|| {
+                    StoreError::Corrupt("nonterminal operation lacks immutable admission".into())
+                })
+            })
+            .collect()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_rejection(
+        &self,
+        operation_id: &str,
+        key: &str,
+        digest: &str,
+        manifest: &[u8],
+        policy_revision: u64,
+        state: OperationState,
+        receipt: &[u8],
+    ) -> Result<Vec<u8>, StoreError> {
+        if !matches!(state, OperationState::Rejected | OperationState::Expired) {
+            return Err(StoreError::Invalid("rejection state required".into()));
+        }
+        if manifest.len() > MAX_MANIFEST_BYTES || receipt.len() > MAX_EVENT_BYTES {
+            return Err(StoreError::TooLarge {
+                limit: MAX_MANIFEST_BYTES,
+            });
+        }
+        validate_digest(digest)?;
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        if let Some(existing) = query_operation(&tx, key)? {
+            if existing.request_digest != digest {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            if !matches!(
+                existing.state,
+                OperationState::Rejected | OperationState::Expired
+            ) {
+                return Err(StoreError::Invalid(
+                    "operation already has executable custody".into(),
+                ));
+            }
+            let saved = existing
+                .receipt
+                .ok_or_else(|| StoreError::Corrupt("rejection receipt missing".into()))?;
+            tx.commit().map_err(map_sql)?;
+            return Ok(saved);
+        }
+        tx.execute(
+            "INSERT INTO operations(operation_id,idempotency_key,request_digest,manifest,local_policy_revision,state,receipt) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![operation_id, key, digest, manifest, policy_revision, state.as_str(), receipt],
+        )
+        .map_err(map_sql)?;
+        tx.commit().map_err(map_sql)?;
+        Ok(receipt.to_vec())
     }
 
     pub fn transition_operation(
@@ -449,10 +613,14 @@ impl NodeStore {
             )
             .map_err(map_sql)?;
         if item.sequence < expected {
-            let prior: Option<(String,String)> = tx.query_row("SELECT message_id,payload_digest FROM transport_inbox WHERE direction=?1 AND sequence=?2", params![direction.as_str(),item.sequence], |r| Ok((r.get(0)?,r.get(1)?))).optional().map_err(map_sql)?;
+            let prior: Option<(String,String,String)> = tx.query_row("SELECT message_id,payload_digest,application_state FROM transport_inbox WHERE direction=?1 AND sequence=?2", params![direction.as_str(),item.sequence], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?))).optional().map_err(map_sql)?;
             return match prior {
-                Some((m, d)) if m == item.message_id && d == item.payload_digest => {
-                    Ok(ReceiveResult::Duplicate)
+                Some((m, d, state)) if m == item.message_id && d == item.payload_digest => {
+                    Ok(if state == "applied" {
+                        ReceiveResult::Duplicate
+                    } else {
+                        ReceiveResult::DuplicatePending
+                    })
                 }
                 _ => Err(StoreError::SequenceConflict),
             };
@@ -468,6 +636,24 @@ impl NodeStore {
         .map_err(map_sql)?;
         tx.commit().map_err(map_sql)?;
         Ok(ReceiveResult::Applied)
+    }
+
+    pub fn mark_inbound_applied(
+        &self,
+        direction: Direction,
+        sequence: u64,
+    ) -> Result<(), StoreError> {
+        let changed = self
+            .conn()?
+            .execute(
+                "UPDATE transport_inbox SET application_state='applied' WHERE direction=?1 AND sequence=?2 AND application_state='pending'",
+                params![direction.as_str(), sequence],
+            )
+            .map_err(map_sql)?;
+        if changed > 1 {
+            return Err(StoreError::Corrupt("multiple inbox rows changed".into()));
+        }
+        Ok(())
     }
 
     pub fn ack_outbound(&self, direction: Direction, through: u64) -> Result<usize, StoreError> {
@@ -492,6 +678,24 @@ impl NodeStore {
         .map_err(map_sql)
     }
 
+    pub fn transport_positions(&self) -> Result<TransportPositions, StoreError> {
+        let conn = self.conn()?;
+        let control_received_through=conn.query_row("SELECT received_through FROM transport_positions WHERE direction='control_to_node'",[],|r|r.get(0)).map_err(map_sql)?;
+        let node_sent_through = conn
+            .query_row(
+                "SELECT next_sequence-1 FROM transport_positions WHERE direction='node_to_control'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(map_sql)?;
+        let node_acknowledged_through=conn.query_row("SELECT COALESCE(MAX(sequence),0) FROM transport_outbox WHERE direction='node_to_control' AND acknowledged=1",[],|r|r.get(0)).map_err(map_sql)?;
+        Ok(TransportPositions {
+            control_received_through,
+            node_sent_through,
+            node_acknowledged_through,
+        })
+    }
+
     pub fn replay_outbound(
         &self,
         direction: Direction,
@@ -512,6 +716,25 @@ impl NodeStore {
             })
             .map_err(map_sql)?;
         rows.collect::<Result<Vec<_>, _>>().map_err(map_sql)
+    }
+    pub fn unacknowledged_outbound(
+        &self,
+        from: u64,
+        limit: usize,
+    ) -> Result<Vec<TransportFrame>, StoreError> {
+        let conn = self.conn()?;
+        let mut stmt=conn.prepare("SELECT sequence,message_id,payload_digest,frame FROM transport_outbox WHERE direction='node_to_control' AND acknowledged=0 AND sequence>=?1 ORDER BY sequence LIMIT ?2").map_err(map_sql)?;
+        stmt.query_map(params![from, limit.min(512)], |r| {
+            Ok(TransportFrame {
+                sequence: r.get(0)?,
+                message_id: r.get(1)?,
+                payload_digest: r.get(2)?,
+                frame: r.get(3)?,
+            })
+        })
+        .map_err(map_sql)?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(map_sql)
     }
 
     pub fn set_connection_epoch(&self, epoch: u64) -> Result<(), StoreError> {
@@ -647,6 +870,30 @@ impl NodeStore {
     }
 }
 
+fn secure_store_root(path: &Path) -> Result<(), StoreError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        return Err(StoreError::Invalid(
+            "journal root must be an owner-controlled directory".into(),
+        ));
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+fn secure_regular_file(path: &Path) -> Result<(), StoreError> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(StoreError::Invalid(
+            "journal file must be owner-only and regular".into(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_digest(value: &str) -> Result<(), StoreError> {
     if value.len() == 64
         && value
@@ -664,6 +911,15 @@ fn query_operation(conn: &Connection, key: &str) -> Result<Option<OperationRecor
         .optional().map_err(map_sql)?.map(|v| Ok(OperationRecord { operation_id:v.0,idempotency_key:v.1,request_digest:v.2,manifest:v.3,local_policy_revision:v.4,state:OperationState::parse(&v.5)?,runtime_id:v.6,process_identity:v.7,last_event_sequence:v.8,receipt:v.9 })).transpose()
 }
 
+fn query_admission(conn: &Connection, key: &str) -> Result<Option<AdmissionRecord>, StoreError> {
+    let operation = match query_operation(conn, key)? {
+        Some(v) => v,
+        None => return Ok(None),
+    };
+    conn.query_row("SELECT provider_id,access_scope,approval_policy,runtime_request,launch_plan,admission_receipt FROM operation_admissions WHERE idempotency_key=?1",[key],|r|Ok((r.get::<_,String>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Vec<u8>>(3)?,r.get::<_,Vec<u8>>(4)?,r.get::<_,Vec<u8>>(5)?)))
+        .optional().map_err(map_sql)?.map(|v|AdmissionRecord{operation,provider_id:v.0,access_scope:v.1,approval_policy:v.2,runtime_request:v.3,launch_plan:v.4,admission_receipt:v.5}).map_or(Ok(None),|v|Ok(Some(v)))
+}
+
 fn integrity(conn: &Connection) -> Result<(), StoreError> {
     let result: String = conn
         .query_row("PRAGMA quick_check", [], |r| r.get(0))
@@ -676,6 +932,31 @@ fn integrity(conn: &Connection) -> Result<(), StoreError> {
 }
 
 fn migrate(conn: &Connection) -> Result<(), StoreError> {
+    let has_migrations:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type='table' AND name='schema_migrations')",[],|r|r.get(0)).map_err(map_sql)?;
+    let version = if has_migrations {
+        let version: u32 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version),0) FROM schema_migrations",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(map_sql)?;
+        if version > STORE_SCHEMA_VERSION {
+            return Err(StoreError::Invalid(format!(
+                "journal schema version {version} is newer than supported {STORE_SCHEMA_VERSION}"
+            )));
+        }
+        version
+    } else {
+        0
+    };
+    if version > 0 && version < 3 {
+        conn.execute(
+            "ALTER TABLE transport_inbox ADD COLUMN application_state TEXT NOT NULL DEFAULT 'pending'",
+            [],
+        )
+        .map_err(map_sql)?;
+    }
     conn.execute_batch(r#"
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL DEFAULT(unixepoch()));
@@ -687,17 +968,22 @@ CREATE TABLE IF NOT EXISTS operations(
  runtime_id TEXT, process_identity TEXT, last_event_sequence INTEGER NOT NULL DEFAULT 0,
  receipt BLOB, updated_at INTEGER NOT NULL DEFAULT(unixepoch()),
  CHECK(length(request_digest)=64), CHECK(length(manifest)<=262144));
+CREATE TABLE IF NOT EXISTS operation_admissions(
+ idempotency_key TEXT PRIMARY KEY REFERENCES operations(idempotency_key) ON DELETE RESTRICT,
+ provider_id TEXT NOT NULL, access_scope TEXT NOT NULL, approval_policy TEXT NOT NULL,
+ runtime_request BLOB NOT NULL, launch_plan BLOB NOT NULL, admission_receipt BLOB NOT NULL,
+ CHECK(length(runtime_request)<=262144), CHECK(length(launch_plan)<=262144), CHECK(length(admission_receipt)<=262144));
 CREATE TABLE IF NOT EXISTS transport_positions(direction TEXT PRIMARY KEY, next_sequence INTEGER NOT NULL DEFAULT 1, received_through INTEGER NOT NULL DEFAULT 0);
 INSERT OR IGNORE INTO transport_positions(direction) VALUES('control_to_node'),('node_to_control');
 CREATE TABLE IF NOT EXISTS transport_outbox(direction TEXT NOT NULL, sequence INTEGER NOT NULL, message_id TEXT NOT NULL, payload_digest TEXT NOT NULL, frame BLOB NOT NULL, priority INTEGER NOT NULL, acknowledged INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(direction,sequence));
-CREATE TABLE IF NOT EXISTS transport_inbox(direction TEXT NOT NULL, sequence INTEGER NOT NULL, message_id TEXT NOT NULL, payload_digest TEXT NOT NULL, frame BLOB NOT NULL, PRIMARY KEY(direction,sequence));
+CREATE TABLE IF NOT EXISTS transport_inbox(direction TEXT NOT NULL, sequence INTEGER NOT NULL, message_id TEXT NOT NULL, payload_digest TEXT NOT NULL, frame BLOB NOT NULL, application_state TEXT NOT NULL DEFAULT 'pending', PRIMARY KEY(direction,sequence));
 CREATE TABLE IF NOT EXISTS run_events(run_id TEXT NOT NULL, sequence INTEGER NOT NULL, event_id TEXT NOT NULL, content_digest TEXT NOT NULL, payload BLOB NOT NULL, priority INTEGER NOT NULL, PRIMARY KEY(run_id,sequence), UNIQUE(run_id,event_id));
 CREATE TABLE IF NOT EXISTS runtime_records(runtime_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, provider_id TEXT NOT NULL, spec_digest TEXT NOT NULL, provider_object_id TEXT, generation INTEGER NOT NULL, state TEXT NOT NULL, process_identity TEXT, metadata BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS credential_profiles(profile_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, adapter_id TEXT NOT NULL, kind TEXT NOT NULL, nonce BLOB NOT NULL, ciphertext BLOB NOT NULL, metadata BLOB NOT NULL, UNIQUE(profile_id,revision));
 CREATE TABLE IF NOT EXISTS storage_objects(object_id TEXT PRIMARY KEY, class TEXT NOT NULL, path BLOB NOT NULL, size_bytes INTEGER NOT NULL, pinned INTEGER NOT NULL DEFAULT 0, custody_count INTEGER NOT NULL DEFAULT 1, contains_credentials INTEGER NOT NULL DEFAULT 0, collected INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS content_objects(digest TEXT PRIMARY KEY, size_bytes INTEGER NOT NULL, path BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS reconciliation_plans(plan_id TEXT PRIMARY KEY, connection_epoch INTEGER NOT NULL, payload_digest TEXT NOT NULL, plan BLOB NOT NULL, state TEXT NOT NULL, completed_at INTEGER);
-INSERT OR IGNORE INTO schema_migrations(version) VALUES(1);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3);
 COMMIT;"#).map_err(map_sql)
 }
 
@@ -762,6 +1048,11 @@ mod tests {
             s.receive(Direction::ControlToNode, &one).unwrap(),
             ReceiveResult::Applied
         );
+        assert_eq!(
+            s.receive(Direction::ControlToNode, &one).unwrap(),
+            ReceiveResult::DuplicatePending
+        );
+        s.mark_inbound_applied(Direction::ControlToNode, 1).unwrap();
         assert_eq!(
             s.receive(Direction::ControlToNode, &one).unwrap(),
             ReceiveResult::Duplicate
@@ -867,7 +1158,75 @@ mod tests {
         .unwrap();
         assert!(matches!(
             NodeStore::open(d.path()),
-            Err(StoreError::Corrupt(_)) | Err(StoreError::Unavailable(_))
+            Err(StoreError::Corrupt(_))
+                | Err(StoreError::Unavailable(_))
+                | Err(StoreError::Invalid(_))
+        ));
+    }
+    #[test]
+    fn atomic_admission_replays_immutable_execution_inputs() {
+        let d = tempdir().unwrap();
+        let s = NodeStore::open(d.path()).unwrap();
+        let key = "immutable-idempotency-key";
+        let first = s
+            .admit_operation(
+                "op_12345678",
+                key,
+                &digest(4),
+                b"manifest",
+                7,
+                "native",
+                "project_full",
+                "never",
+                b"runtime-v1",
+                b"launch-v1",
+                b"receipt-v1",
+            )
+            .unwrap();
+        assert!(matches!(first, AdmissionResult::Admitted(_)));
+        drop(s);
+        let s = NodeStore::open(d.path()).unwrap();
+        let replay = s
+            .admit_operation(
+                "op_12345678",
+                key,
+                &digest(4),
+                b"changed-manifest",
+                99,
+                "docker",
+                "full_device",
+                "always",
+                b"runtime-v2",
+                b"launch-v2",
+                b"receipt-v2",
+            )
+            .unwrap();
+        let AdmissionResult::Replay(saved) = replay else {
+            panic!("expected replay")
+        };
+        assert_eq!(saved.provider_id, "native");
+        assert_eq!(saved.operation.local_policy_revision, 7);
+        assert_eq!(saved.runtime_request, b"runtime-v1");
+        assert_eq!(saved.launch_plan, b"launch-v1");
+        assert_eq!(saved.admission_receipt, b"receipt-v1");
+    }
+    #[test]
+    fn future_schema_version_is_rejected() {
+        let d = tempdir().unwrap();
+        let conn = Connection::open(d.path().join("node.sqlite3")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL); INSERT INTO schema_migrations VALUES(999, 0);",
+        )
+        .unwrap();
+        drop(conn);
+        fs::set_permissions(
+            d.path().join("node.sqlite3"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        assert!(matches!(
+            NodeStore::open(d.path()),
+            Err(StoreError::Invalid(message)) if message.contains("newer than supported")
         ));
     }
 }

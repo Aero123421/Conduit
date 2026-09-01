@@ -33,6 +33,9 @@ impl ContainerProvider {
     fn name(id: &str) -> String {
         format!("conduit-{}", id.trim_start_matches("rt_"))
     }
+    fn tracked_launch_available(&self) -> bool {
+        false
+    }
     fn inspect_labels(&self, name: &str) -> Result<(String, String, bool), RuntimeError> {
         let args=vec!["inspect".into(),"--format".into(),"{{index .Config.Labels \"dev.conduit.runtime-id\"}}|{{index .Config.Labels \"dev.conduit.spec-digest\"}}|{{.State.Running}}".into(),name.into()];
         let o = self.run(&args, Duration::from_secs(10))?;
@@ -62,32 +65,46 @@ impl RuntimeProvider for ContainerProvider {
         Ok(CapabilityReceipt {
             provider_id: self.provider_id().into(),
             provider_version: version(self.backend.program()),
-            capabilities: vec![CapabilityEvidence {
-                capability: "container_boundary".into(),
-                state: if effective {
-                    CapabilityState::Effective
-                } else {
-                    CapabilityState::Unavailable
-                },
-                source: "provider_info_live_probe".into(),
-                reason_code: if effective {
-                    "daemon_reachable"
-                } else {
-                    "daemon_unavailable"
-                }
-                .into(),
-                detail: "provider info completed; per-runtime limits are verified separately"
+            capabilities: vec![
+                CapabilityEvidence {
+                    capability: "container_boundary".into(),
+                    state: if effective {
+                        CapabilityState::Effective
+                    } else {
+                        CapabilityState::Unavailable
+                    },
+                    source: "provider_info_live_probe".into(),
+                    reason_code: if effective {
+                        "daemon_reachable"
+                    } else {
+                        "daemon_unavailable"
+                    }
                     .into(),
-            }],
+                    detail: "provider info completed; per-runtime limits are verified separately"
+                        .into(),
+                },
+                CapabilityEvidence {
+                    capability: "tracked_launch_plan".into(),
+                    state: CapabilityState::Unavailable,
+                    source: "container_exec_adapter".into(),
+                    reason_code: "exec_identity_backend_unavailable".into(),
+                    detail: "Running is not reported without tracked LaunchPlan completion".into(),
+                },
+            ],
         })
     }
     fn prepare(&self, r: &RuntimeRequest) -> Result<PreparedRuntime, RuntimeError> {
-        validate_request(r, RuntimeKind::Container)?;
+        validate_request(r, RuntimeKind::Container, &[self.provider_id()])?;
         if self.probe()?.capabilities[0].state != CapabilityState::Effective {
             return Err(RuntimeError::CapabilityUnavailable(format!(
                 "{} service",
                 self.provider_id()
             )));
+        }
+        if !self.tracked_launch_available() {
+            return Err(RuntimeError::CapabilityUnavailable(
+                "tracked container LaunchPlan execution".into(),
+            ));
         }
         let image = r
             .image
@@ -180,27 +197,19 @@ impl RuntimeProvider for ContainerProvider {
     fn start(
         &self,
         p: &PreparedRuntime,
-        _: &LaunchPlan,
+        _launch: &LaunchPlan,
     ) -> Result<RuntimeStateReceipt, RuntimeError> {
-        let o = self.run(
-            &["start".into(), p.object_id.clone()],
-            Duration::from_secs(30),
-        )?;
-        if !o.status.success() {
-            return Err(RuntimeError::Provider {
-                code: "container_start_failed".into(),
-            });
+        if p.provider_id != self.provider_id() {
+            return Err(RuntimeError::IdentityMismatch);
         }
-        let h = RuntimeHandle {
-            runtime_id: p.runtime_id.clone(),
-            provider_id: self.provider_id().into(),
-            spec_digest: p.spec_digest.clone(),
-            object_id: p.object_id.clone(),
-            process_identity: None,
-        };
-        self.inspect(&h)
+        Err(RuntimeError::CapabilityUnavailable(
+            "tracked container LaunchPlan execution requires an exec identity backend".into(),
+        ))
     }
     fn inspect(&self, h: &RuntimeHandle) -> Result<RuntimeStateReceipt, RuntimeError> {
+        if h.provider_id != self.provider_id() || h.object_id != Self::name(&h.runtime_id) {
+            return Err(RuntimeError::IdentityMismatch);
+        }
         let (id, digest, running) = self.inspect_labels(&h.object_id)?;
         if id != h.runtime_id || digest != h.spec_digest {
             return Err(RuntimeError::IdentityMismatch);
@@ -221,6 +230,7 @@ impl RuntimeProvider for ContainerProvider {
         h: &RuntimeHandle,
         s: RuntimeSignal,
     ) -> Result<RuntimeStateReceipt, RuntimeError> {
+        self.inspect(h)?;
         let op = match s {
             RuntimeSignal::GracefulStop => "stop",
             RuntimeSignal::ForceStop => "kill",
@@ -236,8 +246,14 @@ impl RuntimeProvider for ContainerProvider {
         self.inspect(h)
     }
     fn snapshot(&self, h: &RuntimeHandle, name: &str) -> Result<SnapshotReceipt, RuntimeError> {
-        if name.len() > 128 {
-            return Err(RuntimeError::Invalid("snapshot name too long".into()));
+        self.inspect(h)?;
+        if name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        {
+            return Err(RuntimeError::Invalid("invalid snapshot name".into()));
         }
         let image = format!(
             "conduit-snapshot:{}-{}",
@@ -253,27 +269,56 @@ impl RuntimeProvider for ContainerProvider {
                 code: "container_snapshot_failed".into(),
             });
         }
+        let inspected = self.run(
+            &[
+                "image".into(),
+                "inspect".into(),
+                "--format".into(),
+                "{{.Id}}".into(),
+                image,
+            ],
+            Duration::from_secs(30),
+        )?;
+        if !inspected.status.success() {
+            return Err(RuntimeError::Provider {
+                code: "container_snapshot_digest_unavailable".into(),
+            });
+        }
+        let raw = String::from_utf8_lossy(&inspected.stdout);
+        let digest = raw
+            .trim()
+            .strip_prefix("sha256:")
+            .ok_or_else(|| RuntimeError::Provider {
+                code: "container_snapshot_digest_invalid".into(),
+            })?
+            .to_owned();
+        if digest.len() != 64 || !digest.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(RuntimeError::Provider {
+                code: "container_snapshot_digest_invalid".into(),
+            });
+        }
         Ok(SnapshotReceipt {
             runtime_id: h.runtime_id.clone(),
-            snapshot_id: format!("snap_{}", &digest_bytes(image.as_bytes())[..16]),
-            digest: digest_bytes(image.as_bytes()),
+            snapshot_id: format!("snap_{}", &digest[..16]),
+            digest,
             bytes: None,
         })
     }
     fn collect(&self, h: &RuntimeHandle) -> Result<CollectionReceipt, RuntimeError> {
-        let evidence = format!("{}:{}", h.runtime_id, h.spec_digest);
-        Ok(CollectionReceipt {
-            runtime_id: h.runtime_id.clone(),
-            collection_id: format!("collect_{}", &digest_bytes(evidence.as_bytes())[..16]),
-            custody_complete: true,
-            digest: digest_bytes(evidence.as_bytes()),
-        })
+        if h.provider_id != self.provider_id() {
+            return Err(RuntimeError::IdentityMismatch);
+        }
+        Err(RuntimeError::CapabilityUnavailable(format!(
+            "container collection target is not configured for {}",
+            h.runtime_id
+        )))
     }
     fn destroy(
         &self,
         h: &RuntimeHandle,
         r: &DestroyRequest,
     ) -> Result<DestroyReceipt, RuntimeError> {
+        self.inspect(h)?;
         if !r.custody_complete && !r.discard_authorized {
             return Err(RuntimeError::Invalid("collection receipt required".into()));
         }

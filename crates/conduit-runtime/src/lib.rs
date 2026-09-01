@@ -13,7 +13,14 @@ pub use restricted::RestrictedNativeProvider;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, path::PathBuf, process::Command, time::Duration};
+use std::{
+    collections::BTreeMap,
+    io::Read,
+    os::unix::process::CommandExt,
+    path::PathBuf,
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -110,6 +117,7 @@ pub struct RuntimeRequest {
     pub runtime_id: String,
     pub run_id: String,
     pub kind: RuntimeKind,
+    pub provider_selector: String,
     pub spec_digest: String,
     pub image: Option<String>,
     pub resources: ResourceLimits,
@@ -232,14 +240,37 @@ pub enum RuntimeSignal {
 pub(crate) fn validate_request(
     request: &RuntimeRequest,
     kind: RuntimeKind,
+    provider_ids: &[&str],
 ) -> Result<(), RuntimeError> {
     if request.kind != kind {
         return Err(RuntimeError::Invalid(
             "runtime kind does not match provider".into(),
         ));
     }
-    if !request.runtime_id.starts_with("rt_") || request.runtime_id.len() < 11 {
+    if !provider_ids.contains(&request.provider_selector.as_str()) {
+        return Err(RuntimeError::Invalid(
+            "runtime provider selector does not match provider".into(),
+        ));
+    }
+    if !request.runtime_id.starts_with("rt_")
+        || request.runtime_id.len() < 11
+        || request.runtime_id.len() > 131
+        || !request
+            .runtime_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
         return Err(RuntimeError::Invalid("invalid Runtime ID".into()));
+    }
+    if !(request.run_id.starts_with("run_") || request.run_id.starts_with("lrun_"))
+        || request.run_id.len() < 12
+        || request.run_id.len() > 132
+        || !request
+            .run_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(RuntimeError::Invalid("invalid Run ID".into()));
     }
     if request.spec_digest.len() != 64
         || !request
@@ -255,7 +286,20 @@ pub(crate) fn validate_request(
                 "workspace paths must be absolute".into(),
             ));
         }
-        let s = w.host_path.to_string_lossy();
+        let canonical = std::fs::canonicalize(&w.host_path)
+            .map_err(|_| RuntimeError::Invalid("workspace host path cannot be resolved".into()))?;
+        if canonical != w.host_path {
+            return Err(RuntimeError::Invalid(
+                "workspace host path must be canonical".into(),
+            ));
+        }
+        let s = canonical.to_string_lossy();
+        let guest = w.guest_path.to_string_lossy();
+        if s.contains([',', '\n', '\r', '\0']) || guest.contains([',', '\n', '\r', '\0']) {
+            return Err(RuntimeError::Invalid(
+                "workspace mount path contains a provider delimiter".into(),
+            ));
+        }
         if s == "/" || s == std::env::var("HOME").unwrap_or_default() {
             return Err(RuntimeError::Invalid(
                 "broad host mounts are forbidden".into(),
@@ -276,17 +320,63 @@ pub(crate) fn command_output(
     mut command: Command,
     timeout: Duration,
 ) -> Result<std::process::Output, RuntimeError> {
-    use std::sync::mpsc;
-    let (tx, rx) = mpsc::sync_channel(1);
-    std::thread::spawn(move || {
-        let _ = tx.send(command.output());
-    });
-    match rx.recv_timeout(timeout) {
-        Ok(v) => v.map_err(RuntimeError::Io),
-        Err(_) => Err(RuntimeError::Provider {
-            code: "provider_timeout".into(),
-        }),
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setpgid(0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
+    let mut child = command.spawn()?;
+    let pid = child.id() as i32;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| RuntimeError::Record("provider stdout unavailable".into()))?;
+    let mut stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| RuntimeError::Record("provider stderr unavailable".into()))?;
+    let out = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stdout.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let err = std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        stderr.read_to_end(&mut bytes).map(|_| bytes)
+    });
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= timeout {
+            unsafe {
+                libc::kill(-pid, libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = out.join();
+            let _ = err.join();
+            return Err(RuntimeError::Provider {
+                code: "provider_timeout_killed".into(),
+            });
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = out
+        .join()
+        .map_err(|_| RuntimeError::Record("provider stdout reader panicked".into()))??;
+    let stderr = err
+        .join()
+        .map_err(|_| RuntimeError::Record("provider stderr reader panicked".into()))??;
+    Ok(std::process::Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 pub(crate) fn version(program: &str) -> Option<String> {
     let mut c = Command::new(program);
@@ -304,4 +394,63 @@ pub(crate) fn version(program: &str) -> Option<String> {
 }
 pub(crate) fn digest_bytes(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn request(path: PathBuf) -> RuntimeRequest {
+        RuntimeRequest {
+            runtime_id: "rt_contract_01".into(),
+            run_id: "run_contract_01".into(),
+            kind: RuntimeKind::Container,
+            provider_selector: "docker".into(),
+            spec_digest: "44".repeat(32),
+            image: Some("example.invalid/image@sha256:00".into()),
+            resources: ResourceLimits {
+                cpu: None,
+                memory_bytes: None,
+                pid_limit: None,
+                storage_bytes: None,
+            },
+            network: NetworkMode::Offline,
+            workspaces: vec![WorkspaceAttachment {
+                host_path: path,
+                guest_path: "/workspace".into(),
+                read_only: true,
+            }],
+        }
+    }
+
+    #[test]
+    fn provider_timeout_kills_and_waits() {
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", "sleep 30"]);
+        let started = Instant::now();
+        assert!(matches!(
+            command_output(command, Duration::from_millis(20)),
+            Err(RuntimeError::Provider { code }) if code == "provider_timeout_killed"
+        ));
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    #[test]
+    fn mounts_require_canonical_custody_and_reject_delimiters_and_sockets() {
+        let d = tempdir().unwrap();
+        let real = d.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = d.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        assert!(validate_request(&request(alias), RuntimeKind::Container, &["docker"]).is_err());
+        let delimited = d.path().join("comma,name");
+        std::fs::create_dir(&delimited).unwrap();
+        assert!(
+            validate_request(&request(delimited), RuntimeKind::Container, &["docker"]).is_err()
+        );
+        let socket = d.path().join("docker.sock");
+        std::fs::create_dir(&socket).unwrap();
+        assert!(validate_request(&request(socket), RuntimeKind::Container, &["docker"]).is_err());
+    }
 }

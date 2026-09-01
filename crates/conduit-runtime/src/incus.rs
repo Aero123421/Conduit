@@ -30,6 +30,9 @@ impl IncusProvider {
     fn name(id: &str) -> String {
         format!("conduit-{}", id.trim_start_matches("rt_"))
     }
+    fn tracked_guest_launch_available(&self) -> bool {
+        false
+    }
     fn inspect_json(&self, name: &str) -> Result<Value, RuntimeError> {
         let o = self.run(
             &["list".into(), name.into(), "--format=json".into()],
@@ -92,28 +95,24 @@ impl RuntimeProvider for IncusProvider {
                 },
                 CapabilityEvidence {
                     capability: "guest_exec".into(),
-                    state: if live {
-                        CapabilityState::Supported
-                    } else {
-                        CapabilityState::Unavailable
-                    },
+                    state: CapabilityState::Unavailable,
                     source: "incus_service_probe".into(),
-                    reason_code: if live {
-                        "incus_agent_path_supported"
-                    } else {
-                        "incus_unreachable"
-                    }
-                    .into(),
-                    detail: "effective only after instance exec succeeds".into(),
+                    reason_code: "versioned_guest_agent_unavailable".into(),
+                    detail: "no tracked guest-agent execution contract is installed".into(),
                 },
             ],
         })
     }
     fn prepare(&self, r: &RuntimeRequest) -> Result<PreparedRuntime, RuntimeError> {
-        validate_request(r, RuntimeKind::Vm)?;
+        validate_request(r, RuntimeKind::Vm, &["incus_kvm", "incus.kvm"])?;
         if self.probe()?.capabilities[0].state != CapabilityState::Effective {
             return Err(RuntimeError::CapabilityUnavailable(
                 "Incus KVM prerequisites".into(),
+            ));
+        }
+        if !self.tracked_guest_launch_available() {
+            return Err(RuntimeError::CapabilityUnavailable(
+                "tracked VM LaunchPlan execution through a versioned guest agent".into(),
             ));
         }
         let image = r
@@ -170,6 +169,24 @@ impl RuntimeProvider for IncusProvider {
                 code: "incus_vm_init_failed".into(),
             });
         }
+        if r.network == NetworkMode::Offline {
+            let removed = self.run(
+                &[
+                    "config".into(),
+                    "device".into(),
+                    "remove".into(),
+                    name.clone(),
+                    "eth0".into(),
+                ],
+                Duration::from_secs(30),
+            )?;
+            if !removed.status.success() {
+                let _ = self.run(&["delete".into(), name.clone()], Duration::from_secs(30));
+                return Err(RuntimeError::Provider {
+                    code: "incus_offline_network_not_enforced".into(),
+                });
+            }
+        }
         Ok(PreparedRuntime {
             runtime_id: r.runtime_id.clone(),
             provider_id: self.provider_id().into(),
@@ -188,48 +205,19 @@ impl RuntimeProvider for IncusProvider {
     fn start(
         &self,
         p: &PreparedRuntime,
-        _: &LaunchPlan,
+        _launch: &LaunchPlan,
     ) -> Result<RuntimeStateReceipt, RuntimeError> {
-        let o = self.run(
-            &["start".into(), p.object_id.clone()],
-            Duration::from_secs(120),
-        )?;
-        if !o.status.success() {
-            return Err(RuntimeError::Provider {
-                code: "incus_vm_start_failed".into(),
-            });
+        if p.provider_id != self.provider_id() {
+            return Err(RuntimeError::IdentityMismatch);
         }
-        let mut ready = false;
-        for _ in 0..30 {
-            let o = self.run(
-                &[
-                    "exec".into(),
-                    p.object_id.clone(),
-                    "--".into(),
-                    "/bin/true".into(),
-                ],
-                Duration::from_secs(5),
-            );
-            if o.is_ok_and(|o| o.status.success()) {
-                ready = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_secs(1));
-        }
-        if !ready {
-            return Err(RuntimeError::Uncertain(
-                "VM started but guest exec liveness was not proven".into(),
-            ));
-        }
-        self.inspect(&RuntimeHandle {
-            runtime_id: p.runtime_id.clone(),
-            provider_id: self.provider_id().into(),
-            spec_digest: p.spec_digest.clone(),
-            object_id: p.object_id.clone(),
-            process_identity: None,
-        })
+        Err(RuntimeError::CapabilityUnavailable(
+            "tracked VM LaunchPlan execution requires a versioned guest-agent identity".into(),
+        ))
     }
     fn inspect(&self, h: &RuntimeHandle) -> Result<RuntimeStateReceipt, RuntimeError> {
+        if h.provider_id != self.provider_id() || h.object_id != Self::name(&h.runtime_id) {
+            return Err(RuntimeError::IdentityMismatch);
+        }
         let v = self.inspect_json(&h.object_id)?;
         let (id, d, status) = Self::metadata(&v);
         if id != Some(h.runtime_id.as_str()) || d != Some(h.spec_digest.as_str()) {
@@ -253,6 +241,7 @@ impl RuntimeProvider for IncusProvider {
         h: &RuntimeHandle,
         s: RuntimeSignal,
     ) -> Result<RuntimeStateReceipt, RuntimeError> {
+        self.inspect(h)?;
         let args = match s {
             RuntimeSignal::GracefulStop => {
                 vec!["stop".into(), h.object_id.clone(), "--timeout=30".into()]
@@ -270,43 +259,35 @@ impl RuntimeProvider for IncusProvider {
         self.inspect(h)
     }
     fn snapshot(&self, h: &RuntimeHandle, name: &str) -> Result<SnapshotReceipt, RuntimeError> {
+        if h.provider_id != self.provider_id() {
+            return Err(RuntimeError::IdentityMismatch);
+        }
         if name.is_empty()
             || name.len() > 64
             || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
         {
             return Err(RuntimeError::Invalid("invalid snapshot name".into()));
         }
-        let o = self.run(
-            &["snapshot".into(), h.object_id.clone(), name.into()],
-            Duration::from_secs(120),
-        )?;
-        if !o.status.success() {
-            return Err(RuntimeError::Provider {
-                code: "incus_snapshot_failed".into(),
-            });
-        }
-        let identity = format!("{}/{name}:{}", h.object_id, h.spec_digest);
-        Ok(SnapshotReceipt {
-            runtime_id: h.runtime_id.clone(),
-            snapshot_id: format!("snap_{}", &digest_bytes(identity.as_bytes())[..16]),
-            digest: digest_bytes(identity.as_bytes()),
-            bytes: None,
-        })
+        let _ = (h, name);
+        Err(RuntimeError::CapabilityUnavailable(
+            "Incus snapshot digest custody requires archive export".into(),
+        ))
     }
     fn collect(&self, h: &RuntimeHandle) -> Result<CollectionReceipt, RuntimeError> {
-        let evidence = format!("incus:{}:{}", h.object_id, h.spec_digest);
-        Ok(CollectionReceipt {
-            runtime_id: h.runtime_id.clone(),
-            collection_id: format!("collect_{}", &digest_bytes(evidence.as_bytes())[..16]),
-            custody_complete: true,
-            digest: digest_bytes(evidence.as_bytes()),
-        })
+        if h.provider_id != self.provider_id() {
+            return Err(RuntimeError::IdentityMismatch);
+        }
+        Err(RuntimeError::CapabilityUnavailable(format!(
+            "VM collection target is not configured for {}",
+            h.runtime_id
+        )))
     }
     fn destroy(
         &self,
         h: &RuntimeHandle,
         r: &DestroyRequest,
     ) -> Result<DestroyReceipt, RuntimeError> {
+        self.inspect(h)?;
         if !r.custody_complete && !r.discard_authorized {
             return Err(RuntimeError::Invalid("collection receipt required".into()));
         }

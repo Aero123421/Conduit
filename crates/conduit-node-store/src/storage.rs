@@ -53,9 +53,15 @@ impl StorageManager {
         for p in [&hot, &archive, &backup, &cache] {
             fs::create_dir_all(p)?;
         }
+        let roots = [
+            fs::canonicalize(hot)?,
+            fs::canonicalize(archive)?,
+            fs::canonicalize(backup)?,
+            fs::canonicalize(cache)?,
+        ];
         Ok(Self {
             store,
-            roots: [hot, archive, backup, cache],
+            roots,
             quotas,
         })
     }
@@ -81,8 +87,34 @@ impl StorageManager {
             .map_err(map_sql)
     }
     pub fn reserve(&self, object: &StorageObject) -> Result<(), StoreError> {
+        validate_object_id(&object.object_id)?;
+        if object.custody_count == 0 {
+            return Err(StoreError::Invalid(
+                "storage object must have custody".into(),
+            ));
+        }
+        if !object.path.is_absolute() || !object.path.starts_with(self.root(object.class)) {
+            return Err(StoreError::Invalid(
+                "storage path is outside its class root".into(),
+            ));
+        }
+        if object.path.to_string_lossy().contains(['\n', '\r', '\0']) {
+            return Err(StoreError::Invalid(
+                "storage path contains a delimiter".into(),
+            ));
+        }
+        if let Some(parent) = object.path.parent() {
+            let canonical = fs::canonicalize(parent)?;
+            if !canonical.starts_with(self.root(object.class)) {
+                return Err(StoreError::Invalid(
+                    "storage path parent escaped class root".into(),
+                ));
+            }
+        }
         let i = Self::index(object.class);
-        if self.used(object.class)?.saturating_add(object.size_bytes) > self.quotas[i] {
+        if self.used(object.class)?.saturating_add(object.size_bytes) > self.quotas[i]
+            || free_bytes(self.root(object.class))? < object.size_bytes
+        {
             return Err(StoreError::Exhausted);
         }
         self.store.conn()?.execute("INSERT INTO storage_objects(object_id,class,path,size_bytes,pinned,custody_count,contains_credentials,collected) VALUES(?1,?2,?3,?4,?5,?6,?7,?8)",params![object.object_id,object.class.as_str(),object.path.as_os_str().as_encoded_bytes(),object.size_bytes,object.pinned,object.custody_count,object.contains_credentials,object.collected]).map_err(map_sql)?;
@@ -112,6 +144,7 @@ impl StorageManager {
         Ok(())
     }
     pub fn move_class(&self, id: &str, to: StorageClass) -> Result<PathBuf, StoreError> {
+        validate_object_id(id)?;
         let row: Option<(Vec<u8>, u64)> = self
             .store
             .conn()?
@@ -123,21 +156,66 @@ impl StorageManager {
             .optional()
             .map_err(map_sql)?;
         let (raw, size) = row.ok_or(StoreError::NotFound)?;
-        if self.used(to)?.saturating_add(size) > self.quotas[Self::index(to)] {
+        if self.used(to)?.saturating_add(size) > self.quotas[Self::index(to)]
+            || free_bytes(self.root(to))? < size
+        {
             return Err(StoreError::Exhausted);
         }
         let from = PathBuf::from(std::ffi::OsString::from_vec(raw));
+        let canonical = fs::canonicalize(&from)?;
+        if !self.roots.iter().any(|r| canonical.starts_with(r)) {
+            return Err(StoreError::Invalid(
+                "stored path escaped configured roots".into(),
+            ));
+        }
         let dest = self.root(to).join(id);
+        if dest.exists() {
+            return Err(StoreError::Invalid(
+                "storage destination already exists".into(),
+            ));
+        }
+        let conn = self.store.conn()?;
         fs::rename(&from, &dest)?;
-        self.store
-            .conn()?
+        if let Err(error) = conn
             .execute(
                 "UPDATE storage_objects SET class=?2,path=?3 WHERE object_id=?1",
                 params![id, to.as_str(), dest.as_os_str().as_encoded_bytes()],
             )
-            .map_err(map_sql)?;
+            .map_err(map_sql)
+        {
+            fs::rename(&dest, &from).map_err(|rollback| {
+                StoreError::Corrupt(format!(
+                    "storage metadata update failed ({error}); rollback failed ({rollback})"
+                ))
+            })?;
+            return Err(error);
+        }
         Ok(dest)
     }
+}
+fn validate_object_id(id: &str) -> Result<(), StoreError> {
+    let suffix = id
+        .strip_prefix("obj_")
+        .ok_or_else(|| StoreError::Invalid("invalid storage object ID".into()))?;
+    if !(8..=128).contains(&suffix.len())
+        || !suffix
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+    {
+        return Err(StoreError::Invalid("invalid storage object ID".into()));
+    }
+    Ok(())
+}
+fn free_bytes(path: &Path) -> Result<u64, StoreError> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| StoreError::Invalid("storage root contains NUL".into()))?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(c.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return Err(StoreError::Io(std::io::Error::last_os_error()));
+    }
+    let stat = unsafe { stat.assume_init() };
+    Ok(stat.f_bavail.saturating_mul(stat.f_frsize))
 }
 
 #[cfg(test)]

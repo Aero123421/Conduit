@@ -18,21 +18,22 @@ const readPermissions: Partial<Record<ResourceName, string>> = {
 const writePermissions: Partial<Record<ResourceName, string>> = { projects: "config.write", sources: "config.write", locations: "config.write", sessions: "board.write", messages: "board.write", project_agents: "config.write", assignments: "assignment.create", runs: "run.start", tasks: "board.write", artifacts: "artifact.upload" };
 
 export const CLI_CONTROL_PLANE_ROUTE_MANIFEST = [
-  ["POST", "/v1/auth/passkeys/register"], ["POST", "/v1/auth/login"], ["POST", "/v1/auth/logout"], ["GET", "/v1/auth/status"], ["POST", "/v1/auth/recovery"], ["DELETE", "/v1/auth/passkeys/revoke"],
-  ["GET", "/v1/devices"], ["GET", "/v1/devices/dev_contract01"], ["DELETE", "/v1/devices/revoke"],
-  ["POST", "/v1/projects"], ["GET", "/v1/projects"], ["GET", "/v1/projects/prj_contract01"], ["POST", "/v1/projects/sources"], ["PATCH", "/v1/projects"],
-  ["POST", "/v1/sessions"], ["GET", "/v1/sessions"], ["GET", "/v1/sessions/csess_contract01"], ["POST", "/v1/sessions/accept"],
-  ["POST", "/v1/board/messages"], ["GET", "/v1/board/messages/msg_contract01"], ["GET", "/v1/board/search"], ["PATCH", "/v1/board/messages"],
-  ["POST", "/v1/agents"], ["GET", "/v1/agents"], ["GET", "/v1/agents/pagent_contract01"], ["DELETE", "/v1/agents"],
-  ["POST", "/v1/assignments"], ["GET", "/v1/assignments/asg_contract01"], ["POST", "/v1/assignments/cancel"], ["POST", "/v1/assignments/input"], ["POST", "/v1/assignments/steer"],
-  ["GET", "/v1/runs"], ["GET", "/v1/runs/run_contract01"], ["GET", "/v1/runs/run_contract01/events"], ["POST", "/v1/runs/pause"], ["POST", "/v1/runs/resume"], ["POST", "/v1/runs/cancel"], ["POST", "/v1/runs/recover"],
-  ["POST", "/v1/quick/command"], ["POST", "/v1/quick/agent"], ["POST", "/v1/quick/vm"],
-  ["POST", "/v1/tasks"], ["GET", "/v1/tasks"], ["GET", "/v1/tasks/task_contract01"], ["PATCH", "/v1/tasks"], ["POST", "/v1/tasks/link"],
-  ["POST", "/v1/evaluations"], ["GET", "/v1/evaluations/evid_contract01"], ["GET", "/v1/evaluations/compare"],
-  ["POST", "/v1/connectors"], ["GET", "/v1/connectors"], ["GET", "/v1/connectors/grant_contract01"], ["POST", "/v1/connectors/pause"], ["POST", "/v1/connectors/resume"], ["DELETE", "/v1/connectors"], ["PATCH", "/v1/connectors/policy"],
+  ["POST", "/v1/auth/setup/options"], ["POST", "/v1/auth/setup/verify"], ["POST", "/v1/auth/login/options"], ["POST", "/v1/auth/login/verify"], ["POST", "/v1/auth/passkeys/options"], ["POST", "/v1/auth/passkeys/verify"], ["POST", "/v1/auth/recovery"], ["POST", "/v1/auth/passkeys/passkey_contract01/revoke"],
+  ["GET", "/v1/devices"], ["GET", "/v1/devices/dev_contract01"], ["POST", "/v1/devices/dev_contract01/revoke"],
+  ["POST", "/v1/projects"], ["GET", "/v1/projects"], ["GET", "/v1/projects/prj_contract01"], ["PATCH", "/v1/projects/prj_contract01"], ["POST", "/v1/sources"],
+  ["POST", "/v1/sessions"], ["GET", "/v1/sessions"], ["GET", "/v1/sessions/csess_contract01"], ["PATCH", "/v1/sessions/csess_contract01"],
+  ["POST", "/v1/messages"], ["GET", "/v1/messages/msg_contract01"], ["GET", "/v1/messages"], ["PATCH", "/v1/messages/msg_contract01"],
+  ["POST", "/v1/project_agents"], ["GET", "/v1/project_agents"], ["GET", "/v1/project_agents/pagent_contract01"], ["PATCH", "/v1/project_agents/pagent_contract01"],
+  ["POST", "/v1/assignments"], ["GET", "/v1/assignments/asg_contract01"], ["POST", "/v1/assignments/asg_contract01/transitions"],
+  ["GET", "/v1/runs"], ["GET", "/v1/runs/run_contract01"], ["GET", "/v1/runs/run_contract01/events"], ["POST", "/v1/operations"],
+  ["POST", "/v1/tasks"], ["GET", "/v1/tasks"], ["GET", "/v1/tasks/task_contract01"], ["PATCH", "/v1/tasks/task_contract01"],
+  ["GET", "/v1/evidence/evid_contract01"], ["GET", "/v1/evidence"],
+  ["POST", "/v1/connector-policies"], ["PATCH", "/v1/connector-policies/cpol_contract01"],
+  ["POST", "/v1/oauth/grants/grant_contract01/pause"], ["POST", "/v1/oauth/grants/grant_contract01/resume"], ["POST", "/v1/oauth/grants/grant_contract01/revoke"], ["POST", "/v1/oauth/grants/grant_contract01/reauthorize"],
+  ["POST", "/v1/artifacts"], ["GET", "/v1/artifacts"], ["GET", "/v1/artifacts/art_contract01"], ["PUT", "/v1/artifacts/art_contract01/content"],
 ] as const;
 
-const cliCompatibilityPaths = new Set([
+const legacyCompatibilityPaths = new Set([
   "POST /v1/auth/logout", "GET /v1/auth/status", "DELETE /v1/auth/passkeys/revoke", "DELETE /v1/devices/revoke", "PATCH /v1/projects", "POST /v1/sessions/accept", "GET /v1/board/search", "PATCH /v1/messages", "DELETE /v1/project_agents",
   "POST /v1/assignments/cancel", "POST /v1/assignments/input", "POST /v1/assignments/steer", "POST /v1/runs/pause", "POST /v1/runs/resume", "POST /v1/runs/cancel", "POST /v1/runs/recover",
   "POST /v1/quick/command", "POST /v1/quick/agent", "POST /v1/quick/vm", "PATCH /v1/tasks", "POST /v1/tasks/link", "POST /v1/evaluations", "GET /v1/evaluations/compare",
@@ -203,7 +204,7 @@ export async function handleApi(request: Request, env: ControlPlaneEnv, path: st
     const rows = await env.DB.prepare("SELECT * FROM normalized_events WHERE run_id=?1 ORDER BY CAST(sequence AS INTEGER) LIMIT 500").bind(runEvents[1]).all<Record<string, unknown>>();
     return Response.json({ items: rows.results });
   }
-  if (cliCompatibilityPaths.has(`${request.method} ${path}`) || (request.method === "GET" && /^\/v1\/connectors\/[^/]+$/.test(path))) {
+  if (legacyCompatibilityPaths.has(`${request.method} ${path}`) || (request.method === "GET" && /^\/v1\/connectors\/[^/]+$/.test(path))) {
     await actorFor(request, env, request.method !== "GET");
     throw new PublicError("invalid_request", 400, "This CLI route requires a targetId and typed payload; use the canonical resource URL documented by the control plane");
   }

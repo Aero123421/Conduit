@@ -1753,80 +1753,84 @@ impl NodeService {
             let Some(agent) = self.agents.get_mut(id) else {
                 continue;
             };
-            for journal in self.node.store().unqueued_agent_approvals(&agent.key)? {
-                let request_payload = journal.request_payload.ok_or_else(|| {
-                    ServiceError::Unavailable("approval_request_payload_missing".into())
-                })?;
-                let payload: Value = serde_json::from_slice(&request_payload)
-                    .map_err(|_| TransportError::Malformed)?;
-                let correlation_id = payload
-                    .get("operationId")
-                    .and_then(Value::as_str)
-                    .ok_or(TransportError::Malformed)?
-                    .to_owned();
-                let message_id = journal.approval_id.replacen("appr_", "nmsg_", 1);
-                client.session.queue_outbound(
-                    &message_id,
-                    "operation.approval_request",
-                    Some(correlation_id),
-                    payload,
-                    0,
-                )?;
-                self.node
-                    .store()
-                    .mark_agent_approval_requested(&journal.approval_id)?;
-            }
-            for journal in self.node.store().resolved_agent_approvals(&agent.key)? {
-                let frame =
-                    conduit_adapters::ProtocolFrame(journal.resolution.ok_or_else(|| {
-                        ServiceError::Unavailable("approval_response_missing".into())
-                    })?);
-                agent
-                    .child
-                    .write(&frame)
-                    .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
-                self.node
-                    .store()
-                    .mark_agent_approval_applied_and_resume(&journal.approval_id, &agent.key)?;
-            }
-            let (expired_frames, expired_events) = agent
-                .driver
-                .expire_codex_approvals(unix_ms_now())
-                .map_err(|error| ServiceError::Unavailable(adapter_reason(&error)))?;
-            for (frame, event) in expired_frames.into_iter().zip(expired_events) {
-                let provider_request_id = event
-                    .data
-                    .as_ref()
-                    .and_then(|data| data.get("providerRequestId"))
-                    .ok_or(TransportError::Malformed)?;
-                let encoded_id = serde_jcs::to_vec(provider_request_id)
-                    .map_err(|_| TransportError::Malformed)?;
-                let journal = self
-                    .node
-                    .store()
-                    .agent_approval_for_provider_request(&agent.key, &encoded_id)?
-                    .ok_or_else(|| ServiceError::Unavailable("approval_request_unknown".into()))?;
-                let timeout_authority = format!("local_timeout:{}", journal.expires_at_unix_ms);
-                self.node.store().record_agent_approval_resolution(
-                    &journal.approval_id,
-                    &frame.0,
-                    timeout_authority.as_bytes(),
-                )?;
-                agent
-                    .child
-                    .write(&frame)
-                    .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
-                self.node
-                    .store()
-                    .mark_agent_approval_applied_and_resume(&journal.approval_id, &agent.key)?;
-                agent.event_sequence = agent.event_sequence.saturating_add(1);
-                events.push(PendingEvent {
-                    key: agent.key.clone(),
-                    run_id: agent.run_id.clone(),
-                    operation_id: agent.operation_id.clone(),
-                    sequence: agent.event_sequence,
-                    event,
-                });
+            if agent.driver.state() != AdapterState::Failed {
+                for journal in self.node.store().unqueued_agent_approvals(&agent.key)? {
+                    let request_payload = journal.request_payload.ok_or_else(|| {
+                        ServiceError::Unavailable("approval_request_payload_missing".into())
+                    })?;
+                    let payload: Value = serde_json::from_slice(&request_payload)
+                        .map_err(|_| TransportError::Malformed)?;
+                    let correlation_id = payload
+                        .get("operationId")
+                        .and_then(Value::as_str)
+                        .ok_or(TransportError::Malformed)?
+                        .to_owned();
+                    let message_id = journal.approval_id.replacen("appr_", "nmsg_", 1);
+                    client.session.queue_outbound(
+                        &message_id,
+                        "operation.approval_request",
+                        Some(correlation_id),
+                        payload,
+                        0,
+                    )?;
+                    self.node
+                        .store()
+                        .mark_agent_approval_requested(&journal.approval_id)?;
+                }
+                for journal in self.node.store().resolved_agent_approvals(&agent.key)? {
+                    let frame =
+                        conduit_adapters::ProtocolFrame(journal.resolution.ok_or_else(|| {
+                            ServiceError::Unavailable("approval_response_missing".into())
+                        })?);
+                    agent
+                        .child
+                        .write(&frame)
+                        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                    self.node
+                        .store()
+                        .mark_agent_approval_applied_and_resume(&journal.approval_id, &agent.key)?;
+                }
+                let (expired_frames, expired_events) = agent
+                    .driver
+                    .expire_codex_approvals(unix_ms_now())
+                    .map_err(|error| ServiceError::Unavailable(adapter_reason(&error)))?;
+                for (frame, event) in expired_frames.into_iter().zip(expired_events) {
+                    let provider_request_id = event
+                        .data
+                        .as_ref()
+                        .and_then(|data| data.get("providerRequestId"))
+                        .ok_or(TransportError::Malformed)?;
+                    let encoded_id = serde_jcs::to_vec(provider_request_id)
+                        .map_err(|_| TransportError::Malformed)?;
+                    let journal = self
+                        .node
+                        .store()
+                        .agent_approval_for_provider_request(&agent.key, &encoded_id)?
+                        .ok_or_else(|| {
+                            ServiceError::Unavailable("approval_request_unknown".into())
+                        })?;
+                    let timeout_authority = format!("local_timeout:{}", journal.expires_at_unix_ms);
+                    self.node.store().record_agent_approval_resolution(
+                        &journal.approval_id,
+                        &frame.0,
+                        timeout_authority.as_bytes(),
+                    )?;
+                    agent
+                        .child
+                        .write(&frame)
+                        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                    self.node
+                        .store()
+                        .mark_agent_approval_applied_and_resume(&journal.approval_id, &agent.key)?;
+                    agent.event_sequence = agent.event_sequence.saturating_add(1);
+                    events.push(PendingEvent {
+                        key: agent.key.clone(),
+                        run_id: agent.run_id.clone(),
+                        operation_id: agent.operation_id.clone(),
+                        sequence: agent.event_sequence,
+                        event,
+                    });
+                }
             }
             for _ in 0..128 {
                 let record = match agent.child.try_read_record() {
@@ -1976,8 +1980,14 @@ impl NodeService {
                 });
             }
         }
+        let terminal_ids = terminals
+            .iter()
+            .map(|pending| pending.id.clone())
+            .collect::<BTreeSet<_>>();
         for pending in approvals {
-            self.queue_agent_approval(client, pending)?;
+            if approval_projection_allowed(&pending.operation_id, &terminal_ids) {
+                self.queue_agent_approval(client, pending)?;
+            }
         }
         for pending in events {
             let payload = visible_adapter_payload(&pending.event);
@@ -2133,23 +2143,20 @@ impl NodeService {
         reason: Option<&str>,
         last_sequence: u64,
     ) -> Result<(), ServiceError> {
-        let Some(agent) = self.agents.remove(id) else {
+        let Some(agent) = self.agents.get(id) else {
             return Ok(());
         };
-        self.node.store().transition_operation(
-            &agent.key,
-            OperationState::Running,
-            OperationState::Finishing,
-            None,
-            None,
-            None,
-        )?;
+        self.node.store().begin_agent_finalization(&agent.key)?;
+        let key = agent.key.clone();
+        let operation_id = agent.operation_id.clone();
+        let run_id = agent.run_id.clone();
+        let request_digest = agent.request_digest.clone();
         let state = match terminal {
             OperationState::Completed => "completed",
             OperationState::Cancelled => "cancelled",
             _ => "failed",
         };
-        let mut payload = json!({"operationId":agent.operation_id,"runId":agent.run_id,"state":state,"requestDigest":agent.request_digest,"lastRunEventSequence":last_sequence.to_string(),"observedAt":now()});
+        let mut payload = json!({"operationId":operation_id,"runId":run_id,"state":state,"requestDigest":request_digest,"lastRunEventSequence":last_sequence.to_string(),"observedAt":now()});
         if let Some(reason) = reason {
             payload["reasonCode"] = Value::String(reason.into());
             payload["resultSummary"] = json!({"adapterTerminal":reason});
@@ -2160,12 +2167,15 @@ impl NodeService {
         payload["receiptDigest"] = Value::String(digest);
         let bytes = serde_jcs::to_vec(&payload).map_err(|_| TransportError::Malformed)?;
         self.node
-            .terminal(&agent.key, OperationState::Finishing, terminal, &bytes)?;
+            .terminal(&key, OperationState::Finishing, terminal, &bytes)?;
+        self.agents
+            .remove(id)
+            .expect("agent remained present until durable terminalization");
         let message_id = self.message_id();
         client.session.queue_outbound(
             &message_id,
             "operation.terminal",
-            Some(agent.operation_id),
+            Some(operation_id),
             payload,
             0,
         )?;
@@ -2475,6 +2485,13 @@ fn adapter_operation_state(state: AdapterState) -> &'static str {
         AdapterState::Failed => "failed",
         AdapterState::RecoveryRequired => "recovery_required",
     }
+}
+
+fn approval_projection_allowed(
+    operation_id: &str,
+    terminal_operation_ids: &BTreeSet<String>,
+) -> bool {
+    !terminal_operation_ids.contains(operation_id)
 }
 
 fn terminal_state_name(state: OperationState) -> &'static str {
@@ -3164,7 +3181,234 @@ mod tests {
     }
 
     #[test]
+    fn terminal_same_poll_suppresses_new_approval_projection() {
+        let terminal_ids = BTreeSet::from(["op_terminal01".to_owned()]);
+        assert!(!approval_projection_allowed("op_terminal01", &terminal_ids));
+        assert!(approval_projection_allowed("op_running01", &terminal_ids));
+    }
+
+    #[test]
     fn failed_driver_terminates_waiting_child_before_durable_finalization() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = NodeStore::open(directory.path().join("store")).unwrap();
+        let identity = Arc::new(
+            DeviceIdentity::load_or_create(directory.path().join("identity/device.ed25519"))
+                .unwrap(),
+        );
+        let node = Arc::new(Node::new(store.clone()));
+        let local = Arc::new(
+            LocalServices::open(directory.path().join("local-services"), [7; 32]).unwrap(),
+        );
+        let supervisor = ProcessSupervisor::open(directory.path().join("supervisor")).unwrap();
+        let mut service = NodeService::new(
+            node,
+            identity,
+            "wss://control.example.invalid/connect".into(),
+            "dev_policy_01".into(),
+            "cd".repeat(32),
+            "node-boot-adapter-failure-0001".into(),
+            NodePolicyConfig {
+                local_policy: LocalPolicy {
+                    revision: 1,
+                    capabilities: vec![],
+                    providers: vec![],
+                    access_scopes: vec![],
+                    approval_modes: vec![],
+                    required_approval_risk_classes: vec![],
+                    launch_profiles: vec![],
+                    max_cpu: None,
+                    max_memory_bytes: None,
+                    max_storage_bytes: None,
+                    allow_full_access_without_approval: false,
+                },
+                profiles: HashMap::new(),
+            },
+            local,
+            supervisor.clone(),
+        )
+        .unwrap();
+        let request = LaunchRequest {
+            cwd: directory.path().to_path_buf(),
+            prompt: Some("exercise provider request reuse".into()),
+            native_session_id: None,
+            model: None,
+            effort: None,
+            session_data_dir: Some(directory.path().join("sessions")),
+        };
+        let mut driver = ProtocolDriver::new(AdapterKind::Pi, &request).unwrap();
+        let original = b"{\"type\":\"extension_ui_request\",\"id\":\"settled-pi\",\"method\":\"confirm\",\"title\":\"Continue?\"}\n";
+        assert_eq!(driver.on_record(original).unwrap().0.len(), 1);
+        let (responses, events) = driver
+            .on_record(
+                b"{\"type\":\"extension_ui_request\",\"id\":\"settled-pi\",\"method\":\"input\",\"title\":\"Changed\"}\n",
+            )
+            .unwrap();
+        assert!(responses.is_empty());
+        assert_eq!(events[0].kind, AdapterEventKind::AdapterError);
+        assert_eq!(driver.state(), AdapterState::Failed);
+
+        let child_spec = conduit_adapters::LaunchSpec {
+            executable: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "while :; do sleep 60; done".into()],
+            cwd: directory.path().to_path_buf(),
+            protocol: conduit_adapters::AdapterProtocol::PiRpcJsonl,
+            initial_frames: vec![],
+        };
+        let child = AdapterChild::spawn_uninitialized(&child_spec).unwrap();
+        let runtime_id = "rt_adapter_failure01";
+        let runtime = RuntimeRequest {
+            runtime_id: runtime_id.into(),
+            run_id: "run_adapter_failure01".into(),
+            kind: RuntimeKind::Native,
+            provider_selector: "native".into(),
+            spec_digest: "22".repeat(32),
+            image: None,
+            resources: ResourceLimits {
+                cpu: None,
+                memory_bytes: None,
+                pid_limit: None,
+                storage_bytes: None,
+            },
+            network: NetworkMode::Open,
+            workspaces: vec![],
+        };
+        let launch = LaunchPlan {
+            executable: child_spec.executable.clone(),
+            argv: child_spec.args.clone(),
+            cwd: child_spec.cwd.clone(),
+            environment: BTreeMap::new(),
+            io_mode: IoMode::Pipes,
+            timeout_ms: None,
+        };
+        let prepared = supervisor
+            .reserve(&runtime, "native", child_spec.executable.clone(), false)
+            .unwrap();
+        let custody = supervisor
+            .adopt_external(&prepared, &launch, child.id())
+            .unwrap();
+        let operation_id = "op_adapter_failure01";
+        let key = "adapter-failure-idempotency-key";
+        let request_digest = "11".repeat(32);
+        let manifest = build_manifest(
+            &ManifestOperation {
+                operation_id,
+                idempotency_key: key,
+                request_digest: &request_digest,
+                run_id: &runtime.run_id,
+                assignment_id: None,
+                actor_id: "prin_adapter_failure01",
+                client_id: "conduit.adapter-failure-test",
+                device_id: "dev_policy_01",
+                boot_id: "node-boot-adapter-failure-0001",
+                capability_digest: &"cd".repeat(32),
+                local_policy_revision: 1,
+                runtime_kind: "native",
+                runtime_provider: "native",
+                runtime_config: b"{}",
+                access_scope: "read_only",
+                approval_mode: "always",
+                adapter_id: Some("pi"),
+                adapter_version: Some("fixture"),
+                executable_digest: None,
+                model: None,
+                effort: None,
+            },
+            &[],
+        )
+        .unwrap();
+        service.local.commit_manifest(&manifest).unwrap();
+        store
+            .admit_operation(
+                operation_id,
+                key,
+                &request_digest,
+                b"{}",
+                1,
+                "native",
+                "read_only",
+                "always",
+                b"{}",
+                b"{}",
+                b"{}",
+            )
+            .unwrap();
+        store
+            .transition_operation(
+                key,
+                OperationState::Admitted,
+                OperationState::Starting,
+                Some(runtime_id),
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .transition_operation(
+                key,
+                OperationState::Starting,
+                OperationState::Running,
+                Some(runtime_id),
+                custody.handle.process_identity.as_deref(),
+                None,
+            )
+            .unwrap();
+        service.agents.insert(
+            operation_id.into(),
+            AgentActive {
+                key: key.into(),
+                operation_id: operation_id.into(),
+                run_id: runtime.run_id.clone(),
+                request_digest: request_digest.clone(),
+                runtime_id: runtime_id.into(),
+                provider_id: "native".into(),
+                handle: custody.handle,
+                child,
+                driver,
+                adapter_kind: AdapterKind::Pi,
+                actor_principal_id: "prin_adapter_failure01".into(),
+                client_id: "conduit.adapter-failure-test".into(),
+                access_scope: "read_only".into(),
+                approval_mode: "always".into(),
+                effective_required_approval_risk_classes: vec![],
+                local_policy_revision: 1,
+                controller_epoch: 1,
+                event_sequence: 0,
+            },
+        );
+        let session =
+            crate::transport::TransportSession::new(store.clone(), "dev_policy_01".into(), 1)
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let mut client = WssClient::from_test_stream(stream, session, true);
+
+        service.poll_agents(&mut client).unwrap();
+
+        assert!(!service.agents.contains_key(operation_id));
+        assert_eq!(
+            store.operation(key).unwrap().unwrap().state,
+            OperationState::Failed
+        );
+        assert_eq!(
+            supervisor.inspect(runtime_id).unwrap().state,
+            RuntimeState::Stopped
+        );
+        let outbound = store
+            .unacknowledged_outbound(1, 16)
+            .unwrap()
+            .into_iter()
+            .map(|row| serde_json::from_slice::<Envelope>(&row.frame).unwrap())
+            .collect::<Vec<_>>();
+        let terminal = outbound
+            .iter()
+            .find(|frame| frame.kind == "operation.terminal")
+            .unwrap();
+        assert_eq!(terminal.payload["reasonCode"], "adapter_protocol_error");
+    }
+
+    #[test]
+    fn failed_driver_finalizes_child_exit_while_waiting_for_approval() {
         let directory = tempfile::tempdir().unwrap();
         let store = NodeStore::open(directory.path().join("store")).unwrap();
         let identity = Arc::new(
@@ -3227,10 +3471,11 @@ mod tests {
         assert!(second_response.is_empty());
         assert_eq!(events[0].kind, AdapterEventKind::AdapterError);
         assert_eq!(driver.state(), AdapterState::Failed);
+        let failure_event = events[0].clone();
 
         let child_spec = conduit_adapters::LaunchSpec {
             executable: PathBuf::from("/bin/sh"),
-            args: vec!["-c".into(), "while :; do sleep 60; done".into()],
+            args: vec!["-c".into(), "IFS= read -r ignored; exit 17".into()],
             cwd: directory.path().to_path_buf(),
             protocol: conduit_adapters::AdapterProtocol::PiRpcJsonl,
             initial_frames: vec![],
@@ -3334,6 +3579,27 @@ mod tests {
                 None,
             )
             .unwrap();
+        for suffix in ["pending", "requested"] {
+            store
+                .record_agent_approval(
+                    &format!("appr_xservice_{suffix}01"),
+                    key,
+                    &"33".repeat(32),
+                    format!("\"provider-{suffix}\"").as_bytes(),
+                    "extension_ui_request.confirm",
+                    &"44".repeat(32),
+                    unix_ms_now() + 300_000,
+                    format!("{{\"approvalId\":\"appr_xservice_{suffix}01\"}}").as_bytes(),
+                )
+                .unwrap();
+        }
+        store
+            .mark_agent_approval_requested("appr_xservice_requested01")
+            .unwrap();
+        assert_eq!(
+            store.operation(key).unwrap().unwrap().state,
+            OperationState::WaitingApproval
+        );
         service.agents.insert(
             operation_id.into(),
             AgentActive {
@@ -3354,7 +3620,7 @@ mod tests {
                 effective_required_approval_risk_classes: vec![],
                 local_policy_revision: 1,
                 controller_epoch: 1,
-                event_sequence: 0,
+                event_sequence: 1,
             },
         );
 
@@ -3365,6 +3631,56 @@ mod tests {
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
         let (_peer, _) = listener.accept().unwrap();
         let mut client = WssClient::from_test_stream(stream, session, true);
+
+        let normalized = service
+            .local
+            .append_visible_event(
+                &runtime.run_id,
+                "dev_policy_01",
+                1,
+                "node-boot-adapter-failure-0001",
+                operation_id,
+                adapter_event_name(failure_event.kind),
+                visible_adapter_payload(&failure_event),
+            )
+            .unwrap();
+        let encoded = serde_jcs::to_vec(&normalized).unwrap();
+        let event_digest = normalized["eventDigest"].as_str().unwrap();
+        store
+            .append_operation_event(
+                key,
+                &runtime.run_id,
+                normalized["eventId"].as_str().unwrap(),
+                event_digest,
+                &encoded,
+                0,
+            )
+            .unwrap();
+
+        let trigger = conduit_adapters::ProtocolFrame::json(&json!({"stop":true})).unwrap();
+        service
+            .agents
+            .get_mut(operation_id)
+            .unwrap()
+            .child
+            .write(&trigger)
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if service
+                .agents
+                .get_mut(operation_id)
+                .unwrap()
+                .child
+                .try_wait()
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "adapter fixture did not exit");
+            std::thread::sleep(Duration::from_millis(5));
+        }
 
         service.poll_agents(&mut client).unwrap();
 
@@ -3377,6 +3693,16 @@ mod tests {
             supervisor.inspect(runtime_id).unwrap().state,
             RuntimeState::Stopped
         );
+        for suffix in ["pending", "requested"] {
+            assert_eq!(
+                store
+                    .agent_approval(&format!("appr_xservice_{suffix}01"))
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "abandoned"
+            );
+        }
 
         let outbound = store
             .unacknowledged_outbound(1, 16)
@@ -3388,6 +3714,14 @@ mod tests {
             .iter()
             .position(|frame| frame.kind == "operation.terminal")
             .unwrap();
+        assert_eq!(
+            store.event_range(&runtime.run_id, 1, 1).unwrap()[0].sequence,
+            1
+        );
+        assert_eq!(
+            outbound[terminal_index].payload["lastRunEventSequence"],
+            "1"
+        );
         assert_eq!(
             outbound[terminal_index].payload["reasonCode"],
             "adapter_protocol_error"

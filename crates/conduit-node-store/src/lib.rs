@@ -26,7 +26,7 @@ use thiserror::Error;
 pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 pub const MAX_FRAME_BYTES: usize = 65_536;
 pub const MAX_EVENT_BYTES: usize = 60_000;
-const STORE_SCHEMA_VERSION: u32 = 7;
+const STORE_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -665,6 +665,11 @@ impl NodeStore {
         ).map_err(map_sql)?;
         if changed != 1 {
             let current = query_agent_approval(&conn, approval_id)?.ok_or(StoreError::NotFound)?;
+            if current.state == "abandoned" {
+                return Err(StoreError::Invalid(
+                    "approval request was abandoned during agent finalization".into(),
+                ));
+            }
             if current.resolution.as_deref() != Some(resolution)
                 || current.resolution_authority.as_deref() != Some(resolution_authority)
             {
@@ -709,6 +714,47 @@ impl NodeStore {
                 return Err(StoreError::Invalid(
                     "approval apply and operation resume are not jointly ready".into(),
                 ));
+            }
+        }
+        tx.commit().map_err(map_sql)
+    }
+
+    /// Atomically closes approval custody before an Agent operation is finalized.
+    ///
+    /// Replays while the operation is already finishing are idempotent. An
+    /// abandoned approval can never be requested, resolved, or applied later.
+    pub fn begin_agent_finalization(&self, idempotency_key: &str) -> Result<(), StoreError> {
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        let operation = query_operation(&tx, idempotency_key)?.ok_or(StoreError::NotFound)?;
+        if !matches!(
+            operation.state,
+            OperationState::Running | OperationState::WaitingApproval | OperationState::Finishing
+        ) {
+            return Err(StoreError::InvalidTransition {
+                from: operation.state.as_str().into(),
+                to: OperationState::Finishing.as_str().into(),
+            });
+        }
+        tx.execute(
+            "UPDATE agent_approval_journal SET state='abandoned',updated_at=unixepoch() WHERE idempotency_key=?1 AND state IN ('pending','requested','resolved')",
+            [idempotency_key],
+        )
+        .map_err(map_sql)?;
+        if operation.state != OperationState::Finishing {
+            let changed = tx
+                .execute(
+                    "UPDATE operations SET state='finishing',updated_at=unixepoch() WHERE idempotency_key=?1 AND state IN ('running','waiting_approval')",
+                    [idempotency_key],
+                )
+                .map_err(map_sql)?;
+            if changed != 1 {
+                return Err(StoreError::InvalidTransition {
+                    from: operation.state.as_str().into(),
+                    to: OperationState::Finishing.as_str().into(),
+                });
             }
         }
         tx.commit().map_err(map_sql)
@@ -1460,6 +1506,40 @@ COMMIT;"#,
         )
         .map_err(map_sql)?;
     }
+    if (4..8).contains(&version) {
+        conn.execute_batch(
+            r#"BEGIN IMMEDIATE;
+DROP INDEX IF EXISTS agent_approval_pending_idx;
+DROP INDEX IF EXISTS agent_approval_provider_request_unique_idx;
+ALTER TABLE agent_approval_journal RENAME TO agent_approval_journal_v7;
+CREATE TABLE agent_approval_journal(
+ approval_id TEXT PRIMARY KEY,
+ idempotency_key TEXT NOT NULL REFERENCES operations(idempotency_key) ON DELETE RESTRICT,
+ operation_digest TEXT NOT NULL,
+ provider_request_id BLOB NOT NULL,
+ method TEXT NOT NULL,
+ parameters_digest TEXT NOT NULL,
+ expires_at_unix_ms INTEGER NOT NULL,
+ request_payload BLOB,
+ state TEXT NOT NULL CHECK(state IN ('pending','requested','resolved','applied','abandoned')),
+ resolution BLOB,
+ resolution_authority BLOB,
+ created_at INTEGER NOT NULL DEFAULT(unixepoch()),
+ updated_at INTEGER NOT NULL DEFAULT(unixepoch()),
+ CHECK(length(operation_digest)=64), CHECK(length(parameters_digest)=64),
+ CHECK(length(provider_request_id)<=512), CHECK(length(method)<=128),
+ CHECK(request_payload IS NULL OR length(request_payload)<=60000),
+ CHECK(resolution IS NULL OR length(resolution)<=60000),
+ CHECK(resolution_authority IS NULL OR (length(resolution_authority)>=1 AND length(resolution_authority)<=256)));
+INSERT INTO agent_approval_journal(approval_id,idempotency_key,operation_digest,provider_request_id,method,parameters_digest,expires_at_unix_ms,request_payload,state,resolution,resolution_authority,created_at,updated_at)
+ SELECT approval_id,idempotency_key,operation_digest,provider_request_id,method,parameters_digest,expires_at_unix_ms,request_payload,state,resolution,resolution_authority,created_at,updated_at FROM agent_approval_journal_v7;
+DROP TABLE agent_approval_journal_v7;
+CREATE INDEX agent_approval_pending_idx ON agent_approval_journal(state,expires_at_unix_ms);
+CREATE UNIQUE INDEX agent_approval_provider_request_unique_idx ON agent_approval_journal(idempotency_key,provider_request_id);
+COMMIT;"#,
+        )
+        .map_err(map_sql)?;
+    }
     conn.execute_batch(r#"
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL DEFAULT(unixepoch()));
@@ -1495,7 +1575,7 @@ CREATE TABLE IF NOT EXISTS agent_approval_journal(
  parameters_digest TEXT NOT NULL,
  expires_at_unix_ms INTEGER NOT NULL,
  request_payload BLOB,
- state TEXT NOT NULL CHECK(state IN ('pending','requested','resolved','applied')),
+ state TEXT NOT NULL CHECK(state IN ('pending','requested','resolved','applied','abandoned')),
  resolution BLOB,
  resolution_authority BLOB,
  created_at INTEGER NOT NULL DEFAULT(unixepoch()),
@@ -1507,7 +1587,7 @@ CREATE TABLE IF NOT EXISTS agent_approval_journal(
  CHECK(resolution_authority IS NULL OR (length(resolution_authority)>=1 AND length(resolution_authority)<=256)));
 CREATE INDEX IF NOT EXISTS agent_approval_pending_idx ON agent_approval_journal(state,expires_at_unix_ms);
 CREATE UNIQUE INDEX IF NOT EXISTS agent_approval_provider_request_unique_idx ON agent_approval_journal(idempotency_key,provider_request_id);
-INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8);
 COMMIT;"#).map_err(map_sql)
 }
 
@@ -1750,6 +1830,149 @@ mod tests {
                 .is_empty()
         );
     }
+
+    #[test]
+    fn agent_finalization_atomically_abandons_outstanding_approvals() {
+        let directory = tempdir().unwrap();
+        let store = NodeStore::open(directory.path()).unwrap();
+        let key = "finalization-idempotency-key";
+        store
+            .reserve_operation("op_finalize01", key, &digest(1), b"{}", 1)
+            .unwrap();
+        for (from, to) in [
+            (OperationState::Reserved, OperationState::Admitted),
+            (OperationState::Admitted, OperationState::Starting),
+            (OperationState::Starting, OperationState::Running),
+        ] {
+            store
+                .transition_operation(key, from, to, None, None, None)
+                .unwrap();
+        }
+        for suffix in ["pending", "requested", "resolved"] {
+            store
+                .record_agent_approval(
+                    &format!("appr_x{suffix}01"),
+                    key,
+                    &digest(2),
+                    format!("\"provider-{suffix}\"").as_bytes(),
+                    "item/commandExecution/requestApproval",
+                    &digest(3),
+                    2_000_000_000_000,
+                    format!("{{\"approvalId\":\"appr_x{suffix}01\"}}").as_bytes(),
+                )
+                .unwrap();
+        }
+        store
+            .mark_agent_approval_requested("appr_xrequested01")
+            .unwrap();
+        store
+            .record_agent_approval_resolution(
+                "appr_xresolved01",
+                b"provider-frame\n",
+                b"receipt-digest",
+            )
+            .unwrap();
+
+        store.begin_agent_finalization(key).unwrap();
+        store.begin_agent_finalization(key).unwrap();
+
+        assert_eq!(
+            store.operation(key).unwrap().unwrap().state,
+            OperationState::Finishing
+        );
+        for suffix in ["pending", "requested", "resolved"] {
+            assert_eq!(
+                store
+                    .agent_approval(&format!("appr_x{suffix}01"))
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                "abandoned"
+            );
+        }
+        assert!(store.unqueued_agent_approvals(key).unwrap().is_empty());
+        assert!(store.resolved_agent_approvals(key).unwrap().is_empty());
+        assert!(matches!(
+            store.mark_agent_approval_requested("appr_xpending01"),
+            Err(StoreError::Invalid(_))
+        ));
+        assert!(matches!(
+            store.record_agent_approval_resolution(
+                "appr_xrequested01",
+                b"late-provider-frame\n",
+                b"late-receipt"
+            ),
+            Err(StoreError::Invalid(message)) if message.contains("abandoned")
+        ));
+        assert!(matches!(
+            store.mark_agent_approval_applied_and_resume("appr_xresolved01", key),
+            Err(StoreError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn version_seven_approval_journal_migrates_to_abandoned_state() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("node.sqlite3");
+        let conn = Connection::open(&database).unwrap();
+        conn.execute_batch(
+            r#"CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL DEFAULT(unixepoch()));
+INSERT INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7);
+CREATE TABLE operations(
+ operation_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE, request_digest TEXT NOT NULL,
+ manifest BLOB NOT NULL, local_policy_revision INTEGER NOT NULL, state TEXT NOT NULL,
+ runtime_id TEXT, process_identity TEXT, last_event_sequence INTEGER NOT NULL DEFAULT 0,
+ receipt BLOB, updated_at INTEGER NOT NULL DEFAULT(unixepoch()),
+ CHECK(length(request_digest)=64), CHECK(length(manifest)<=262144));
+CREATE TABLE agent_approval_journal(
+ approval_id TEXT PRIMARY KEY,
+ idempotency_key TEXT NOT NULL REFERENCES operations(idempotency_key) ON DELETE RESTRICT,
+ operation_digest TEXT NOT NULL, provider_request_id BLOB NOT NULL, method TEXT NOT NULL,
+ parameters_digest TEXT NOT NULL, expires_at_unix_ms INTEGER NOT NULL, request_payload BLOB,
+ state TEXT NOT NULL CHECK(state IN ('pending','requested','resolved','applied')),
+ resolution BLOB, resolution_authority BLOB,
+ created_at INTEGER NOT NULL DEFAULT(unixepoch()), updated_at INTEGER NOT NULL DEFAULT(unixepoch()));
+CREATE INDEX agent_approval_pending_idx ON agent_approval_journal(state,expires_at_unix_ms);
+CREATE UNIQUE INDEX agent_approval_provider_request_unique_idx ON agent_approval_journal(idempotency_key,provider_request_id);
+INSERT INTO operations(operation_id,idempotency_key,request_digest,manifest,local_policy_revision,state)
+ VALUES('op_migrate01','migration-idempotency-key','1111111111111111111111111111111111111111111111111111111111111111',X'7B7D',1,'waiting_approval');
+INSERT INTO agent_approval_journal(approval_id,idempotency_key,operation_digest,provider_request_id,method,parameters_digest,expires_at_unix_ms,request_payload,state)
+ VALUES('appr_xmigrate01','migration-idempotency-key','2222222222222222222222222222222222222222222222222222222222222222',X'2270726F76696465722D3122','approval','3333333333333333333333333333333333333333333333333333333333333333',2000000000000,X'7B7D','requested');"#,
+        )
+        .unwrap();
+        drop(conn);
+        fs::set_permissions(&database, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let store = NodeStore::open(directory.path()).unwrap();
+        store
+            .begin_agent_finalization("migration-idempotency-key")
+            .unwrap();
+        assert_eq!(
+            store
+                .agent_approval("appr_xmigrate01")
+                .unwrap()
+                .unwrap()
+                .state,
+            "abandoned"
+        );
+        assert_eq!(
+            store
+                .operation("migration-idempotency-key")
+                .unwrap()
+                .unwrap()
+                .state,
+            OperationState::Finishing
+        );
+        let version: u32 = store
+            .conn()
+            .unwrap()
+            .query_row("SELECT MAX(version) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(version, STORE_SCHEMA_VERSION);
+    }
+
     #[test]
     fn sequences_reject_gaps_conflicts_and_accept_exact_duplicates() {
         let d = tempdir().unwrap();

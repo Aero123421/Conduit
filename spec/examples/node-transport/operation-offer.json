@@ -1,0 +1,62 @@
+{
+  "schemaVersion": 1,
+  "protocol": "conduit.node/1",
+  "type": "operation.offer",
+  "messageId": "msg_offer00001",
+  "connectionId": "conn_example0001",
+  "connectionEpoch": 7,
+  "sequence": 1,
+  "sentAt": "2026-09-01T09:00:05Z",
+  "payload": {
+    "operation": {
+      "schemaVersion": 1,
+      "operationContract": "conduit.operation/1",
+      "operationId": "op_example0001",
+      "idempotencyKey": "example-assignment-0001",
+      "kind": "run.start",
+      "issuedAt": "2026-09-01T09:00:05Z",
+      "admissionExpiresAt": "2026-09-01T09:05:05Z",
+      "maxExecutionMs": 21600000,
+      "authority": {
+        "principalId": "prin_example0001",
+        "clientKind": "dashboard",
+        "clientId": "dashboard",
+        "connectorPolicyRevision": 1,
+        "projectPolicyRevision": 3,
+        "devicePolicyRevision": 5,
+        "accessScope": "project_full",
+        "approvalMode": "never"
+      },
+      "target": {
+        "deviceId": "dev_example0001",
+        "runtimeKind": "native",
+        "projectId": "prj_example0001",
+        "collaborationSessionId": "csess_example001",
+        "runId": "run_example0001",
+        "assignmentId": "asg_example0001",
+        "runtimeProfileRevision": 2,
+        "sourceLocations": [
+          {
+            "sourceId": "src_example0001",
+            "locationId": "loc_example0001",
+            "revision": 4,
+            "mode": "isolated_worktree"
+          }
+        ]
+      },
+      "arguments": {
+        "agentProfileId": "codex-builder",
+        "model": "gpt-5.6",
+        "effort": "high",
+        "promptRef": "msg_assignment001"
+      }
+    },
+    "payloadDigest": "798daac77f5206a93dcf75c6466bf0361138a67800550505de29b3adefc1641a",
+    "controlPlaneCommitment": {
+      "keyId": "cpkey_example0001",
+      "algorithm": "Ed25519",
+      "signedDigest": "798daac77f5206a93dcf75c6466bf0361138a67800550505de29b3adefc1641a",
+      "signature": "4XdCSn3RR07IFpeCM0mPJhyA0szJfll9B92zWHHdBygslYn9bXKCRjPUv5RdKezGzFM1osFjbNiEzUejPQ6IAA"
+    }
+  }
+}

@@ -94,8 +94,9 @@ categories. After a terminal response, the Adapter retains a bounded,
 non-evicting tombstone containing the normalized ID, method, canonical
 parameters digest, and exact response bytes. Exact duplicate requests replay
 those bytes. Reusing a settled ID with another commitment produces a visible
-Adapter error without a contradictory second response. Capacity exhaustion
-terminally fails the Adapter rather than evicting an ID.
+Adapter error and terminally fails the Adapter without a contradictory second
+response. Capacity exhaustion terminally fails the Adapter rather than evicting
+an ID.
 
 The effective Access Scope is translated into an explicit Codex sandbox policy
 at thread and turn start. Read-only becomes `readOnly`; Restricted Native,

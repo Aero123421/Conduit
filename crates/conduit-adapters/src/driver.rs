@@ -2285,14 +2285,18 @@ impl ProtocolDriver {
     }
 
     fn terminal_provider_request_outcome(
-        &self,
+        &mut self,
         key: &str,
         method: &str,
         params_digest: &str,
         correlation_id: &str,
     ) -> Option<(Vec<ProtocolFrame>, Vec<AdapterEvent>)> {
-        let terminal = self.provider_request_terminals.get(key)?;
+        let terminal = self.provider_request_terminals.get(key)?.clone();
         let same_commitment = terminal.method == method && terminal.params_digest == params_digest;
+        if !same_commitment {
+            self.phase = Phase::Terminal;
+            self.state = AdapterState::Failed;
+        }
         let event = AdapterEvent::bounded(
             if same_commitment {
                 AdapterEventKind::State
@@ -2305,7 +2309,7 @@ impl ProtocolDriver {
             Some(if same_commitment {
                 "exact duplicate provider request replayed its recorded terminal response"
             } else {
-                "settled provider request id was reused with a changed commitment; no response was emitted"
+                "settled provider request id was reused with a changed commitment; the adapter failed without emitting a second response"
             }),
             Some(json!({
                 "existingMethod": terminal.method,
@@ -3340,6 +3344,8 @@ mod tests {
             .unwrap();
         assert!(changed_frames.is_empty());
         assert_eq!(changed_events[0].kind, AdapterEventKind::AdapterError);
+        assert_eq!(driver.state(), AdapterState::Failed);
+        assert_eq!(driver.phase, Phase::Terminal);
 
         let (unknown_frames, unknown_events) = driver
             .on_record(b"{\"id\":\"settled-codex\",\"method\":\"future/unsafe\",\"params\":{\"command\":\"pwd\"}}\n")
@@ -3648,6 +3654,8 @@ mod tests {
             .unwrap();
         assert!(changed_frames.is_empty());
         assert_eq!(changed_events[0].kind, AdapterEventKind::AdapterError);
+        assert_eq!(driver.state(), AdapterState::Failed);
+        assert_eq!(driver.phase, Phase::Terminal);
     }
 
     #[test]
@@ -3807,6 +3815,8 @@ mod tests {
             .unwrap();
         assert!(changed_frames.is_empty());
         assert_eq!(changed_events[0].kind, AdapterEventKind::AdapterError);
+        assert_eq!(driver.state(), AdapterState::Failed);
+        assert_eq!(driver.phase, Phase::Terminal);
 
         let (unknown_frames, unknown_events) = driver
             .on_record(b"{\"jsonrpc\":\"2.0\",\"id\":\"settled-acp\",\"method\":\"future/client_request\",\"params\":{}}\n")

@@ -562,11 +562,12 @@ ignored while the original commitment remains pending. After settlement, the
 Adapter retains a bounded, non-evicting process-lifetime tombstone keyed by the
 normalized provider request ID, method, and canonical parameters digest. An
 exact duplicate replays the identical recorded response bytes; a changed
-commitment receives no second terminal JSON-RPC response and emits a visible
-Adapter error. Exhausting the tombstone bound terminally fails the Adapter
-instead of evicting an ID or leaving the operation running. When the deadline expires, the Node durably
-journals and writes one same-ID decline, resumes the operation, and rejects late
-receipts without sending a second provider response.
+commitment receives no second terminal JSON-RPC response and terminally fails
+the Adapter with a visible error. Exhausting the tombstone bound terminally
+fails the Adapter instead of evicting an ID or leaving the operation running.
+When the deadline expires, the Node durably journals and writes one same-ID
+decline, resumes the operation, and rejects late receipts without sending a
+second provider response.
 
 ## Agent server-request correlation
 
@@ -590,7 +591,8 @@ Pi extension dialog requests preserve their request ID in
 `extension_ui_response`; without a typed bridge they are cancelled. ACP and Pi
 share the same process-lifetime terminal tombstone rule as Codex. Exact
 duplicates replay identical response bytes; changed commitments do not receive
-a contradictory second response.
+a contradictory second response and terminally fail the Adapter so the provider
+cannot remain waiting.
 Pi `agent_end` remains nonterminal even when `willRetry` is false;
 `agent_settled` is the terminal event after retries and queued follow-ups are
 drained.

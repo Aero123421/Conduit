@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conduit.dev/spec/schemas/node-control-v1.schema.json",
+  "title": "Conduit node flow-control and protocol-error frames v1",
+  "oneOf": [
+    { "$ref": "#/$defs/FlowControlEnvelope" },
+    { "$ref": "#/$defs/ProtocolErrorEnvelope" }
+  ],
+  "$defs": {
+    "FlowPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["maxInFlightBatches", "maxInFlightBytes"],
+      "properties": {
+        "maxInFlightBatches": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "maxInFlightBytes": { "type": "integer", "minimum": 0, "maximum": 16777216 },
+        "pauseUntil": { "$ref": "node-common-v1.schema.json#/$defs/Timestamp" },
+        "reason": { "enum": ["normal", "ingress_backpressure", "materialization_lag", "maintenance"] }
+      }
+    },
+    "FlowControlEnvelope": {
+      "allOf": [
+        { "$ref": "node-common-v1.schema.json#/$defs/AuthenticatedHeader" },
+        { "type": "object", "properties": { "type": { "const": "flow.control" }, "payload": { "$ref": "#/$defs/FlowPayload" } } }
+      ],
+      "unevaluatedProperties": false
+    },
+    "ErrorPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "fatal"],
+      "properties": {
+        "code": { "enum": ["bad_frame", "unsupported_type", "sequence_mismatch", "epoch_mismatch", "message_id_reuse", "record_hash_conflict", "idempotency_conflict", "payload_digest_mismatch", "signature_invalid", "frame_too_large", "rate_limited", "reconciliation_required"] },
+        "message": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "fatal": { "type": "boolean" },
+        "relatedMessageId": { "$ref": "node-common-v1.schema.json#/$defs/MessageId" }
+      }
+    },
+    "ProtocolErrorEnvelope": {
+      "allOf": [
+        { "$ref": "node-common-v1.schema.json#/$defs/AuthenticatedHeader" },
+        { "type": "object", "properties": { "type": { "const": "protocol.error" }, "payload": { "$ref": "#/$defs/ErrorPayload" } } }
+      ],
+      "unevaluatedProperties": false
+    }
+  }
+}

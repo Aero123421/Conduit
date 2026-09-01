@@ -60,6 +60,59 @@ pub enum EffectiveApprovalPolicy {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ApprovalRiskClassSet(u16);
+
+impl ApprovalRiskClassSet {
+    pub const EMPTY: Self = Self(0);
+    pub const EXTERNAL_PUBLISH: Self = Self(1 << 0);
+    pub const SECRET_ACCESS: Self = Self(1 << 1);
+    pub const DESTRUCTIVE_DELETE: Self = Self(1 << 2);
+    pub const ELEVATION: Self = Self(1 << 3);
+    pub const PRODUCTION_DEPLOY: Self = Self(1 << 4);
+    pub const DEVICE_ADMIN: Self = Self(1 << 5);
+    pub const RAW_LOG_EXPORT: Self = Self(1 << 6);
+    pub const LAN_ACCESS: Self = Self(1 << 7);
+    pub const CREDENTIAL_EXPORT: Self = Self(1 << 8);
+    pub const RUNTIME_MANAGEMENT: Self = Self(1 << 9);
+    pub const ALL: Self = Self((1 << 10) - 1);
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    pub const fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+
+    pub const fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn from_name(value: &str) -> Option<Self> {
+        match value {
+            "external_publish" => Some(Self::EXTERNAL_PUBLISH),
+            "secret_access" => Some(Self::SECRET_ACCESS),
+            "destructive_delete" => Some(Self::DESTRUCTIVE_DELETE),
+            "elevation" => Some(Self::ELEVATION),
+            "production_deploy" => Some(Self::PRODUCTION_DEPLOY),
+            "device_admin" => Some(Self::DEVICE_ADMIN),
+            "raw_log_export" => Some(Self::RAW_LOG_EXPORT),
+            "lan_access" => Some(Self::LAN_ACCESS),
+            "credential_export" => Some(Self::CREDENTIAL_EXPORT),
+            "runtime_management" => Some(Self::RUNTIME_MANAGEMENT),
+            _ => None,
+        }
+    }
+}
+
+impl Default for ApprovalRiskClassSet {
+    fn default() -> Self {
+        Self::EMPTY
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EffectiveAccessScope {
     ReadOnly,
@@ -119,6 +172,8 @@ pub enum ApprovalBridgeOwnership {
 pub struct ApprovalContext {
     pub effective_policy: EffectiveApprovalPolicy,
     pub bridge: ApprovalBridgeOwnership,
+    #[serde(default)]
+    pub required_risk_classes: ApprovalRiskClassSet,
 }
 
 impl Default for ApprovalContext {
@@ -126,6 +181,7 @@ impl Default for ApprovalContext {
         Self {
             effective_policy: EffectiveApprovalPolicy::Always,
             bridge: ApprovalBridgeOwnership::Unavailable,
+            required_risk_classes: ApprovalRiskClassSet::EMPTY,
         }
     }
 }

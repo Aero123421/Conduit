@@ -11,6 +11,6 @@ pub use process::AdapterChild;
 pub use types::{
     AdapterCapability, AdapterError, AdapterEvent, AdapterEventKind, AdapterKind, AdapterOperation,
     AdapterProbe, AdapterProtocol, AdapterState, ApprovalBridgeOwnership, ApprovalContext,
-    AuthenticationState, EffectiveAccessScope, EffectiveApprovalPolicy, EffectiveSandboxPolicy,
-    LaunchRequest, LaunchSpec, ProtocolFrame, SupportLevel,
+    ApprovalRiskClassSet, AuthenticationState, EffectiveAccessScope, EffectiveApprovalPolicy,
+    EffectiveSandboxPolicy, LaunchRequest, LaunchSpec, ProtocolFrame, SupportLevel,
 };

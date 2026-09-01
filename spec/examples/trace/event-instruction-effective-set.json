@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "kind": "normalized_event",
+  "eventId": "evt_instruction_effective_set_01",
+  "runId": "run_conduit_codex_01",
+  "deviceId": "dev_sahur_pc_01",
+  "sequence": "4",
+  "eventType": "instruction.effective_set",
+  "source": "adapter.codex",
+  "observedAt": "2026-09-01T10:00:05Z",
+  "monotonicNanos": "5000000000",
+  "nodeBootId": "boot-2026-09-01T09-58-00Z-01",
+  "correlationId": "agent_open_01",
+  "traceId": "c128113b728b5b59fefc3db0744cd8c2",
+  "spanId": "5a1e8a8f20ddb617",
+  "parentSpanId": "182d07415bb5356c",
+  "evidenceLevel": "explicit",
+  "sensitivity": "metadata",
+  "retentionClass": "R1",
+  "payloadDigest": "2df9e2973d719335b2881c66ff270a929b0a8f4bc3e14d8e1254c23c929e220a",
+  "eventDigest": "f86779f031eb7ba1f047eed3682d02e53fc8d3d314360330ff714aa234a58841",
+  "previousChainHash": "3020164b8ba120f5aa43d3929f59573557732720075f2c36fc29be730088bbe2",
+  "chainHash": "ab985f2edb5bcbe13cf5725f61b08d8dcd9ca38ba4f81782b13cc49b5849240a",
+  "payload": {
+    "catalogDigest": "6edb811794d2379507aa69fed89b6c95c4664294f4478206675d22045d9c41b1",
+    "instructionIds": [
+      "ins_conduit_root_01"
+    ],
+    "loadedBytes": 3176,
+    "configuredAggregateLimit": 32768,
+    "truncated": false,
+    "providerEvidence": "codex_project_instructions_loaded"
+  }
+}

@@ -148,8 +148,7 @@ CREATE TABLE oauth_grants (
   created_at TEXT NOT NULL,
   last_used_at TEXT,
   expires_at TEXT,
-  revoked_at TEXT,
-  FOREIGN KEY (connector_policy_id, connector_policy_revision) REFERENCES connector_policies(id, revision)
+  revoked_at TEXT
 ) STRICT;
 
 CREATE TABLE oauth_consent_transactions (

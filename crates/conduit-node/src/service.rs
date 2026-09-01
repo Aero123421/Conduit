@@ -428,7 +428,11 @@ impl NodeService {
             let retained_event_ranges = self.agents.values().filter(|agent| agent.event_sequence > 0).map(|agent| json!({"runId":agent.run_id,"fromSequence":"1","throughSequence":agent.event_sequence.to_string()})).collect::<Vec<_>>();
             let unresolved = self.active.len() + self.agents.len();
             let journal_generation = self.node.store().journal_generation()?;
-            let payload = json!({"nodeBootId":self.node_boot_id,"journalGeneration":journal_generation.to_string(),"capabilityDigest":self.capability_digest,"lastControlSequenceApplied":positions.control_received_through.to_string(),"lastNodeSequenceAcknowledged":positions.node_acknowledged_through.to_string(),"lastNodeSequenceRetained":retained,"runs":runs,"retainedEventRanges":retained_event_ranges,"unresolvedCount":unresolved,"truncated":unresolved>256,"storageHealth":"healthy"});
+            let control_applied = self
+                .node
+                .store()
+                .inbound_applied_through(Direction::ControlToNode)?;
+            let payload = json!({"nodeBootId":self.node_boot_id,"journalGeneration":journal_generation.to_string(),"capabilityDigest":self.capability_digest,"lastControlSequenceApplied":control_applied.to_string(),"lastNodeSequenceAcknowledged":positions.node_acknowledged_through.to_string(),"lastNodeSequenceRetained":retained,"runs":runs,"retainedEventRanges":retained_event_ranges,"unresolvedCount":unresolved,"truncated":unresolved>256,"storageHealth":"healthy"});
             let id = self.message_id();
             client
                 .session
@@ -481,6 +485,16 @@ impl NodeService {
                 .queue_outbound(&ack_id, "transport.ack", None, ack, 0)?;
             return Ok(());
         }
+        if matches!(result, ReceiveResult::DuplicatePending)
+            && matches!(frame.kind.as_str(), "operation.input" | "operation.cancel")
+        {
+            return Err(ServiceError::Unavailable(
+                "ambiguous_control_effect_pending_recovery".into(),
+            ));
+        }
+        if !client.session.control_frame_allowed(&frame.kind, seq) {
+            return Err(ServiceError::Unavailable("reconciliation_required".into()));
+        }
         match frame.kind.as_str() {
             "transport.ack" => {
                 let direction = frame.payload["direction"]
@@ -528,13 +542,6 @@ impl NodeService {
                 }
             }
             "operation.offer" => {
-                let requested_replay = self
-                    .pending_reconciliation
-                    .as_ref()
-                    .is_some_and(|pending| seq <= pending.control_applied_through);
-                if !client.session.remote_work_allowed() && !requested_replay {
-                    return Err(ServiceError::Unavailable("reconciliation_required".into()));
-                }
                 if let Err(error) = self.offer(client, &frame.payload) {
                     match error {
                         ServiceError::Unavailable(reason) => {
@@ -664,11 +671,15 @@ impl NodeService {
             client.replay_range(from, through)?;
         }
         let mut control_applied_through = plan_sequence;
+        let already_applied = self
+            .node
+            .store()
+            .inbound_applied_through(Direction::ControlToNode)?;
         for range in payload["controlReplay"]
             .as_array()
             .ok_or(TransportError::Malformed)?
         {
-            let from = range["from"]
+            let requested_from = range["from"]
                 .as_str()
                 .and_then(|value| value.parse::<u64>().ok())
                 .ok_or(TransportError::Malformed)?;
@@ -676,20 +687,22 @@ impl NodeService {
                 .as_str()
                 .and_then(|value| value.parse::<u64>().ok())
                 .ok_or(TransportError::Malformed)?;
-            if from == 0 || through < from {
+            if requested_from == 0 || through < requested_from {
                 return Err(TransportError::Malformed.into());
             }
             control_applied_through = control_applied_through.max(through);
-            let request =
-                json!({"direction":"control_to_node","expectedSequence":from.to_string()});
-            let message_id = self.message_id();
-            client.session.queue_outbound(
-                &message_id,
-                "transport.replay_required",
-                None,
-                request,
-                0,
-            )?;
+            let from = requested_from.max(already_applied.saturating_add(1));
+            if from <= through {
+                let request = json!({"direction":"control_to_node","expectedSequence":from.to_string(),"receivedSequence":through.to_string()});
+                let message_id = self.message_id();
+                client.session.queue_outbound(
+                    &message_id,
+                    "transport.replay_required",
+                    None,
+                    request,
+                    0,
+                )?;
+            }
         }
         for request in payload["eventReplay"]
             .as_array()
@@ -2227,6 +2240,52 @@ pub(crate) fn now() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use conduit_node_store::NodeStore;
+    use std::net::{TcpListener, TcpStream};
+
+    fn control_envelope(sequence: u64, kind: &str, payload: Value) -> Envelope {
+        Envelope {
+            protocol: "conduit.node/1".into(),
+            message_id: format!("cmsg_service_replay_{sequence:08}"),
+            device_id: "dev_policy_01".into(),
+            connection_epoch: "1".into(),
+            direction: "control_to_node".into(),
+            sequence: sequence.to_string(),
+            kind: kind.into(),
+            correlation_id: None,
+            payload_digest: hex::encode(Sha256::digest(serde_jcs::to_vec(&payload).unwrap())),
+            payload,
+        }
+    }
+
+    fn expired_offer_envelope(sequence: u64) -> Envelope {
+        let mut operation = json!({
+            "schemaVersion": 1,
+            "operationId": format!("op_service_replay_{sequence:08}"),
+            "idempotencyKey": format!("service-replay-idempotency-{sequence:08}"),
+            "actorPrincipalId": "prin_service_replay01",
+            "clientId": "conduit.service-replay-test",
+            "deviceId": "dev_policy_01",
+            "capability": "runtime.command.start",
+            "sourceRevisions": [],
+            "runtime": {
+                "kind": "native",
+                "providerId": "native.linux",
+                "configurationRevision": 1
+            },
+            "accessScope": "project_full",
+            "approvalMode": "always",
+            "connectorPolicyId": "cpol_service_replay01",
+            "connectorPolicyRevision": 1,
+            "arguments": {"launchProfileId": "unused-expired-profile"},
+            "issuedAt": "2020-01-01T00:00:00Z",
+            "expiresAt": "2020-01-01T00:05:00Z",
+            "validForMs": 300000
+        });
+        let request_digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&operation).unwrap()));
+        operation["payloadDigest"] = Value::String(request_digest);
+        control_envelope(sequence, "operation.offer", json!({"operation": operation}))
+    }
 
     fn operation(scope: &str, approval: &str, cpu: f64) -> WireOperation {
         serde_json::from_value(json!({
@@ -2283,6 +2342,240 @@ mod tests {
             policy(true)
                 .evaluate(&operation("full_device", "never", 1.0), "safe")
                 .is_ok()
+        );
+    }
+
+    #[test]
+    fn reconciliation_allows_only_preexisting_effectful_control() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = conduit_node_store::NodeStore::open(directory.path()).unwrap();
+        let mut session = crate::transport::TransportSession::new_with_control_frontier(
+            store,
+            "dev_policy_01".into(),
+            1,
+            43,
+        )
+        .unwrap();
+        for kind in [
+            "operation.offer",
+            "operation.input",
+            "operation.cancel",
+            "operation.approval",
+        ] {
+            assert!(session.control_frame_allowed(kind, 43));
+            assert!(!session.control_frame_allowed(kind, 44));
+        }
+        assert!(session.control_frame_allowed("reconcile.plan", 44));
+        session.mark_reconciliation_complete();
+        assert!(session.control_frame_allowed("operation.offer", 44));
+    }
+
+    #[test]
+    fn service_dispatch_converges_chunked_offer_replay_and_reapplies_duplicate_pending() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = NodeStore::open(directory.path().join("store")).unwrap();
+        let identity = Arc::new(
+            DeviceIdentity::load_or_create(directory.path().join("identity/device.ed25519"))
+                .unwrap(),
+        );
+        let node = Arc::new(Node::new(store.clone()));
+        let local = Arc::new(
+            LocalServices::open(directory.path().join("local-services"), [9; 32]).unwrap(),
+        );
+        let supervisor = ProcessSupervisor::open(directory.path().join("supervisor")).unwrap();
+        let mut service = NodeService::new(
+            node,
+            identity,
+            "wss://control.example.invalid/connect".into(),
+            "dev_policy_01".into(),
+            "ab".repeat(32),
+            "node-boot-service-replay-0001".into(),
+            NodePolicyConfig {
+                local_policy: LocalPolicy {
+                    revision: 1,
+                    capabilities: vec![],
+                    providers: vec![],
+                    access_scopes: vec![],
+                    approval_modes: vec![],
+                    launch_profiles: vec![],
+                    max_cpu: None,
+                    max_memory_bytes: None,
+                    max_storage_bytes: None,
+                    allow_full_access_without_approval: false,
+                },
+                profiles: HashMap::new(),
+            },
+            local,
+            supervisor,
+        )
+        .unwrap();
+        for sequence in 1..=3 {
+            let frame = control_envelope(
+                sequence,
+                "transport.ack",
+                json!({"direction":"node_to_control","throughSequence":"0"}),
+            );
+            let bytes = serde_json::to_vec(&frame).unwrap();
+            store
+                .receive(
+                    Direction::ControlToNode,
+                    &conduit_node_store::TransportFrame {
+                        sequence,
+                        message_id: frame.message_id,
+                        payload_digest: frame.payload_digest,
+                        frame: bytes,
+                    },
+                )
+                .unwrap();
+            store
+                .mark_inbound_applied(Direction::ControlToNode, sequence)
+                .unwrap();
+        }
+        let session = crate::transport::TransportSession::new_with_control_frontier(
+            store.clone(),
+            "dev_policy_01".into(),
+            1,
+            43,
+        )
+        .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let mut client = WssClient::from_test_stream(stream, session, true);
+
+        let plan = control_envelope(
+            44,
+            "reconcile.plan",
+            json!({
+                "reconciliationId":"rec_service_replay01",
+                "controlReplay":[{"from":"4","through":"43"}],
+                "nodeReplay":[],
+                "eventReplay":[],
+                "statusRunIds":[],
+                "cancelOperationIds":[],
+                "quarantineRunIds":[]
+            }),
+        );
+        let plan_bytes = serde_json::to_vec(&plan).unwrap();
+        let (gap_plan, gap) = client.session.receive(&plan_bytes).unwrap();
+        assert_eq!(gap, ReceiveResult::Gap { expected: 4 });
+        service.dispatch(&mut client, gap_plan, gap).unwrap();
+
+        let first_offer = expired_offer_envelope(4);
+        let first_bytes = serde_json::to_vec(&first_offer).unwrap();
+        assert_eq!(
+            client.session.receive(&first_bytes).unwrap().1,
+            ReceiveResult::Applied
+        );
+        let (pending_offer, pending) = client.session.receive(&first_bytes).unwrap();
+        assert_eq!(pending, ReceiveResult::DuplicatePending);
+        service
+            .dispatch(&mut client, pending_offer, pending)
+            .unwrap();
+        for sequence in 5..=35 {
+            let bytes = serde_json::to_vec(&expired_offer_envelope(sequence)).unwrap();
+            let (frame, result) = client.session.receive(&bytes).unwrap();
+            service.dispatch(&mut client, frame, result).unwrap();
+        }
+        let (second_gap_plan, second_gap) = client.session.receive(&plan_bytes).unwrap();
+        assert_eq!(second_gap, ReceiveResult::Gap { expected: 36 });
+        service
+            .dispatch(&mut client, second_gap_plan, second_gap)
+            .unwrap();
+        for sequence in 36..=43 {
+            let bytes = serde_json::to_vec(&expired_offer_envelope(sequence)).unwrap();
+            let (frame, result) = client.session.receive(&bytes).unwrap();
+            service.dispatch(&mut client, frame, result).unwrap();
+        }
+        let (replayed_plan, result) = client.session.receive(&plan_bytes).unwrap();
+        assert_eq!(result, ReceiveResult::Applied);
+        service
+            .dispatch(&mut client, replayed_plan, result)
+            .unwrap();
+
+        assert!(client.session.remote_work_allowed());
+        assert!(service.pending_reconciliation.is_none());
+        for sequence in 4..=43 {
+            assert_eq!(
+                store
+                    .operation(&format!("service-replay-idempotency-{sequence:08}"))
+                    .unwrap()
+                    .unwrap()
+                    .state,
+                OperationState::Expired
+            );
+        }
+        let first_receipt = store
+            .operation("service-replay-idempotency-00000004")
+            .unwrap()
+            .unwrap()
+            .receipt;
+        let (applied_duplicate, duplicate) = client.session.receive(&first_bytes).unwrap();
+        assert_eq!(duplicate, ReceiveResult::Duplicate);
+        service
+            .dispatch(&mut client, applied_duplicate, duplicate)
+            .unwrap();
+        assert_eq!(
+            store
+                .operation("service-replay-idempotency-00000004")
+                .unwrap()
+                .unwrap()
+                .receipt,
+            first_receipt
+        );
+
+        let outbound = store
+            .unacknowledged_outbound(1, 512)
+            .unwrap()
+            .into_iter()
+            .map(|row| serde_json::from_slice::<Envelope>(&row.frame).unwrap())
+            .collect::<Vec<_>>();
+        let requested = outbound
+            .iter()
+            .filter(|frame| frame.kind == "transport.replay_required")
+            .map(|frame| frame.payload["expectedSequence"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(requested, ["4", "36"]);
+        assert_eq!(
+            outbound
+                .iter()
+                .filter(|frame| frame.kind == "operation.admission")
+                .count(),
+            40
+        );
+        assert!(
+            outbound
+                .iter()
+                .any(|frame| frame.kind == "reconcile.complete")
+        );
+
+        let cancel = control_envelope(
+            45,
+            "operation.cancel",
+            json!({
+                "operationId":"op_service_replay_00000004",
+                "targetRunId":"run_service_replay01",
+                "targetControllerEpoch":"1",
+                "expectedState":"running"
+            }),
+        );
+        let cancel_bytes = serde_json::to_vec(&cancel).unwrap();
+        assert_eq!(
+            client.session.receive(&cancel_bytes).unwrap().1,
+            ReceiveResult::Applied
+        );
+        let (pending_cancel, pending) = client.session.receive(&cancel_bytes).unwrap();
+        assert_eq!(pending, ReceiveResult::DuplicatePending);
+        assert!(matches!(
+            service.dispatch(&mut client, pending_cancel, pending),
+            Err(ServiceError::Unavailable(reason))
+                if reason == "ambiguous_control_effect_pending_recovery"
+        ));
+        assert_eq!(
+            store
+                .inbound_applied_through(Direction::ControlToNode)
+                .unwrap(),
+            44
         );
     }
 

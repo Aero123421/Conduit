@@ -43,6 +43,21 @@ interface StoredDispatchReceipt {
   expires_at: string;
 }
 
+interface StoredControlReplayIntent {
+  [key: string]: string | number;
+  request_sequence: number;
+  request_message_id: string;
+  from_sequence: number;
+  through_sequence: number;
+  attempt_count: number;
+  next_attempt_at: string;
+}
+
+interface ValidatedControlReplay {
+  intent: StoredControlReplayIntent;
+  frames: StoredOutboundFrame[];
+}
+
 const MAX_CONTROL_REPLAY_FRAMES = 32;
 
 export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
@@ -59,7 +74,9 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
         CREATE TABLE IF NOT EXISTS reconciliation_sessions(id TEXT PRIMARY KEY, epoch INTEGER NOT NULL, state TEXT NOT NULL, summary_json TEXT, plan_json TEXT, created_at TEXT NOT NULL, completed_at TEXT);
         CREATE TABLE IF NOT EXISTS terminal_receipt_cache(operation_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, receipt_json TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS outbound_message_receipts(message_id TEXT PRIMARY KEY, correlation_id TEXT, payload_digest TEXT NOT NULL, sequence INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('queued','sent','acknowledged')), expires_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS control_replay_intents(request_sequence INTEGER PRIMARY KEY, request_message_id TEXT NOT NULL UNIQUE, from_sequence INTEGER NOT NULL, through_sequence INTEGER NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS outbound_receipt_expiry_idx ON outbound_message_receipts(expires_at);
+        CREATE INDEX IF NOT EXISTS control_replay_due_idx ON control_replay_intents(next_attempt_at,request_sequence);
         INSERT OR IGNORE INTO transport_positions(direction,durable_sequence,acknowledged_sequence) VALUES ('control_to_node',0,0),('node_to_control',0,0);
         INSERT OR IGNORE INTO _sql_schema_migrations(id,applied_at) VALUES (1,datetime('now'));
       `);
@@ -72,6 +89,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       if (!outboundColumns.has("next_attempt_at")) this.ctx.storage.sql.exec("ALTER TABLE outbound_frames ADD COLUMN next_attempt_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'");
       this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS outbound_dispatch_due_idx ON outbound_frames(state,next_attempt_at,expires_at)");
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO _sql_schema_migrations(id,applied_at) VALUES (3,datetime('now'))");
+      this.ctx.storage.sql.exec("INSERT OR IGNORE INTO _sql_schema_migrations(id,applied_at) VALUES (4,datetime('now'))");
       this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     });
   }
@@ -160,8 +178,16 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     const sequence = BigInt(body.sequence);
     const position = this.ctx.storage.sql.exec<{ durable_sequence: number }>("SELECT durable_sequence FROM transport_positions WHERE direction='node_to_control'").one().durable_sequence;
     if (sequence <= BigInt(position)) {
-      const prior = this.ctx.storage.sql.exec<{ message_id: string; payload_digest: string }>("SELECT message_id,payload_digest FROM inbound_frames WHERE sequence=?", Number(sequence)).toArray()[0];
+      const prior = this.ctx.storage.sql.exec<{ message_id: string; payload_digest: string; frame_json: string; projected: number }>("SELECT message_id,payload_digest,frame_json,projected FROM inbound_frames WHERE sequence=?", Number(sequence)).toArray()[0];
       if (prior?.message_id === body.messageId && prior.payload_digest === body.payloadDigest) {
+        if (body.type === "transport.replay_required") {
+          const intent = this.ctx.storage.sql.exec<StoredControlReplayIntent>("SELECT * FROM control_replay_intents WHERE request_sequence=? AND request_message_id=?", Number(sequence), body.messageId).toArray()[0];
+          if (intent !== undefined) await this.dispatchControlReplayIntent(intent, ws);
+        }
+        if (prior.projected === 0) {
+          const persisted = parseWireDocumentText(schemaIds.nodeV1, prior.frame_json);
+          if ("protocol" in persisted) this.ctx.waitUntil(this.project(persisted));
+        }
         if (body.type !== "transport.ack") await this.enqueueControlFrame("transport.ack", { direction: "node_to_control", throughSequence: String(position) }, undefined, new Date(Date.now() + 300_000).toISOString(), ws);
         return;
       }
@@ -169,16 +195,18 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     }
     if (sequence !== BigInt(position) + 1n) { await this.enqueueControlFrame("transport.replay_required", { direction: "node_to_control", expectedSequence: String(position + 1), receivedSequence: String(sequence) }, undefined, new Date(Date.now() + 300_000).toISOString(), ws); return; }
     const frame = body as unknown as NodeV1PostAuthFrame;
-    const replayFrames = frame.type === "transport.replay_required" ? await this.validateControlReplayRequest(ws, frame) : undefined;
-    if (frame.type === "transport.replay_required" && replayFrames === null) return;
+    const replay = frame.type === "transport.replay_required" ? await this.validateControlReplayRequest(ws, frame) : undefined;
+    if (frame.type === "transport.replay_required" && replay === null) return;
+    if (replay !== undefined && replay !== null) await this.scheduleOutboxAlarm(Date.now() + 1_000);
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec("INSERT INTO inbound_frames(sequence,message_id,correlation_id,payload_digest,frame_json,created_at) VALUES (?,?,?,?,?,?)", Number(sequence), frame.messageId, frame.correlationId ?? null, frame.payloadDigest, JSON.stringify(frame), nowIso());
       this.ctx.storage.sql.exec("UPDATE transport_positions SET durable_sequence=? WHERE direction='node_to_control'", Number(sequence));
+      if (replay !== undefined && replay !== null) this.ctx.storage.sql.exec("INSERT INTO control_replay_intents(request_sequence,request_message_id,from_sequence,through_sequence,next_attempt_at,created_at) VALUES (?,?,?,?,?,?)", replay.intent.request_sequence, replay.intent.request_message_id, replay.intent.from_sequence, replay.intent.through_sequence, replay.intent.next_attempt_at, nowIso());
       if (frame.type === "operation.terminal" && typeof frame.payload.operationId === "string" && typeof frame.payload.requestDigest === "string") this.ctx.storage.sql.exec("INSERT OR REPLACE INTO terminal_receipt_cache(operation_id,request_digest,receipt_json,created_at) VALUES (?,?,?,?)", frame.payload.operationId, frame.payload.requestDigest, JSON.stringify(frame.payload), nowIso());
     });
     if (frame.type === "reconcile.summary") await this.planReconciliation(ws, attachment, frame);
     if (frame.type === "reconcile.complete") await this.completeReconciliation(ws, attachment, frame);
-    if (replayFrames !== undefined && replayFrames !== null) for (const replay of replayFrames) await this.sendStoredFrame(replay, ws);
+    if (replay !== undefined && replay !== null) await this.dispatchControlReplayIntent(replay.intent, ws, replay.frames);
     if (frame.type === "transport.ack") {
       const acknowledged = BigInt(frame.payload.throughSequence);
       const controlPosition = this.ctx.storage.sql.exec<{ durable_sequence: number; acknowledged_sequence: number }>("SELECT durable_sequence,acknowledged_sequence FROM transport_positions WHERE direction='control_to_node'").one();
@@ -187,6 +215,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
         this.ctx.storage.sql.exec("UPDATE transport_positions SET acknowledged_sequence=? WHERE direction='control_to_node'", Number(acknowledged));
         this.ctx.storage.sql.exec("UPDATE outbound_message_receipts SET state='acknowledged',updated_at=? WHERE sequence<=?", nowIso(), Number(acknowledged));
         this.ctx.storage.sql.exec("DELETE FROM outbound_frames WHERE sequence<=?", Number(acknowledged));
+        this.ctx.storage.sql.exec("DELETE FROM control_replay_intents WHERE through_sequence<=?", Number(acknowledged));
       });
     } else {
       await this.enqueueControlFrame("transport.ack", { direction: "node_to_control", throughSequence: frame.sequence }, undefined, new Date(Date.now() + 300_000).toISOString(), ws);
@@ -194,28 +223,67 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     this.ctx.waitUntil(this.project(frame));
   }
 
-  private async validateControlReplayRequest(ws: WebSocket, frame: Extract<NodeV1PostAuthFrame, { type: "transport.replay_required" }>): Promise<StoredOutboundFrame[] | null> {
+  private async validateControlReplayRequest(ws: WebSocket, frame: Extract<NodeV1PostAuthFrame, { type: "transport.replay_required" }>): Promise<ValidatedControlReplay | null> {
     if (frame.payload.direction !== "control_to_node") { ws.close(1008, "replay_direction_invalid"); return null; }
     const expected = BigInt(frame.payload.expectedSequence);
     const position = this.ctx.storage.sql.exec<{ durable_sequence: number; acknowledged_sequence: number }>("SELECT durable_sequence,acknowledged_sequence FROM transport_positions WHERE direction='control_to_node'").one();
     const through = frame.payload.receivedSequence === undefined ? BigInt(position.durable_sequence) : BigInt(frame.payload.receivedSequence);
     if (expected < 1n || expected > through || through > BigInt(position.durable_sequence) || through > BigInt(Number.MAX_SAFE_INTEGER)) { ws.close(1008, "replay_range_invalid"); return null; }
     if (expected <= BigInt(position.acknowledged_sequence)) { ws.close(1008, "replay_range_acknowledged"); return null; }
-    if (through - expected + 1n > BigInt(MAX_CONTROL_REPLAY_FRAMES)) { ws.close(1008, "replay_range_too_large"); return null; }
-    const rows = this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE sequence BETWEEN ? AND ? ORDER BY sequence", Number(expected), Number(through)).toArray();
-    if (rows.length !== Number(through - expected + 1n)) { ws.close(1011, "replay_range_unavailable"); return null; }
+    const chunkEnd = expected + BigInt(MAX_CONTROL_REPLAY_FRAMES - 1);
+    const chunkThrough = through < chunkEnd ? through : chunkEnd;
+    const chunkLength = Number(chunkThrough - expected + 1n);
+    const rows = this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE sequence BETWEEN ? AND ? ORDER BY sequence", Number(expected), Number(chunkThrough)).toArray();
+    if (rows.length !== chunkLength) { ws.close(1011, "replay_range_unavailable"); return null; }
+    if (chunkThrough < through) {
+      const sentinel = this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE sequence=?", Number(through)).toArray()[0];
+      if (sentinel === undefined) { ws.close(1011, "replay_range_unavailable"); return null; }
+      rows.push(sentinel);
+    }
     for (let index = 0; index < rows.length; index += 1) {
       const row = rows[index]!;
       let persisted: unknown;
       try { persisted = parseWireDocumentText(schemaIds.nodeV1, row.frame_json); } catch { ws.close(1011, "replay_record_invalid"); return null; }
       if (persisted === null || typeof persisted !== "object" || Array.isArray(persisted)) { ws.close(1011, "replay_record_invalid"); return null; }
       const wire = persisted as Record<string, unknown>;
-      const expectedSequence = expected + BigInt(index);
+      const expectedSequence = index < chunkLength ? expected + BigInt(index) : through;
       if (!Number.isSafeInteger(row.sequence) || BigInt(row.sequence) !== expectedSequence || !["queued", "sent"].includes(row.state) || wire.protocol !== "conduit.node/1" || wire.direction !== "control_to_node" || wire.sequence !== String(expectedSequence) || wire.messageId !== row.message_id || (wire.correlationId ?? null) !== row.correlation_id || wire.payloadDigest !== row.payload_digest || wire.payload === null || typeof wire.payload !== "object" || Array.isArray(wire.payload) || await sha256Hex(canonicalJson(wire.payload)) !== row.payload_digest || Date.parse(row.expires_at) <= Date.now()) {
         ws.close(1011, "replay_record_invalid"); return null;
       }
     }
+    return {
+      intent: { request_sequence: Number(frame.sequence), request_message_id: frame.messageId, from_sequence: Number(expected), through_sequence: Number(through), attempt_count: 0, next_attempt_at: nowIso() },
+      frames: rows,
+    };
+  }
+
+  private controlReplayFrames(intent: StoredControlReplayIntent): StoredOutboundFrame[] {
+    const from = BigInt(intent.from_sequence);
+    const through = BigInt(intent.through_sequence);
+    const chunkEnd = from + BigInt(MAX_CONTROL_REPLAY_FRAMES - 1);
+    const chunkThrough = through < chunkEnd ? through : chunkEnd;
+    const rows = this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE sequence BETWEEN ? AND ? ORDER BY sequence", Number(from), Number(chunkThrough)).toArray();
+    if (rows.length !== Number(chunkThrough - from + 1n)) throw new TypeError("control replay chunk is unavailable");
+    if (chunkThrough < through) {
+      const sentinel = this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE sequence=?", Number(through)).toArray()[0];
+      if (sentinel === undefined) throw new TypeError("control replay sentinel is unavailable");
+      rows.push(sentinel);
+    }
     return rows;
+  }
+
+  private async dispatchControlReplayIntent(intent: StoredControlReplayIntent, socket?: WebSocket, validatedFrames?: StoredOutboundFrame[]): Promise<void> {
+    let frames: StoredOutboundFrame[];
+    try { frames = validatedFrames ?? this.controlReplayFrames(intent); } catch {
+      this.ctx.storage.sql.exec("DELETE FROM control_replay_intents WHERE request_sequence=?", intent.request_sequence);
+      return;
+    }
+    for (const frame of frames) await this.sendStoredFrame(frame, socket);
+    const attempts = intent.attempt_count + 1;
+    const delay = Math.min(60_000, 2 ** Math.min(attempts, 6) * 1_000);
+    const next = new Date(Date.now() + delay).toISOString();
+    this.ctx.storage.sql.exec("UPDATE control_replay_intents SET attempt_count=?,next_attempt_at=? WHERE request_sequence=?", attempts, next, intent.request_sequence);
+    await this.scheduleOutboxAlarm(Date.parse(next));
   }
 
   private async planReconciliation(ws: WebSocket, attachment: SocketAttachment, frame: Extract<NodeV1PostAuthFrame, { type: "reconcile.summary" }>): Promise<void> {
@@ -380,7 +448,9 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     this.ctx.storage.sql.exec("DELETE FROM outbound_message_receipts WHERE expires_at<=?", now);
     const rows = this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE state='queued' AND next_attempt_at<=? ORDER BY sequence LIMIT 32", now).toArray();
     for (const row of rows) await this.sendStoredFrame(row);
-    const next = this.ctx.storage.sql.exec<{ next_attempt_at: string }>("SELECT next_attempt_at FROM outbound_frames WHERE state='queued' ORDER BY next_attempt_at LIMIT 1").toArray()[0];
+    const replayIntents = this.ctx.storage.sql.exec<StoredControlReplayIntent>("SELECT * FROM control_replay_intents WHERE next_attempt_at<=? ORDER BY next_attempt_at,request_sequence LIMIT 8", now).toArray();
+    for (const intent of replayIntents) await this.dispatchControlReplayIntent(intent);
+    const next = this.ctx.storage.sql.exec<{ next_attempt_at: string }>("SELECT next_attempt_at FROM (SELECT next_attempt_at FROM outbound_frames WHERE state='queued' UNION ALL SELECT next_attempt_at FROM control_replay_intents) ORDER BY next_attempt_at LIMIT 1").toArray()[0];
     if (next !== undefined) await this.scheduleOutboxAlarm(Math.max(Date.now() + 1_000, Date.parse(next.next_attempt_at)));
   }
 

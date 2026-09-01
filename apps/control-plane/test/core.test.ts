@@ -219,62 +219,90 @@ describe.sequential("control-plane contracts", () => {
     await expect.poll(async () => runInDurableObject(env.DEVICE_ROOMS.getByName(deviceId), (_instance, state) => state.storage.sql.exec<{ acknowledged_sequence: number }>("SELECT acknowledged_sequence FROM transport_positions WHERE direction='control_to_node'").one().acknowledged_sequence)).toBe(3);
 
     const issuedAt = new Date();
-    const operation = {
-      schemaVersion: 1,
-      operationId: "op_control_replay0001",
-      idempotencyKey: "control-replay-idempotency-0001",
-      actorPrincipalId: "prin_control_replay01",
-      clientId: "conduit.test",
-      deviceId,
-      capability: "command.start",
-      sourceRevisions: [],
-      runtime: { kind: "native", providerId: "native.linux", configurationRevision: 1 },
-      accessScope: "full_user",
-      approvalMode: "never",
-      connectorPolicyId: "cpol_control_replay01",
-      connectorPolicyRevision: 1,
-      arguments: { argv: ["true"] },
-      payloadDigest: "5".repeat(64),
-      issuedAt: issuedAt.toISOString(),
-      expiresAt: new Date(issuedAt.getTime() + 300_000).toISOString(),
-      validForMs: 300_000,
-    };
-    const offerPayload = { operation };
-    const messageId = "cmsg_control_replay_offer01";
-    const delivery = await env.DEVICE_ROOMS.getByName(deviceId).offer({ deviceId, messageId, correlationId: operation.operationId, payloadDigest: await sha256Hex(canonicalJson(offerPayload)), payload: offerPayload, expiresAt: operation.expiresAt });
-    expect(delivery).toEqual({ sequence: "4", delivered: true });
-    const originalOffer = parseWireDocumentText(schemaIds.nodeV1, await first.next());
-    expect(originalOffer).toMatchObject({ type: "operation.offer", sequence: "4", messageId, payload: offerPayload });
+    const originalOffers = [];
+    for (let index = 0; index < 40; index += 1) {
+      const suffix = index.toString().padStart(4, "0");
+      const operation = {
+        schemaVersion: 1,
+        operationId: `op_control_replay${suffix}`,
+        idempotencyKey: `control-replay-idempotency-${suffix}`,
+        actorPrincipalId: "prin_control_replay01",
+        clientId: "conduit.test",
+        deviceId,
+        capability: "command.start",
+        sourceRevisions: [],
+        runtime: { kind: "native", providerId: "native.linux", configurationRevision: 1 },
+        accessScope: "full_user",
+        approvalMode: "never",
+        connectorPolicyId: "cpol_control_replay01",
+        connectorPolicyRevision: 1,
+        arguments: { argv: ["true"] },
+        payloadDigest: "5".repeat(64),
+        issuedAt: issuedAt.toISOString(),
+        expiresAt: new Date(issuedAt.getTime() + 300_000).toISOString(),
+        validForMs: 300_000,
+      };
+      const offerPayload = { operation };
+      const messageId = `cmsg_control_replay_${suffix}`;
+      const delivery = await env.DEVICE_ROOMS.getByName(deviceId).offer({ deviceId, messageId, correlationId: operation.operationId, payloadDigest: await sha256Hex(canonicalJson(offerPayload)), payload: offerPayload, expiresAt: operation.expiresAt });
+      expect(delivery).toEqual({ sequence: String(index + 4), delivered: true });
+      const offered = parseWireDocumentText(schemaIds.nodeV1, await first.next());
+      expect(offered).toMatchObject({ type: "operation.offer", sequence: String(index + 4), messageId, payload: offerPayload });
+      originalOffers.push(offered);
+    }
+    const originalOffer = originalOffers[0]!;
     if (originalOffer.type !== "operation.offer") throw new Error("expected operation.offer");
+    const messageId = originalOffer.messageId;
     first.socket.close(1000, "fault_disconnect_before_ack");
     await evictDurableObject(env.DEVICE_ROOMS.getByName(deviceId));
 
     const second = await connect("node-boot-control-replay-0002");
-    expect(second.accepted).toMatchObject({ controlNextSequence: "5", nodeStoredThroughSequence: "3" });
+    expect(second.accepted).toMatchObject({ controlNextSequence: "44", nodeStoredThroughSequence: "3" });
     await second.send(4, "reconcile.summary", { nodeBootId: "node-boot-control-replay-0002", journalGeneration: "1", capabilityDigest: "4".repeat(64), lastControlSequenceApplied: "3", lastNodeSequenceAcknowledged: "3", lastNodeSequenceRetained: "4", runs: [], retainedEventRanges: [], unresolvedCount: 0, truncated: false, storageHealth: "healthy" }, second.accepted.connectionId);
     const reconnectMessages = [parseWireDocumentText(schemaIds.nodeV1, await second.next()), parseWireDocumentText(schemaIds.nodeV1, await second.next())];
     const replayPlan = reconnectMessages.find((frame) => frame.type === "reconcile.plan");
-    expect(replayPlan).toMatchObject({ type: "reconcile.plan", sequence: "5", payload: { controlReplay: [{ from: "4", through: "4" }] } });
+    expect(replayPlan).toMatchObject({ type: "reconcile.plan", sequence: "44", payload: { controlReplay: [{ from: "4", through: "43" }] } });
     const planFrame = reconnectMessages.find((frame) => frame.type === "reconcile.plan");
     if (planFrame?.type !== "reconcile.plan") throw new Error("expected reconnect reconcile.plan");
-    await second.send(5, "transport.replay_required", { direction: "control_to_node", expectedSequence: "4", receivedSequence: "5" });
-    const replayedOffer = parseWireDocumentText(schemaIds.nodeV1, await second.next());
-    const replayedPlan = parseWireDocumentText(schemaIds.nodeV1, await second.next());
-    const replayRequestAck = parseWireDocumentText(schemaIds.nodeV1, await second.next());
+    const replayPayload = { direction: "control_to_node", expectedSequence: "4", receivedSequence: "44" };
+    const replayRequest = { protocol: "conduit.node/1", messageId: "nmsg_control_replay_05", deviceId, connectionEpoch: second.accepted.connectionEpoch, direction: "node_to_control", sequence: "5", type: "transport.replay_required", payloadDigest: await sha256Hex(canonicalJson(replayPayload)), payload: replayPayload };
+    await runInDurableObject(env.DEVICE_ROOMS.getByName(deviceId), async (_instance, state) => {
+      await state.storage.setAlarm(Date.now() + 60_000);
+      state.storage.transactionSync(() => {
+        state.storage.sql.exec("INSERT INTO inbound_frames(sequence,message_id,correlation_id,payload_digest,frame_json,created_at) VALUES (5,?,NULL,?,?,?)", replayRequest.messageId, replayRequest.payloadDigest, JSON.stringify(replayRequest), now);
+        state.storage.sql.exec("UPDATE transport_positions SET durable_sequence=5 WHERE direction='node_to_control'");
+        state.storage.sql.exec("INSERT INTO control_replay_intents(request_sequence,request_message_id,from_sequence,through_sequence,next_attempt_at,created_at) VALUES (5,?,4,44,?,?)", replayRequest.messageId, now, now);
+      });
+    });
+    await evictDurableObject(env.DEVICE_ROOMS.getByName(deviceId));
+    await second.send(5, "transport.replay_required", replayPayload);
+    const firstChunk = [];
+    for (let index = 0; index < 34; index += 1) firstChunk.push(parseWireDocumentText(schemaIds.nodeV1, await second.next()));
+    const replayedOffer = firstChunk[0]!;
+    const replayedPlan = firstChunk[32]!;
+    const replayRequestAck = firstChunk[33]!;
     expect(replayedOffer).toMatchObject({ type: "operation.offer", sequence: originalOffer.sequence, messageId: originalOffer.messageId, payloadDigest: originalOffer.payloadDigest, payload: originalOffer.payload, connectionEpoch: second.accepted.connectionEpoch });
     expect(replayedPlan).toMatchObject({ type: "reconcile.plan", sequence: planFrame.sequence, messageId: planFrame.messageId, payloadDigest: planFrame.payloadDigest });
-    expect(replayRequestAck).toMatchObject({ type: "transport.ack", sequence: "7", payload: { direction: "node_to_control", throughSequence: "5" } });
+    expect(replayRequestAck).toMatchObject({ type: "transport.ack", sequence: "46", payload: { direction: "node_to_control", throughSequence: "5" } });
 
-    await second.send(6, "transport.ack", { direction: "control_to_node", throughSequence: "5" });
+    await second.send(6, "transport.replay_required", { direction: "control_to_node", expectedSequence: "36", receivedSequence: "44" });
+    const secondChunk = [];
+    for (let index = 0; index < 10; index += 1) secondChunk.push(parseWireDocumentText(schemaIds.nodeV1, await second.next()));
+    expect(secondChunk.slice(0, 8).map((frame) => "sequence" in frame ? frame.sequence : null)).toEqual(["36", "37", "38", "39", "40", "41", "42", "43"]);
+    expect(secondChunk[8]).toMatchObject({ type: "reconcile.plan", sequence: "44", messageId: planFrame.messageId, payloadDigest: planFrame.payloadDigest });
+    expect(secondChunk[9]).toMatchObject({ type: "transport.ack", sequence: "47", payload: { throughSequence: "6" } });
+
+    await second.send(7, "transport.ack", { direction: "control_to_node", throughSequence: "44" });
     await expect.poll(async () => runInDurableObject(env.DEVICE_ROOMS.getByName(deviceId), (_instance, state) => ({
       frameCount: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_frames WHERE message_id=?", messageId).one().count,
       receipt: state.storage.sql.exec<{ message_id: string; sequence: number; payload_digest: string; state: string }>("SELECT message_id,sequence,payload_digest,state FROM outbound_message_receipts WHERE message_id=?", messageId).toArray()[0],
-    }))).toEqual({ frameCount: 0, receipt: { message_id: messageId, sequence: 4, payload_digest: originalOffer.payloadDigest, state: "acknowledged" } });
+      replayIntents: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM control_replay_intents").one().count,
+    }))).toEqual({ frameCount: 0, receipt: { message_id: messageId, sequence: 4, payload_digest: originalOffer.payloadDigest, state: "acknowledged" }, replayIntents: 0 });
 
     const rejected = new Promise<{ code: number; reason: string }>((resolve) => second.socket.addEventListener("close", (event) => resolve({ code: event.code, reason: event.reason }), { once: true }));
-    await second.send(7, "transport.replay_required", { direction: "control_to_node", expectedSequence: "4", receivedSequence: "4" });
+    await second.send(8, "transport.replay_required", { direction: "control_to_node", expectedSequence: "4", receivedSequence: "4" });
     await expect(rejected).resolves.toEqual({ code: 1008, reason: "replay_range_acknowledged" });
-    const invalidPersisted = await runInDurableObject(env.DEVICE_ROOMS.getByName(deviceId), (_instance, state) => state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM inbound_frames WHERE sequence=7").one().count);
+    const invalidPersisted = await runInDurableObject(env.DEVICE_ROOMS.getByName(deviceId), (_instance, state) => state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM inbound_frames WHERE sequence=8").one().count);
     expect(invalidPersisted).toBe(0);
   });
 

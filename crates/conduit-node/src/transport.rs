@@ -33,6 +33,8 @@ pub enum TransportError {
     SequenceConflict,
     #[error("protocol_version_unsupported")]
     ProtocolUnsupported,
+    #[error("reconciliation_required")]
+    ReconciliationRequired,
     #[error("WebSocket failed: {0}")]
     WebSocket(String),
 }
@@ -117,18 +119,32 @@ pub struct TransportSession {
     store: NodeStore,
     device_id: String,
     epoch: u64,
+    preexisting_control_frontier: u64,
     reconciliation_complete: bool,
 }
 impl TransportSession {
     pub fn new(store: NodeStore, device_id: String, epoch: u64) -> Result<Self, TransportError> {
+        let frontier = store.transport_positions()?.control_received_through;
+        Self::new_with_control_frontier(store, device_id, epoch, frontier)
+    }
+    pub(crate) fn new_with_control_frontier(
+        store: NodeStore,
+        device_id: String,
+        epoch: u64,
+        preexisting_control_frontier: u64,
+    ) -> Result<Self, TransportError> {
         if epoch <= store.connection_epoch()? {
             return Err(TransportError::StaleEpoch);
+        }
+        if preexisting_control_frontier < store.transport_positions()?.control_received_through {
+            return Err(TransportError::Malformed);
         }
         store.set_connection_epoch(epoch)?;
         Ok(Self {
             store,
             device_id,
             epoch,
+            preexisting_control_frontier,
             reconciliation_complete: false,
         })
     }
@@ -149,6 +165,16 @@ impl TransportSession {
     }
     pub fn remote_work_allowed(&self) -> bool {
         self.reconciliation_complete
+    }
+    pub fn preexisting_control_replay_allowed(&self, sequence: u64) -> bool {
+        !self.reconciliation_complete && sequence <= self.preexisting_control_frontier
+    }
+    pub fn control_frame_allowed(&self, kind: &str, sequence: u64) -> bool {
+        !matches!(
+            kind,
+            "operation.offer" | "operation.input" | "operation.cancel" | "operation.approval"
+        ) || self.reconciliation_complete
+            || self.preexisting_control_replay_allowed(sequence)
     }
     pub fn receive(&self, bytes: &[u8]) -> Result<(Envelope, ReceiveResult), TransportError> {
         if bytes.len() > MAX_FRAME_BYTES {
@@ -175,6 +201,9 @@ impl TransportSession {
             return Err(TransportError::DigestMismatch);
         }
         let sequence = e.sequence.parse().map_err(|_| TransportError::Malformed)?;
+        if !self.control_frame_allowed(&e.kind, sequence) {
+            return Err(TransportError::ReconciliationRequired);
+        }
         let result = self
             .store
             .receive(
@@ -250,6 +279,23 @@ pub struct WssClient {
     reconciliation_required: bool,
 }
 impl WssClient {
+    #[cfg(test)]
+    pub(crate) fn from_test_stream(
+        stream: TcpStream,
+        session: TransportSession,
+        reconciliation_required: bool,
+    ) -> Self {
+        Self {
+            socket: WebSocket::from_raw_socket(
+                MaybeTlsStream::Plain(stream),
+                tungstenite::protocol::Role::Client,
+                None,
+            ),
+            session,
+            reconciliation_required,
+        }
+    }
+
     pub fn connect(
         url: &str,
         store: NodeStore,
@@ -354,22 +400,18 @@ impl WssClient {
             .parse()
             .map_err(|_| TransportError::Malformed)?;
         let positions = store.transport_positions()?;
-        if control_next == 0
-            || control_next > positions.control_received_through.saturating_add(1)
-            || node_stored > positions.node_sent_through
-        {
-            return Err(TransportError::Malformed);
-        }
-        if !accepted.reconciliation_required
-            && control_next == positions.control_received_through.saturating_add(1)
-            && node_stored == positions.node_sent_through
-        {
-            // The server may explicitly waive reconciliation only when both
-            // durable sequence positions already agree.
-        } else if !accepted.reconciliation_required {
-            return Err(TransportError::Malformed);
-        }
-        let session = TransportSession::new(store.clone(), device_id.into(), epoch)?;
+        let preexisting_control_frontier = validate_accepted_positions(
+            control_next,
+            node_stored,
+            accepted.reconciliation_required,
+            positions,
+        )?;
+        let session = TransportSession::new_with_control_frontier(
+            store.clone(),
+            device_id.into(),
+            epoch,
+            preexisting_control_frontier,
+        )?;
         store.ack_outbound(Direction::NodeToControl, node_stored)?;
         Ok(Self {
             socket,
@@ -437,6 +479,27 @@ impl WssClient {
         }
         .map(Some)
     }
+}
+
+fn validate_accepted_positions(
+    control_next: u64,
+    node_stored: u64,
+    reconciliation_required: bool,
+    positions: conduit_node_store::TransportPositions,
+) -> Result<u64, TransportError> {
+    let local_control_next = positions.control_received_through.saturating_add(1);
+    if control_next == 0
+        || control_next < local_control_next
+        || node_stored > positions.node_sent_through
+    {
+        return Err(TransportError::Malformed);
+    }
+    if !reconciliation_required
+        && (control_next != local_control_next || node_stored != positions.node_sent_through)
+    {
+        return Err(TransportError::Malformed);
+    }
+    Ok(control_next - 1)
 }
 use tungstenite::client::IntoClientRequest;
 fn set_timeouts(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
@@ -509,6 +572,21 @@ mod tests {
             correlation_id: None,
             payload_digest: digest(&p),
             payload: p,
+        }
+    }
+    fn operation_offer_envelope(seq: u64) -> Envelope {
+        let payload = serde_json::json!({"operation":{"schemaVersion":1,"operationId":format!("op_replay_{seq:08}"),"idempotencyKey":format!("replay-operation-key-{seq:08}"),"actorPrincipalId":"prin_replay_0001","clientId":"conduit.test","deviceId":"dev_12345678","capability":"command.start","sourceRevisions":[],"runtime":{"kind":"native","providerId":"native.linux","configurationRevision":1},"accessScope":"full_user","approvalMode":"never","connectorPolicyId":"cpol_replay_0001","connectorPolicyRevision":1,"arguments":{"argv":["true"]},"payloadDigest":"11".repeat(32),"issuedAt":"2026-09-01T00:00:00Z","expiresAt":"2026-09-01T00:05:00Z","validForMs":300000}});
+        Envelope {
+            protocol: PROTOCOL.into(),
+            message_id: format!("cmsg_offer_{seq:08}"),
+            device_id: "dev_12345678".into(),
+            connection_epoch: "1".into(),
+            direction: "control_to_node".into(),
+            sequence: seq.to_string(),
+            kind: "operation.offer".into(),
+            correlation_id: Some(format!("op_replay_{seq:08}")),
+            payload_digest: digest(&payload),
+            payload,
         }
     }
     #[test]
@@ -607,5 +685,141 @@ mod tests {
             t.queue_outbound(&format!("nmsg_fixture_{index:02}"), kind, None, payload, 0)
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn accepted_frontier_allows_bounded_contiguous_replay_before_new_effects() {
+        let positions = conduit_node_store::TransportPositions {
+            control_received_through: 3,
+            node_sent_through: 9,
+            node_acknowledged_through: 7,
+        };
+        assert_eq!(
+            validate_accepted_positions(44, 7, true, positions).unwrap(),
+            43
+        );
+        assert!(validate_accepted_positions(3, 7, true, positions).is_err());
+        assert_eq!(
+            validate_accepted_positions(4, 9, false, positions).unwrap(),
+            3
+        );
+        assert!(validate_accepted_positions(44, 9, false, positions).is_err());
+
+        let directory = tempdir().unwrap();
+        let store = NodeStore::open(directory.path()).unwrap();
+        let mut session = TransportSession::new_with_control_frontier(
+            store.clone(),
+            "dev_12345678".into(),
+            1,
+            43,
+        )
+        .unwrap();
+        for sequence in 1..=3 {
+            let bytes = serde_json::to_vec(&envelope(
+                sequence,
+                serde_json::json!({"direction":"node_to_control","throughSequence":"0"}),
+            ))
+            .unwrap();
+            assert_eq!(session.receive(&bytes).unwrap().1, ReceiveResult::Applied);
+            store
+                .mark_inbound_applied(Direction::ControlToNode, sequence)
+                .unwrap();
+        }
+        let sentinel = serde_json::to_vec(&envelope(
+            44,
+            serde_json::json!({"direction":"node_to_control","throughSequence":"0"}),
+        ))
+        .unwrap();
+        assert_eq!(
+            session.receive(&sentinel).unwrap().1,
+            ReceiveResult::Gap { expected: 4 }
+        );
+        for sequence in 4..=35 {
+            let bytes = serde_json::to_vec(&envelope(
+                sequence,
+                serde_json::json!({"direction":"node_to_control","throughSequence":"0"}),
+            ))
+            .unwrap();
+            assert_eq!(session.receive(&bytes).unwrap().1, ReceiveResult::Applied);
+            assert!(session.preexisting_control_replay_allowed(sequence));
+            if sequence == 4 {
+                assert_eq!(
+                    session.receive(&bytes).unwrap().1,
+                    ReceiveResult::DuplicatePending
+                );
+            }
+            store
+                .mark_inbound_applied(Direction::ControlToNode, sequence)
+                .unwrap();
+        }
+        assert_eq!(
+            session.receive(&sentinel).unwrap().1,
+            ReceiveResult::Gap { expected: 36 }
+        );
+        for sequence in 36..=43 {
+            let bytes = serde_json::to_vec(&envelope(
+                sequence,
+                serde_json::json!({"direction":"node_to_control","throughSequence":"0"}),
+            ))
+            .unwrap();
+            assert_eq!(session.receive(&bytes).unwrap().1, ReceiveResult::Applied);
+            assert!(session.preexisting_control_replay_allowed(sequence));
+            store
+                .mark_inbound_applied(Direction::ControlToNode, sequence)
+                .unwrap();
+        }
+        assert!(!session.preexisting_control_replay_allowed(44));
+        assert_eq!(
+            session.receive(&sentinel).unwrap().1,
+            ReceiveResult::Applied
+        );
+        store
+            .mark_inbound_applied(Direction::ControlToNode, 44)
+            .unwrap();
+        session.mark_reconciliation_complete();
+        assert!(session.remote_work_allowed());
+        assert!(!session.preexisting_control_replay_allowed(43));
+    }
+
+    #[test]
+    fn replayed_offer_duplicate_pending_reapplies_but_new_offer_is_not_persisted() {
+        let directory = tempdir().unwrap();
+        let store = NodeStore::open(directory.path()).unwrap();
+        let mut session =
+            TransportSession::new_with_control_frontier(store.clone(), "dev_12345678".into(), 1, 1)
+                .unwrap();
+        let replayed = serde_json::to_vec(&operation_offer_envelope(1)).unwrap();
+        assert_eq!(
+            session.receive(&replayed).unwrap().1,
+            ReceiveResult::Applied
+        );
+        assert_eq!(
+            session.receive(&replayed).unwrap().1,
+            ReceiveResult::DuplicatePending
+        );
+        let new_effect = serde_json::to_vec(&operation_offer_envelope(2)).unwrap();
+        assert!(matches!(
+            session.receive(&new_effect),
+            Err(TransportError::ReconciliationRequired)
+        ));
+        assert_eq!(
+            store
+                .transport_positions()
+                .unwrap()
+                .control_received_through,
+            1
+        );
+        store
+            .mark_inbound_applied(Direction::ControlToNode, 1)
+            .unwrap();
+        assert_eq!(
+            session.receive(&replayed).unwrap().1,
+            ReceiveResult::Duplicate
+        );
+        session.mark_reconciliation_complete();
+        assert_eq!(
+            session.receive(&new_effect).unwrap().1,
+            ReceiveResult::Applied
+        );
     }
 }

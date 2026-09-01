@@ -10,6 +10,7 @@ pub use driver::ProtocolDriver;
 pub use process::AdapterChild;
 pub use types::{
     AdapterCapability, AdapterError, AdapterEvent, AdapterEventKind, AdapterKind, AdapterOperation,
-    AdapterProbe, AdapterProtocol, AdapterState, AuthenticationState, LaunchRequest, LaunchSpec,
-    ProtocolFrame, SupportLevel,
+    AdapterProbe, AdapterProtocol, AdapterState, ApprovalBridgeOwnership, ApprovalContext,
+    AuthenticationState, EffectiveApprovalPolicy, LaunchRequest, LaunchSpec, ProtocolFrame,
+    SupportLevel,
 };

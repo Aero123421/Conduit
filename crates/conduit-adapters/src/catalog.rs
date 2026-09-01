@@ -15,8 +15,8 @@ use crate::{
     driver::ProtocolDriver,
     types::{
         AdapterCapability, AdapterError, AdapterKind, AdapterOperation, AdapterProbe,
-        AdapterProtocol, AuthenticationState, LaunchRequest, LaunchSpec, MAX_VERSION_OUTPUT_BYTES,
-        SupportLevel, bound_utf8, validate_launch_request,
+        AdapterProtocol, ApprovalContext, AuthenticationState, LaunchRequest, LaunchSpec,
+        MAX_VERSION_OUTPUT_BYTES, SupportLevel, bound_utf8, validate_launch_request,
     },
 };
 
@@ -197,11 +197,19 @@ impl AdapterCatalog {
         kind: AdapterKind,
         request: &LaunchRequest,
     ) -> Result<(LaunchSpec, ProtocolDriver), AdapterError> {
+        Self::launch_with_approval_context(kind, request, ApprovalContext::default())
+    }
+
+    pub fn launch_with_approval_context(
+        kind: AdapterKind,
+        request: &LaunchRequest,
+        approval_context: ApprovalContext,
+    ) -> Result<(LaunchSpec, ProtocolDriver), AdapterError> {
         validate_launch_request(request)?;
         let profile = Self::profile(kind);
         let executable = find_executable(profile.executable)
             .ok_or(AdapterError::ExecutableUnavailable(profile.executable))?;
-        Self::launch_resolved(kind, request, executable)
+        Self::launch_resolved(kind, request, executable, approval_context)
     }
 
     /// Builds the fixed Device-owned guest image contract without claiming
@@ -211,18 +219,28 @@ impl AdapterCatalog {
         kind: AdapterKind,
         request: &LaunchRequest,
     ) -> Result<(LaunchSpec, ProtocolDriver), AdapterError> {
+        Self::launch_in_guest_with_approval_context(kind, request, ApprovalContext::default())
+    }
+
+    pub fn launch_in_guest_with_approval_context(
+        kind: AdapterKind,
+        request: &LaunchRequest,
+        approval_context: ApprovalContext,
+    ) -> Result<(LaunchSpec, ProtocolDriver), AdapterError> {
         validate_launch_request(request)?;
         let executable = PathBuf::from("/usr/local/bin").join(Self::profile(kind).executable);
-        Self::launch_resolved(kind, request, executable)
+        Self::launch_resolved(kind, request, executable, approval_context)
     }
 
     fn launch_resolved(
         kind: AdapterKind,
         request: &LaunchRequest,
         executable: PathBuf,
+        approval_context: ApprovalContext,
     ) -> Result<(LaunchSpec, ProtocolDriver), AdapterError> {
         let profile = Self::profile(kind);
-        let mut driver = ProtocolDriver::new(kind, request)?;
+        let mut driver =
+            ProtocolDriver::new_with_approval_context(kind, request, approval_context)?;
         let args = launch_args(kind, request)?;
         let initial_frames = driver.start()?;
         Ok((

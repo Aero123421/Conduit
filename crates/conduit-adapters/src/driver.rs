@@ -4,7 +4,8 @@ use serde_json::{Value, json};
 
 use crate::types::{
     AdapterError, AdapterEvent, AdapterEventKind, AdapterKind, AdapterOperation, AdapterState,
-    LaunchRequest, MAX_PROTOCOL_FRAME_BYTES, ProtocolFrame, validate_launch_request,
+    ApprovalContext, LaunchRequest, MAX_PROTOCOL_FRAME_BYTES, ProtocolFrame,
+    validate_launch_request,
 };
 
 const MAX_REPLAY_EVENTS: usize = 4_096;
@@ -34,11 +35,20 @@ pub struct ProtocolDriver {
     native_session_id: Option<String>,
     active_turn_id: Option<String>,
     next_request_id: u64,
+    approval_context: ApprovalContext,
     replay: VecDeque<AdapterEvent>,
 }
 
 impl ProtocolDriver {
     pub fn new(kind: AdapterKind, request: &LaunchRequest) -> Result<Self, AdapterError> {
+        Self::new_with_approval_context(kind, request, ApprovalContext::default())
+    }
+
+    pub fn new_with_approval_context(
+        kind: AdapterKind,
+        request: &LaunchRequest,
+        approval_context: ApprovalContext,
+    ) -> Result<Self, AdapterError> {
         validate_launch_request(request)?;
         let phase = match kind {
             AdapterKind::Codex => Phase::CodexInitialize,
@@ -56,6 +66,7 @@ impl ProtocolDriver {
             native_session_id: None,
             active_turn_id: None,
             next_request_id: 1,
+            approval_context,
             replay: VecDeque::new(),
         })
     }
@@ -120,6 +131,10 @@ impl ProtocolDriver {
 
     pub const fn state(&self) -> AdapterState {
         self.state
+    }
+
+    pub const fn approval_context(&self) -> ApprovalContext {
+        self.approval_context
     }
 
     pub fn native_session_id(&self) -> Option<&str> {

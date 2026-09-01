@@ -52,6 +52,52 @@ pub enum AdapterProtocol {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum EffectiveApprovalPolicy {
+    Always,
+    OutsideScope,
+    RiskClasses,
+    Never,
+}
+
+impl TryFrom<&str> for EffectiveApprovalPolicy {
+    type Error = AdapterError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "always" => Ok(Self::Always),
+            "outside_scope" => Ok(Self::OutsideScope),
+            "risk_based" | "risk_classes" => Ok(Self::RiskClasses),
+            "never" => Ok(Self::Never),
+            _ => Err(AdapterError::InvalidApprovalPolicy),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalBridgeOwnership {
+    Unavailable,
+    Typed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ApprovalContext {
+    pub effective_policy: EffectiveApprovalPolicy,
+    pub bridge: ApprovalBridgeOwnership,
+}
+
+impl Default for ApprovalContext {
+    fn default() -> Self {
+        Self {
+            effective_policy: EffectiveApprovalPolicy::Always,
+            bridge: ApprovalBridgeOwnership::Unavailable,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum SupportLevel {
     Supported,
     Degraded,
@@ -243,6 +289,8 @@ pub enum AdapterError {
     NulInput,
     #[error("invalid native session identifier")]
     InvalidNativeSessionId,
+    #[error("invalid effective approval policy")]
+    InvalidApprovalPolicy,
     #[error("protocol frame is {actual} bytes; maximum is {maximum}")]
     FrameTooLarge { actual: usize, maximum: usize },
     #[error("protocol frame is not LF-terminated UTF-8 JSON")]

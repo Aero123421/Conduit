@@ -8,5 +8,9 @@ Managed Git uses stable Git interfaces. Repository observation covers object for
 
 Managed folders use bounded, content-addressed manifests. Acceptance is prepare/CAS/finalize; `MaterializationRequest` and `PushRequest` remain separate effect and approval boundaries.
 
-Integration must add these crates to the repository lockfile. This workstream intentionally does not edit the root `Cargo.toml` or `Cargo.lock`.
+The `wire_v1` module is the schema-exact serde boundary for
+`changeset-v1.schema.json`. It represents Baseline, Run Workspace, Change Set,
+Review, acceptance, custody, and materialization records without changing the
+acceptance service's established operational API.
 
+The crate remains in the existing root workspace; this wire-boundary addition does not alter workspace registration.

@@ -3,6 +3,7 @@
 mod evidence;
 mod store;
 mod types;
+pub mod wire_v1;
 
 pub use evidence::*;
 pub use store::*;

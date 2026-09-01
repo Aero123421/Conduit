@@ -1,0 +1,44 @@
+{
+  "schemaVersion": 1,
+  "kind": "connector_policy",
+  "id": "cpol_read_only_01",
+  "principalId": "prin_owner_01",
+  "clientId": "https://client.example/research-assistant/conduit",
+  "revision": 1,
+  "status": "active",
+  "deviceSelector": {
+    "mode": "all"
+  },
+  "projectSelector": {
+    "mode": "ids",
+    "ids": [
+      "prj_conduit_01"
+    ]
+  },
+  "allowedOperations": [
+    "project.read",
+    "session.read",
+    "board.read",
+    "run.read",
+    "logs.summary.read",
+    "logs.normalized.read",
+    "artifact.read"
+  ],
+  "allowedRuntimes": [
+    "native",
+    "restricted_native",
+    "container",
+    "vm"
+  ],
+  "maxAccessScope": "read_only",
+  "mostPermissiveApprovalMode": "always",
+  "requiredApprovalRiskClasses": [
+    "raw_log_export",
+    "secret_access"
+  ],
+  "allowRawContent": false,
+  "allowArtifactUpload": false,
+  "rateLimitProfileId": "rate_read_only_01",
+  "createdAt": "2026-09-01T00:00:00Z",
+  "updatedAt": "2026-09-01T00:00:00Z"
+}

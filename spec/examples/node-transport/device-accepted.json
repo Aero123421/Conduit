@@ -1,0 +1,24 @@
+{
+  "schemaVersion": 1,
+  "protocol": "conduit.node/1",
+  "type": "device.accepted",
+  "messageId": "msg_accept0001",
+  "payload": {
+    "connectionId": "conn_example0001",
+    "connectionEpoch": 7,
+    "reconciliationId": "recon_example0001",
+    "selectedProtocolVersion": "conduit.node/1",
+    "serverTime": "2026-09-01T09:00:01Z",
+    "controlPlaneKeyId": "cpkey_example0001",
+    "currentCloudAckedRecordSeq": 40,
+    "transportLimits": {
+      "maxFrameBytes": 524288,
+      "maxBatchRecords": 256,
+      "maxInlineRecordBytes": 65536,
+      "maxInFlightBatches": 4,
+      "heartbeatIntervalMs": 30000,
+      "heartbeatTimeoutMs": 90000
+    },
+    "reconciliationRequired": true
+  }
+}

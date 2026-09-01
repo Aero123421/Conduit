@@ -62,6 +62,7 @@ export interface NodeProtocolPayloadCatalogV1 {
   "operation.terminal": OperationTerminalPayload;
   "operation.input": OperationTargetPayload;
   "operation.cancel": OperationTargetPayload;
+  "operation.approval_request": OperationApprovalRequestPayload;
   "operation.approval": OperationApprovalPayload;
   "event.batch": EventBatchPayload;
   "event.gap": EventGapPayload;
@@ -264,6 +265,29 @@ export interface OperationTargetPayload {
   mode?: string;
   content?: string;
   targetDigest?: Sha256Hex;
+}
+export interface OperationApprovalRequestPayload {
+  approvalId: ApprovalId;
+  operationId: OperationId;
+  runId: RunId;
+  requesterPrincipalId: PrincipalId;
+  clientId: string;
+  deviceId: DeviceId;
+  operationDigest: Sha256Hex;
+  providerRequestId: string | number;
+  method: string;
+  parametersDigest: Sha256Hex;
+  argumentsSummary: {
+    [k: string]: unknown;
+  };
+  adapterId: string;
+  accessScope: AccessScope;
+  approvalMode: ApprovalMode;
+  controllerEpoch: U64Decimal;
+  localPolicyRevision: number;
+  issuedAt: Timestamp;
+  expiresAt: Timestamp;
+  validForMs: number;
 }
 export interface OperationApprovalPayload {
   approvalId: ApprovalId;

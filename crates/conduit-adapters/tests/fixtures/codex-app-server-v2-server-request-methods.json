@@ -1,0 +1,17 @@
+{
+  "generatedBy": "codex-cli 0.151.0-alpha.7.1",
+  "schemaCommand": "codex app-server generate-json-schema --experimental",
+  "methods": [
+    "item/commandExecution/requestApproval",
+    "item/fileChange/requestApproval",
+    "item/tool/requestUserInput",
+    "mcpServer/elicitation/request",
+    "item/permissions/requestApproval",
+    "item/tool/call",
+    "account/chatgptAuthTokens/refresh",
+    "attestation/generate",
+    "currentTime/read",
+    "applyPatchApproval",
+    "execCommandApproval"
+  ]
+}

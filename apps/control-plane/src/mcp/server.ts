@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/server";
 import { z } from "zod";
+import { approvalOutboxInsert, attemptApprovalDispatch, buildApprovalReceipt } from "../approval-dispatch.ts";
 import { newId, nowIso, operationDigest } from "../crypto.ts";
 import { PublicError } from "../errors.ts";
 import { completeEffect, reserveEffect } from "../idempotency.ts";
@@ -142,15 +143,22 @@ export function createConduitMcpServer(env: ControlPlaneEnv, actor: AuthActor): 
     try {
       const approval = await env.DB.prepare("SELECT commitment_digest,expires_at,decision FROM approvals WHERE id=?1 LIMIT 1").bind(approvalId).first<{ commitment_digest: string; expires_at: string; decision: string | null }>();
       if (approval === null || approval.commitment_digest !== commitmentDigest) throw new PublicError("approval_digest_mismatch", 409, "Approval commitment does not match");
-      if (approval.decision !== null || Date.parse(approval.expires_at) <= Date.now()) throw new PublicError("approval_expired", 409, "Approval is resolved or expired");
       const target = await resolveResourceAuthority(env.DB, "approvals", approvalId);
       await authorizeConnector(env, actor, { operation: "approval.resolve", ...target, idempotencyKey, operationId: newId("op"), payloadDigest: commitmentDigest });
       const reserved = await reserveEffect(env.DB, actor.grantId!, idempotencyKey, await operationDigest({ approvalId, commitmentDigest, decision }));
       if (reserved.replay !== undefined) return result(reserved.replay);
-      const updated = await env.DB.prepare("UPDATE approvals SET decision=?1,resolved_at=?2 WHERE id=?3 AND decision IS NULL").bind(decision, nowIso(), approvalId).run();
-      if (updated.meta.changes !== 1) throw new PublicError("approval_expired", 409, "Approval changed before resolution");
+      if (approval.decision !== null || Date.parse(approval.expires_at) <= Date.now()) throw new PublicError("approval_expired", 409, "Approval is resolved or expired");
+      const resolvedAt = nowIso();
+      const receipt = await buildApprovalReceipt(env, approvalId, decision, new Date(resolvedAt));
       const response = { approvalId, commitmentDigest, decision };
-      await completeEffect(env.DB, reserved.reservation!, response);
+      const reservation = reserved.reservation!;
+      const [updated, outbox, completed] = await env.DB.batch([
+        env.DB.prepare("UPDATE approvals SET decision=?1,resolved_at=?2 WHERE id=?3 AND decision IS NULL AND expires_at>?2").bind(decision, resolvedAt, approvalId),
+        approvalOutboxInsert(env, approvalId, receipt, resolvedAt),
+        env.DB.prepare("UPDATE effect_idempotency_records SET state='completed',response_json=?1,updated_at=?2 WHERE scope=?3 AND idempotency_key=?4 AND payload_digest=?5 AND state='reserved' AND EXISTS (SELECT 1 FROM approvals WHERE id=?6 AND decision=?7 AND resolved_at=?2)").bind(JSON.stringify(response), resolvedAt, reservation.scope, reservation.key, reservation.digest, approvalId, decision),
+      ]);
+      if (updated?.meta.changes !== 1 || outbox?.meta.changes !== 1 || completed?.meta.changes !== 1) throw new PublicError("approval_expired", 409, "Approval changed before resolution");
+      await attemptApprovalDispatch(env, approvalId);
       return result(response);
     } catch (error) { return toolFailure(error); }
   });

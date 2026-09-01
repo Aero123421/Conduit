@@ -38,6 +38,7 @@ export type PostAuthFrame = {
     | "operation.input"
     | "operation.cancel"
     | "operation.approval"
+    | "operation.approval_request"
     | "event.batch"
     | "event.gap"
     | "device.health";

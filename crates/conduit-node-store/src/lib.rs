@@ -26,7 +26,7 @@ use thiserror::Error;
 pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 pub const MAX_FRAME_BYTES: usize = 65_536;
 pub const MAX_EVENT_BYTES: usize = 60_000;
-const STORE_SCHEMA_VERSION: u32 = 3;
+const STORE_SCHEMA_VERSION: u32 = 5;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -229,6 +229,20 @@ pub struct AdmissionRecord {
     pub runtime_request: Vec<u8>,
     pub launch_plan: Vec<u8>,
     pub admission_receipt: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentApprovalRecord {
+    pub approval_id: String,
+    pub idempotency_key: String,
+    pub operation_digest: String,
+    pub provider_request_id: Vec<u8>,
+    pub method: String,
+    pub parameters_digest: String,
+    pub expires_at_unix_ms: u64,
+    pub request_payload: Option<Vec<u8>>,
+    pub state: String,
+    pub resolution: Option<Vec<u8>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -467,6 +481,231 @@ impl NodeStore {
         query_admission(&conn, key)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_agent_approval(
+        &self,
+        approval_id: &str,
+        idempotency_key: &str,
+        operation_digest: &str,
+        provider_request_id: &[u8],
+        method: &str,
+        parameters_digest: &str,
+        expires_at_unix_ms: u64,
+        request_payload: &[u8],
+    ) -> Result<AgentApprovalRecord, StoreError> {
+        validate_digest(operation_digest)?;
+        validate_digest(parameters_digest)?;
+        if provider_request_id.len() > 512
+            || method.is_empty()
+            || method.len() > 128
+            || request_payload.len() > MAX_EVENT_BYTES
+        {
+            return Err(StoreError::Invalid(
+                "agent approval fields exceed bounds".into(),
+            ));
+        }
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        tx.execute(
+            "INSERT OR IGNORE INTO agent_approval_journal(approval_id,idempotency_key,operation_digest,provider_request_id,method,parameters_digest,expires_at_unix_ms,request_payload,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,'pending')",
+            params![approval_id,idempotency_key,operation_digest,provider_request_id,method,parameters_digest,expires_at_unix_ms,request_payload],
+        ).map_err(map_sql)?;
+        let record = query_agent_approval(&tx, approval_id)?.ok_or(StoreError::NotFound)?;
+        if record.idempotency_key != idempotency_key
+            || record.operation_digest != operation_digest
+            || record.provider_request_id != provider_request_id
+            || record.method != method
+            || record.parameters_digest != parameters_digest
+            || record.expires_at_unix_ms != expires_at_unix_ms
+            || record.request_payload.as_deref() != Some(request_payload)
+        {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        let state = query_operation(&tx, idempotency_key)?
+            .ok_or(StoreError::NotFound)?
+            .state;
+        match state {
+            OperationState::Running => {
+                tx.execute(
+                    "UPDATE operations SET state='waiting_approval',updated_at=unixepoch() WHERE idempotency_key=?1 AND state='running'",
+                    [idempotency_key],
+                )
+                .map_err(map_sql)?;
+            }
+            OperationState::WaitingApproval => {}
+            other => {
+                return Err(StoreError::InvalidTransition {
+                    from: other.as_str().into(),
+                    to: OperationState::WaitingApproval.as_str().into(),
+                });
+            }
+        }
+        tx.commit().map_err(map_sql)?;
+        Ok(record)
+    }
+
+    pub fn unqueued_agent_approvals(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Vec<AgentApprovalRecord>, StoreError> {
+        let conn = self.conn()?;
+        let mut statement = conn
+            .prepare("SELECT approval_id FROM agent_approval_journal WHERE idempotency_key=?1 AND state='pending' ORDER BY created_at LIMIT 1")
+            .map_err(map_sql)?;
+        let ids = statement
+            .query_map([idempotency_key], |row| row.get::<_, String>(0))
+            .map_err(map_sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sql)?;
+        ids.into_iter()
+            .map(|id| query_agent_approval(&conn, &id)?.ok_or(StoreError::NotFound))
+            .collect()
+    }
+
+    pub fn mark_agent_approval_requested(&self, approval_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        let changed = conn.execute(
+            "UPDATE agent_approval_journal SET state='requested',updated_at=unixepoch() WHERE approval_id=?1 AND state='pending'",
+            [approval_id],
+        ).map_err(map_sql)?;
+        if changed != 1 {
+            let current = query_agent_approval(&conn, approval_id)?.ok_or(StoreError::NotFound)?;
+            if current.state != "requested" {
+                return Err(StoreError::Invalid(
+                    "approval request is not pending".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn agent_approval(
+        &self,
+        approval_id: &str,
+    ) -> Result<Option<AgentApprovalRecord>, StoreError> {
+        let conn = self.conn()?;
+        query_agent_approval(&conn, approval_id)
+    }
+
+    pub fn agent_approval_for_provider_request(
+        &self,
+        idempotency_key: &str,
+        provider_request_id: &[u8],
+    ) -> Result<Option<AgentApprovalRecord>, StoreError> {
+        let conn = self.conn()?;
+        let approval_id = conn
+            .query_row(
+                "SELECT approval_id FROM agent_approval_journal WHERE idempotency_key=?1 AND provider_request_id=?2 ORDER BY created_at DESC LIMIT 1",
+                params![idempotency_key, provider_request_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sql)?;
+        approval_id
+            .map(|id| query_agent_approval(&conn, &id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
+    pub fn resolved_agent_approvals(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Vec<AgentApprovalRecord>, StoreError> {
+        let conn = self.conn()?;
+        let mut statement = conn
+            .prepare("SELECT approval_id FROM agent_approval_journal WHERE idempotency_key=?1 AND state='resolved' ORDER BY created_at LIMIT 32")
+            .map_err(map_sql)?;
+        let ids = statement
+            .query_map([idempotency_key], |row| row.get::<_, String>(0))
+            .map_err(map_sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sql)?;
+        ids.into_iter()
+            .map(|id| query_agent_approval(&conn, &id)?.ok_or(StoreError::NotFound))
+            .collect()
+    }
+
+    pub fn record_agent_approval_resolution(
+        &self,
+        approval_id: &str,
+        resolution: &[u8],
+    ) -> Result<(), StoreError> {
+        if resolution.len() > MAX_EVENT_BYTES {
+            return Err(StoreError::TooLarge {
+                limit: MAX_EVENT_BYTES,
+            });
+        }
+        let conn = self.conn()?;
+        let changed = conn.execute(
+            "UPDATE agent_approval_journal SET state='resolved',resolution=?1,updated_at=unixepoch() WHERE approval_id=?2 AND state IN ('pending','requested')",
+            params![resolution, approval_id],
+        ).map_err(map_sql)?;
+        if changed != 1 {
+            let current = query_agent_approval(&conn, approval_id)?.ok_or(StoreError::NotFound)?;
+            if current.resolution.as_deref() != Some(resolution) {
+                return Err(StoreError::IdempotencyConflict);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn mark_agent_approval_applied(&self, approval_id: &str) -> Result<(), StoreError> {
+        let conn = self.conn()?;
+        let changed = conn.execute(
+            "UPDATE agent_approval_journal SET state='applied',updated_at=unixepoch() WHERE approval_id=?1 AND state='resolved'",
+            [approval_id],
+        ).map_err(map_sql)?;
+        if changed != 1 {
+            let current = query_agent_approval(&conn, approval_id)?.ok_or(StoreError::NotFound)?;
+            if current.state != "applied" {
+                return Err(StoreError::Invalid(
+                    "approval resolution is not journaled".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn mark_agent_approval_applied_and_resume(
+        &self,
+        approval_id: &str,
+        idempotency_key: &str,
+        receipt: &[u8],
+    ) -> Result<(), StoreError> {
+        let mut conn = self.conn()?;
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        let approval = query_agent_approval(&tx, approval_id)?.ok_or(StoreError::NotFound)?;
+        if approval.idempotency_key != idempotency_key {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        let operation = query_operation(&tx, idempotency_key)?.ok_or(StoreError::NotFound)?;
+        match (approval.state.as_str(), operation.state) {
+            ("resolved", OperationState::WaitingApproval) => {
+                tx.execute(
+                    "UPDATE agent_approval_journal SET state='applied',updated_at=unixepoch() WHERE approval_id=?1 AND state='resolved'",
+                    [approval_id],
+                )
+                .map_err(map_sql)?;
+                tx.execute(
+                    "UPDATE operations SET state='running',receipt=?1,updated_at=unixepoch() WHERE idempotency_key=?2 AND state='waiting_approval'",
+                    params![receipt, idempotency_key],
+                )
+                .map_err(map_sql)?;
+            }
+            ("applied", OperationState::Running) => {}
+            _ => {
+                return Err(StoreError::Invalid(
+                    "approval apply and operation resume are not jointly ready".into(),
+                ));
+            }
+        }
+        tx.commit().map_err(map_sql)
+    }
+
     pub fn nonterminal_admissions(&self) -> Result<Vec<AdmissionRecord>, StoreError> {
         let conn = self.conn()?;
         let mut statement = conn
@@ -679,6 +918,27 @@ impl NodeStore {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sql)?;
+        if let Some((sequence, prior_digest, frame)) = tx
+            .query_row(
+                "SELECT sequence,payload_digest,frame FROM transport_outbox WHERE direction=?1 AND message_id=?2 LIMIT 1",
+                params![direction.as_str(), message_id],
+                |row| {
+                    Ok((
+                        row.get::<_, u64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(map_sql)?
+        {
+            if prior_digest != digest {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            tx.commit().map_err(map_sql)?;
+            return Ok((sequence, frame));
+        }
         let sequence: u64 = tx
             .query_row(
                 "SELECT next_sequence FROM transport_positions WHERE direction=?1",
@@ -1093,6 +1353,30 @@ fn query_admission(conn: &Connection, key: &str) -> Result<Option<AdmissionRecor
         .optional().map_err(map_sql)?.map(|v|AdmissionRecord{operation,provider_id:v.0,access_scope:v.1,approval_policy:v.2,runtime_request:v.3,launch_plan:v.4,admission_receipt:v.5}).map_or(Ok(None),|v|Ok(Some(v)))
 }
 
+fn query_agent_approval(
+    conn: &Connection,
+    approval_id: &str,
+) -> Result<Option<AgentApprovalRecord>, StoreError> {
+    conn.query_row(
+        "SELECT approval_id,idempotency_key,operation_digest,provider_request_id,method,parameters_digest,expires_at_unix_ms,request_payload,state,resolution FROM agent_approval_journal WHERE approval_id=?1 LIMIT 1",
+        [approval_id],
+        |row| Ok(AgentApprovalRecord {
+            approval_id: row.get(0)?,
+            idempotency_key: row.get(1)?,
+            operation_digest: row.get(2)?,
+            provider_request_id: row.get(3)?,
+            method: row.get(4)?,
+            parameters_digest: row.get(5)?,
+            expires_at_unix_ms: row.get(6)?,
+            request_payload: row.get(7)?,
+            state: row.get(8)?,
+            resolution: row.get(9)?,
+        }),
+    )
+    .optional()
+    .map_err(map_sql)
+}
+
 fn integrity(conn: &Connection) -> Result<(), StoreError> {
     let result: String = conn
         .query_row("PRAGMA quick_check", [], |r| r.get(0))
@@ -1130,6 +1414,34 @@ fn migrate(conn: &Connection) -> Result<(), StoreError> {
         )
         .map_err(map_sql)?;
     }
+    if version == 4 {
+        conn.execute_batch(
+            r#"BEGIN IMMEDIATE;
+ALTER TABLE agent_approval_journal RENAME TO agent_approval_journal_v4;
+CREATE TABLE agent_approval_journal(
+ approval_id TEXT PRIMARY KEY,
+ idempotency_key TEXT NOT NULL REFERENCES operations(idempotency_key) ON DELETE RESTRICT,
+ operation_digest TEXT NOT NULL,
+ provider_request_id BLOB NOT NULL,
+ method TEXT NOT NULL,
+ parameters_digest TEXT NOT NULL,
+ expires_at_unix_ms INTEGER NOT NULL,
+ request_payload BLOB,
+ state TEXT NOT NULL CHECK(state IN ('pending','requested','resolved','applied')),
+ resolution BLOB,
+ created_at INTEGER NOT NULL DEFAULT(unixepoch()),
+ updated_at INTEGER NOT NULL DEFAULT(unixepoch()),
+ CHECK(length(operation_digest)=64), CHECK(length(parameters_digest)=64),
+ CHECK(length(provider_request_id)<=512), CHECK(length(method)<=128),
+ CHECK(request_payload IS NULL OR length(request_payload)<=60000),
+ CHECK(resolution IS NULL OR length(resolution)<=60000));
+INSERT INTO agent_approval_journal(approval_id,idempotency_key,operation_digest,provider_request_id,method,parameters_digest,expires_at_unix_ms,state,resolution,created_at,updated_at)
+ SELECT approval_id,idempotency_key,operation_digest,provider_request_id,method,parameters_digest,expires_at_unix_ms,CASE WHEN state='pending' THEN 'requested' ELSE state END,resolution,created_at,updated_at FROM agent_approval_journal_v4;
+DROP TABLE agent_approval_journal_v4;
+COMMIT;"#,
+        )
+        .map_err(map_sql)?;
+    }
     conn.execute_batch(r#"
 BEGIN IMMEDIATE;
 CREATE TABLE IF NOT EXISTS schema_migrations(version INTEGER PRIMARY KEY, applied_at INTEGER NOT NULL DEFAULT(unixepoch()));
@@ -1156,7 +1468,24 @@ CREATE TABLE IF NOT EXISTS credential_profiles(profile_id TEXT PRIMARY KEY, revi
 CREATE TABLE IF NOT EXISTS storage_objects(object_id TEXT PRIMARY KEY, class TEXT NOT NULL, path BLOB NOT NULL, size_bytes INTEGER NOT NULL, pinned INTEGER NOT NULL DEFAULT 0, custody_count INTEGER NOT NULL DEFAULT 1, contains_credentials INTEGER NOT NULL DEFAULT 0, collected INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS content_objects(digest TEXT PRIMARY KEY, size_bytes INTEGER NOT NULL, path BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS reconciliation_plans(plan_id TEXT PRIMARY KEY, connection_epoch INTEGER NOT NULL, payload_digest TEXT NOT NULL, plan BLOB NOT NULL, state TEXT NOT NULL, completed_at INTEGER);
-INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3);
+CREATE TABLE IF NOT EXISTS agent_approval_journal(
+ approval_id TEXT PRIMARY KEY,
+ idempotency_key TEXT NOT NULL REFERENCES operations(idempotency_key) ON DELETE RESTRICT,
+ operation_digest TEXT NOT NULL,
+ provider_request_id BLOB NOT NULL,
+ method TEXT NOT NULL,
+ parameters_digest TEXT NOT NULL,
+ expires_at_unix_ms INTEGER NOT NULL,
+ request_payload BLOB,
+ state TEXT NOT NULL CHECK(state IN ('pending','requested','resolved','applied')),
+ resolution BLOB,
+ created_at INTEGER NOT NULL DEFAULT(unixepoch()),
+ updated_at INTEGER NOT NULL DEFAULT(unixepoch()),
+ CHECK(length(operation_digest)=64), CHECK(length(parameters_digest)=64),
+ CHECK(length(provider_request_id)<=512), CHECK(length(method)<=128),
+ CHECK(request_payload IS NULL OR length(request_payload)<=60000), CHECK(resolution IS NULL OR length(resolution)<=60000));
+CREATE INDEX IF NOT EXISTS agent_approval_pending_idx ON agent_approval_journal(state,expires_at_unix_ms);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5);
 COMMIT;"#).map_err(map_sql)
 }
 
@@ -1221,6 +1550,132 @@ mod tests {
             ),
             Err(StoreError::IdempotencyConflict)
         ));
+    }
+
+    #[test]
+    fn agent_approval_response_is_durable_and_idempotent_before_apply() {
+        let directory = tempdir().unwrap();
+        let store = NodeStore::open(directory.path()).unwrap();
+        store
+            .reserve_operation(
+                "op_approval01",
+                "approval-idempotency-key",
+                &digest(1),
+                b"{}",
+                1,
+            )
+            .unwrap();
+        store
+            .transition_operation(
+                "approval-idempotency-key",
+                OperationState::Reserved,
+                OperationState::Admitted,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .transition_operation(
+                "approval-idempotency-key",
+                OperationState::Admitted,
+                OperationState::Starting,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .transition_operation(
+                "approval-idempotency-key",
+                OperationState::Starting,
+                OperationState::Running,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        let request_id = br#""provider-7""#;
+        let request_payload = br#"{"approvalId":"appr_xapproval01"}"#;
+        store
+            .record_agent_approval(
+                "appr_xapproval01",
+                "approval-idempotency-key",
+                &digest(2),
+                request_id,
+                "item/commandExecution/requestApproval",
+                &digest(3),
+                2_000_000_000_000,
+                request_payload,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .operation("approval-idempotency-key")
+                .unwrap()
+                .unwrap()
+                .state,
+            OperationState::WaitingApproval
+        );
+        let unqueued = store
+            .unqueued_agent_approvals("approval-idempotency-key")
+            .unwrap();
+        assert_eq!(unqueued.len(), 1);
+        assert_eq!(
+            unqueued[0].request_payload.as_deref(),
+            Some(request_payload.as_slice())
+        );
+        store
+            .mark_agent_approval_requested("appr_xapproval01")
+            .unwrap();
+        store
+            .mark_agent_approval_requested("appr_xapproval01")
+            .unwrap();
+        store
+            .record_agent_approval_resolution("appr_xapproval01", b"provider-frame\n")
+            .unwrap();
+        store
+            .record_agent_approval_resolution("appr_xapproval01", b"provider-frame\n")
+            .unwrap();
+        drop(store);
+        let reopened = NodeStore::open(directory.path()).unwrap();
+        let pending = reopened
+            .resolved_agent_approvals("approval-idempotency-key")
+            .unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].provider_request_id, request_id);
+        assert_eq!(
+            pending[0].resolution.as_deref(),
+            Some(b"provider-frame\n".as_slice())
+        );
+        reopened
+            .mark_agent_approval_applied_and_resume(
+                "appr_xapproval01",
+                "approval-idempotency-key",
+                b"approval-applied",
+            )
+            .unwrap();
+        reopened
+            .mark_agent_approval_applied_and_resume(
+                "appr_xapproval01",
+                "approval-idempotency-key",
+                b"approval-applied",
+            )
+            .unwrap();
+        assert_eq!(
+            reopened
+                .operation("approval-idempotency-key")
+                .unwrap()
+                .unwrap()
+                .state,
+            OperationState::Running
+        );
+        assert!(
+            reopened
+                .resolved_agent_approvals("approval-idempotency-key")
+                .unwrap()
+                .is_empty()
+        );
     }
     #[test]
     fn sequences_reject_gaps_conflicts_and_accept_exact_duplicates() {

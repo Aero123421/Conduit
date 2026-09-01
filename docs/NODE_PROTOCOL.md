@@ -519,13 +519,46 @@ The approval message binds:
 - server expiry
 - bounded validity duration
 
-The node journals the approval receipt before applying it. A receipt for another digest, revision, or controller epoch is rejected.
+The Node journals the approval request commitment and the transition to
+`waiting_approval` in one local SQLite transaction before queueing
+`operation.approval_request`. The request frame uses a deterministic message ID,
+so an unqueued journal row is re-driven without allocating a second logical
+message. The Control Plane persists and projects that request before sending its
+transport ACK. Invalid or stale requests are recorded as security deadletters
+and terminalized for projection so one poison frame cannot block the alarm.
 
-If the connection is lost before the receipt is received, the run remains `waiting_approval` unless a prior approval already covers the exact operation.
+Browser and MCP resolution commit the approval decision, idempotency completion,
+and a D1 dispatch outbox row atomically. Delivery retries until expiry. The
+outbox state `offered` means the frame is durably held by DeviceRoom; it is not
+evidence that the Node wrote the response to the provider.
+
+The Node verifies the receipt commitment and deadline, journals the exact
+provider response before child I/O, and marks it applied only after a successful
+write. A failed write is retried from the journal. A receipt for another digest,
+revision, deadline, or controller epoch is rejected. The controller epoch is an
+Agent-controller generation and is independent of the WebSocket connection
+epoch; reconnect alone does not invalidate a pending approval. The current
+non-attachable restart path creates a new operation/run rather than replacing a
+same-run controller. A future attach implementation must durably increment this
+generation before accepting receipts for the replacement controller.
+
+If the connection is lost before the receipt is received, the run remains
+`waiting_approval` unless a prior approval already covers the exact operation.
+Only one Codex approval is pending per Agent; a second provider request receives
+an immediate same-ID decline. When the deadline expires, the Node durably
+journals and writes one same-ID decline, resumes the operation, and rejects late
+receipts without sending a second provider response.
 
 ## Agent server-request correlation
 
 An Agent Adapter must answer every provider-initiated request that carries an ID. A supported approval request is bridged to the typed approval flow or receives a correlated explicit decline. A request for an unadvertised capability, including host-managed authentication refresh, client attestation, dynamic tools, or user input, receives a correlated fail-closed protocol error. Unknown request methods receive a correlated method-not-found error and a bounded visible Adapter error event. No provider request is left pending merely because Conduit does not implement it.
+
+Codex client requests are held in a bounded request-ID map that also records the
+method and expected response shape. Wrong IDs, duplicate responses, and stale
+turn notifications cannot consume or mutate another turn. The test fixture is
+derived from the locally generated Codex app-server `ServerRequest` union,
+including `currentTime/read`, so adding a union member without a response fails
+conformance.
 
 ACP permission responses preserve the JSON-RPC request ID and use the
 versioned nested outcome shape. A missing typed bridge returns

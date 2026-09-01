@@ -10,6 +10,7 @@ import { authorizeConnector } from "./policy.ts";
 import { DomainRepository, resourceSpecs, type ResourceName } from "./repositories/domain.ts";
 import { resolveInputAuthority, resolveResourceAuthority, type ResourceAuthority } from "./repositories/resource-authority.ts";
 import type { AuthActor, ControlPlaneEnv } from "./types.ts";
+import { approvalOutboxInsert, attemptApprovalDispatch, buildApprovalReceipt } from "./approval-dispatch.ts";
 
 const readPermissions: Partial<Record<ResourceName, string>> = {
   projects: "project.read", sources: "project.read", locations: "project.read", sessions: "session.read", messages: "board.read",
@@ -81,16 +82,23 @@ async function resolveApproval(request: Request, env: ControlPlaneEnv, approvalI
   if (!['approved', 'denied'].includes(decision)) throw new PublicError("invalid_request", 400, "decision is invalid");
   const approval = await env.DB.prepare("SELECT operation_id,commitment_digest,expires_at,decision FROM approvals WHERE id=?1 LIMIT 1").bind(approvalId).first<{ operation_id: string; commitment_digest: string; expires_at: string; decision: string | null }>();
   if (approval === null) throw new PublicError("not_found", 404, "Approval not found");
-  if (approval.decision !== null || Date.parse(approval.expires_at) <= Date.now()) throw new PublicError("approval_expired", 409, "Approval is resolved or expired");
   if (boundedString(body.commitmentDigest, "commitmentDigest", 64, 64) !== approval.commitment_digest) throw new PublicError("approval_digest_mismatch", 409, "Approval commitment does not match");
   if (auth.connector) await authorizeConnector(env, auth.actor, { operation: "approval.resolve", ...await resolveResourceAuthority(env.DB, "approvals", approvalId), idempotencyKey: key, operationId: newId("op"), payloadDigest: approval.commitment_digest });
   else await requireBrowserSession(request, env, { csrf: true, fresh: true });
   const reserved = await reserveEffect(env.DB, auth.actor.grantId ?? `${auth.actor.clientId}:${auth.actor.principalId}`, key, await operationDigest({ approvalId, decision, commitmentDigest: approval.commitment_digest }));
   if (reserved.replay !== undefined) return Response.json(reserved.replay);
-  const result = await env.DB.prepare("UPDATE approvals SET decision=?1,resolved_at=?2 WHERE id=?3 AND decision IS NULL AND expires_at>?2").bind(decision, nowIso(), approvalId).run();
-  if (result.meta.changes !== 1) throw new PublicError("approval_expired", 409, "Approval changed before resolution");
+  if (approval.decision !== null || Date.parse(approval.expires_at) <= Date.now()) throw new PublicError("approval_expired", 409, "Approval is resolved or expired");
+  const resolvedAt = nowIso();
+  const receipt = await buildApprovalReceipt(env, approvalId, decision as "approved" | "denied", new Date(resolvedAt));
   const response = { approvalId, decision, commitmentDigest: approval.commitment_digest };
-  await completeEffect(env.DB, reserved.reservation!, response);
+  const reservation = reserved.reservation!;
+  const [result, outbox, completed] = await env.DB.batch([
+    env.DB.prepare("UPDATE approvals SET decision=?1,resolved_at=?2 WHERE id=?3 AND decision IS NULL AND expires_at>?2").bind(decision, resolvedAt, approvalId),
+    approvalOutboxInsert(env, approvalId, receipt, resolvedAt),
+    env.DB.prepare("UPDATE effect_idempotency_records SET state='completed',response_json=?1,updated_at=?2 WHERE scope=?3 AND idempotency_key=?4 AND payload_digest=?5 AND state='reserved' AND EXISTS (SELECT 1 FROM approvals WHERE id=?6 AND decision=?7 AND resolved_at=?2)").bind(JSON.stringify(response), resolvedAt, reservation.scope, reservation.key, reservation.digest, approvalId, decision),
+  ]);
+  if (result?.meta.changes !== 1 || outbox?.meta.changes !== 1 || completed?.meta.changes !== 1) throw new PublicError("approval_expired", 409, "Approval changed before resolution");
+  await attemptApprovalDispatch(env, approvalId);
   return Response.json(response);
 }
 

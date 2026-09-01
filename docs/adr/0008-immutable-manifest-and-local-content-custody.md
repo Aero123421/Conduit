@@ -81,6 +81,48 @@ never inferred from `never`: an unavailable bridge receives a correlated
 cancel response. Only `agent_settled`, not the lower-level `agent_end`, is a Pi
 terminal receipt because retry, compaction, or queued input may still follow.
 
+Codex app-server client requests are tracked in a bounded map keyed by the
+exact JSON-RPC request ID. Each entry also records the method and expected
+response shape. A wrong, duplicate, stale, or out-of-order response cannot
+consume another request. Turn notifications are accepted only for the active
+turn ID. Every method in the locally generated `ServerRequest` union receives
+either its typed response or a correlated fail-closed response; unknown methods
+receive a same-ID method-not-found response.
+
+The effective Access Scope is translated into an explicit Codex sandbox policy
+at thread and turn start. Read-only becomes `readOnly`; Restricted Native,
+Container, and VM use `externalSandbox` because the Node enforces the boundary;
+selected/workspace Native access uses `workspaceWrite`; and configured Full
+User or Full Device Native access uses `dangerFullAccess`. Approval Policy is a
+separate parameter. `never` is pre-authorized, `always` uses Codex `untrusted`,
+and outside-scope or risk-class modes conservatively use `on-request`. Until a
+typed risk-class set is present in the immutable operation snapshot, the latter
+does not claim selective risk-class pre-authorization.
+
+Only one interactive Codex approval may be pending for an Agent. A concurrent
+request receives an immediate correlated decline. The Node transactionally
+journals the request commitment and `waiting_approval` transition before it can
+queue the transport frame. The frame has a deterministic message ID; re-queue
+after a crash is idempotent. Resolution is journaled as the exact provider
+response before child I/O, then marked applied after the write succeeds. A
+write failure is retried from the journal. Expiry produces one same-ID decline;
+a late receipt cannot create a second response.
+
+The approval controller epoch is the generation of the Agent controller, not
+the Device WebSocket connection epoch. Ordinary reconnect increments only the
+transport epoch and does not invalidate a pending approval. Replacing the Agent
+controller requires a new operation/run in the current non-attachable
+implementation, so its generation remains `1`. A future same-run attach path
+must persist and increment this generation before it may claim receipt fencing.
+
+The control plane takes durable custody of `operation.approval_request` before
+acknowledging the Node sequence and projects it idempotently into D1. Invalid or
+stale requests are security-event deadletters so they cannot poison replay;
+the Node-side deadline still settles the provider request. Browser or MCP
+resolution commits the decision, approval dispatch outbox row, and idempotency
+effect completion in one D1 batch. A dispatch state of `offered` proves only
+DeviceRoom durable custody, not Node application or provider settlement.
+
 ### Local storage
 
 Normalized events and sequence advancement commit transactionally in SQLite. Inline event payloads are bounded. Larger content uses immutable references.

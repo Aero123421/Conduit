@@ -7,6 +7,7 @@ import { readJsonBounded } from "../src/bounds.ts";
 import { CLI_CONTROL_PLANE_ROUTE_MANIFEST } from "../src/api.ts";
 import { durableObjectOperationDispatcher, reconcileOperationDispatches, type OperationDispatcher } from "../src/dispatch.ts";
 import { createOperation } from "../src/operations.ts";
+import { attemptApprovalDispatch, buildApprovalReceipt } from "../src/approval-dispatch.ts";
 
 function derEcdsaSignature(signature: Uint8Array): Uint8Array {
   if (signature[0] === 0x30) return signature;
@@ -30,10 +31,10 @@ describe.sequential("control-plane contracts", () => {
 
   it("applies forward D1 migrations", async () => {
     const version = await env.DB.prepare("SELECT version FROM schema_versions WHERE component='control_plane'").first<{ version: number }>();
-    expect(version?.version).toBe(8);
+    expect(version?.version).toBe(9);
     const tables = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table'").all<{ name: string }>();
     const names = new Set(tables.results.map((row) => row.name));
-    for (const required of ["owner_principals", "oauth_grants", "connector_policies", "devices", "projects", "collaboration_sessions", "runs", "operation_journal", "operation_dispatch_outbox", "artifacts", "normalized_events", "security_events"]) expect(names.has(required)).toBe(true);
+    for (const required of ["owner_principals", "oauth_grants", "connector_policies", "devices", "projects", "collaboration_sessions", "runs", "operation_journal", "operation_dispatch_outbox", "approval_dispatch_outbox", "artifacts", "normalized_events", "security_events"]) expect(names.has(required)).toBe(true);
   });
 
   it("keeps security events immutable", async () => {
@@ -487,6 +488,34 @@ describe.sequential("control-plane contracts", () => {
     const invariant = await env.DB.prepare("SELECT (SELECT state FROM operation_dispatch_outbox WHERE operation_id=?1) AS outbox_state,(SELECT state FROM operation_journal WHERE id=?1) AS operation_state,(SELECT state FROM idempotency_records WHERE operation_id=?1) AS idempotency_state,(SELECT response_json FROM idempotency_records WHERE operation_id=?1) AS response_json").bind(operationId).first<{ outbox_state: string; operation_state: string; idempotency_state: string; response_json: string }>();
     expect(invariant).toMatchObject({ outbox_state: "offered", operation_state: "offered", idempotency_state: "offered" });
     expect(JSON.parse(invariant!.response_json)).toEqual(response);
+  });
+
+  it("retries a durably journaled approval after DeviceRoom delivery failure and worker restart", async () => {
+    const approvalId = "appr_dispatch_retry0001";
+    const operationId = "op_approval_dispatch_retry01";
+    const digest = "a".repeat(64);
+    const created = new Date();
+    const createdAt = created.toISOString();
+    const retryAt = new Date(Date.now() + 3_000);
+    const expiresAt = new Date(Date.now() + 60_000).toISOString();
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO operation_journal(id,idempotency_key,actor_principal_id,client_id,device_id,connector_policy_id,connector_policy_revision,capability,payload_digest,request_json,state,expires_at,created_at,updated_at) VALUES (?1,'approval-dispatch-retry-key01','prin_board_contract','conduit.cli','dev_handshake01','cpol_owner_first_party_v1',1,'agent.start',?2,'{}','claimed',?3,?4,?4)").bind(operationId, digest, expiresAt, createdAt),
+      env.DB.prepare("INSERT INTO approvals(id,operation_id,requester_principal_id,client_id,device_id,run_id,commitment_digest,operation_type,normalized_arguments_json,revisions_json,decision,reuse_scope_json,expires_at,resolved_at,created_at) VALUES (?1,?2,'prin_board_contract','conduit.cli','dev_handshake01','run_approval_retry01',?3,'item/commandExecution/requestApproval','{}','{\"controllerEpoch\":\"1\"}','approved','{\"kind\":\"once\"}',?4,?5,?5)").bind(approvalId, operationId, digest, expiresAt, createdAt),
+    ]);
+    const receipt = await buildApprovalReceipt(env, approvalId, "approved", created);
+    await env.DB.prepare("INSERT INTO approval_dispatch_outbox(approval_id,device_id,message_id,payload_digest,payload_json,state,next_attempt_at,expires_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,'pending',?6,?7,?6,?6)")
+      .bind(approvalId, receipt.deviceId, receipt.messageId, receipt.payloadDigest, canonicalJson(receipt.payload), createdAt, receipt.expiresAt).run();
+
+    await attemptApprovalDispatch(env, approvalId, new Date(createdAt), async () => { throw new Error("DeviceRoom unavailable"); });
+    const failed = await env.DB.prepare("SELECT state,attempt_count,last_error_code FROM approval_dispatch_outbox WHERE approval_id=?1").bind(approvalId).first<{ state: string; attempt_count: number; last_error_code: string | null }>();
+    expect(failed).toEqual({ state: "pending", attempt_count: 1, last_error_code: "device_room_delivery_failed" });
+
+    await attemptApprovalDispatch(env, approvalId, retryAt);
+    const roomCustody = await runInDurableObject(env.DEVICE_ROOMS.getByName("dev_handshake01"), (_instance, state) => state.storage.sql.exec<{ payload_digest: string; frame_json: string }>("SELECT payload_digest,frame_json FROM outbound_frames WHERE message_id=?", receipt.messageId).one());
+    expect(roomCustody.payload_digest).toBe(receipt.payloadDigest);
+    expect(JSON.parse(roomCustody.frame_json)).toMatchObject({ type: "operation.approval", payload: receipt.payload });
+    const retried = await env.DB.prepare("SELECT state,attempt_count,lease_token,last_error_code FROM approval_dispatch_outbox WHERE approval_id=?1").bind(approvalId).first<{ state: string; attempt_count: number; lease_token: string | null; last_error_code: string | null }>();
+    expect(retried).toEqual({ state: "offered", attempt_count: 2, lease_token: null, last_error_code: null });
   });
 
   it("expires an undispatched operation and releases its Connector concurrency slot once", async () => {

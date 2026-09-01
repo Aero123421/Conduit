@@ -242,6 +242,20 @@ An approval binds:
 
 Board text is not an approval receipt.
 
+Agent Adapters receive Access Scope and Approval Policy as separate effective
+settings. For Codex, read-only maps to `readOnly`; Restricted Native, Container,
+and VM map to `externalSandbox`; selected/workspace Native access maps to
+`workspaceWrite`; and configured Full User or Full Device Native access maps to
+`dangerFullAccess`. `never` pre-authorizes provider approval requests, `always`
+uses the provider's untrusted mode, and outside-scope or risk-class policies use
+a conservative request boundary. Risk-class-selective pre-authorization is not
+claimed until the selected classes are part of the immutable policy snapshot.
+
+Cloud-visible approval arguments are bounded, provider-specific summaries.
+Exact argv, canonical local paths, and credentials remain Device-local. The
+commitment digest still covers the original provider parameters, so summary
+redaction does not weaken resolution binding.
+
 ## Runtime cleanup
 
 Agent completion does not automatically authorize Runtime destruction.

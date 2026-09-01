@@ -6,8 +6,8 @@ use crate::{
 };
 use conduit_adapters::{
     AdapterCatalog, AdapterChild, AdapterEvent, AdapterEventKind, AdapterKind, AdapterOperation,
-    AdapterState, ApprovalBridgeOwnership, ApprovalContext, EffectiveApprovalPolicy, LaunchRequest,
-    ProtocolDriver,
+    AdapterState, ApprovalBridgeOwnership, ApprovalContext, EffectiveAccessScope,
+    EffectiveApprovalPolicy, EffectiveSandboxPolicy, LaunchRequest, ProtocolDriver,
 };
 use conduit_domain::{DeviceId, Sha256Digest};
 use conduit_node_store::{DeviceIdentity, Direction, OperationState, ReceiveResult, StoreError};
@@ -223,6 +223,23 @@ struct WireOperation {
     expires_at: String,
     valid_for_ms: u64,
 }
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireOperationApproval {
+    approval_id: String,
+    operation_id: String,
+    run_id: String,
+    operation_digest: String,
+    decision: String,
+    #[serde(default)]
+    reuse_scope: Option<String>,
+    controller_epoch: String,
+    issued_at: String,
+    expires_at: String,
+    valid_for_ms: u64,
+    receipt_digest: String,
+}
 fn default_actor_id() -> String {
     "local-owner".into()
 }
@@ -273,7 +290,33 @@ struct AgentActive {
     handle: RuntimeHandle,
     child: AdapterChild,
     driver: ProtocolDriver,
+    adapter_kind: AdapterKind,
+    actor_principal_id: String,
+    client_id: String,
+    access_scope: String,
+    approval_mode: String,
+    local_policy_revision: u64,
+    controller_epoch: u64,
     event_sequence: u64,
+}
+
+struct PendingAgentApproval {
+    key: String,
+    operation_id: String,
+    run_id: String,
+    request_digest: String,
+    adapter_kind: AdapterKind,
+    actor_principal_id: String,
+    client_id: String,
+    access_scope: String,
+    approval_mode: String,
+    local_policy_revision: u64,
+    controller_epoch: u64,
+    provider_request_id: Value,
+    method: String,
+    parameters_digest: String,
+    arguments_summary: Value,
+    expires_at_unix_ms: u64,
 }
 
 struct PendingReconciliation {
@@ -564,6 +607,19 @@ impl NodeService {
                     )?;
                 }
             }
+            "operation.approval" => {
+                if let Err(reason) = self.apply_agent_approval(client, &frame.payload) {
+                    let payload = json!({"code":"capability_unavailable","retryable":false,"details":{"messageType":frame.kind,"reason":bounded(reason.to_string(),192)}});
+                    let id = self.message_id();
+                    client.session.queue_outbound(
+                        &id,
+                        "transport.error",
+                        frame.correlation_id.clone(),
+                        payload,
+                        0,
+                    )?;
+                }
+            }
             _ => {
                 let payload = json!({"code":"capability_unavailable","retryable":false,"details":{"messageType":frame.kind}});
                 let id = self.message_id();
@@ -587,6 +643,128 @@ impl NodeService {
                 .session
                 .queue_outbound(&ack_id, "transport.ack", None, ack, 0)?;
         }
+        Ok(())
+    }
+
+    fn apply_agent_approval(
+        &mut self,
+        _client: &mut WssClient,
+        payload: &Value,
+    ) -> Result<(), ServiceError> {
+        let receipt: WireOperationApproval =
+            serde_json::from_value(payload.clone()).map_err(|_| TransportError::Malformed)?;
+        if !matches!(receipt.decision.as_str(), "approved" | "denied") {
+            return Err(ServiceError::Unavailable(
+                "approval_receipt_authority_mismatch".into(),
+            ));
+        }
+        let issued = OffsetDateTime::parse(&receipt.issued_at, &Rfc3339)
+            .map_err(|_| ServiceError::Unavailable("approval_receipt_time_invalid".into()))?;
+        let expires = OffsetDateTime::parse(&receipt.expires_at, &Rfc3339)
+            .map_err(|_| ServiceError::Unavailable("approval_receipt_time_invalid".into()))?;
+        let observed = OffsetDateTime::now_utc();
+        if expires <= observed
+            || issued >= expires
+            || issued > observed + time::Duration::minutes(5)
+            || expires - issued > time::Duration::milliseconds(receipt.valid_for_ms as i64)
+        {
+            return Err(ServiceError::Unavailable("approval_receipt_expired".into()));
+        }
+        let mut receipt_commitment =
+            serde_json::to_value(&receipt).map_err(|_| TransportError::Malformed)?;
+        receipt_commitment
+            .as_object_mut()
+            .ok_or(TransportError::Malformed)?
+            .remove("receiptDigest");
+        let expected_receipt_digest = hex::encode(Sha256::digest(
+            serde_jcs::to_vec(&receipt_commitment).map_err(|_| TransportError::Malformed)?,
+        ));
+        if expected_receipt_digest != receipt.receipt_digest {
+            return Err(ServiceError::Unavailable(
+                "approval_receipt_digest_mismatch".into(),
+            ));
+        }
+        let journal = self
+            .node
+            .store()
+            .agent_approval(&receipt.approval_id)?
+            .ok_or_else(|| ServiceError::Unavailable("approval_request_unknown".into()))?;
+        if journal.operation_digest != receipt.operation_digest {
+            return Err(ServiceError::Unavailable(
+                "approval_commitment_mismatch".into(),
+            ));
+        }
+        if u64::try_from(expires.unix_timestamp_nanos().max(0) / 1_000_000).unwrap_or(u64::MAX)
+            > journal.expires_at_unix_ms
+            || unix_ms_now() > journal.expires_at_unix_ms
+        {
+            return Err(ServiceError::Unavailable(
+                "approval_receipt_extended_deadline".into(),
+            ));
+        }
+        let agent = self
+            .agents
+            .get_mut(&receipt.operation_id)
+            .ok_or_else(|| ServiceError::Unavailable("approval_agent_not_active".into()))?;
+        if agent.run_id != receipt.run_id || agent.key != journal.idempotency_key {
+            return Err(ServiceError::Unavailable("approval_target_mismatch".into()));
+        }
+        if receipt.controller_epoch.parse::<u64>().ok() != Some(agent.controller_epoch) {
+            return Err(ServiceError::Unavailable(
+                "approval_controller_epoch_mismatch".into(),
+            ));
+        }
+        if journal.state == "applied" {
+            return Ok(());
+        }
+        if journal.state == "resolved" {
+            let frame =
+                conduit_adapters::ProtocolFrame(journal.resolution.ok_or_else(|| {
+                    ServiceError::Unavailable("approval_response_missing".into())
+                })?);
+            agent
+                .child
+                .write(&frame)
+                .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+            self.node.store().mark_agent_approval_applied_and_resume(
+                &receipt.approval_id,
+                &agent.key,
+                receipt.receipt_digest.as_bytes(),
+            )?;
+            return Ok(());
+        }
+        let request_id: Value = serde_json::from_slice(&journal.provider_request_id)
+            .map_err(|_| TransportError::Malformed)?;
+        let allow = receipt.decision == "approved";
+        let frame = if agent.adapter_kind == AdapterKind::Codex {
+            agent
+                .driver
+                .resolve_codex_approval(
+                    &request_id,
+                    &journal.method,
+                    &journal.parameters_digest,
+                    allow,
+                    unix_ms_now(),
+                )
+                .map_err(|error| ServiceError::Unavailable(adapter_reason(&error)))?
+        } else {
+            agent
+                .driver
+                .approval_response(&request_id, allow)
+                .map_err(|error| ServiceError::Unavailable(adapter_reason(&error)))?
+        };
+        self.node
+            .store()
+            .record_agent_approval_resolution(&receipt.approval_id, &frame.0)?;
+        agent
+            .child
+            .write(&frame)
+            .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+        self.node.store().mark_agent_approval_applied_and_resume(
+            &receipt.approval_id,
+            &agent.key,
+            receipt.receipt_digest.as_bytes(),
+        )?;
         Ok(())
     }
     fn reject_offer(
@@ -944,17 +1122,45 @@ impl NodeService {
             let approval_context = ApprovalContext {
                 effective_policy: EffectiveApprovalPolicy::try_from(op.approval_mode.as_str())
                     .map_err(|error| ServiceError::Unavailable(adapter_reason(&error)))?,
-                bridge: ApprovalBridgeOwnership::Unavailable,
+                bridge: if kind == AdapterKind::Codex {
+                    ApprovalBridgeOwnership::Typed
+                } else {
+                    ApprovalBridgeOwnership::Unavailable
+                },
+            };
+            let access_scope = EffectiveAccessScope::try_from(op.access_scope.as_str())
+                .map_err(|error| ServiceError::Unavailable(adapter_reason(&error)))?;
+            let sandbox_policy = match (access_scope, runtime_kind) {
+                (EffectiveAccessScope::ReadOnly, _) => EffectiveSandboxPolicy::ReadOnly,
+                (_, RuntimeKind::RestrictedNative | RuntimeKind::Container | RuntimeKind::Vm) => {
+                    EffectiveSandboxPolicy::External
+                }
+                (
+                    EffectiveAccessScope::SelectedSources | EffectiveAccessScope::ProjectFull,
+                    RuntimeKind::Native,
+                ) => EffectiveSandboxPolicy::WorkspaceWrite,
+                (
+                    EffectiveAccessScope::FullUser | EffectiveAccessScope::FullDevice,
+                    RuntimeKind::Native,
+                ) => EffectiveSandboxPolicy::DangerFullAccess,
             };
             let (spec, driver) =
                 if matches!(runtime_kind, RuntimeKind::Container | RuntimeKind::Vm) {
-                    AdapterCatalog::launch_in_guest_with_approval_context(
+                    AdapterCatalog::launch_in_guest_with_effective_authority(
                         kind,
                         &request,
+                        access_scope,
+                        sandbox_policy,
                         approval_context,
                     )
                 } else {
-                    AdapterCatalog::launch_with_approval_context(kind, &request, approval_context)
+                    AdapterCatalog::launch_with_effective_authority(
+                        kind,
+                        &request,
+                        access_scope,
+                        sandbox_policy,
+                        approval_context,
+                    )
                 }
                 .map_err(|error| ServiceError::Unavailable(adapter_reason(&error)))?;
             let launch = LaunchPlan {
@@ -1095,7 +1301,7 @@ impl NodeService {
             0,
         )?;
         if decision == "admitted" {
-            if let Some((spec, driver, _)) = agent_launch {
+            if let Some((spec, driver, kind)) = agent_launch {
                 if !matches!(runtime_kind, RuntimeKind::Native) || selected != "native" {
                     let interactive = match self.node.start_interactive(&op.idempotency_key) {
                         Ok(interactive) => interactive,
@@ -1162,6 +1368,13 @@ impl NodeService {
                             handle,
                             child,
                             driver,
+                            adapter_kind: kind,
+                            actor_principal_id: op.actor_principal_id,
+                            client_id: op.client_id,
+                            access_scope: op.access_scope,
+                            approval_mode: op.approval_mode,
+                            local_policy_revision: self.local_policy.revision,
+                            controller_epoch: 1,
                             event_sequence: 0,
                         },
                     );
@@ -1279,6 +1492,13 @@ impl NodeService {
                         handle: custody.handle,
                         child,
                         driver,
+                        adapter_kind: kind,
+                        actor_principal_id: op.actor_principal_id,
+                        client_id: op.client_id,
+                        access_scope: op.access_scope,
+                        approval_mode: op.approval_mode,
+                        local_policy_revision: self.local_policy.revision,
+                        controller_epoch: 1,
                         event_sequence: 0,
                     },
                 );
@@ -1493,10 +1713,87 @@ impl NodeService {
         let ids = self.agents.keys().cloned().collect::<Vec<_>>();
         let mut events = Vec::new();
         let mut terminals = Vec::new();
+        let mut approvals = Vec::new();
         for id in &ids {
             let Some(agent) = self.agents.get_mut(id) else {
                 continue;
             };
+            for journal in self.node.store().unqueued_agent_approvals(&agent.key)? {
+                let request_payload = journal.request_payload.ok_or_else(|| {
+                    ServiceError::Unavailable("approval_request_payload_missing".into())
+                })?;
+                let payload: Value = serde_json::from_slice(&request_payload)
+                    .map_err(|_| TransportError::Malformed)?;
+                let correlation_id = payload
+                    .get("operationId")
+                    .and_then(Value::as_str)
+                    .ok_or(TransportError::Malformed)?
+                    .to_owned();
+                let message_id = journal.approval_id.replacen("appr_", "nmsg_", 1);
+                client.session.queue_outbound(
+                    &message_id,
+                    "operation.approval_request",
+                    Some(correlation_id),
+                    payload,
+                    0,
+                )?;
+                self.node
+                    .store()
+                    .mark_agent_approval_requested(&journal.approval_id)?;
+            }
+            for journal in self.node.store().resolved_agent_approvals(&agent.key)? {
+                let frame =
+                    conduit_adapters::ProtocolFrame(journal.resolution.ok_or_else(|| {
+                        ServiceError::Unavailable("approval_response_missing".into())
+                    })?);
+                agent
+                    .child
+                    .write(&frame)
+                    .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                self.node.store().mark_agent_approval_applied_and_resume(
+                    &journal.approval_id,
+                    &agent.key,
+                    b"approval_response_replayed",
+                )?;
+            }
+            let (expired_frames, expired_events) = agent
+                .driver
+                .expire_codex_approvals(unix_ms_now())
+                .map_err(|error| ServiceError::Unavailable(adapter_reason(&error)))?;
+            for (frame, event) in expired_frames.into_iter().zip(expired_events) {
+                let provider_request_id = event
+                    .data
+                    .as_ref()
+                    .and_then(|data| data.get("providerRequestId"))
+                    .ok_or(TransportError::Malformed)?;
+                let encoded_id = serde_jcs::to_vec(provider_request_id)
+                    .map_err(|_| TransportError::Malformed)?;
+                let journal = self
+                    .node
+                    .store()
+                    .agent_approval_for_provider_request(&agent.key, &encoded_id)?
+                    .ok_or_else(|| ServiceError::Unavailable("approval_request_unknown".into()))?;
+                self.node
+                    .store()
+                    .record_agent_approval_resolution(&journal.approval_id, &frame.0)?;
+                agent
+                    .child
+                    .write(&frame)
+                    .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                self.node.store().mark_agent_approval_applied_and_resume(
+                    &journal.approval_id,
+                    &agent.key,
+                    b"approval_expired",
+                )?;
+                agent.event_sequence = agent.event_sequence.saturating_add(1);
+                events.push(PendingEvent {
+                    key: agent.key.clone(),
+                    run_id: agent.run_id.clone(),
+                    operation_id: agent.operation_id.clone(),
+                    sequence: agent.event_sequence,
+                    event,
+                });
+            }
             for _ in 0..128 {
                 let record = match agent.child.try_read_record() {
                     Ok(Some(record)) => record,
@@ -1522,6 +1819,56 @@ impl NodeService {
                                 .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
                         }
                         for event in normalized {
+                            if event.kind == AdapterEventKind::ApprovalRequest
+                                && event
+                                    .data
+                                    .as_ref()
+                                    .and_then(|data| data.get("preAuthorized"))
+                                    .and_then(Value::as_bool)
+                                    == Some(false)
+                                && let Some(data) = event.data.as_ref()
+                            {
+                                let provider_request_id = data
+                                    .get("providerRequestId")
+                                    .cloned()
+                                    .ok_or(TransportError::Malformed)?;
+                                let method = data
+                                    .get("method")
+                                    .and_then(Value::as_str)
+                                    .ok_or(TransportError::Malformed)?
+                                    .to_owned();
+                                let parameters_digest = data
+                                    .get("parametersDigest")
+                                    .and_then(Value::as_str)
+                                    .ok_or(TransportError::Malformed)?
+                                    .to_owned();
+                                let expires_at_unix_ms = data
+                                    .get("expiresAtUnixMs")
+                                    .and_then(Value::as_u64)
+                                    .ok_or(TransportError::Malformed)?;
+                                let arguments_summary = data
+                                    .get("argumentsSummary")
+                                    .cloned()
+                                    .ok_or(TransportError::Malformed)?;
+                                approvals.push(PendingAgentApproval {
+                                    key: agent.key.clone(),
+                                    operation_id: agent.operation_id.clone(),
+                                    run_id: agent.run_id.clone(),
+                                    request_digest: agent.request_digest.clone(),
+                                    adapter_kind: agent.adapter_kind,
+                                    actor_principal_id: agent.actor_principal_id.clone(),
+                                    client_id: agent.client_id.clone(),
+                                    access_scope: agent.access_scope.clone(),
+                                    approval_mode: agent.approval_mode.clone(),
+                                    local_policy_revision: agent.local_policy_revision,
+                                    controller_epoch: agent.controller_epoch,
+                                    provider_request_id,
+                                    method,
+                                    parameters_digest,
+                                    arguments_summary,
+                                    expires_at_unix_ms,
+                                });
+                            }
                             agent.event_sequence = agent.event_sequence.saturating_add(1);
                             events.push(PendingEvent {
                                 key: agent.key.clone(),
@@ -1578,6 +1925,9 @@ impl NodeService {
                     exit_code: exit.code(),
                 });
             }
+        }
+        for pending in approvals {
+            self.queue_agent_approval(client, pending)?;
         }
         for pending in events {
             let payload = visible_adapter_payload(&pending.event);
@@ -1643,6 +1993,83 @@ impl NodeService {
                 pending.last_sequence,
             )?;
         }
+        Ok(())
+    }
+
+    fn queue_agent_approval(
+        &mut self,
+        client: &mut WssClient,
+        pending: PendingAgentApproval,
+    ) -> Result<(), ServiceError> {
+        let controller_epoch = pending.controller_epoch;
+        let commitment = json!({
+            "domain": "conduit.agent-approval.v1",
+            "operationId": pending.operation_id,
+            "runId": pending.run_id,
+            "requestDigest": pending.request_digest,
+            "providerRequestId": pending.provider_request_id,
+            "method": pending.method,
+            "parametersDigest": pending.parameters_digest,
+            "argumentsSummary": pending.arguments_summary,
+            "approvalExpiresAtUnixMs": pending.expires_at_unix_ms,
+            "adapterId": pending.adapter_kind.as_str(),
+            "accessScope": pending.access_scope,
+            "approvalMode": pending.approval_mode,
+            "controllerEpoch": controller_epoch.to_string(),
+            "localPolicyRevision": pending.local_policy_revision,
+        });
+        let operation_digest = hex::encode(Sha256::digest(
+            serde_jcs::to_vec(&commitment).map_err(|_| TransportError::Malformed)?,
+        ));
+        let approval_id = format!("appr_x{}", &operation_digest[..24]);
+        let provider_request_id = serde_jcs::to_vec(&pending.provider_request_id)
+            .map_err(|_| TransportError::Malformed)?;
+        let issued_at_unix_ms = unix_ms_now();
+        let (issued_at, expires_at, valid_for_ms) =
+            approval_request_window_at(issued_at_unix_ms, pending.expires_at_unix_ms)?;
+        let payload = json!({
+            "approvalId": approval_id,
+            "operationId": pending.operation_id,
+            "runId": pending.run_id,
+            "requesterPrincipalId": pending.actor_principal_id,
+            "clientId": pending.client_id,
+            "deviceId": self.device_id,
+            "operationDigest": operation_digest,
+            "providerRequestId": pending.provider_request_id,
+            "method": pending.method,
+            "parametersDigest": pending.parameters_digest,
+            "argumentsSummary": pending.arguments_summary,
+            "adapterId": pending.adapter_kind.as_str(),
+            "accessScope": pending.access_scope,
+            "approvalMode": pending.approval_mode,
+            "controllerEpoch": controller_epoch.to_string(),
+            "localPolicyRevision": pending.local_policy_revision,
+            "issuedAt": issued_at,
+            "expiresAt": expires_at,
+            "validForMs": valid_for_ms,
+        });
+        let request_payload = serde_jcs::to_vec(&payload).map_err(|_| TransportError::Malformed)?;
+        self.node.store().record_agent_approval(
+            &approval_id,
+            &pending.key,
+            &operation_digest,
+            &provider_request_id,
+            &pending.method,
+            &pending.parameters_digest,
+            pending.expires_at_unix_ms,
+            &request_payload,
+        )?;
+        let message_id = format!("nmsg_x{}", &operation_digest[..24]);
+        client.session.queue_outbound(
+            &message_id,
+            "operation.approval_request",
+            Some(pending.operation_id),
+            payload,
+            0,
+        )?;
+        self.node
+            .store()
+            .mark_agent_approval_requested(&approval_id)?;
         Ok(())
     }
 
@@ -2237,6 +2664,36 @@ pub(crate) fn now() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".into())
 }
 
+fn unix_ms_now() -> u64 {
+    let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    u64::try_from(nanos.max(0) / 1_000_000).unwrap_or(u64::MAX)
+}
+
+fn timestamp_from_unix_ms(value: u64) -> Result<String, ServiceError> {
+    let nanos = i128::from(value) * 1_000_000;
+    OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .map_err(|_| ServiceError::Unavailable("approval_expiry_invalid".into()))?
+        .format(&Rfc3339)
+        .map_err(|_| ServiceError::Unavailable("approval_expiry_invalid".into()))
+}
+
+fn approval_request_window_at(
+    issued_at_unix_ms: u64,
+    expires_at_unix_ms: u64,
+) -> Result<(String, String, u64), ServiceError> {
+    if expires_at_unix_ms <= issued_at_unix_ms || expires_at_unix_ms - issued_at_unix_ms > 3_600_000
+    {
+        return Err(ServiceError::Unavailable(
+            "approval_request_expired_before_custody".into(),
+        ));
+    }
+    Ok((
+        timestamp_from_unix_ms(issued_at_unix_ms)?,
+        timestamp_from_unix_ms(expires_at_unix_ms)?,
+        expires_at_unix_ms - issued_at_unix_ms,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2576,6 +3033,21 @@ mod tests {
                 .inbound_applied_through(Direction::ControlToNode)
                 .unwrap(),
             44
+        );
+    }
+
+    #[test]
+    fn approval_request_window_uses_one_exact_clock_observation() {
+        let issued = 1_800_000_000_123;
+        let expires = issued + 300_000;
+        let (issued_at, expires_at, valid_for_ms) =
+            approval_request_window_at(issued, expires).unwrap();
+        let issued_parsed = OffsetDateTime::parse(&issued_at, &Rfc3339).unwrap();
+        let expires_parsed = OffsetDateTime::parse(&expires_at, &Rfc3339).unwrap();
+        assert_eq!(valid_for_ms, 300_000);
+        assert_eq!(
+            (expires_parsed - issued_parsed).whole_milliseconds(),
+            i128::from(valid_for_ms)
         );
     }
 

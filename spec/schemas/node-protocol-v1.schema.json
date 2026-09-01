@@ -384,6 +384,57 @@
         "targetDigest": { "$ref": "#/$defs/Sha256Hex" }
       }
     },
+    "OperationApprovalRequestPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approvalId",
+        "operationId",
+        "runId",
+        "requesterPrincipalId",
+        "clientId",
+        "deviceId",
+        "operationDigest",
+        "providerRequestId",
+        "method",
+        "parametersDigest",
+        "argumentsSummary",
+        "adapterId",
+        "accessScope",
+        "approvalMode",
+        "controllerEpoch",
+        "localPolicyRevision",
+        "issuedAt",
+        "expiresAt",
+        "validForMs"
+      ],
+      "properties": {
+        "approvalId": { "$ref": "#/$defs/ApprovalId" },
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "requesterPrincipalId": { "$ref": "#/$defs/PrincipalId" },
+        "clientId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "operationDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "providerRequestId": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 128 },
+            { "type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991 }
+          ]
+        },
+        "method": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "parametersDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "argumentsSummary": { "type": "object", "maxProperties": 64 },
+        "adapterId": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "accessScope": { "$ref": "#/$defs/AccessScope" },
+        "approvalMode": { "$ref": "#/$defs/ApprovalMode" },
+        "controllerEpoch": { "$ref": "#/$defs/U64Decimal" },
+        "localPolicyRevision": { "type": "integer", "minimum": 1 },
+        "issuedAt": { "$ref": "#/$defs/Timestamp" },
+        "expiresAt": { "$ref": "#/$defs/Timestamp" },
+        "validForMs": { "type": "integer", "minimum": 1, "maximum": 3600000 }
+      }
+    },
     "OperationApprovalPayload": {
       "type": "object",
       "additionalProperties": false,
@@ -631,6 +682,7 @@
             "operation.input",
             "operation.cancel",
             "operation.approval",
+            "operation.approval_request",
             "event.batch",
             "event.gap",
             "device.health"
@@ -684,6 +736,10 @@
         {
           "if": { "properties": { "type": { "enum": ["operation.input", "operation.cancel"] } }, "required": ["type"] },
           "then": { "properties": { "payload": { "$ref": "#/$defs/OperationTargetPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "operation.approval_request" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/OperationApprovalRequestPayload" } } }
         },
         {
           "if": { "properties": { "type": { "const": "operation.approval" } }, "required": ["type"] },

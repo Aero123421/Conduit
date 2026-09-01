@@ -2,6 +2,7 @@ import { DurableObject } from "cloudflare:workers";
 import { parseWireDocumentText, schemaIds, type NodeV1PostAuthFrame } from "@conduit/schema";
 import { canonicalJson, newId, nowIso, randomToken, sha256Hex, verifyEd25519 } from "../crypto.ts";
 import { ensureOperationConcurrencyReleased, type DeviceRoomOffer } from "../dispatch.ts";
+import type { DeviceRoomApproval } from "../approval-dispatch.ts";
 import type { ControlPlaneEnv, QueueEventMessage } from "../types.ts";
 
 interface SocketAttachment {
@@ -192,7 +193,10 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
         }
         if (prior.projected === 0) {
           const persisted = parseWireDocumentText(schemaIds.nodeV1, prior.frame_json);
-          if ("protocol" in persisted) this.ctx.waitUntil(this.project(persisted));
+          if ("protocol" in persisted) {
+            if (persisted.type === "operation.approval_request") await this.projectApprovalOrDeadletter(persisted);
+            else this.ctx.waitUntil(this.project(persisted));
+          }
         }
         if (body.type !== "transport.ack") await this.enqueueControlFrame("transport.ack", { direction: "node_to_control", throughSequence: String(position) }, undefined, new Date(Date.now() + 300_000).toISOString(), ws);
         return;
@@ -213,6 +217,10 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     if (frame.type === "reconcile.summary") await this.planReconciliation(ws, attachment, frame);
     if (frame.type === "reconcile.complete") await this.completeReconciliation(ws, attachment, frame);
     if (replay !== undefined && replay !== null) await this.dispatchControlReplayIntent(replay.intent, ws, replay.frames);
+    if (frame.type === "operation.approval_request") {
+      await this.scheduleOutboxAlarm(Date.now() + 1_000);
+      await this.projectApprovalOrDeadletter(frame);
+    }
     if (frame.type === "transport.ack") {
       const acknowledged = BigInt(frame.payload.throughSequence);
       const controlPosition = this.ctx.storage.sql.exec<{ durable_sequence: number; acknowledged_sequence: number }>("SELECT durable_sequence,acknowledged_sequence FROM transport_positions WHERE direction='control_to_node'").one();
@@ -226,7 +234,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     } else {
       await this.enqueueControlFrame("transport.ack", { direction: "node_to_control", throughSequence: frame.sequence }, undefined, new Date(Date.now() + 300_000).toISOString(), ws);
     }
-    this.ctx.waitUntil(this.project(frame));
+    if (frame.type !== "operation.approval_request") this.ctx.waitUntil(this.project(frame));
   }
 
   private async validateControlReplayRequest(ws: WebSocket, frame: Extract<NodeV1PostAuthFrame, { type: "transport.replay_required" }>): Promise<ValidatedControlReplay | null> {
@@ -344,6 +352,41 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
   }
 
   private async project(frame: NodeV1PostAuthFrame): Promise<void> {
+    if (frame.type === "operation.approval_request") {
+      const request = frame.payload;
+      const issuedAt = Date.parse(request.issuedAt);
+      const expiresAt = Date.parse(request.expiresAt);
+      if (!Number.isFinite(issuedAt) || !Number.isFinite(expiresAt) || issuedAt >= expiresAt || expiresAt <= Date.now() || expiresAt - issuedAt > request.validForMs || !/^[1-9][0-9]*$/.test(request.controllerEpoch) || request.localPolicyRevision < 1) throw new TypeError("approval request validity is invalid");
+      const operation = await this.env.DB.prepare("SELECT id,payload_digest,actor_principal_id,client_id,device_id,run_id,request_json FROM operation_journal WHERE id=?1 LIMIT 1")
+        .bind(request.operationId)
+        .first<{ id: string; payload_digest: string; actor_principal_id: string; client_id: string; device_id: string; run_id: string | null; request_json: string }>();
+      if (operation === null || operation.device_id !== frame.deviceId || operation.device_id !== request.deviceId || operation.run_id !== request.runId || operation.actor_principal_id !== request.requesterPrincipalId || operation.client_id !== request.clientId) throw new TypeError("approval request target does not match operation custody");
+      const operationRequest = JSON.parse(operation.request_json) as { accessScope?: unknown; approvalMode?: unknown; arguments?: { adapterId?: unknown } };
+      if (operationRequest.accessScope !== request.accessScope || operationRequest.approvalMode !== request.approvalMode || operationRequest.arguments?.adapterId !== request.adapterId || request.approvalMode === "never") throw new TypeError("approval request authority differs from immutable operation");
+      const expected = await sha256Hex(canonicalJson({
+        domain: "conduit.agent-approval.v1",
+        operationId: request.operationId,
+        runId: request.runId,
+        requestDigest: operation.payload_digest,
+        providerRequestId: request.providerRequestId,
+        method: request.method,
+        parametersDigest: request.parametersDigest,
+        argumentsSummary: request.argumentsSummary,
+        approvalExpiresAtUnixMs: Date.parse(request.expiresAt),
+        adapterId: request.adapterId,
+        accessScope: request.accessScope,
+        approvalMode: request.approvalMode,
+        controllerEpoch: request.controllerEpoch,
+        localPolicyRevision: request.localPolicyRevision,
+      }));
+      if (expected !== request.operationDigest) throw new TypeError("approval request commitment mismatch");
+      const normalized = canonicalJson({ providerRequestId: request.providerRequestId, method: request.method, parametersDigest: request.parametersDigest, argumentsSummary: request.argumentsSummary, adapterId: request.adapterId, accessScope: request.accessScope, approvalMode: request.approvalMode });
+      const revisions = canonicalJson({ controllerEpoch: request.controllerEpoch, localPolicyRevision: request.localPolicyRevision });
+      await this.env.DB.prepare("INSERT OR IGNORE INTO approvals(id,operation_id,requester_principal_id,client_id,device_id,run_id,commitment_digest,operation_type,normalized_arguments_json,revisions_json,expires_at,created_at) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)")
+        .bind(request.approvalId, request.operationId, request.requesterPrincipalId, request.clientId, request.deviceId, request.runId, request.operationDigest, request.method, normalized, revisions, request.expiresAt, request.issuedAt).run();
+      const stored = await this.env.DB.prepare("SELECT commitment_digest,normalized_arguments_json,revisions_json FROM approvals WHERE id=?1 LIMIT 1").bind(request.approvalId).first<{ commitment_digest: string; normalized_arguments_json: string; revisions_json: string }>();
+      if (stored === null || stored.commitment_digest !== request.operationDigest || stored.normalized_arguments_json !== normalized || stored.revisions_json !== revisions) throw new TypeError("approval id is bound to a different commitment");
+    }
     if (frame.type === "operation.terminal") {
       const operation = await this.env.DB.prepare("SELECT payload_digest,connector_grant_id,concurrency_class,state FROM operation_journal WHERE id=?1 LIMIT 1").bind(frame.payload.operationId).first<{ payload_digest: string; connector_grant_id: string | null; concurrency_class: "commands" | "agentRuns" | "runtimeStarts" | null; state: string }>();
       if (operation === null) {
@@ -365,6 +408,18 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       }
     }
     this.ctx.storage.sql.exec("UPDATE inbound_frames SET projected=1 WHERE sequence=?", Number(frame.sequence));
+  }
+
+  private async projectApprovalOrDeadletter(frame: Extract<NodeV1PostAuthFrame, { type: "operation.approval_request" }>): Promise<void> {
+    try {
+      await this.project(frame);
+    } catch (error) {
+      if (!(error instanceof TypeError)) throw error;
+      const reason = error instanceof Error ? error.message.slice(0, 192) : "approval_projection_failed";
+      await this.env.DB.prepare("INSERT INTO security_events(id,event_type,device_id,metadata_json,created_at) VALUES (?1,'agent_approval.invalid_request',?2,?3,?4)")
+        .bind(newId("sevt"), frame.deviceId, JSON.stringify({ approvalId: frame.payload.approvalId, operationId: frame.payload.operationId, reason }), nowIso()).run();
+      this.ctx.storage.sql.exec("UPDATE inbound_frames SET projected=2 WHERE sequence=?", Number(frame.sequence));
+    }
   }
 
   private async enqueueControlFrame(type: NodeV1PostAuthFrame["type"], payload: Record<string, unknown>, correlationId: string | undefined, expiresAt: string, preferredSocket?: WebSocket, suppliedMessageId?: string): Promise<{ sequence: string; delivered: boolean }> {
@@ -469,6 +524,12 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
   }
 
   override async alarm(): Promise<void> {
+    const unprojected = this.ctx.storage.sql.exec<{ frame_json: string }>("SELECT frame_json FROM inbound_frames WHERE projected=0 ORDER BY sequence LIMIT 32").toArray();
+    for (const row of unprojected) {
+      const frame = JSON.parse(row.frame_json) as NodeV1PostAuthFrame;
+      if (frame.type === "operation.approval_request") await this.projectApprovalOrDeadletter(frame);
+      else await this.project(frame);
+    }
     await this.dispatchQueuedFrames();
   }
 
@@ -485,6 +546,15 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       return item?.stage === "authenticated" && connection?.reconciliation_state === "complete" && !item.reconciling && item.epoch === String(connection?.epoch);
     });
     return this.enqueueControlFrame("operation.offer", frame.payload, frame.correlationId, frame.expiresAt, socket, frame.messageId);
+  }
+
+  async deliverApproval(frame: DeviceRoomApproval): Promise<{ sequence: string; delivered: boolean }> {
+    const computed = await sha256Hex(canonicalJson(frame.payload));
+    if (computed !== frame.payloadDigest) throw new TypeError("approval payload digest mismatch");
+    if (frame.payload.approvalId !== frame.correlationId || frame.payload.operationId === undefined) throw new TypeError("approval correlation mismatch");
+    const persistedDevice = this.ctx.storage.sql.exec<{ device_id: string }>("SELECT device_id FROM connection_state WHERE singleton=1").toArray()[0]?.device_id;
+    if (persistedDevice !== undefined && persistedDevice !== frame.deviceId) throw new TypeError("approval device target conflicts with room identity");
+    return this.enqueueControlFrame("operation.approval", frame.payload, frame.correlationId, frame.expiresAt, undefined, frame.messageId);
   }
 
   async revoke(reason: string): Promise<void> {

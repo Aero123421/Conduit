@@ -22,9 +22,14 @@ use std::{
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 use tempfile::tempdir;
+
+// One fixture temporarily narrows PATH so AdapterCatalog resolves a synthetic
+// executable. Serialize this integration-test binary so that concurrent Git
+// fixtures never observe that process-wide environment change.
+static PROCESS_ENVIRONMENT: Mutex<()> = Mutex::new(());
 
 fn run(command: &mut Command) {
     let output = command.output().unwrap();
@@ -81,6 +86,7 @@ fn source_entry(path: &Path, digest: Sha256Digest) -> LocalSourceConfig {
 
 #[test]
 fn source_revision_failures_and_worktree_restart_are_durable() {
+    let _environment = PROCESS_ENVIRONMENT.lock().unwrap();
     let directory = tempdir().unwrap();
     let repo = directory.path().join("repo");
     let (head, identity) = repository(&repo);
@@ -203,6 +209,7 @@ fn source_revision_failures_and_worktree_restart_are_durable() {
 
 #[test]
 fn structured_agent_fixture_completes_without_inference_and_crash_is_visible() {
+    let _environment = PROCESS_ENVIRONMENT.lock().unwrap();
     let directory = tempdir().unwrap();
     let bin = directory.path().join("bin");
     fs::create_dir(&bin).unwrap();
@@ -299,6 +306,7 @@ fn request(method: &str, params: Value) -> IpcRequest {
 
 #[test]
 fn ipc_runtime_backup_storage_and_enrollment_services_are_real() {
+    let _environment = PROCESS_ENVIRONMENT.lock().unwrap();
     let directory = tempdir().unwrap();
     let store = NodeStore::open(directory.path().join("data")).unwrap();
     let identity = Arc::new(

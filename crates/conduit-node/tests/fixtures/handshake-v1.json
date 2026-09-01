@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "hello": {
+    "type": "device.hello",
+    "deviceId": "dev_fixture_01",
+    "keyId": "dkey_fixture_01",
+    "supportedProtocols": ["conduit.node/1"],
+    "capabilityDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+    "clientNonce": "Y2xpZW50LW5vbmNl",
+    "nodeBootId": "boot_fixture_0001"
+  },
+  "challenge": {
+    "type": "device.challenge",
+    "connectionId": "conn_fixture_01",
+    "serverNonce": "c2VydmVyLW5vbmNl",
+    "serverTime": "2026-09-01T00:00:00Z",
+    "expiresInMs": 30000,
+    "selectedProtocol": "conduit.node/1"
+  },
+  "proof": {
+    "type": "device.proof",
+    "connectionId": "conn_fixture_01",
+    "deviceId": "dev_fixture_01",
+    "keyId": "dkey_fixture_01",
+    "signature": "c2lnbmF0dXJl"
+  },
+  "accepted": {
+    "type": "transport.accepted",
+    "connectionId": "conn_fixture_01",
+    "deviceId": "dev_fixture_01",
+    "connectionEpoch": "42",
+    "selectedProtocol": "conduit.node/1",
+    "controlNextSequence": "101",
+    "nodeStoredThroughSequence": "75",
+    "reconciliationRequired": true
+  }
+}

@@ -3,6 +3,7 @@ use conduit_node_store::{
     DeviceIdentity, Direction, MAX_FRAME_BYTES, NodeStore, ReceiveResult, StoreError,
     TransportFrame,
 };
+use conduit_protocol::{NodeProtocolV1, ValidatedDocument};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -74,8 +75,13 @@ struct Proof<'a> {
 struct Accepted {
     #[serde(rename = "type")]
     kind: String,
+    connection_id: String,
+    device_id: String,
     connection_epoch: String,
     selected_protocol: String,
+    control_next_sequence: String,
+    node_stored_through_sequence: String,
+    reconciliation_required: bool,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -115,12 +121,10 @@ pub struct TransportSession {
 }
 impl TransportSession {
     pub fn new(store: NodeStore, device_id: String, epoch: u64) -> Result<Self, TransportError> {
-        if epoch < store.connection_epoch()? {
+        if epoch <= store.connection_epoch()? {
             return Err(TransportError::StaleEpoch);
         }
-        if epoch > store.connection_epoch()? {
-            store.set_connection_epoch(epoch)?
-        }
+        store.set_connection_epoch(epoch)?;
         Ok(Self {
             store,
             device_id,
@@ -150,7 +154,10 @@ impl TransportSession {
         if bytes.len() > MAX_FRAME_BYTES {
             return Err(TransportError::FrameTooLarge);
         }
-        let e: Envelope = serde_json::from_slice(bytes).map_err(|_| TransportError::Malformed)?;
+        let validated = ValidatedDocument::<NodeProtocolV1>::from_slice(bytes)
+            .map_err(|_| TransportError::Malformed)?;
+        let e: Envelope = serde_json::from_value(validated.into_value())
+            .map_err(|_| TransportError::Malformed)?;
         if e.protocol != PROTOCOL {
             return Err(TransportError::ProtocolUnsupported);
         }
@@ -215,8 +222,12 @@ impl TransportSession {
             |seq| {
                 let mut exact = base.clone();
                 exact.sequence = seq.to_string();
-                serde_json::to_vec(&exact)
-                    .map_err(|_| StoreError::Invalid("outbound frame encoding failed".into()))
+                let bytes = serde_json::to_vec(&exact)
+                    .map_err(|_| StoreError::Invalid("outbound frame encoding failed".into()))?;
+                ValidatedDocument::<NodeProtocolV1>::from_slice(&bytes).map_err(|_| {
+                    StoreError::Invalid("outbound frame violates protocol schema".into())
+                })?;
+                Ok(bytes)
             },
         )?;
         serde_json::from_slice(&bytes).map_err(|_| TransportError::Malformed)
@@ -236,6 +247,7 @@ impl TransportSession {
 pub struct WssClient {
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
     pub session: TransportSession,
+    reconciliation_required: bool,
 }
 impl WssClient {
     pub fn connect(
@@ -303,7 +315,7 @@ impl WssClient {
             node_boot_id,
         };
         write_json(&mut socket, &hello)?;
-        let challenge: Challenge = read_json(&mut socket)?;
+        let challenge: Challenge = read_validated_json(&mut socket)?;
         if challenge.kind != "device.challenge" || challenge.selected_protocol != PROTOCOL {
             return Err(TransportError::ProtocolUnsupported);
         }
@@ -322,45 +334,108 @@ impl WssClient {
             signature: identity.sign(&transcript),
         };
         write_json(&mut socket, &proof)?;
-        let accepted: Accepted = read_json(&mut socket)?;
+        let accepted: Accepted = read_validated_json(&mut socket)?;
         if accepted.kind != "transport.accepted" || accepted.selected_protocol != PROTOCOL {
             return Err(TransportError::ProtocolUnsupported);
+        }
+        if accepted.connection_id != challenge.connection_id || accepted.device_id != device_id {
+            return Err(TransportError::Malformed);
         }
         let epoch = accepted
             .connection_epoch
             .parse()
             .map_err(|_| TransportError::Malformed)?;
-        let session = TransportSession::new(store, device_id.into(), epoch)?;
-        Ok(Self { socket, session })
-    }
-    pub fn send(&mut self, frame: &Envelope) -> Result<(), TransportError> {
-        let b = serde_json::to_vec(frame).map_err(|_| TransportError::Malformed)?;
-        if b.len() > MAX_FRAME_BYTES {
-            return Err(TransportError::FrameTooLarge);
+        let control_next: u64 = accepted
+            .control_next_sequence
+            .parse()
+            .map_err(|_| TransportError::Malformed)?;
+        let node_stored: u64 = accepted
+            .node_stored_through_sequence
+            .parse()
+            .map_err(|_| TransportError::Malformed)?;
+        let positions = store.transport_positions()?;
+        if control_next == 0
+            || control_next > positions.control_received_through.saturating_add(1)
+            || node_stored > positions.node_sent_through
+        {
+            return Err(TransportError::Malformed);
         }
+        if !accepted.reconciliation_required
+            && control_next == positions.control_received_through.saturating_add(1)
+            && node_stored == positions.node_sent_through
+        {
+            // The server may explicitly waive reconciliation only when both
+            // durable sequence positions already agree.
+        } else if !accepted.reconciliation_required {
+            return Err(TransportError::Malformed);
+        }
+        let session = TransportSession::new(store.clone(), device_id.into(), epoch)?;
+        store.ack_outbound(Direction::NodeToControl, node_stored)?;
+        Ok(Self {
+            socket,
+            session,
+            reconciliation_required: accepted.reconciliation_required,
+        })
+    }
+    fn send_durable(&mut self, b: &[u8]) -> Result<(), TransportError> {
         self.socket
             .send(Message::Text(
-                String::from_utf8(b)
+                String::from_utf8(b.to_vec())
                     .map_err(|_| TransportError::Malformed)?
                     .into(),
             ))
             .map_err(|e| TransportError::WebSocket(e.to_string()))
     }
+    pub fn flush_unacknowledged(&mut self, from: u64) -> Result<usize, TransportError> {
+        let frames = self.session.store.unacknowledged_outbound(from, 512)?;
+        for frame in &frames {
+            self.send_durable(&frame.frame)?
+        }
+        Ok(frames.len())
+    }
+    pub fn replay_range(&mut self, from: u64, through: u64) -> Result<usize, TransportError> {
+        let frames = self
+            .session
+            .store
+            .replay_outbound(Direction::NodeToControl, from, 512)?;
+        let mut sent = 0;
+        for frame in frames.into_iter().take_while(|f| f.sequence <= through) {
+            self.send_durable(&frame.frame)?;
+            sent += 1
+        }
+        Ok(sent)
+    }
+    pub fn reconciliation_required(&self) -> bool {
+        self.reconciliation_required
+    }
     pub fn receive(&mut self) -> Result<(Envelope, ReceiveResult), TransportError> {
-        match self
-            .socket
-            .read()
-            .map_err(|e| TransportError::WebSocket(e.to_string()))?
-        {
+        self.poll()?
+            .ok_or_else(|| TransportError::WebSocket("read_timeout".into()))
+    }
+    pub fn poll(&mut self) -> Result<Option<(Envelope, ReceiveResult)>, TransportError> {
+        let message = match self.socket.read() {
+            Ok(v) => v,
+            Err(tungstenite::Error::Io(e))
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(e) => return Err(TransportError::WebSocket(e.to_string())),
+        };
+        match message {
             Message::Text(v) => self.session.receive(v.as_bytes()),
             Message::Ping(v) => {
                 self.socket
                     .send(Message::Pong(v))
                     .map_err(|e| TransportError::WebSocket(e.to_string()))?;
-                self.receive()
+                return self.poll();
             }
-            _ => Err(TransportError::Malformed),
+            _ => return Err(TransportError::Malformed),
         }
+        .map(Some)
     }
 }
 use tungstenite::client::IntoClientRequest;
@@ -392,15 +467,17 @@ fn write_json<T: Serialize>(
     ))
     .map_err(|e| TransportError::WebSocket(e.to_string()))
 }
-fn read_json<T: for<'de> Deserialize<'de>>(
+fn read_validated_json<T: for<'de> Deserialize<'de>>(
     s: &mut WebSocket<MaybeTlsStream<TcpStream>>,
 ) -> Result<T, TransportError> {
     match s
         .read()
         .map_err(|e| TransportError::WebSocket(e.to_string()))?
     {
-        Message::Text(v) if v.len() <= MAX_FRAME_BYTES => {
-            serde_json::from_str(&v).map_err(|_| TransportError::Malformed)
+        Message::Text(v) => {
+            let validated = ValidatedDocument::<NodeProtocolV1>::from_slice(v.as_bytes())
+                .map_err(|_| TransportError::Malformed)?;
+            serde_json::from_value(validated.into_value()).map_err(|_| TransportError::Malformed)
         }
         _ => Err(TransportError::Malformed),
     }
@@ -439,11 +516,21 @@ mod tests {
         let d = tempdir().unwrap();
         let s = NodeStore::open(d.path()).unwrap();
         let t = TransportSession::new(s.clone(), "dev_12345678".into(), 1).unwrap();
-        let e = envelope(1, serde_json::json!({"x":1}));
+        let e = envelope(
+            1,
+            serde_json::json!({"direction":"node_to_control","throughSequence":"0"}),
+        );
         let b = serde_json::to_vec(&e).unwrap();
         assert_eq!(t.receive(&b).unwrap().1, ReceiveResult::Applied);
+        t.store
+            .mark_inbound_applied(Direction::ControlToNode, 1)
+            .unwrap();
         assert_eq!(t.receive(&b).unwrap().1, ReceiveResult::Duplicate);
-        let gap = serde_json::to_vec(&envelope(3, serde_json::json!({"x":3}))).unwrap();
+        let gap = serde_json::to_vec(&envelope(
+            3,
+            serde_json::json!({"direction":"node_to_control","throughSequence":"0"}),
+        ))
+        .unwrap();
         assert_eq!(
             t.receive(&gap).unwrap().1,
             ReceiveResult::Gap { expected: 2 }
@@ -463,7 +550,7 @@ mod tests {
                 "nmsg_12345678",
                 "reconcile.summary",
                 None,
-                serde_json::json!({"ok":true}),
+                serde_json::json!({"nodeBootId":"boot_123456789012","journalGeneration":"2","capabilityDigest":"11".repeat(32),"lastControlSequenceApplied":"0","lastNodeSequenceAcknowledged":"0","lastNodeSequenceRetained":"0","runs":[],"retainedEventRanges":[],"unresolvedCount":0,"truncated":false,"storageHealth":"healthy"}),
                 0,
             )
             .unwrap();
@@ -471,5 +558,54 @@ mod tests {
         let replay = t.replay(1).unwrap();
         let durable: Envelope = serde_json::from_slice(&replay[0]).unwrap();
         assert_eq!(durable.sequence, "1");
+    }
+    #[test]
+    fn shared_handshake_fixture_is_versioned_and_schema_valid() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/handshake-v1.json")).unwrap();
+        assert_eq!(fixture["version"], 1);
+        for field in ["hello", "challenge", "proof", "accepted"] {
+            let bytes = serde_json::to_vec(&fixture[field]).unwrap();
+            ValidatedDocument::<NodeProtocolV1>::from_slice(&bytes).unwrap();
+        }
+        let accepted: Accepted = serde_json::from_value(fixture["accepted"].clone()).unwrap();
+        assert_eq!(accepted.connection_id, "conn_fixture_01");
+        assert_eq!(accepted.device_id, "dev_fixture_01");
+        assert_eq!(accepted.connection_epoch, "42");
+        assert_eq!(accepted.control_next_sequence, "101");
+        assert_eq!(accepted.node_stored_through_sequence, "75");
+        assert!(accepted.reconciliation_required);
+    }
+    #[test]
+    fn outbound_control_payloads_match_protocol_schema() {
+        let d = tempdir().unwrap();
+        let s = NodeStore::open(d.path()).unwrap();
+        let t = TransportSession::new(s, "dev_12345678".into(), 1).unwrap();
+        let values = [
+            (
+                "transport.ack",
+                serde_json::json!({"direction":"control_to_node","throughSequence":"1"}),
+            ),
+            (
+                "transport.replay_required",
+                serde_json::json!({"direction":"control_to_node","expectedSequence":"2","receivedSequence":"3"}),
+            ),
+            (
+                "transport.error",
+                serde_json::json!({"code":"capability_unavailable","retryable":false,"details":{"messageType":"operation.input"}}),
+            ),
+            (
+                "device.health",
+                serde_json::json!({"observedAt":"2026-09-01T00:00:00Z","nodeState":"ready","journalState":"healthy","storageState":"healthy","activeCommands":0,"activeAgentRuns":0,"activeRuntimes":0}),
+            ),
+            (
+                "reconcile.complete",
+                serde_json::json!({"reconciliationId":"rec_fixture_01","lastControlSequenceApplied":"1","lastNodeSequenceAcknowledged":"0","unresolvedRunIds":[]}),
+            ),
+        ];
+        for (index, (kind, payload)) in values.into_iter().enumerate() {
+            t.queue_outbound(&format!("nmsg_fixture_{index:02}"), kind, None, payload, 0)
+                .unwrap();
+        }
     }
 }

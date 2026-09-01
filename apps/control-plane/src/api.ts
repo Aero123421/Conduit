@@ -11,6 +11,8 @@ import { DomainRepository, resourceSpecs, type ResourceName } from "./repositori
 import { resolveInputAuthority, resolveResourceAuthority, type ResourceAuthority } from "./repositories/resource-authority.ts";
 import type { AuthActor, ControlPlaneEnv } from "./types.ts";
 import { approvalOutboxInsert, attemptApprovalDispatch, buildApprovalReceipt } from "./approval-dispatch.ts";
+import { scheduleBoardAssignment } from "./board-workflow.ts";
+import { acceptChangeSet, createReview, projectDeviceTerminalSubmission } from "./review-workflow.ts";
 
 const readPermissions: Partial<Record<ResourceName, string>> = {
   projects: "project.read", sources: "project.read", locations: "project.read", sessions: "session.read", messages: "board.read",
@@ -28,6 +30,7 @@ export const CLI_CONTROL_PLANE_ROUTE_MANIFEST = [
   ["POST", "/v1/project_agents"], ["GET", "/v1/project_agents"], ["GET", "/v1/project_agents/pagent_contract01"], ["PATCH", "/v1/project_agents/pagent_contract01"],
   ["POST", "/v1/assignments"], ["GET", "/v1/assignments/asg_contract01"], ["POST", "/v1/assignments/asg_contract01/transitions"],
   ["GET", "/v1/runs"], ["GET", "/v1/runs/run_contract01"], ["GET", "/v1/runs/run_contract01/events"], ["POST", "/v1/operations"],
+  ["POST", "/v1/runs/run_contract01/submissions"], ["GET", "/v1/change_sets/cset_contract01"], ["POST", "/v1/change_sets/cset_contract01/reviews"], ["POST", "/v1/sessions/csess_contract01/acceptances"],
   ["POST", "/v1/tasks"], ["GET", "/v1/tasks"], ["GET", "/v1/tasks/task_contract01"], ["PATCH", "/v1/tasks/task_contract01"], ["POST", "/v1/tasks/task_contract01/links"],
   ["GET", "/v1/evidence/evid_contract01"], ["GET", "/v1/evidence"],
   ["POST", "/v1/connector-policies"], ["PATCH", "/v1/connector-policies/cpol_contract01"], ["GET", "/v1/oauth/grants"], ["GET", "/v1/oauth/grants/grant_contract01"],
@@ -150,6 +153,32 @@ async function postBoardMessage(request: Request, env: ControlPlaneEnv): Promise
   const text = boundedString(body.body, "body", 32_768);
   const rawMentions = body.mentions === undefined ? [] : body.mentions;
   if (!Array.isArray(rawMentions) || rawMentions.length > 64) throw new PublicError("invalid_request", 400, "mentions must be an array with at most 64 entries");
+  const scheduledMentions = rawMentions.filter((value) => {
+    const mention = record(value, "mention");
+    if (mention.assignment === undefined) return false;
+    return record(mention.assignment, "mention.assignment").schedule !== undefined;
+  });
+  if (scheduledMentions.length > 0) {
+    if (scheduledMentions.length !== 1 || rawMentions.length !== 1) throw new PublicError("invalid_request", 400, "A scheduled Board post must contain exactly one Project Agent assignment");
+    const mention = record(scheduledMentions[0], "mentions[0]");
+    if (boundedString(mention.type, "mentions[0].type", 64) !== "project_agent") throw new PublicError("invalid_request", 400, "Scheduled Board assignments require a Project Agent mention");
+    const targetId = boundedString(mention.targetId, "mentions[0].targetId", 128);
+    const startOffset = Number(mention.startOffset);
+    const endOffset = Number(mention.endOffset);
+    if (!Number.isSafeInteger(startOffset) || !Number.isSafeInteger(endOffset) || startOffset < 0 || endOffset <= startOffset || endOffset > text.length) throw new PublicError("invalid_request", 400, "Structured mention offsets are invalid");
+    const assignment = record(mention.assignment, "mentions[0].assignment");
+    const result = await scheduleBoardAssignment(env, auth.actor, { kind: auth.connector ? "connector" : "owner" }, key, sessionId, text, {
+      targetId,
+      startOffset,
+      endOffset,
+      title: boundedString(assignment.title, "assignment.title", 256),
+      body: boundedString(assignment.body ?? text, "assignment.body", 32_768),
+      payload: mention.payload === undefined ? {} : record(mention.payload, "mentions[0].payload"),
+      schedule: assignment.schedule,
+    });
+    if (result.replay !== true) await env.BOARD_ROOMS.getByName(sessionId).publish({ eventId: newId("bevt"), sessionId, type: "assignment.scheduled", recordId: result.assignmentIds[0]!, revision: 1 });
+    return Response.json(result, { status: result.replay === true ? 200 : 202, headers: { etag: '"1"' } });
+  }
   const digest = await operationDigest({ sessionId, body: text, mentions: rawMentions });
   const reserved = await reserveEffect(env.DB, auth.actor.grantId ?? `${auth.actor.clientId}:${auth.actor.principalId}`, key, digest);
   if (reserved.replay !== undefined) return Response.json(reserved.replay);
@@ -257,6 +286,39 @@ async function linkTask(request: Request, env: ControlPlaneEnv, rawTaskId: strin
 
 export async function handleApi(request: Request, env: ControlPlaneEnv, path: string): Promise<Response | null> {
   if (request.method === "POST" && path === "/v1/messages") return postBoardMessage(request, env);
+  const terminalSubmission = path.match(/^\/v1\/runs\/([^/]+)\/submissions$/);
+  if (request.method === "POST" && terminalSubmission?.[1] !== undefined) {
+    const auth = await actorFor(request, env, true);
+    if (auth.connector) throw new PublicError("operation_not_allowed", 403, "Terminal projection is accepted from authenticated Device custody, not a Connector");
+    idempotencyKey(request);
+    const body = record(await readJsonBounded(request));
+    return Response.json(await projectDeviceTerminalSubmission(env, {
+      operationId: boundedString(body.operationId, "operationId", 128),
+      runId: terminalSubmission[1],
+      deviceId: boundedString(body.deviceId, "deviceId", 128),
+      submission: body.submission,
+    }), { status: 201 });
+  }
+  const changeSetReview = path.match(/^\/v1\/change_sets\/([^/]+)\/reviews$/);
+  if (request.method === "POST" && changeSetReview?.[1] !== undefined) {
+    const auth = await actorFor(request, env, true);
+    if (auth.connector) throw new PublicError("operation_not_allowed", 403, "Review decisions are owner-only in this vertical slice");
+    return Response.json(await createReview(env, auth.actor, idempotencyKey(request), changeSetReview[1], parseIfMatch(request), await readJsonBounded(request)), { status: 201 });
+  }
+  const acceptance = path.match(/^\/v1\/sessions\/([^/]+)\/acceptances$/);
+  if (request.method === "POST" && acceptance?.[1] !== undefined) {
+    const auth = await actorFor(request, env, true);
+    if (auth.connector) throw new PublicError("operation_not_allowed", 403, "Baseline acceptance is owner-only");
+    return Response.json(await acceptChangeSet(env, auth.actor, idempotencyKey(request), acceptance[1], parseIfMatch(request), await readJsonBounded(request)), { status: 201 });
+  }
+  const changeSetRead = path.match(/^\/v1\/change_sets\/([^/]+)$/);
+  if (request.method === "GET" && changeSetRead?.[1] !== undefined) {
+    const auth = await actorFor(request, env, false);
+    if (auth.connector) throw new PublicError("operation_not_allowed", 403, "Change Set projection reads are owner-only in this vertical slice");
+    const row = await env.DB.prepare("SELECT c.*,s.state,s.revision AS state_revision FROM change_sets c JOIN change_set_state s ON s.change_set_id=c.id WHERE c.id=?1 LIMIT 1").bind(changeSetRead[1]).first<Record<string, unknown>>();
+    if (row === null) throw new PublicError("not_found", 404, "Change Set not found");
+    return Response.json(row, { headers: { etag: `"${String(row.state_revision)}"` } });
+  }
   const artifactUpload = path.match(/^\/v1\/artifacts\/([^/]+)\/content$/);
   if (request.method === "PUT" && artifactUpload?.[1] !== undefined) return uploadArtifact(request, env, artifactUpload[1]);
   const approval = path.match(/^\/v1\/approvals\/([^/]+)\/resolve$/);

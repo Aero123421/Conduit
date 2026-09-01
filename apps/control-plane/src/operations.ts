@@ -26,6 +26,23 @@ export type OperationAuthorization =
   | { kind: "connector" }
   | { kind: "owner" };
 
+export interface OperationTransactionContext {
+  operationId: string;
+  request: OperationRequest;
+  createdAt: string;
+}
+
+export interface CreateOperationOptions {
+  dispatcher?: OperationDispatcher;
+  /** Reserve an ID so related immutable records can commit with the operation. */
+  operationId?: string;
+  /**
+   * Statements returned here are committed in the same D1 batch as operation
+   * custody, idempotency, and the dispatch outbox, before dispatch is attempted.
+   */
+  transactionStatements?: (context: OperationTransactionContext) => D1PreparedStatement[] | Promise<D1PreparedStatement[]>;
+}
+
 const OWNER_FIRST_PARTY_POLICY_ID = "cpol_owner_first_party_v1";
 const OWNER_FIRST_PARTY_POLICY_REVISION = 1;
 
@@ -89,14 +106,16 @@ export async function createOperation(
   actor: AuthActor,
   rawInput: StartOperationInput,
   authorization: OperationAuthorization = { kind: "connector" },
-  dispatcher: OperationDispatcher = durableObjectOperationDispatcher,
+  dispatcherOrOptions: OperationDispatcher | CreateOperationOptions = durableObjectOperationDispatcher,
 ): Promise<Record<string, unknown>> {
+  const options: CreateOperationOptions = "offer" in dispatcherOrOptions ? { dispatcher: dispatcherOrOptions } : dispatcherOrOptions;
+  const dispatcher = options.dispatcher ?? durableObjectOperationDispatcher;
   const input = parseStartOperationInput(rawInput);
   const effectiveActor: AuthActor = authorization.kind === "owner"
     ? { ...actor, policyId: OWNER_FIRST_PARTY_POLICY_ID, policyRevision: OWNER_FIRST_PARTY_POLICY_REVISION }
     : actor;
   if (effectiveActor.policyId === undefined || effectiveActor.policyRevision === undefined) throw new PublicError("grant_required", 403, "Operation requires an exact connector policy revision");
-  const operationId = newId("op");
+  const operationId = options.operationId ?? newId("op");
   const now = new Date();
   const expiresInSeconds = Math.min(Math.max(input.expiresInSeconds ?? 600, 30), 3600);
   const snapshottedRiskClasses = (snapshot: ConnectorPolicyAuthoritySnapshot | undefined) => {
@@ -183,7 +202,11 @@ export async function createOperation(
   const dispatchPayload = { operation: request };
   const dispatchPayloadDigest = await sha256Hex(canonicalJson(dispatchPayload));
   try {
+    const transactionStatements = options.transactionStatements === undefined
+      ? []
+      : await options.transactionStatements({ operationId, request, createdAt });
     await env.DB.batch([
+      ...transactionStatements,
       env.DB.prepare("INSERT INTO operation_journal(id,idempotency_key,actor_principal_id,client_id,device_id,project_id,session_id,assignment_id,run_id,connector_policy_id,connector_policy_revision,connector_grant_id,concurrency_class,capability,payload_digest,request_json,state,expires_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'queued',?17,?18,?18)").bind(operationId, input.idempotencyKey, effectiveActor.principalId, effectiveActor.clientId, input.deviceId, input.projectId ?? null, input.sessionId ?? null, input.assignmentId ?? null, input.runId ?? null, effectiveActor.policyId, effectiveActor.policyRevision, effectiveActor.grantId ?? null, limitClass ?? null, input.capability, digest, canonicalJson(request), request.expiresAt, createdAt),
       env.DB.prepare("INSERT INTO idempotency_records(scope,idempotency_key,payload_digest,operation_id,state,response_status,response_json,expires_at,created_at) VALUES (?1,?2,?3,?4,'queued',202,?5,?6,?7)").bind(idempotencyScope, input.idempotencyKey, stableDigest, operationId, JSON.stringify(row), request.expiresAt, createdAt),
       env.DB.prepare("INSERT INTO operation_dispatch_outbox(operation_id,device_id,message_id,correlation_id,payload_digest,payload_json,state,next_attempt_at,expires_at,created_at,updated_at) VALUES (?1,?2,?3,?1,?4,?5,'pending',?6,?7,?6,?6)").bind(operationId, input.deviceId, dispatchMessageId, dispatchPayloadDigest, canonicalJson(dispatchPayload), createdAt, request.expiresAt),

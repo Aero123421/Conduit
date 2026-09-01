@@ -182,6 +182,45 @@ paths:
       parameters: [{ $ref: "#/components/parameters/RunId" }]
       security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.read] }]
       responses: { "200": { $ref: "#/components/responses/PageSuccess" } }
+  /api/v1/runs/{runId}/submissions:
+    post:
+      operationId: projectRunTerminalSubmission
+      tags: [domain]
+      description: Administrative projection of an already validated Device terminal receipt. Normal Node delivery calls the same custody-checked projection directly.
+      parameters: [{ $ref: "#/components/parameters/RunId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      security: [{ ownerCli: [] }, { ownerSession: [] }]
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "201": { $ref: "#/components/responses/JsonSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/change_sets/{changeSetId}:
+    get:
+      operationId: getChangeSet
+      tags: [domain]
+      parameters: [{ name: changeSetId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }]
+      security: [{ ownerCli: [] }, { ownerSession: [] }]
+      responses: { "200": { $ref: "#/components/responses/RevisionedSuccess" } }
+  /api/v1/change_sets/{changeSetId}/reviews:
+    post:
+      operationId: reviewChangeSet
+      tags: [domain]
+      parameters:
+        - { name: changeSetId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+        - { $ref: "#/components/parameters/IfMatch" }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      security: [{ ownerCli: [] }, { ownerSession: [] }]
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "201": { $ref: "#/components/responses/RevisionedSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/sessions/{sessionId}/acceptances:
+    post:
+      operationId: acceptChangeSetBaseline
+      tags: [domain]
+      description: Advances the immutable Session Baseline vector using exact Session-revision and expected-Baseline compare-and-swap inputs.
+      parameters:
+        - { $ref: "#/components/parameters/SessionId" }
+        - { $ref: "#/components/parameters/IfMatch" }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      security: [{ ownerCli: [] }, { ownerSession: [] }]
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "201": { $ref: "#/components/responses/RevisionedSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
   /api/v1/approvals/{approvalId}/resolve:
     post:
       operationId: resolveApproval

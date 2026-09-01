@@ -33,6 +33,8 @@ The MCP endpoint is an OAuth protected resource. Authorization Code with PKCE S2
 
 DCR registration does not create an authorization grant.
 
+OAuth authorization requests remain client-portable and contain standard parameters only. A client does not name a Connector Policy. The owner selects one of the active policies already bound to that client on the browser consent page. Browser sign-in and stale-session step-up use WebAuthn on the authorization-server origin, and the final consent is a same-origin HTML form protected by a session-bound form CSRF token.
+
 ### Connector policy
 
 OAuth scopes remain coarse. Each grant references a mutable, server-side connector policy containing:
@@ -45,6 +47,8 @@ OAuth scopes remain coarse. Each grant references a mutable, server-side connect
 - exact rate-limit profile
 
 Every effectful request resolves the current grant and connector-policy revision. Lowering or revoking a policy does not wait for access-token expiry.
+
+Object authorization resolves the target's stored Project and Device relationships before evaluating that policy. Caller-supplied Project identifiers are inputs to be checked, never evidence of ownership. Session, Source Location, Assignment, Run, Task, Artifact, trace, evidence, approval, and operation relationships must converge on one authority boundary or fail closed. MCP Agent starts that name a Project Agent bind the stored adapter and role; a stored Reviewer role forces read-only access.
 
 ### Full access
 
@@ -91,6 +95,8 @@ Rejected for the first release. Conduit needs passkey-based owner step-up, MCP O
 - Authentication tables and protocol messages carry explicit actor, client, device, grant, and policy identifiers.
 - Device enrollment and MCP authorization are separate user flows.
 - The control plane performs a current-policy lookup for effectful MCP calls.
+- OAuth clients remain interoperable without Conduit-specific authorization parameters; policy choice belongs to the owner consent surface.
+- Object-level Connector decisions require a server-side relationship lookup, including cross-reference consistency checks for creates and updates.
 - A stable public origin and WebAuthn relying-party ID must be selected before owner setup.
 - Recovery must be tested as a restricted state, not an administrative bypass.
 - DCR interoperability remains testable without treating arbitrary registered clients as trusted.

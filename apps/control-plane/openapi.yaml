@@ -272,8 +272,8 @@ paths:
   /oauth/register:
     post: { operationId: registerOAuthClient, tags: [connectors], security: [], requestBody: { $ref: "#/components/requestBodies/JsonBody" }, responses: { "201": { $ref: "#/components/responses/JsonSuccess" } } }
   /authorize:
-    get: { operationId: beginOAuthAuthorization, tags: [connectors], security: [{ ownerSession: [] }], responses: { "200": { description: Bare OAuth consent document } } }
-    post: { operationId: completeOAuthAuthorization, tags: [connectors], parameters: [{ $ref: "#/components/parameters/CsrfToken" }], security: [{ ownerSession: [] }], requestBody: { $ref: "#/components/requestBodies/JsonBody" }, responses: { "303": { description: Exact registered redirect } } }
+    get: { operationId: beginOAuthAuthorization, tags: [connectors], description: Accepts standard Authorization Code + PKCE parameters. The Owner selects an active Connector Policy in the browser; clients do not supply a policy identifier., security: [{ ownerSession: [] }, {}], responses: { "200": { description: Browser consent and optional Passkey step-up document }, "303": { description: Browser sign-in redirect } } }
+    post: { operationId: completeOAuthAuthorization, tags: [connectors], description: Same-origin HTML form submission with a session-bound form CSRF token., security: [{ ownerSession: [] }], requestBody: { $ref: "#/components/requestBodies/FormBody" }, responses: { "303": { description: Exact registered redirect } } }
   /oauth/token:
     post: { operationId: issueOAuthToken, tags: [connectors], security: [], requestBody: { $ref: "#/components/requestBodies/FormBody" }, responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
   /oauth/revoke:

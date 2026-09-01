@@ -11,7 +11,7 @@ import { fromBase64url, keyedHash, newId, nowIso, operationDigest, randomToken, 
 import { PublicError } from "../errors.ts";
 import { completeEffect, reserveEffect } from "../idempotency.ts";
 import type { ControlPlaneEnv } from "../types.ts";
-import { AuthRepository, readCookie, sessionCookie, type SessionRow } from "../repositories/auth.ts";
+import { AuthRepository, readCookie, sessionCookieHeaders, type SessionRow } from "../repositories/auth.ts";
 
 function equalFixed(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
@@ -21,7 +21,9 @@ function equalFixed(a: string, b: string): boolean {
 }
 
 function responseJson(value: unknown, status = 200, headers?: HeadersInit): Response {
-  return Response.json(value, { status, headers: { "cache-control": "no-store", ...headers } });
+  const responseHeaders = new Headers(headers);
+  if (!responseHeaders.has("cache-control")) responseHeaders.set("cache-control", "no-store");
+  return Response.json(value, { status, headers: responseHeaders });
 }
 
 function assertSameOrigin(request: Request, env: ControlPlaneEnv): void {
@@ -41,6 +43,14 @@ export async function requireBrowserSession(request: Request, env: ControlPlaneE
   }
   if (options.fresh) repo.requireFresh(session);
   return { repo, session };
+}
+
+export async function requireBrowserFormSession(request: Request, env: ControlPlaneEnv, csrfToken: string, options: { fresh?: boolean } = {}): Promise<{ repo: AuthRepository; session: SessionRow }> {
+  assertSameOrigin(request, env);
+  const auth = await requireBrowserSession(request, env);
+  await auth.repo.verifyCsrf(auth.session, boundedString(csrfToken, "csrf_token", 128));
+  if (options.fresh) auth.repo.requireFresh(auth.session);
+  return auth;
 }
 
 async function registrationOptions(request: Request, env: ControlPlaneEnv, mode: "setup" | "add" | "recovery"): Promise<Response> {
@@ -121,7 +131,7 @@ async function registrationVerify(request: Request, env: ControlPlaneEnv, mode: 
     }
     recoveryCodes = await repo.generateRecoveryCodes(principalId);
   }
-  return responseJson({ principalId, csrfToken: session.csrf, recoveryCodes }, 201, { "set-cookie": sessionCookie(session.token, session.expiresAt) });
+  return responseJson({ principalId, csrfToken: session.csrf, recoveryCodes }, 201, sessionCookieHeaders(session.token, session.csrf, session.expiresAt));
 }
 
 async function authenticationOptions(request: Request, env: ControlPlaneEnv, stepUp: boolean): Promise<Response> {
@@ -178,7 +188,7 @@ async function authenticationVerify(request: Request, env: ControlPlaneEnv, step
       .bind(newId("otk"), passkey.principal_id, await keyedHash(env.TOKEN_PEPPER, ownerAccessToken), body.cliTokenLabel === undefined ? "Conduit CLI" : boundedString(body.cliTokenLabel, "cliTokenLabel", 128), session.id, new Date().toISOString(), ownerAccessTokenExpiresAt).run();
     await repo.audit("owner_api_token.issued", { expiresAt: ownerAccessTokenExpiresAt }, passkey.principal_id);
   }
-  return responseJson({ principalId: passkey.principal_id, csrfToken: session.csrf, fresh: true, ...(ownerAccessToken === undefined ? {} : { ownerAccessToken, ownerAccessTokenExpiresAt }) }, 200, { "set-cookie": sessionCookie(session.token, session.expiresAt) });
+  return responseJson({ principalId: passkey.principal_id, csrfToken: session.csrf, fresh: true, ...(ownerAccessToken === undefined ? {} : { ownerAccessToken, ownerAccessTokenExpiresAt }) }, 200, sessionCookieHeaders(session.token, session.csrf, session.expiresAt));
 }
 
 interface OwnerCliToken {
@@ -239,7 +249,7 @@ async function recovery(request: Request, env: ControlPlaneEnv): Promise<Respons
   const principalId = await repo.consumeRecoveryCode(boundedString(body.recoveryCode, "recoveryCode", 256));
   const session = await repo.createSession(principalId, "recovery", false);
   await repo.audit("recovery_code.used", {}, principalId);
-  return responseJson({ principalId, csrfToken: session.csrf, allowedActions: ["passkey.register", "sessions.revoke", "grants.reauthorize", "recovery.replace", "devices.revoke"] }, 200, { "set-cookie": sessionCookie(session.token, session.expiresAt) });
+  return responseJson({ principalId, csrfToken: session.csrf, allowedActions: ["passkey.register", "sessions.revoke", "grants.reauthorize", "recovery.replace", "devices.revoke"] }, 200, sessionCookieHeaders(session.token, session.csrf, session.expiresAt));
 }
 
 async function revokePasskey(request: Request, env: ControlPlaneEnv, passkeyId: string): Promise<Response> {
@@ -254,6 +264,7 @@ async function revokePasskey(request: Request, env: ControlPlaneEnv, passkeyId: 
 }
 
 export async function handleBrowserAuth(request: Request, env: ControlPlaneEnv, path: string): Promise<Response | null> {
+  if (request.method === "GET" && path === "/v1/auth/browser.js") return browserAuthScript();
   if (request.method === "GET" && path === "/v1/auth/status") return ownerCliStatus(request, env);
   if (request.method === "POST" && path === "/v1/auth/logout") return ownerCliLogout(request, env);
   if (request.method === "POST" && path === "/v1/auth/setup/options") return registrationOptions(request, env, "setup");
@@ -274,11 +285,75 @@ export async function handleBrowserAuth(request: Request, env: ControlPlaneEnv, 
   return null;
 }
 
-export async function renderAuthPage(env: ControlPlaneEnv): Promise<Response> {
+function safeReturnPath(request: Request): string {
+  const candidate = new URL(request.url).searchParams.get("return_to");
+  if (candidate === null) return "/";
+  try {
+    const parsed = new URL(candidate, request.url);
+    if (parsed.origin === new URL(request.url).origin && parsed.pathname === "/authorize") return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    // Invalid return paths fall back to the control-plane root.
+  }
+  return "/";
+}
+
+export async function renderAuthPage(request: Request, env: ControlPlaneEnv): Promise<Response> {
   const repo = new AuthRepository(env.DB, env.TOKEN_PEPPER);
   const owner = await repo.owner();
+  const returnPath = safeReturnPath(request);
   const body = owner === null
     ? "<h1>Set up Conduit</h1><p>Use a WebAuthn-capable client to call the versioned setup ceremony endpoints.</p>"
-    : "<h1>Conduit sign in</h1><p>Use a WebAuthn-capable client to call the versioned login ceremony endpoints.</p>";
-  return new Response(`<!doctype html><meta charset=utf-8><title>Conduit authentication</title>${body}`, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'" } });
+    : `<h1>Conduit sign in</h1><p>Authenticate with your passkey to continue.</p><button id=passkey-sign-in type=button data-return-to="${returnPath.replace(/[&<>"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[char] ?? char)}">Sign in with passkey</button><p id=auth-status role=status aria-live=polite></p><script src=/api/v1/auth/browser.js defer></script>`;
+  return new Response(`<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Conduit authentication</title><body>${body}</body></html>`, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; script-src 'self'; form-action 'self'; frame-ancestors 'none'", "permissions-policy": "publickey-credentials-get=(self)" } });
+}
+
+const BROWSER_AUTH_SCRIPT = `(() => {
+  const fromBase64url = (value) => {
+    const padded = value.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((value.length + 3) % 4);
+    return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+  };
+  const toBase64url = (value) => {
+    if (value === null) return null;
+    const bytes = new Uint8Array(value);
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/g, "");
+  };
+  const csrf = () => document.cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith("__Host-conduit_csrf="))?.slice("__Host-conduit_csrf=".length) ?? "";
+  const assertion = async (options) => {
+    const publicKey = { ...options, challenge: fromBase64url(options.challenge), allowCredentials: (options.allowCredentials ?? []).map((item) => ({ ...item, id: fromBase64url(item.id) })) };
+    const credential = await navigator.credentials.get({ publicKey });
+    if (!(credential instanceof PublicKeyCredential)) throw new Error("The browser did not return a passkey credential");
+    const response = credential.response;
+    return { id: credential.id, rawId: toBase64url(credential.rawId), type: credential.type, authenticatorAttachment: credential.authenticatorAttachment, clientExtensionResults: credential.getClientExtensionResults(), response: { clientDataJSON: toBase64url(response.clientDataJSON), authenticatorData: toBase64url(response.authenticatorData), signature: toBase64url(response.signature), userHandle: toBase64url(response.userHandle) } };
+  };
+  const post = async (path, body, withCsrf) => {
+    const response = await fetch(path, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json", ...(withCsrf ? { "x-csrf-token": csrf() } : {}) }, body: JSON.stringify(body) });
+    const value = await response.json();
+    if (!response.ok) throw new Error(value?.error?.message ?? "Passkey request failed");
+    return value;
+  };
+  const run = async (stepUp) => {
+    const optionsPath = stepUp ? "/api/v1/auth/step-up/options" : "/api/v1/auth/login/options";
+    const verifyPath = stepUp ? "/api/v1/auth/step-up/verify" : "/api/v1/auth/login/verify";
+    const ceremony = await post(optionsPath, {}, stepUp);
+    const response = await assertion(ceremony.options);
+    await post(verifyPath, { challengeId: ceremony.challengeId, challenge: ceremony.options.challenge, response }, stepUp);
+  };
+  document.querySelector("#passkey-sign-in")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    const status = document.querySelector("#auth-status");
+    try { button.disabled = true; if (status) status.textContent = "Waiting for passkey…"; await run(false); location.assign(button.dataset.returnTo || "/"); }
+    catch (error) { button.disabled = false; if (status) status.textContent = error instanceof Error ? error.message : "Passkey sign-in failed"; }
+  });
+  document.querySelector("#oauth-step-up")?.addEventListener("click", async () => {
+    const button = document.querySelector("#oauth-step-up");
+    const status = document.querySelector("#oauth-status");
+    try { button.disabled = true; if (status) status.textContent = "Waiting for passkey…"; await run(true); location.reload(); }
+    catch (error) { button.disabled = false; if (status) status.textContent = error instanceof Error ? error.message : "Passkey verification failed"; }
+  });
+})();`;
+
+export function browserAuthScript(): Response {
+  return new Response(BROWSER_AUTH_SCRIPT, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'" } });
 }

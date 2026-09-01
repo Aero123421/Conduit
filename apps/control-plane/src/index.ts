@@ -36,7 +36,7 @@ async function fetchHandler(request: Request, env: ControlPlaneEnv, ctx: Executi
     let routePath = url.pathname.startsWith("/api/v1/") ? url.pathname.slice(4) : url.pathname;
     routePath = routePath.replace(/^\/v1\/board\/messages(?=\/|$)/, "/v1/messages").replace(/^\/v1\/projects\/sources$/, "/v1/sources").replace(/^\/v1\/agents(?=\/|$)/, "/v1/project_agents").replace(/^\/v1\/evaluations\/([^/]+)$/, "/v1/evidence/$1");
     if (url.pathname === "/healthz" && request.method === "GET") return withSecurityHeaders(Response.json({ status: "ok", version: 1 }), requestId);
-    if ((url.pathname === "/setup" || url.pathname === "/login") && request.method === "GET") return withSecurityHeaders(await renderAuthPage(env), requestId);
+    if ((url.pathname === "/setup" || url.pathname === "/login") && request.method === "GET") return withSecurityHeaders(await renderAuthPage(request, env), requestId);
     if (url.pathname === "/device" && request.method === "GET") return withSecurityHeaders(new Response("<!doctype html><meta charset=utf-8><title>Device enrollment</title><h1>Device enrollment</h1><p>Sign in, perform fresh passkey authentication, then review the displayed code and public-key fingerprint.</p>", { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; frame-ancestors 'none'" } }), requestId);
     const oauth = await handleOAuth(request, env, routePath);
     if (oauth !== null) return withSecurityHeaders(oauth, requestId);

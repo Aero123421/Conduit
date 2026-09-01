@@ -2,8 +2,9 @@ import { boundedString, boundedStringArray, readJsonBounded, readTextBounded, re
 import { canonicalJson, keyedHash, newId, nowIso, operationDigest, randomToken, sha256Hex } from "../crypto.ts";
 import { PublicError } from "../errors.ts";
 import { completeEffect, reserveEffect } from "../idempotency.ts";
+import { readCookie } from "../repositories/auth.ts";
 import type { AuthActor, ControlPlaneEnv } from "../types.ts";
-import { requireBrowserSession } from "./browser.ts";
+import { requireBrowserFormSession, requireBrowserSession } from "./browser.ts";
 
 const SUPPORTED_SCOPES = new Set([
   "conduit.read", "conduit.board.write", "conduit.run.start", "conduit.run.control",
@@ -13,6 +14,7 @@ const SUPPORTED_SCOPES = new Set([
 
 interface ClientRow {
   client_id: string;
+  registration_mechanism: string;
   client_name: string;
   redirect_uris_json: string;
   token_endpoint_auth_method: string;
@@ -78,8 +80,8 @@ async function readMetadataDocument(clientId: string): Promise<{ clientName: str
 }
 
 async function client(env: ControlPlaneEnv, clientId: string): Promise<ClientRow> {
-  let row = await env.DB.prepare("SELECT client_id,client_name,redirect_uris_json,token_endpoint_auth_method,status FROM oauth_clients WHERE client_id=?1 LIMIT 1").bind(clientId).first<ClientRow>();
-  if (clientId.startsWith("https://")) {
+  let row = await env.DB.prepare("SELECT client_id,registration_mechanism,client_name,redirect_uris_json,token_endpoint_auth_method,status FROM oauth_clients WHERE client_id=?1 LIMIT 1").bind(clientId).first<ClientRow>();
+  if (clientId.startsWith("https://") && (row === null || row.registration_mechanism === "client_id_metadata_document")) {
     const metadata = await readMetadataDocument(clientId);
     const stored = await env.DB.prepare("SELECT metadata_digest,status FROM oauth_clients WHERE client_id=?1 LIMIT 1").bind(clientId).first<{ metadata_digest: string; status: string }>();
     const now = nowIso();
@@ -93,7 +95,7 @@ async function client(env: ControlPlaneEnv, clientId: string): Promise<ClientRow
       ]);
       throw new PublicError("grant_reauthorization_required", 403, "Client metadata changed and requires owner review");
     }
-    row = await env.DB.prepare("SELECT client_id,client_name,redirect_uris_json,token_endpoint_auth_method,status FROM oauth_clients WHERE client_id=?1 LIMIT 1").bind(clientId).first<ClientRow>();
+    row = await env.DB.prepare("SELECT client_id,registration_mechanism,client_name,redirect_uris_json,token_endpoint_auth_method,status FROM oauth_clients WHERE client_id=?1 LIMIT 1").bind(clientId).first<ClientRow>();
   }
   if (row === null || row.status !== "active") throw new PublicError("client_not_registered", 400, "OAuth client is not active");
   return row;
@@ -135,7 +137,25 @@ async function approveClient(request: Request, env: ControlPlaneEnv, clientId: s
 
 async function authorizeGet(request: Request, env: ControlPlaneEnv): Promise<Response> {
   if (request.url.length > 8192) throw new PublicError("invalid_request", 414, "Authorization request is too large");
-  const { session } = await requireBrowserSession(request, env);
+  let auth: Awaited<ReturnType<typeof requireBrowserSession>>;
+  try {
+    auth = await requireBrowserSession(request, env);
+  } catch (error) {
+    if (!(error instanceof PublicError) || error.code !== "authentication_required") throw error;
+    const login = new URL("/login", env.PUBLIC_ORIGIN);
+    const requested = new URL(request.url);
+    login.searchParams.set("return_to", `${requested.pathname}${requested.search}`);
+    return Response.redirect(login.toString(), 303);
+  }
+  const { repo, session } = auth;
+  const csrfToken = readCookie(request, "__Host-conduit_csrf");
+  if (csrfToken === null) {
+    const login = new URL("/login", env.PUBLIC_ORIGIN);
+    const requested = new URL(request.url);
+    login.searchParams.set("return_to", `${requested.pathname}${requested.search}`);
+    return Response.redirect(login.toString(), 303);
+  }
+  await repo.verifyCsrf(session, csrfToken);
   const url = new URL(request.url);
   const clientId = boundedString(url.searchParams.get("client_id"), "client_id", 2048);
   const clientRow = await client(env, clientId);
@@ -147,22 +167,32 @@ async function authorizeGet(request: Request, env: ControlPlaneEnv): Promise<Res
   const codeChallenge = boundedString(url.searchParams.get("code_challenge"), "code_challenge", 128);
   if (url.searchParams.get("code_challenge_method") !== "S256") return oauthError("invalid_request", "PKCE S256 is required");
   const scopes = parseScopes(url.searchParams.get("scope") ?? "");
-  const policyId = boundedString(url.searchParams.get("connector_policy_id"), "connector_policy_id", 128);
-  const policy = await env.DB.prepare("SELECT id,revision,client_id,status FROM connector_policies WHERE id=?1 LIMIT 1").bind(policyId).first<{ id: string; revision: number; client_id: string; status: string }>();
-  if (policy === null || policy.client_id !== clientId || policy.status !== "active") throw new PublicError("connector_ceiling_exceeded", 403, "Connector policy is not active for this client");
+  const policies = await env.DB.prepare("SELECT id,revision,max_access_scope,most_permissive_approval_mode FROM connector_policies WHERE principal_id=?1 AND client_id=?2 AND status='active' AND (expires_at IS NULL OR expires_at>?3) ORDER BY id LIMIT 100")
+    .bind(session.principal_id, clientId, nowIso()).all<{ id: string; revision: number; max_access_scope: string; most_permissive_approval_mode: string }>();
+  if (policies.results.length === 0) throw new PublicError("connector_ceiling_exceeded", 403, "No active Connector Policy is available for this client");
   const transactionId = newId("consent");
   const now = new Date();
   await env.DB.prepare("INSERT INTO oauth_consent_transactions(id,principal_id,browser_session_id,client_id,redirect_uri,resource,scopes_json,state_value,code_challenge,code_challenge_method,connector_policy_id,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,'S256',?10,?11,?12)")
-    .bind(transactionId, session.principal_id, session.id, clientId, redirectUri, resource, JSON.stringify(scopes), url.searchParams.get("state"), codeChallenge, policyId, new Date(now.getTime() + 300_000).toISOString(), now.toISOString()).run();
-  const html = `<!doctype html><meta charset=utf-8><title>Authorize ${escapeHtml(clientRow.client_name)}</title><h1>Authorize ${escapeHtml(clientRow.client_name)}</h1><p>Scopes: ${escapeHtml(scopes.join(" "))}</p><form method=post action=/authorize><input type=hidden name=transaction_id value="${escapeHtml(transactionId)}"><input type=hidden name=csrf_token value=""><button name=decision value=approve>Approve</button><button name=decision value=deny>Deny</button></form><p>Supply the session CSRF token as the X-CSRF-Token header when submitting.</p>`;
-  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; form-action 'self'; frame-ancestors 'none'" } });
+    .bind(transactionId, session.principal_id, session.id, clientId, redirectUri, resource, JSON.stringify(scopes), url.searchParams.get("state"), codeChallenge, policies.results[0]!.id, new Date(now.getTime() + 300_000).toISOString(), now.toISOString()).run();
+  let fresh = true;
+  try { repo.requireFresh(session); } catch (error) {
+    if (!(error instanceof PublicError) || error.code !== "fresh_authentication_required") throw error;
+    fresh = false;
+  }
+  const policyOptions = policies.results.map((policy) => `<option value="${escapeHtml(policy.id)}">${escapeHtml(policy.id)} · revision ${policy.revision} · ${escapeHtml(policy.max_access_scope)} · approval ${escapeHtml(policy.most_permissive_approval_mode)}</option>`).join("");
+  const approval = fresh
+    ? "<button name=decision value=approve>Approve</button>"
+    : "<button id=oauth-step-up type=button>Verify passkey to approve</button><p id=oauth-status role=status aria-live=polite></p>";
+  const html = `<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Authorize ${escapeHtml(clientRow.client_name)}</title><body><h1>Authorize ${escapeHtml(clientRow.client_name)}</h1><p>Scopes: ${escapeHtml(scopes.join(" "))}</p><form method=post action=/authorize><input type=hidden name=transaction_id value="${escapeHtml(transactionId)}"><input type=hidden name=csrf_token value="${escapeHtml(csrfToken)}"><label>Connector Policy <select name=connector_policy_id required>${policyOptions}</select></label>${approval}<button name=decision value=deny>Deny</button></form>${fresh ? "" : "<script src=/api/v1/auth/browser.js defer></script>"}</body></html>`;
+  return new Response(html, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; script-src 'self'; form-action 'self'; frame-ancestors 'none'", "permissions-policy": "publickey-credentials-get=(self)" } });
 }
 
 function escapeHtml(value: string): string { return value.replace(/[&<>"']/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[char] ?? char); }
 
 async function authorizePost(request: Request, env: ControlPlaneEnv): Promise<Response> {
-  const { repo, session } = await requireBrowserSession(request, env, { csrf: true, fresh: true });
   const form = new URLSearchParams(await readTextBounded(request, 8192));
+  const csrfToken = boundedString(form.get("csrf_token"), "csrf_token", 128);
+  const { repo, session } = await requireBrowserFormSession(request, env, csrfToken);
   const transactionId = boundedString(form.get("transaction_id"), "transaction_id", 128);
   const transaction = await env.DB.prepare("SELECT * FROM oauth_consent_transactions WHERE id=?1 AND principal_id=?2 AND browser_session_id=?3 AND consumed_at IS NULL AND expires_at>?4 LIMIT 1")
     .bind(transactionId, session.principal_id, session.id, nowIso()).first<Record<string, unknown>>();
@@ -174,20 +204,22 @@ async function authorizePost(request: Request, env: ControlPlaneEnv): Promise<Re
     if (typeof transaction.state_value === "string") redirect.searchParams.set("state", transaction.state_value);
     return Response.redirect(redirect.toString(), 303);
   }
-  const policy = await env.DB.prepare("SELECT revision FROM connector_policies WHERE id=?1 AND client_id=?2 AND status='active' LIMIT 1").bind(String(transaction.connector_policy_id), String(transaction.client_id)).first<{ revision: number }>();
+  repo.requireFresh(session);
+  const policyId = boundedString(form.get("connector_policy_id"), "connector_policy_id", 128);
+  const policy = await env.DB.prepare("SELECT revision FROM connector_policies WHERE id=?1 AND principal_id=?2 AND client_id=?3 AND status='active' AND (expires_at IS NULL OR expires_at>?4) LIMIT 1").bind(policyId, session.principal_id, String(transaction.client_id), nowIso()).first<{ revision: number }>();
   if (policy === null) throw new PublicError("connector_ceiling_exceeded", 403, "Connector policy changed before consent");
   const grantId = newId("grant");
   const familyId = newId("tfam");
   const code = randomToken();
   const codeId = newId("code");
   const now = new Date();
-  const consumed = await env.DB.prepare("UPDATE oauth_consent_transactions SET consumed_at=?1 WHERE id=?2 AND consumed_at IS NULL").bind(now.toISOString(), transactionId).run();
+  const consumed = await env.DB.prepare("UPDATE oauth_consent_transactions SET connector_policy_id=?1,consumed_at=?2 WHERE id=?3 AND consumed_at IS NULL").bind(policyId, now.toISOString(), transactionId).run();
   if (consumed.meta.changes !== 1) return oauthError("invalid_request", "Consent transaction was already consumed");
   await env.DB.batch([
-    env.DB.prepare("INSERT INTO oauth_grants(id,principal_id,client_id,resource,scopes_json,connector_policy_id,connector_policy_revision,token_family_id,status,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'active',?9)").bind(grantId, session.principal_id, String(transaction.client_id), String(transaction.resource), String(transaction.scopes_json), String(transaction.connector_policy_id), policy.revision, familyId, now.toISOString()),
+    env.DB.prepare("INSERT INTO oauth_grants(id,principal_id,client_id,resource,scopes_json,connector_policy_id,connector_policy_revision,token_family_id,status,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'active',?9)").bind(grantId, session.principal_id, String(transaction.client_id), String(transaction.resource), String(transaction.scopes_json), policyId, policy.revision, familyId, now.toISOString()),
     env.DB.prepare("INSERT INTO oauth_authorization_codes(id,code_hash,consent_transaction_id,grant_id,client_id,redirect_uri,resource,scopes_json,code_challenge,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)").bind(codeId, await keyedHash(env.TOKEN_PEPPER, code), transactionId, grantId, String(transaction.client_id), String(transaction.redirect_uri), String(transaction.resource), String(transaction.scopes_json), String(transaction.code_challenge), new Date(now.getTime() + 300_000).toISOString(), now.toISOString()),
   ]);
-  await repo.audit("oauth_grant.created", { grantId, policyId: transaction.connector_policy_id, policyRevision: policy.revision }, session.principal_id, String(transaction.client_id));
+  await repo.audit("oauth_grant.created", { grantId, policyId, policyRevision: policy.revision }, session.principal_id, String(transaction.client_id));
   redirect.searchParams.set("code", code);
   if (typeof transaction.state_value === "string") redirect.searchParams.set("state", transaction.state_value);
   return Response.redirect(redirect.toString(), 303);

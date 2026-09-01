@@ -3,6 +3,7 @@ import { newId, nowIso } from "./crypto.ts";
 import { PublicError } from "./errors.ts";
 import { authenticateBearer } from "./auth/oauth.ts";
 import { authorizeConnector } from "./policy.ts";
+import { resolveResourceAuthority } from "./repositories/resource-authority.ts";
 import type { ControlPlaneEnv } from "./types.ts";
 
 export async function uploadArtifact(request: Request, env: ControlPlaneEnv, artifactId: string): Promise<Response> {
@@ -17,7 +18,7 @@ export async function uploadArtifact(request: Request, env: ControlPlaneEnv, art
   if (artifact === null) throw new PublicError("not_found", 404, "Artifact metadata not found");
   if (artifact.content_digest !== digest || artifact.bytes !== bytes || artifact.custody !== "upload_pending") throw new PublicError("invalid_request", 409, "Artifact upload does not match committed metadata");
   const operationId = newId("op");
-  await authorizeConnector(env, actor, { operation: "artifact.upload", ...(artifact.project_id !== null ? { projectId: artifact.project_id } : {}), artifactUploadBytes: bytes, idempotencyKey: request.headers.get("idempotency-key") ?? `${artifactId}:${digest}`, operationId, payloadDigest: digest });
+  await authorizeConnector(env, actor, { operation: "artifact.upload", ...await resolveResourceAuthority(env.DB, "artifacts", artifactId), artifactUploadBytes: bytes, idempotencyKey: request.headers.get("idempotency-key") ?? `${artifactId}:${digest}`, operationId, payloadDigest: digest });
   if (request.body === null) throw new PublicError("invalid_request", 400, "Artifact body is required");
   const r2Key = `artifacts/${artifactId}/${digest}`;
   await env.ARTIFACTS.put(r2Key, request.body, { sha256: digest, customMetadata: { artifactId, digest, uploadedAt: nowIso() }, httpMetadata: { contentType: request.headers.get("content-type") ?? "application/octet-stream" } });

@@ -8,6 +8,7 @@ import { completeEffect, reserveEffect } from "./idempotency.ts";
 import { createOperation, type StartOperationInput } from "./operations.ts";
 import { authorizeConnector } from "./policy.ts";
 import { DomainRepository, resourceSpecs, type ResourceName } from "./repositories/domain.ts";
+import { resolveInputAuthority, resolveResourceAuthority, type ResourceAuthority } from "./repositories/resource-authority.ts";
 import type { AuthActor, ControlPlaneEnv } from "./types.ts";
 
 const readPermissions: Partial<Record<ResourceName, string>> = {
@@ -60,7 +61,7 @@ function parseIfMatch(request: Request): number {
   return revision;
 }
 
-async function authorizeResource(request: Request, env: ControlPlaneEnv, actor: AuthActor, connector: boolean, resource: ResourceName, mutation: boolean, url: URL, body?: unknown): Promise<void> {
+async function authorizeResource(request: Request, env: ControlPlaneEnv, actor: AuthActor, connector: boolean, resource: ResourceName, mutation: boolean, url: URL, body?: unknown, resolvedAuthority?: ResourceAuthority): Promise<void> {
   if (!connector) return;
   const operation = (mutation ? writePermissions : readPermissions)[resource];
   if (operation === undefined) throw new PublicError("operation_not_allowed", 403, "Resource operation is not available to connectors");
@@ -68,7 +69,8 @@ async function authorizeResource(request: Request, env: ControlPlaneEnv, actor: 
   const operationId = newId("op");
   const digest = await operationDigest({ resource, mutation, id: url.pathname.split("/").at(-1), body: input });
   const key = mutation ? idempotencyKey(request) : `read:${operationId}`;
-  await authorizeConnector(env, actor, { operation, ...(typeof input.device_id === "string" ? { deviceId: input.device_id } : {}), ...(typeof input.project_id === "string" ? { projectId: input.project_id } : {}), artifactUploadBytes: resource === "artifacts" ? Number(input.bytes ?? 0) : 0, idempotencyKey: key, operationId, payloadDigest: digest });
+  const target = resolvedAuthority ?? await resolveInputAuthority(env.DB, resource, input);
+  await authorizeConnector(env, actor, { operation, ...target, artifactUploadBytes: resource === "artifacts" ? Number(input.bytes ?? 0) : 0, idempotencyKey: key, operationId, payloadDigest: digest });
 }
 
 async function resolveApproval(request: Request, env: ControlPlaneEnv, approvalId: string): Promise<Response> {
@@ -81,7 +83,7 @@ async function resolveApproval(request: Request, env: ControlPlaneEnv, approvalI
   if (approval === null) throw new PublicError("not_found", 404, "Approval not found");
   if (approval.decision !== null || Date.parse(approval.expires_at) <= Date.now()) throw new PublicError("approval_expired", 409, "Approval is resolved or expired");
   if (boundedString(body.commitmentDigest, "commitmentDigest", 64, 64) !== approval.commitment_digest) throw new PublicError("approval_digest_mismatch", 409, "Approval commitment does not match");
-  if (auth.connector) await authorizeConnector(env, auth.actor, { operation: "approval.resolve", idempotencyKey: key, operationId: newId("op"), payloadDigest: approval.commitment_digest });
+  if (auth.connector) await authorizeConnector(env, auth.actor, { operation: "approval.resolve", ...await resolveResourceAuthority(env.DB, "approvals", approvalId), idempotencyKey: key, operationId: newId("op"), payloadDigest: approval.commitment_digest });
   else await requireBrowserSession(request, env, { csrf: true, fresh: true });
   const reserved = await reserveEffect(env.DB, auth.actor.grantId ?? `${auth.actor.clientId}:${auth.actor.principalId}`, key, await operationDigest({ approvalId, decision, commitmentDigest: approval.commitment_digest }));
   if (reserved.replay !== undefined) return Response.json(reserved.replay);
@@ -134,9 +136,9 @@ async function postBoardMessage(request: Request, env: ControlPlaneEnv): Promise
   const body = record(await readJsonBounded(request));
   const auth = await actorFor(request, env, true);
   const url = new URL(request.url);
-  await authorizeResource(request, env, auth.actor, auth.connector, "messages", true, url, body);
   const key = idempotencyKey(request);
   const sessionId = boundedString(body.session_id ?? body.sessionId, "sessionId", 128);
+  await authorizeResource(request, env, auth.actor, auth.connector, "messages", true, url, { ...body, session_id: sessionId });
   const text = boundedString(body.body, "body", 32_768);
   const rawMentions = body.mentions === undefined ? [] : body.mentions;
   if (!Array.isArray(rawMentions) || rawMentions.length > 64) throw new PublicError("invalid_request", 400, "mentions must be an array with at most 64 entries");
@@ -204,7 +206,8 @@ async function linkTask(request: Request, env: ControlPlaneEnv, rawTaskId: strin
   if (linkKind !== undefined && !["message", "assignment", "run", "change_set", "artifact"].includes(linkKind)) throw new PublicError("invalid_request", 400, "Task link kind is invalid");
 
   const auth = await actorFor(request, env, true);
-  await authorizeResource(request, env, auth.actor, auth.connector, "tasks", true, new URL(request.url), body);
+  const taskAuthority = await resolveResourceAuthority(env.DB, "tasks", taskId);
+  await authorizeResource(request, env, auth.actor, auth.connector, "tasks", true, new URL(request.url), body, taskAuthority);
   const expectedRevision = parseIfMatch(request);
   const key = idempotencyKey(request);
   const reserved = await reserveEffect(env.DB, auth.actor.grantId ?? `${auth.actor.clientId}:${auth.actor.principalId}`, key, await operationDigest({ taskId, expectedRevision, dependency: dependency ?? null, linkKind: linkKind ?? null, targetId: targetId ?? null }));
@@ -214,6 +217,8 @@ async function linkTask(request: Request, env: ControlPlaneEnv, rawTaskId: strin
   if (current.revision !== expectedRevision) throw new PublicError("revision_conflict", 409, "Target revision is stale");
 
   if (dependency !== undefined) {
+    const dependencyAuthority = await resolveResourceAuthority(env.DB, "tasks", dependency);
+    if (taskAuthority.projectId !== dependencyAuthority.projectId) throw new PublicError("project_not_allowed", 403, "Task dependency crosses Project authority");
     const target = await env.DB.prepare("SELECT id FROM tasks WHERE id=?1 LIMIT 1").bind(dependency).first<{ id: string }>();
     if (target === null) throw new PublicError("not_found", 404, "Dependency Task not found");
     const cycle = await env.DB.prepare("WITH RECURSIVE reachable(id) AS (VALUES (?1) UNION SELECT td.depends_on_task_id FROM task_dependencies td JOIN reachable r ON td.task_id=r.id) SELECT id FROM reachable WHERE id=?2 LIMIT 1").bind(dependency, taskId).first<{ id: string }>();
@@ -221,6 +226,12 @@ async function linkTask(request: Request, env: ControlPlaneEnv, rawTaskId: strin
     const existing = await env.DB.prepare("SELECT 1 AS found FROM task_dependencies WHERE task_id=?1 AND depends_on_task_id=?2 LIMIT 1").bind(taskId, dependency).first<{ found: number }>();
     if (existing !== null) throw new PublicError("invalid_request", 409, "Task dependency already exists");
   } else {
+    const targetResource: Partial<Record<string, ResourceName>> = { message: "messages", assignment: "assignments", run: "runs", artifact: "artifacts" };
+    const linkedResource = targetResource[linkKind!];
+    if (linkedResource !== undefined) {
+      const linkedAuthority = await resolveResourceAuthority(env.DB, linkedResource, targetId!);
+      if (taskAuthority.projectId !== linkedAuthority.projectId) throw new PublicError("project_not_allowed", 403, "Task link crosses Project authority");
+    }
     const existing = await env.DB.prepare("SELECT 1 AS found FROM task_links WHERE task_id=?1 AND link_kind=?2 AND target_id=?3 LIMIT 1").bind(taskId, linkKind!, targetId!).first<{ found: number }>();
     if (existing !== null) throw new PublicError("invalid_request", 409, "Task link already exists");
   }
@@ -253,7 +264,16 @@ export async function handleApi(request: Request, env: ControlPlaneEnv, path: st
   if (request.method === "GET" && oauthGrant?.[1] !== undefined) return readOAuthGrants(request, env, oauthGrant[1]);
   if (request.method === "POST" && path === "/v1/operations") {
     const auth = await actorFor(request, env, true);
-    const body = record(await readJsonBounded(request)) as unknown as StartOperationInput;
+    const parsedBody = record(await readJsonBounded(request));
+    const target = await resolveInputAuthority(env.DB, "operations", {
+      ...(typeof parsedBody.deviceId === "string" ? { device_id: parsedBody.deviceId } : {}),
+      ...(typeof parsedBody.projectId === "string" ? { project_id: parsedBody.projectId } : {}),
+      ...(typeof parsedBody.sessionId === "string" ? { session_id: parsedBody.sessionId } : {}),
+      ...(typeof parsedBody.assignmentId === "string" ? { assignment_id: parsedBody.assignmentId } : {}),
+      ...(typeof parsedBody.runId === "string" ? { run_id: parsedBody.runId } : {}),
+    });
+    if (target.projectId !== undefined) parsedBody.projectId = target.projectId;
+    const body = parsedBody as unknown as StartOperationInput;
     const key = idempotencyKey(request);
     if (body.idempotencyKey !== undefined && body.idempotencyKey !== key) throw new PublicError("idempotency_conflict", 409, "Body and Idempotency-Key header differ");
     body.idempotencyKey = key;
@@ -261,12 +281,14 @@ export async function handleApi(request: Request, env: ControlPlaneEnv, path: st
   }
   const stream = path.match(/^\/v1\/sessions\/([^/]+)\/stream$/);
   if (request.method === "GET" && stream?.[1] !== undefined && request.headers.get("upgrade")?.toLowerCase() === "websocket") {
-    await actorFor(request, env, false);
+    const auth = await actorFor(request, env, false);
+    await authorizeResource(request, env, auth.actor, auth.connector, "sessions", false, new URL(request.url), undefined, await resolveResourceAuthority(env.DB, "sessions", stream[1]));
     return env.BOARD_ROOMS.getByName(stream[1]).fetch(request);
   }
   const runEvents = path.match(/^\/v1\/runs\/([^/]+)\/events$/);
   if (request.method === "GET" && runEvents?.[1] !== undefined) {
-    await actorFor(request, env, false);
+    const auth = await actorFor(request, env, false);
+    await authorizeResource(request, env, auth.actor, auth.connector, "runs", false, new URL(request.url), undefined, await resolveResourceAuthority(env.DB, "runs", runEvents[1]));
     const rows = await env.DB.prepare("SELECT * FROM normalized_events WHERE run_id=?1 ORDER BY CAST(sequence AS INTEGER) LIMIT 500").bind(runEvents[1]).all<Record<string, unknown>>();
     return Response.json({ items: rows.results });
   }
@@ -282,8 +304,12 @@ export async function handleApi(request: Request, env: ControlPlaneEnv, path: st
   const url = new URL(request.url);
   if (request.method === "GET") {
     const auth = await actorFor(request, env, false);
-    await authorizeResource(request, env, auth.actor, auth.connector, resource, false, url);
-    if (id === undefined) return Response.json({ items: await repo.list(resource, url) });
+    if (id === undefined) {
+      await authorizeResource(request, env, auth.actor, auth.connector, resource, false, url);
+      return Response.json({ items: await repo.list(resource, url) });
+    }
+    const authority = await resolveResourceAuthority(env.DB, resource, id);
+    await authorizeResource(request, env, auth.actor, auth.connector, resource, false, url, undefined, authority);
     const item = await repo.get(resource, id);
     return typeof item.revision === "number" ? Response.json(item, { headers: { etag: `"${item.revision}"` } }) : Response.json(item);
   }
@@ -291,7 +317,9 @@ export async function handleApi(request: Request, env: ControlPlaneEnv, path: st
     const body = await readJsonBounded(request);
     const auth = await actorFor(request, env, true);
     idempotencyKey(request);
-    await authorizeResource(request, env, auth.actor, auth.connector, resource, true, url, body);
+    const input = record(body);
+    const authority = await resolveInputAuthority(env.DB, resource, input);
+    await authorizeResource(request, env, auth.actor, auth.connector, resource, true, url, body, authority);
     if (resource === "approvals") throw new PublicError("invalid_request", 405, "Approvals are created by operation admission");
     const key = idempotencyKey(request);
     const reserved = await reserveEffect(env.DB, auth.actor.grantId ?? `${auth.actor.clientId}:${auth.actor.principalId}`, key, await operationDigest({ method: "POST", resource, body }));
@@ -305,7 +333,9 @@ export async function handleApi(request: Request, env: ControlPlaneEnv, path: st
     const body = await readJsonBounded(request);
     const auth = await actorFor(request, env, true);
     const key = idempotencyKey(request);
-    await authorizeResource(request, env, auth.actor, auth.connector, resource, true, url, body);
+    const current = await repo.get(resource, id);
+    const authority = await resolveInputAuthority(env.DB, resource, { ...current, ...record(body) });
+    await authorizeResource(request, env, auth.actor, auth.connector, resource, true, url, body, authority);
     const expected = parseIfMatch(request);
     const reserved = await reserveEffect(env.DB, auth.actor.grantId ?? `${auth.actor.clientId}:${auth.actor.principalId}`, key, await operationDigest({ method: "PATCH", resource, id, expected, body }));
     if (reserved.replay !== undefined) return Response.json(reserved.replay, { headers: typeof reserved.replay.revision === "number" ? { etag: `"${reserved.replay.revision}"` } : {} });

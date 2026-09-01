@@ -143,6 +143,17 @@ export function sessionCookie(token: string, expiresAt: string): string {
   return `__Host-conduit_session=${token}; Path=/; Secure; HttpOnly; SameSite=Lax; Expires=${new Date(expiresAt).toUTCString()}`;
 }
 
+export function csrfCookie(token: string, expiresAt: string): string {
+  return `__Host-conduit_csrf=${token}; Path=/; Secure; SameSite=Lax; Expires=${new Date(expiresAt).toUTCString()}`;
+}
+
+export function sessionCookieHeaders(token: string, csrf: string, expiresAt: string): Headers {
+  const headers = new Headers({ "cache-control": "no-store" });
+  headers.append("set-cookie", sessionCookie(token, expiresAt));
+  headers.append("set-cookie", csrfCookie(csrf, expiresAt));
+  return headers;
+}
+
 export function readCookie(request: Request, name: string): string | null {
   const cookie = request.headers.get("cookie");
   if (cookie === null) return null;

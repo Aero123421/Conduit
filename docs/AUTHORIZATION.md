@@ -251,6 +251,10 @@ The MCP endpoint publishes OAuth Protected Resource Metadata. The authorization 
 
 The supported authorization flow is Authorization Code with PKCE S256. The implicit grant and resource-owner password grant are not supported.
 
+The authorization request contains only standard OAuth and protected-resource parameters. It does not contain a `connector_policy_id` or another Conduit authority selector. After browser sign-in, Conduit lists the active Connector Policies already bound to the requesting client and owner. The owner selects one during consent, and the resulting grant stores its exact ID and revision.
+
+The consent surface is usable in a normal WebAuthn-capable browser. A missing owner session redirects to browser passkey sign-in. A session older than the fresh-authentication window performs Passkey step-up in the same origin before enabling approval. Consent is submitted as an ordinary HTML form with a same-origin, session-bound CSRF value; it does not depend on a custom request header that a form cannot send.
+
 Access tokens are short-lived. Refresh tokens rotate on use, and reuse of an old refresh token revokes the token family. The authorization server exposes token revocation. Lowering or revoking a grant takes effect independently of access-token expiry because each effectful call resolves the current server-side grant revision.
 
 DPoP may be enabled for clients that support it. It is not required globally until ChatGPT, Claude, Perplexity, and other supported clients can all use it reliably.
@@ -379,6 +383,10 @@ The effective authority for an operation is the intersection of:
 10. typed approval receipt, when required
 
 The authorization decision binds the exact target and revision. A later request cannot reuse an approval after the source location, runtime, arguments, operation digest, or controller epoch changes.
+
+For MCP object operations, the control plane derives Project and Device authority from stored relationships before applying the Connector Policy. It does not accept a caller-supplied `projectId` as proof of ownership. The binding follows the stored graph, including Session to Project, Location to Source to Project, and Assignment, Run, Task, Artifact, trace, evidence, and operation references to their actual Project. Multiple denormalized references must resolve to the same Project and Device or the request fails closed.
+
+MCP create operations resolve every referenced parent before policy admission. A supplied Project that disagrees with a Session, Assignment, Run, Source Location, or Project Agent is rejected before the record or operation is persisted. When an Agent Run names a Project Agent, its adapter and role are replaced with the stored Project Agent values. A stored `reviewer` role forces `read_only` access; a caller cannot promote or demote the role in request arguments.
 
 Board text is never parsed as an approval receipt.
 

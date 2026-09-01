@@ -258,7 +258,7 @@ fn structured_agent_fixture_completes_without_inference_and_crash_is_visible() {
     let pi = bin.join("pi");
     fs::write(
         &pi,
-        "#!/bin/sh\nIFS= read -r ignored\nprintf '%s\\n' '{\"id\":\"conduit-1\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}' '{\"type\":\"agent_start\"}' '{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"visible fixture response\"}}' '{\"type\":\"agent_end\"}'\n",
+        "#!/bin/sh\nIFS= read -r ignored\nprintf '%s\\n' '{\"id\":\"conduit-1\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}' '{\"type\":\"agent_start\"}' '{\"type\":\"message_update\",\"assistantMessageEvent\":{\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"visible fixture response\"}}' '{\"type\":\"agent_end\",\"willRetry\":false}' '{\"type\":\"agent_settled\"}'\n",
     )
     .unwrap();
     fs::set_permissions(&pi, fs::Permissions::from_mode(0o700)).unwrap();

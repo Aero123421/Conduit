@@ -521,6 +521,16 @@ If the connection is lost before the receipt is received, the run remains `waiti
 
 An Agent Adapter must answer every provider-initiated request that carries an ID. A supported approval request is bridged to the typed approval flow or receives a correlated explicit decline. A request for an unadvertised capability, including host-managed authentication refresh, client attestation, dynamic tools, or user input, receives a correlated fail-closed protocol error. Unknown request methods receive a correlated method-not-found error and a bounded visible Adapter error event. No provider request is left pending merely because Conduit does not implement it.
 
+ACP permission responses preserve the JSON-RPC request ID and use the
+versioned nested outcome shape. A missing typed bridge returns
+`{ "outcome": { "outcome": "cancelled" } }`; effective `never` may select an
+offered `allow_once` option but not a reusable option. Pi extension dialog
+requests preserve their request ID in `extension_ui_response`; without a typed
+bridge, or when a second dialog arrives while one is pending, the response is
+`cancelled`. Pi `agent_end` remains nonterminal even when `willRetry` is false;
+`agent_settled` is the terminal event after retries and queued follow-ups are
+drained.
+
 ## Cancellation
 
 Cancellation is an effectful operation, not a state label.

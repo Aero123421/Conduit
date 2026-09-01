@@ -6,7 +6,8 @@ use crate::{
 };
 use conduit_adapters::{
     AdapterCatalog, AdapterChild, AdapterEvent, AdapterEventKind, AdapterKind, AdapterOperation,
-    AdapterState, LaunchRequest, ProtocolDriver,
+    AdapterState, ApprovalBridgeOwnership, ApprovalContext, EffectiveApprovalPolicy, LaunchRequest,
+    ProtocolDriver,
 };
 use conduit_domain::{DeviceId, Sha256Digest};
 use conduit_node_store::{DeviceIdentity, Direction, OperationState, ReceiveResult, StoreError};
@@ -927,11 +928,20 @@ impl NodeService {
                 )
                 .then(|| self.local.agent_session_dir(&run_id)),
             };
+            let approval_context = ApprovalContext {
+                effective_policy: EffectiveApprovalPolicy::try_from(op.approval_mode.as_str())
+                    .map_err(|error| ServiceError::Unavailable(adapter_reason(&error)))?,
+                bridge: ApprovalBridgeOwnership::Unavailable,
+            };
             let (spec, driver) =
                 if matches!(runtime_kind, RuntimeKind::Container | RuntimeKind::Vm) {
-                    AdapterCatalog::launch_in_guest(kind, &request)
+                    AdapterCatalog::launch_in_guest_with_approval_context(
+                        kind,
+                        &request,
+                        approval_context,
+                    )
                 } else {
-                    AdapterCatalog::launch(kind, &request)
+                    AdapterCatalog::launch_with_approval_context(kind, &request, approval_context)
                 }
                 .map_err(|error| ServiceError::Unavailable(adapter_reason(&error)))?;
             let launch = LaunchPlan {

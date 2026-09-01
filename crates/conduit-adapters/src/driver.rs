@@ -4,8 +4,8 @@ use serde_json::{Value, json};
 
 use crate::types::{
     AdapterError, AdapterEvent, AdapterEventKind, AdapterKind, AdapterOperation, AdapterState,
-    ApprovalContext, LaunchRequest, MAX_PROTOCOL_FRAME_BYTES, ProtocolFrame,
-    validate_launch_request,
+    ApprovalBridgeOwnership, ApprovalContext, EffectiveApprovalPolicy, LaunchRequest,
+    MAX_PROTOCOL_FRAME_BYTES, ProtocolFrame, validate_launch_request,
 };
 
 const MAX_REPLAY_EVENTS: usize = 4_096;
@@ -25,6 +25,18 @@ enum Phase {
 }
 
 #[derive(Debug)]
+struct PendingAcpPermission {
+    request_id: Value,
+    allow_once_option_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct PendingPiDialog {
+    request_id: Value,
+    method: String,
+}
+
+#[derive(Debug)]
 pub struct ProtocolDriver {
     kind: AdapterKind,
     phase: Phase,
@@ -36,6 +48,8 @@ pub struct ProtocolDriver {
     active_turn_id: Option<String>,
     next_request_id: u64,
     approval_context: ApprovalContext,
+    pending_acp_permission: Option<PendingAcpPermission>,
+    pending_pi_dialog: Option<PendingPiDialog>,
     replay: VecDeque<AdapterEvent>,
 }
 
@@ -67,6 +81,8 @@ impl ProtocolDriver {
             active_turn_id: None,
             next_request_id: 1,
             approval_context,
+            pending_acp_permission: None,
+            pending_pi_dialog: None,
             replay: VecDeque::new(),
         })
     }
@@ -155,7 +171,7 @@ impl ProtocolDriver {
         let (frames, events) = match self.kind {
             AdapterKind::Codex => self.on_codex(&value)?,
             AdapterKind::OpenCode => self.on_acp(&value)?,
-            AdapterKind::Pi => (Vec::new(), self.normalize_pi(&value)),
+            AdapterKind::Pi => self.on_pi(&value)?,
             AdapterKind::ClaudeCode => (Vec::new(), self.normalize_claude(&value)),
             AdapterKind::Agy => (Vec::new(), self.normalize_agy(&value)),
         };
@@ -188,7 +204,7 @@ impl ProtocolDriver {
     }
 
     pub fn approval_response(
-        &self,
+        &mut self,
         request_id: &Value,
         allow: bool,
     ) -> Result<ProtocolFrame, AdapterError> {
@@ -197,11 +213,50 @@ impl ProtocolDriver {
                 "id": request_id,
                 "result": {"decision": if allow { "accept" } else { "decline" }}
             })),
-            AdapterKind::OpenCode => ProtocolFrame::json(&json!({
-                "jsonrpc": "2.0",
-                "id": request_id,
-                "result": {"outcome": if allow { "selected" } else { "cancelled" }}
-            })),
+            AdapterKind::OpenCode => {
+                let pending =
+                    self.pending_acp_permission
+                        .take()
+                        .ok_or(AdapterError::UnexpectedResponse {
+                            phase: self.phase_name(),
+                            reason: "no typed ACP permission request is pending",
+                        })?;
+                if pending.request_id != *request_id {
+                    self.pending_acp_permission = Some(pending);
+                    return Err(AdapterError::UnexpectedResponse {
+                        phase: self.phase_name(),
+                        reason: "approval response did not match the pending ACP request",
+                    });
+                }
+                self.state = AdapterState::Working;
+                if allow {
+                    match pending.allow_once_option_id {
+                        Some(option_id) => acp_permission_selected(request_id, &option_id),
+                        None => acp_permission_cancelled(request_id),
+                    }
+                } else {
+                    acp_permission_cancelled(request_id)
+                }
+            }
+            AdapterKind::Pi => {
+                let pending =
+                    self.pending_pi_dialog
+                        .take()
+                        .ok_or(AdapterError::UnexpectedResponse {
+                            phase: self.phase_name(),
+                            reason: "no typed Pi dialog request is pending",
+                        })?;
+                if pending.request_id != *request_id {
+                    self.pending_pi_dialog = Some(pending);
+                    return Err(AdapterError::UnexpectedResponse {
+                        phase: self.phase_name(),
+                        reason: "approval response did not match the pending Pi dialog request",
+                    });
+                }
+                self.state = AdapterState::Working;
+                let _ = (allow, pending.method);
+                pi_dialog_cancelled(request_id)
+            }
             _ => Err(AdapterError::UnsupportedOperation {
                 adapter: self.kind,
                 operation: AdapterOperation::Send,
@@ -463,21 +518,45 @@ impl ProtocolDriver {
         value: &Value,
     ) -> Result<(Vec<ProtocolFrame>, Vec<AdapterEvent>), AdapterError> {
         if let Some(method) = value.get("method").and_then(Value::as_str) {
-            if value.get("id").is_some() {
-                let kind = if method == "session/request_permission" {
-                    self.state = AdapterState::WaitingApproval;
-                    AdapterEventKind::ApprovalRequest
-                } else {
-                    AdapterEventKind::AdapterError
-                };
-                return Ok((
-                    Vec::new(),
-                    vec![AdapterEvent::bounded(
-                        kind,
+            if let Some(request_id) = value.get("id") {
+                let correlation_id = request_id_text(request_id);
+                if method == "session/request_permission" {
+                    let allow_once_option_id = acp_allow_once_option(value);
+                    let event = AdapterEvent::bounded(
+                        AdapterEventKind::ApprovalRequest,
                         method,
                         self.native_session_id(),
-                        value.get("id").map(request_id_text).as_deref(),
+                        Some(&correlation_id),
                         None,
+                        value.get("params").cloned(),
+                    );
+                    if self.approval_context.effective_policy == EffectiveApprovalPolicy::Never {
+                        let frame = match allow_once_option_id {
+                            Some(option_id) => acp_permission_selected(request_id, &option_id)?,
+                            None => acp_permission_cancelled(request_id)?,
+                        };
+                        return Ok((vec![frame], vec![event]));
+                    }
+                    if self.approval_context.bridge == ApprovalBridgeOwnership::Typed
+                        && self.pending_acp_permission.is_none()
+                    {
+                        self.state = AdapterState::WaitingApproval;
+                        self.pending_acp_permission = Some(PendingAcpPermission {
+                            request_id: request_id.clone(),
+                            allow_once_option_id,
+                        });
+                        return Ok((Vec::new(), vec![event]));
+                    }
+                    return Ok((vec![acp_permission_cancelled(request_id)?], vec![event]));
+                }
+                return Ok((
+                    vec![acp_fail_closed_response(method, request_id)?],
+                    vec![AdapterEvent::bounded(
+                        AdapterEventKind::AdapterError,
+                        method,
+                        self.native_session_id(),
+                        Some(&correlation_id),
+                        Some("ACP client request was not advertised and was denied"),
                         value.get("params").cloned(),
                     )],
                 ));
@@ -634,7 +713,61 @@ impl ProtocolDriver {
         )]
     }
 
-    fn normalize_pi(&mut self, value: &Value) -> Vec<AdapterEvent> {
+    fn on_pi(
+        &mut self,
+        value: &Value,
+    ) -> Result<(Vec<ProtocolFrame>, Vec<AdapterEvent>), AdapterError> {
+        if value.get("type").and_then(Value::as_str) == Some("extension_ui_request") {
+            let method = value
+                .get("method")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let request_id = value.get("id");
+            let correlation_id = request_id.map(request_id_text);
+            let dialog = matches!(method, "select" | "confirm" | "input" | "editor");
+            let fire_and_forget = matches!(
+                method,
+                "notify" | "setStatus" | "setWidget" | "setTitle" | "set_editor_text"
+            );
+            let kind = if dialog {
+                AdapterEventKind::ApprovalRequest
+            } else if fire_and_forget {
+                AdapterEventKind::State
+            } else {
+                AdapterEventKind::AdapterError
+            };
+            let event = AdapterEvent::bounded(
+                kind,
+                &format!("extension_ui_request.{method}"),
+                self.native_session_id(),
+                correlation_id.as_deref(),
+                None,
+                Some(value.clone()),
+            );
+            if fire_and_forget {
+                return Ok((Vec::new(), vec![event]));
+            }
+            let Some(request_id) = request_id else {
+                return Ok((Vec::new(), vec![event]));
+            };
+            if dialog
+                && self.approval_context.bridge == ApprovalBridgeOwnership::Typed
+                && self.pending_pi_dialog.is_none()
+            {
+                self.state = AdapterState::WaitingApproval;
+                self.pending_pi_dialog = Some(PendingPiDialog {
+                    request_id: request_id.clone(),
+                    method: method.to_owned(),
+                });
+                return Ok((Vec::new(), vec![event]));
+            }
+            let frame = pi_dialog_cancelled(request_id)?;
+            return Ok((vec![frame], vec![event]));
+        }
+        Ok((Vec::new(), self.normalize_pi_event(value)))
+    }
+
+    fn normalize_pi_event(&mut self, value: &Value) -> Vec<AdapterEvent> {
         let event_type = value
             .get("type")
             .and_then(Value::as_str)
@@ -680,6 +813,20 @@ impl ProtocolDriver {
                 (AdapterEventKind::State, Some("working"), None)
             }
             "agent_end" => {
+                self.state = AdapterState::Working;
+                (
+                    AdapterEventKind::State,
+                    Some(
+                        if value.get("willRetry").and_then(Value::as_bool) == Some(true) {
+                            "low_level_run_ended_retry_pending"
+                        } else {
+                            "low_level_run_ended_settlement_pending"
+                        },
+                    ),
+                    None,
+                )
+            }
+            "agent_settled" => {
                 self.state = AdapterState::Completed;
                 (AdapterEventKind::Completed, Some("completed"), None)
             }
@@ -706,12 +853,19 @@ impl ProtocolDriver {
             ),
             "tool_execution_end" => (
                 AdapterEventKind::ToolResult,
-                value.get("error").and_then(Value::as_str),
+                pi_tool_result_text(value),
                 value.get("toolCallId").and_then(Value::as_str),
             ),
-            "auto_compaction_start" | "auto_compaction_end" => {
-                (AdapterEventKind::State, None, None)
-            }
+            "queue_update"
+            | "compaction_start"
+            | "compaction_end"
+            | "auto_compaction_start"
+            | "auto_compaction_end"
+            | "auto_retry_start"
+            | "auto_retry_end"
+            | "summarization_retry_scheduled"
+            | "summarization_retry_attempt_start"
+            | "summarization_retry_finished" => (AdapterEventKind::State, None, None),
             "extension_error" => (
                 AdapterEventKind::Error,
                 value.get("error").and_then(Value::as_str),
@@ -725,7 +879,16 @@ impl ProtocolDriver {
             self.native_session_id(),
             correlation,
             text,
-            None,
+            matches!(
+                event_type,
+                "agent_end"
+                    | "queue_update"
+                    | "compaction_end"
+                    | "auto_retry_start"
+                    | "auto_retry_end"
+                    | "tool_execution_end"
+            )
+            .then(|| value.clone()),
         )]
     }
 
@@ -1271,6 +1434,70 @@ fn request_id_text(value: &Value) -> String {
         .unwrap_or_else(|| value.to_string())
 }
 
+fn acp_allow_once_option(value: &Value) -> Option<String> {
+    value
+        .pointer("/params/options")
+        .and_then(Value::as_array)
+        .and_then(|options| {
+            options.iter().find_map(|option| {
+                (option.get("kind").and_then(Value::as_str) == Some("allow_once"))
+                    .then(|| option.get("optionId").and_then(Value::as_str))
+                    .flatten()
+                    .map(str::to_owned)
+            })
+        })
+}
+
+fn acp_permission_selected(
+    request_id: &Value,
+    option_id: &str,
+) -> Result<ProtocolFrame, AdapterError> {
+    ProtocolFrame::json(&json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {"outcome": {"outcome": "selected", "optionId": option_id}}
+    }))
+}
+
+fn acp_permission_cancelled(request_id: &Value) -> Result<ProtocolFrame, AdapterError> {
+    ProtocolFrame::json(&json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "result": {"outcome": {"outcome": "cancelled"}}
+    }))
+}
+
+fn acp_fail_closed_response(
+    method: &str,
+    request_id: &Value,
+) -> Result<ProtocolFrame, AdapterError> {
+    ProtocolFrame::json(&json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "error": {
+            "code": -32601,
+            "message": format!("ACP client method is unavailable: {method}"),
+            "data": {"failClosed": true}
+        }
+    }))
+}
+
+fn pi_dialog_cancelled(request_id: &Value) -> Result<ProtocolFrame, AdapterError> {
+    ProtocolFrame::json(&json!({
+        "type": "extension_ui_response",
+        "id": request_id,
+        "cancelled": true
+    }))
+}
+
+fn pi_tool_result_text(value: &Value) -> Option<&str> {
+    value.get("error").and_then(Value::as_str).or_else(|| {
+        value
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+    })
+}
+
 const CODEX_SERVER_REQUEST_METHODS: [&str; 10] = [
     "item/commandExecution/requestApproval",
     "item/fileChange/requestApproval",
@@ -1357,6 +1584,16 @@ mod tests {
             model: None,
             effort: None,
             session_data_dir: Some(PathBuf::from("/tmp/conduit-adapter-sessions")),
+        }
+    }
+
+    fn context(
+        effective_policy: EffectiveApprovalPolicy,
+        bridge: ApprovalBridgeOwnership,
+    ) -> ApprovalContext {
+        ApprovalContext {
+            effective_policy,
+            bridge,
         }
     }
 
@@ -1479,8 +1716,190 @@ mod tests {
             .unwrap();
         assert_eq!(events[0].kind, AdapterEventKind::PromptAccepted);
         assert_eq!(driver.state(), AdapterState::Working);
-        driver.on_record(b"{\"type\":\"agent_end\"}\n").unwrap();
+        let (_, events) = driver
+            .on_record(b"{\"type\":\"agent_end\",\"willRetry\":true}\n")
+            .unwrap();
+        assert_eq!(events[0].kind, AdapterEventKind::State);
+        assert_eq!(driver.state(), AdapterState::Working);
+        driver.on_record(b"{\"type\":\"agent_settled\"}\n").unwrap();
         assert_eq!(driver.state(), AdapterState::Completed);
+    }
+
+    #[test]
+    fn pi_dialog_requests_are_correlated_and_cancelled_without_a_typed_bridge() {
+        let mut driver = ProtocolDriver::new(AdapterKind::Pi, &request()).unwrap();
+        for (index, method) in ["select", "confirm", "input", "editor"]
+            .into_iter()
+            .enumerate()
+        {
+            let id = format!("dialog-{index}");
+            let mut record = serde_json::to_vec(&json!({
+                "type": "extension_ui_request",
+                "id": id,
+                "method": method,
+                "title": "typed input"
+            }))
+            .unwrap();
+            record.push(b'\n');
+            let (frames, events) = driver.on_record(&record).unwrap();
+            assert_eq!(frames.len(), 1, "{method} was left pending");
+            let response: Value = serde_json::from_slice(&frames[0].0).unwrap();
+            assert_eq!(response["type"], "extension_ui_response");
+            assert_eq!(response["id"], id);
+            assert_eq!(response["cancelled"], true);
+            assert_eq!(events[0].kind, AdapterEventKind::ApprovalRequest);
+        }
+    }
+
+    #[test]
+    fn pi_unknown_ui_request_is_correlated_and_fail_closed() {
+        let mut driver = ProtocolDriver::new(AdapterKind::Pi, &request()).unwrap();
+        let (frames, events) = driver
+            .on_record(
+                b"{\"type\":\"extension_ui_request\",\"id\":\"future-1\",\"method\":\"future_dialog\"}\n",
+            )
+            .unwrap();
+        let response: Value = serde_json::from_slice(&frames[0].0).unwrap();
+        assert_eq!(response["id"], "future-1");
+        assert_eq!(response["cancelled"], true);
+        assert_eq!(events[0].kind, AdapterEventKind::AdapterError);
+    }
+
+    #[test]
+    fn pi_typed_dialog_keeps_one_correlated_request_and_resolves_fail_closed() {
+        let mut driver = ProtocolDriver::new_with_approval_context(
+            AdapterKind::Pi,
+            &request(),
+            context(
+                EffectiveApprovalPolicy::Always,
+                ApprovalBridgeOwnership::Typed,
+            ),
+        )
+        .unwrap();
+        let (frames, _) = driver
+            .on_record(b"{\"type\":\"extension_ui_request\",\"id\":\"dialog-1\",\"method\":\"confirm\",\"title\":\"Continue?\"}\n")
+            .unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(driver.state(), AdapterState::WaitingApproval);
+
+        let (frames, events) = driver
+            .on_record(b"{\"type\":\"extension_ui_request\",\"id\":\"dialog-2\",\"method\":\"input\",\"title\":\"Value\"}\n")
+            .unwrap();
+        let second: Value = serde_json::from_slice(&frames[0].0).unwrap();
+        assert_eq!(second["id"], "dialog-2");
+        assert_eq!(second["cancelled"], true);
+        assert_eq!(events[0].kind, AdapterEventKind::ApprovalRequest);
+
+        assert!(matches!(
+            driver.approval_response(&json!("wrong-dialog"), false),
+            Err(AdapterError::UnexpectedResponse { .. })
+        ));
+        assert_eq!(driver.state(), AdapterState::WaitingApproval);
+
+        let timeout = driver.approval_response(&json!("dialog-1"), false).unwrap();
+        let timeout: Value = serde_json::from_slice(&timeout.0).unwrap();
+        assert_eq!(timeout["id"], "dialog-1");
+        assert_eq!(timeout["cancelled"], true);
+        assert_eq!(driver.state(), AdapterState::Working);
+    }
+
+    #[test]
+    fn acp_permission_requests_follow_effective_policy_and_bridge_ownership() {
+        let permission = b"{\"jsonrpc\":\"2.0\",\"id\":77,\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"session-1\",\"toolCall\":{\"toolCallId\":\"tool-1\"},\"options\":[{\"optionId\":\"persist\",\"name\":\"Always\",\"kind\":\"allow_always\"},{\"optionId\":\"once\",\"name\":\"Once\",\"kind\":\"allow_once\"}]}}\n";
+
+        let mut unavailable = ProtocolDriver::new_with_approval_context(
+            AdapterKind::OpenCode,
+            &request(),
+            context(
+                EffectiveApprovalPolicy::Always,
+                ApprovalBridgeOwnership::Unavailable,
+            ),
+        )
+        .unwrap();
+        let (frames, _) = unavailable.on_record(permission).unwrap();
+        let response: Value = serde_json::from_slice(&frames[0].0).unwrap();
+        assert_eq!(response["id"], 77);
+        assert_eq!(
+            response.pointer("/result/outcome/outcome"),
+            Some(&json!("cancelled"))
+        );
+
+        let mut preauthorized = ProtocolDriver::new_with_approval_context(
+            AdapterKind::OpenCode,
+            &request(),
+            context(
+                EffectiveApprovalPolicy::Never,
+                ApprovalBridgeOwnership::Unavailable,
+            ),
+        )
+        .unwrap();
+        let (frames, _) = preauthorized.on_record(permission).unwrap();
+        let response: Value = serde_json::from_slice(&frames[0].0).unwrap();
+        assert_eq!(
+            response.pointer("/result/outcome/outcome"),
+            Some(&json!("selected"))
+        );
+        assert_eq!(
+            response.pointer("/result/outcome/optionId"),
+            Some(&json!("once"))
+        );
+
+        let mut typed = ProtocolDriver::new_with_approval_context(
+            AdapterKind::OpenCode,
+            &request(),
+            context(
+                EffectiveApprovalPolicy::RiskClasses,
+                ApprovalBridgeOwnership::Typed,
+            ),
+        )
+        .unwrap();
+        let (frames, events) = typed.on_record(permission).unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(events[0].correlation_id.as_deref(), Some("77"));
+        assert_eq!(typed.state(), AdapterState::WaitingApproval);
+        let response: Value =
+            serde_json::from_slice(&typed.approval_response(&json!(77), true).unwrap().0).unwrap();
+        assert_eq!(
+            response.pointer("/result/outcome/outcome"),
+            Some(&json!("selected"))
+        );
+        assert_eq!(
+            response.pointer("/result/outcome/optionId"),
+            Some(&json!("once"))
+        );
+    }
+
+    #[test]
+    fn acp_never_does_not_expand_authority_to_allow_always_and_unknown_requests_fail_closed() {
+        let mut driver = ProtocolDriver::new_with_approval_context(
+            AdapterKind::OpenCode,
+            &request(),
+            context(
+                EffectiveApprovalPolicy::Never,
+                ApprovalBridgeOwnership::Unavailable,
+            ),
+        )
+        .unwrap();
+        let (frames, _) = driver
+            .on_record(b"{\"jsonrpc\":\"2.0\",\"id\":\"permission-1\",\"method\":\"session/request_permission\",\"params\":{\"options\":[{\"optionId\":\"persist\",\"kind\":\"allow_always\"}]}}\n")
+            .unwrap();
+        let response: Value = serde_json::from_slice(&frames[0].0).unwrap();
+        assert_eq!(
+            response.pointer("/result/outcome/outcome"),
+            Some(&json!("cancelled"))
+        );
+
+        let (frames, events) = driver
+            .on_record(b"{\"jsonrpc\":\"2.0\",\"id\":\"future-1\",\"method\":\"future/client_request\",\"params\":{}}\n")
+            .unwrap();
+        let response: Value = serde_json::from_slice(&frames[0].0).unwrap();
+        assert_eq!(response["id"], "future-1");
+        assert_eq!(response.pointer("/error/code"), Some(&json!(-32601)));
+        assert_eq!(
+            response.pointer("/error/data/failClosed"),
+            Some(&json!(true))
+        );
+        assert_eq!(events[0].kind, AdapterEventKind::AdapterError);
     }
 
     #[test]

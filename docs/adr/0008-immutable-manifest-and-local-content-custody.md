@@ -70,6 +70,17 @@ Provider-private reasoning is neither requested nor normalized into public messa
 
 Every provider-initiated request with a correlation ID is completed by the Adapter. Approval requests are either bridged to a durable typed Conduit approval or explicitly declined; unadvertised and unknown requests receive correlated fail-closed errors. A Node restart may reattach an Agent only when provider I/O, protocol phase, native session, active turn, and cursor custody are all durable. Otherwise the exact process identity is fenced and a durable `recovery_required` terminal receipt is committed without automatic replay.
 
+The Adapter receives the effective Approval Policy separately from Access
+Scope and an explicit indication of whether the typed approval bridge owns
+provider requests. ACP `session/request_permission` requests are cancelled
+immediately when that bridge is unavailable. Under effective `never`, the
+Adapter may select only an `allow_once` option already offered by the ACP
+server; it never selects `allow_always` because that would broaden reuse
+authority. Pi `select`, `confirm`, `input`, and `editor` extension dialogs are
+never inferred from `never`: an unavailable bridge receives a correlated
+cancel response. Only `agent_settled`, not the lower-level `agent_end`, is a Pi
+terminal receipt because retry, compaction, or queued input may still follow.
+
 ### Local storage
 
 Normalized events and sequence advancement commit transactionally in SQLite. Inline event payloads are bounded. Larger content uses immutable references.

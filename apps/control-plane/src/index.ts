@@ -7,6 +7,7 @@ import { MAX_MCP_BYTES } from "./bounds.ts";
 import { BoardRoom } from "./do/board-room.ts";
 import { ConnectorLimiter } from "./do/connector-limiter.ts";
 import { DeviceRoom } from "./do/device-room.ts";
+import { reconcileOperationDispatches } from "./dispatch.ts";
 import { errorResponse, PublicError } from "./errors.ts";
 import { consumeEvents } from "./ingestion.ts";
 import { createConduitMcpServer } from "./mcp/server.ts";
@@ -63,4 +64,7 @@ async function fetchHandler(request: Request, env: ControlPlaneEnv, ctx: Executi
 export default {
   fetch: fetchHandler,
   queue: consumeEvents,
+  scheduled(controller, env, ctx) {
+    ctx.waitUntil(reconcileOperationDispatches(env, { now: new Date(controller.scheduledTime) }));
+  },
 } satisfies ExportedHandler<ControlPlaneEnv, unknown>;

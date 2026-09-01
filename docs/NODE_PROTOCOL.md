@@ -181,12 +181,17 @@ A side-effecting remote request is created in this order:
 1. authorize actor, client, connector policy, project, device, runtime, access scope, and approval policy
 2. allocate operation ID and idempotency key
 3. canonicalize the exact request and calculate its digest
-4. store intended operation state in D1
-5. submit the exact operation to `DeviceRoom`
-6. store an outbound transport row in Durable Object storage
-7. send it over the current WebSocket if the device is connected
+4. atomically store intended operation state and a dispatch-outbox row in D1
+5. claim the dispatch row with a bounded lease and submit the exact operation to `DeviceRoom`
+6. store an outbound transport row in Durable Object storage using the dispatch row's stable message ID
+7. mark the D1 dispatch row offered only after `DeviceRoom` confirms durable custody
+8. send the stored frame over the current WebSocket if the device is connected
 
-The outbound row is persisted before the frame is sent.
+Both custody boundaries persist before sending or acknowledging. A timeout or Worker failure between `DeviceRoom` custody and the D1 offered transition leaves the dispatch row retryable. An explicit same-key/same-digest request and the scheduled reconciler reuse the original operation ID, message ID, correlation ID, and payload digest. `DeviceRoom` returns the original transport sequence for that exact identity; a conflicting digest is rejected.
+
+Dispatch attempts use expiring leases. An abandoned lease is reclaimable after Worker restart. Deterministic bounded backoff schedules ordinary retry, and operation expiry transitions the journal and releases a held Connector concurrency slot exactly once. A dispatch failure never authorizes a new operation or a new message identity.
+
+The Durable Object outbound row is persisted before any WebSocket send. A failed send remains queued in SQLite-backed storage. A single Durable Object alarm retries due rows idempotently; reconnect and hibernation reconstruct behavior from storage rather than isolate memory.
 
 An offline device keeps queued messages in the Durable Object outbox until expiry, cancellation, or device revocation. A run is not shown as working merely because an offer was queued or transport-acknowledged.
 

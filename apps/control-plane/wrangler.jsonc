@@ -42,6 +42,9 @@
       }
     ]
   },
+  "triggers": {
+    "crons": ["* * * * *"]
+  },
   "durable_objects": {
     "bindings": [
       { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },

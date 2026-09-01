@@ -1,6 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { parseWireDocumentText, schemaIds, type NodeV1PostAuthFrame } from "@conduit/schema";
 import { canonicalJson, newId, nowIso, randomToken, sha256Hex, verifyEd25519 } from "../crypto.ts";
+import type { DeviceRoomOffer } from "../dispatch.ts";
 import type { ControlPlaneEnv, QueueEventMessage } from "../types.ts";
 
 interface SocketAttachment {
@@ -19,6 +20,29 @@ interface SocketAttachment {
   reconciliationId?: string;
 }
 
+interface StoredOutboundFrame {
+  [key: string]: string | number | null;
+  sequence: number;
+  message_id: string;
+  correlation_id: string | null;
+  payload_digest: string;
+  frame_json: string;
+  state: "queued" | "sent";
+  expires_at: string;
+  dispatch_attempts: number;
+  next_attempt_at: string;
+}
+
+interface StoredDispatchReceipt {
+  [key: string]: string | number | null;
+  message_id: string;
+  correlation_id: string | null;
+  payload_digest: string;
+  sequence: number;
+  state: "queued" | "sent" | "acknowledged";
+  expires_at: string;
+}
+
 export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
   constructor(ctx: DurableObjectState, env: ControlPlaneEnv) {
     super(ctx, env);
@@ -32,6 +56,8 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
         CREATE TABLE IF NOT EXISTS auth_challenges(connection_id TEXT PRIMARY KEY, key_id TEXT NOT NULL, client_nonce TEXT NOT NULL, server_nonce TEXT NOT NULL, server_time TEXT NOT NULL, protocol TEXT NOT NULL, capability_digest TEXT NOT NULL, node_boot_id TEXT NOT NULL, expires_at TEXT NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS reconciliation_sessions(id TEXT PRIMARY KEY, epoch INTEGER NOT NULL, state TEXT NOT NULL, summary_json TEXT, plan_json TEXT, created_at TEXT NOT NULL, completed_at TEXT);
         CREATE TABLE IF NOT EXISTS terminal_receipt_cache(operation_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, receipt_json TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS outbound_message_receipts(message_id TEXT PRIMARY KEY, correlation_id TEXT, payload_digest TEXT NOT NULL, sequence INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('queued','sent','acknowledged')), expires_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+        CREATE INDEX IF NOT EXISTS outbound_receipt_expiry_idx ON outbound_message_receipts(expires_at);
         INSERT OR IGNORE INTO transport_positions(direction,durable_sequence,acknowledged_sequence) VALUES ('control_to_node',0,0),('node_to_control',0,0);
         INSERT OR IGNORE INTO _sql_schema_migrations(id,applied_at) VALUES (1,datetime('now'));
       `);
@@ -39,6 +65,11 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       if (!challengeColumns.has("capability_digest")) this.ctx.storage.sql.exec("ALTER TABLE auth_challenges ADD COLUMN capability_digest TEXT NOT NULL DEFAULT 'unknown'");
       if (!challengeColumns.has("node_boot_id")) this.ctx.storage.sql.exec("ALTER TABLE auth_challenges ADD COLUMN node_boot_id TEXT NOT NULL DEFAULT 'unknown'");
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO _sql_schema_migrations(id,applied_at) VALUES (2,datetime('now'))");
+      const outboundColumns = new Set(this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(outbound_frames)").toArray().map((column) => column.name));
+      if (!outboundColumns.has("dispatch_attempts")) this.ctx.storage.sql.exec("ALTER TABLE outbound_frames ADD COLUMN dispatch_attempts INTEGER NOT NULL DEFAULT 0");
+      if (!outboundColumns.has("next_attempt_at")) this.ctx.storage.sql.exec("ALTER TABLE outbound_frames ADD COLUMN next_attempt_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'");
+      this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS outbound_dispatch_due_idx ON outbound_frames(state,next_attempt_at,expires_at)");
+      this.ctx.storage.sql.exec("INSERT OR IGNORE INTO _sql_schema_migrations(id,applied_at) VALUES (3,datetime('now'))");
       this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     });
   }
@@ -149,6 +180,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       if (acknowledged > BigInt(controlPosition.durable_sequence)) { ws.close(1008, "acknowledgement_out_of_range"); return; }
       if (acknowledged > BigInt(controlPosition.acknowledged_sequence)) this.ctx.storage.transactionSync(() => {
         this.ctx.storage.sql.exec("UPDATE transport_positions SET acknowledged_sequence=? WHERE direction='control_to_node'", Number(acknowledged));
+        this.ctx.storage.sql.exec("UPDATE outbound_message_receipts SET state='acknowledged',updated_at=? WHERE sequence<=?", nowIso(), Number(acknowledged));
         this.ctx.storage.sql.exec("DELETE FROM outbound_frames WHERE sequence<=?", Number(acknowledged));
       });
     } else {
@@ -233,29 +265,108 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
   }
 
   private async enqueueControlFrame(type: NodeV1PostAuthFrame["type"], payload: Record<string, unknown>, correlationId: string | undefined, expiresAt: string, preferredSocket?: WebSocket, suppliedMessageId?: string): Promise<{ sequence: string; delivered: boolean }> {
+    const messageId = suppliedMessageId ?? newId("cmsg");
+    const payloadDigest = await sha256Hex(canonicalJson(payload));
+    const prior = suppliedMessageId === undefined ? undefined : this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE message_id=?", suppliedMessageId).toArray()[0];
+    if (prior !== undefined) {
+      if (prior.payload_digest !== payloadDigest || prior.correlation_id !== (correlationId ?? null)) throw new TypeError("control message id is bound to another payload");
+      const delivered = await this.sendStoredFrame(prior, preferredSocket);
+      return { sequence: String(prior.sequence), delivered };
+    }
+    const receipt = suppliedMessageId === undefined ? undefined : this.ctx.storage.sql.exec<StoredDispatchReceipt>("SELECT * FROM outbound_message_receipts WHERE message_id=?", suppliedMessageId).toArray()[0];
+    if (receipt !== undefined) {
+      if (receipt.payload_digest !== payloadDigest || receipt.correlation_id !== (correlationId ?? null)) throw new TypeError("control message id is bound to another payload");
+      return { sequence: String(receipt.sequence), delivered: receipt.state === "acknowledged" || receipt.state === "sent" };
+    }
     const current = this.ctx.storage.sql.exec<{ durable_sequence: number }>("SELECT durable_sequence FROM transport_positions WHERE direction='control_to_node'").one().durable_sequence;
     const sequence = current + 1;
     const state = this.ctx.storage.sql.exec<{ device_id: string; epoch: number }>("SELECT device_id,epoch FROM connection_state WHERE singleton=1").toArray()[0];
-    const messageId = suppliedMessageId ?? newId("cmsg");
-    const payloadDigest = await sha256Hex(canonicalJson(payload));
-    const wire = { protocol: "conduit.node/1", messageId, deviceId: state?.device_id ?? "unconnected", connectionEpoch: String(state?.epoch ?? 0), direction: "control_to_node", sequence: String(sequence), type, ...(correlationId === undefined ? {} : { correlationId }), payloadDigest, payload };
+    const payloadDeviceId = type === "operation.offer" && payload.operation !== null && typeof payload.operation === "object" && !Array.isArray(payload.operation) && typeof (payload.operation as Record<string, unknown>).deviceId === "string"
+      ? String((payload.operation as Record<string, unknown>).deviceId)
+      : undefined;
+    const wire = { protocol: "conduit.node/1", messageId, deviceId: state?.device_id ?? payloadDeviceId ?? "unconnected", connectionEpoch: String(state?.epoch ?? 0), direction: "control_to_node", sequence: String(sequence), type, ...(correlationId === undefined ? {} : { correlationId }), payloadDigest, payload };
     parseWireDocumentText(schemaIds.nodeV1, JSON.stringify(wire));
+    const createdAt = nowIso();
     this.ctx.storage.transactionSync(() => {
-      this.ctx.storage.sql.exec("INSERT INTO outbound_frames(sequence,message_id,correlation_id,payload_digest,frame_json,state,expires_at,created_at) VALUES (?,?,?,?,?,'queued',?,?)", sequence, messageId, correlationId ?? null, payloadDigest, JSON.stringify(wire), expiresAt, nowIso());
+      this.ctx.storage.sql.exec("INSERT INTO outbound_frames(sequence,message_id,correlation_id,payload_digest,frame_json,state,expires_at,created_at,dispatch_attempts,next_attempt_at) VALUES (?,?,?,?,?,'queued',?,?,0,?)", sequence, messageId, correlationId ?? null, payloadDigest, JSON.stringify(wire), expiresAt, createdAt, createdAt);
+      this.ctx.storage.sql.exec("INSERT INTO outbound_message_receipts(message_id,correlation_id,payload_digest,sequence,state,expires_at,created_at,updated_at) VALUES (?,?,?,?,'queued',?,?,?)", messageId, correlationId ?? null, payloadDigest, sequence, expiresAt, createdAt, createdAt);
       this.ctx.storage.sql.exec("UPDATE transport_positions SET durable_sequence=? WHERE direction='control_to_node'", sequence);
     });
-    const socket = preferredSocket ?? this.ctx.getWebSockets().find((candidate) => {
-      const item = candidate.deserializeAttachment() as SocketAttachment | null;
-      return item?.stage === "authenticated" && item.epoch === String(state?.epoch);
-    });
-    if (socket !== undefined) { socket.send(JSON.stringify(wire)); this.ctx.storage.sql.exec("UPDATE outbound_frames SET state='sent' WHERE sequence=?", sequence); }
-    return { sequence: String(sequence), delivered: socket !== undefined };
+    const stored = this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE sequence=?", sequence).one();
+    return { sequence: String(sequence), delivered: await this.sendStoredFrame(stored, preferredSocket) };
   }
 
-  async offer(frame: { messageId: string; correlationId: string; payloadDigest: string; payload: Record<string, unknown>; expiresAt: string }): Promise<{ sequence: string; delivered: boolean }> {
+  private eligibleSocket(frame: StoredOutboundFrame): WebSocket | undefined {
+    const connection = this.ctx.storage.sql.exec<{ epoch: number; reconciliation_state: string }>("SELECT epoch,reconciliation_state FROM connection_state WHERE singleton=1").toArray()[0];
+    const wire = JSON.parse(frame.frame_json) as { type?: unknown };
+    return this.ctx.getWebSockets().find((candidate) => {
+      const item = candidate.deserializeAttachment() as SocketAttachment | null;
+      const ready = wire.type !== "operation.offer" || connection?.reconciliation_state === "complete" && !item?.reconciling;
+      return item?.stage === "authenticated" && item.epoch === String(connection?.epoch) && ready;
+    });
+  }
+
+  private async scheduleOutboxAlarm(at: number): Promise<void> {
+    const scheduled = await this.ctx.storage.getAlarm();
+    if (scheduled === null || at < scheduled) await this.ctx.storage.setAlarm(at);
+  }
+
+  private async sendStoredFrame(frame: StoredOutboundFrame, preferredSocket?: WebSocket): Promise<boolean> {
+    if (Date.parse(frame.expires_at) <= Date.now()) {
+      this.ctx.storage.sql.exec("DELETE FROM outbound_frames WHERE sequence=? AND state='queued'", frame.sequence);
+      return false;
+    }
+    const socket = preferredSocket ?? this.eligibleSocket(frame);
+    if (socket === undefined) {
+      const next = new Date(Date.now() + 30_000).toISOString();
+      this.ctx.storage.sql.exec("UPDATE outbound_frames SET state='queued',next_attempt_at=? WHERE sequence=?", next, frame.sequence);
+      await this.scheduleOutboxAlarm(Date.parse(next));
+      return false;
+    }
+    const connection = this.ctx.storage.sql.exec<{ device_id: string; epoch: number }>("SELECT device_id,epoch FROM connection_state WHERE singleton=1").toArray()[0];
+    const persisted: unknown = JSON.parse(frame.frame_json);
+    if (persisted === null || typeof persisted !== "object" || Array.isArray(persisted)) throw new TypeError("persisted control frame is invalid");
+    const wire = { ...(persisted as Record<string, unknown>), ...(connection === undefined ? {} : { deviceId: connection.device_id, connectionEpoch: String(connection.epoch) }) };
+    parseWireDocumentText(schemaIds.nodeV1, JSON.stringify(wire));
+    try {
+      socket.send(JSON.stringify(wire));
+      this.ctx.storage.transactionSync(() => {
+        this.ctx.storage.sql.exec("UPDATE outbound_frames SET state='sent',frame_json=?,dispatch_attempts=dispatch_attempts+1 WHERE sequence=?", JSON.stringify(wire), frame.sequence);
+        this.ctx.storage.sql.exec("UPDATE outbound_message_receipts SET state='sent',updated_at=? WHERE message_id=?", nowIso(), frame.message_id);
+      });
+      return true;
+    } catch {
+      const attempts = frame.dispatch_attempts + 1;
+      const delay = Math.min(60_000, 2 ** Math.min(attempts, 6) * 1_000);
+      const next = new Date(Date.now() + delay).toISOString();
+      this.ctx.storage.sql.exec("UPDATE outbound_frames SET state='queued',dispatch_attempts=?,next_attempt_at=? WHERE sequence=?", attempts, next, frame.sequence);
+      await this.scheduleOutboxAlarm(Date.parse(next));
+      return false;
+    }
+  }
+
+  private async dispatchQueuedFrames(): Promise<void> {
+    const now = nowIso();
+    this.ctx.storage.sql.exec("DELETE FROM outbound_frames WHERE state='queued' AND expires_at<=?", now);
+    this.ctx.storage.sql.exec("DELETE FROM outbound_message_receipts WHERE expires_at<=?", now);
+    const rows = this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE state='queued' AND next_attempt_at<=? ORDER BY sequence LIMIT 32", now).toArray();
+    for (const row of rows) await this.sendStoredFrame(row);
+    const next = this.ctx.storage.sql.exec<{ next_attempt_at: string }>("SELECT next_attempt_at FROM outbound_frames WHERE state='queued' ORDER BY next_attempt_at LIMIT 1").toArray()[0];
+    if (next !== undefined) await this.scheduleOutboxAlarm(Math.max(Date.now() + 1_000, Date.parse(next.next_attempt_at)));
+  }
+
+  override async alarm(): Promise<void> {
+    await this.dispatchQueuedFrames();
+  }
+
+  async offer(frame: DeviceRoomOffer): Promise<{ sequence: string; delivered: boolean }> {
     const computed = await sha256Hex(canonicalJson(frame.payload));
     if (computed !== frame.payloadDigest) throw new TypeError("operation offer payload digest mismatch");
+    const operation = frame.payload.operation;
+    if (operation === null || typeof operation !== "object" || Array.isArray(operation) || (operation as Record<string, unknown>).deviceId !== frame.deviceId) throw new TypeError("operation offer device target mismatch");
     const connection = this.ctx.storage.sql.exec<{ epoch: number; reconciliation_state: string }>("SELECT epoch,reconciliation_state FROM connection_state WHERE singleton=1").toArray()[0];
+    const persistedDevice = this.ctx.storage.sql.exec<{ device_id: string }>("SELECT device_id FROM connection_state WHERE singleton=1").toArray()[0]?.device_id;
+    if (persistedDevice !== undefined && persistedDevice !== frame.deviceId) throw new TypeError("operation offer device target conflicts with room identity");
     const socket = this.ctx.getWebSockets().find((candidate) => {
       const item = candidate.deserializeAttachment() as SocketAttachment | null;
       return item?.stage === "authenticated" && connection?.reconciliation_state === "complete" && !item.reconciling && item.epoch === String(connection?.epoch);

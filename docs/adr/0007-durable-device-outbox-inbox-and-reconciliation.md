@@ -52,6 +52,14 @@ Runtime providers expose an idempotent start boundary. Native processes are owne
 
 `DeviceRoom` stores a node frame in its durable inbox before acknowledging it. D1 and Queues projection happens after durable custody. Queue retries are deduplicated using Conduit event and receipt identity.
 
+### Durable control-plane dispatch handoff
+
+The operation journal, idempotency record, and a D1 dispatch-outbox row are committed together before the control plane invokes `DeviceRoom`. The dispatch row owns a stable message ID, operation correlation ID, payload digest, exact payload, target Device, and expiry.
+
+Dispatch uses a bounded lease. Same-key/same-digest retries and a scheduled reconciler reclaim pending or expired-lease rows and submit the identical offer. `DeviceRoom` persists the offer before returning and treats the same message ID, correlation ID, and digest as an idempotent replay that returns the original transport sequence. A conflicting replay is rejected.
+
+If the Worker fails after Durable Object custody but before the D1 offered transition, retry closes the ambiguous handoff without allocating another operation, message, or transport sequence. Pending dispatch expiry marks the operation expired and releases a held Connector concurrency slot once. The per-Device Durable Object uses one alarm for due WebSocket-send retry; its alarm handler is idempotent and derives all work from SQLite-backed storage after hibernation.
+
 ### Reconciliation before new work
 
 After authentication, a node sends a bounded reconciliation summary. The control plane responds with exact sequence and event ranges to replay, status requests, pending cancellations, and terminal-receipt confirmations.
@@ -107,12 +115,14 @@ Rejected because stale shared state is not proof that a local runtime is unautho
 ## Consequences
 
 - `DeviceRoom` needs a bounded SQLite schema and compaction rules.
+- The control plane needs a D1 dispatch outbox and scheduled lease reconciler between operation commitment and `DeviceRoom` custody.
 - The node needs a local transactional journal and persistent run supervisor.
 - Control-plane read models are eventually updated from a durable per-device inbox.
 - UI states distinguish queued, delivered, admitted, started, and terminal.
 - Event replay can report an explicit gap when local retention has expired.
 - Runtime-provider design must expose deterministic runtime identity and reconciliation.
 - Transport tests require fake devices, fake Durable Object storage, and injected crash windows.
+- Dispatch tests inject response loss after Durable Object persistence, evict the object, run a fresh reconciler, and prove the stable message ID occupies one outbound sequence.
 
 ## Contract
 

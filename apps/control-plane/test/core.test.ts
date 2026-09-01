@@ -1,10 +1,12 @@
 import { env, exports } from "cloudflare:workers";
 import { parseWireDocumentText, schemaIds } from "@conduit/schema";
-import { evictDurableObject, runInDurableObject } from "cloudflare:test";
+import { evictDurableObject, runDurableObjectAlarm, runInDurableObject } from "cloudflare:test";
 import { beforeAll, describe, expect, it } from "vitest";
 import { base64url, canonicalJson, keyedHash, operationDigest, sha256Hex } from "../src/crypto.ts";
 import { readJsonBounded } from "../src/bounds.ts";
 import { CLI_CONTROL_PLANE_ROUTE_MANIFEST } from "../src/api.ts";
+import { durableObjectOperationDispatcher, reconcileOperationDispatches, type OperationDispatcher } from "../src/dispatch.ts";
+import { createOperation } from "../src/operations.ts";
 
 describe.sequential("control-plane contracts", () => {
   beforeAll(async () => {
@@ -14,10 +16,10 @@ describe.sequential("control-plane contracts", () => {
 
   it("applies forward D1 migrations", async () => {
     const version = await env.DB.prepare("SELECT version FROM schema_versions WHERE component='control_plane'").first<{ version: number }>();
-    expect(version?.version).toBe(6);
+    expect(version?.version).toBe(7);
     const tables = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table'").all<{ name: string }>();
     const names = new Set(tables.results.map((row) => row.name));
-    for (const required of ["owner_principals", "oauth_grants", "connector_policies", "devices", "projects", "collaboration_sessions", "runs", "operation_journal", "artifacts", "normalized_events", "security_events"]) expect(names.has(required)).toBe(true);
+    for (const required of ["owner_principals", "oauth_grants", "connector_policies", "devices", "projects", "collaboration_sessions", "runs", "operation_journal", "operation_dispatch_outbox", "artifacts", "normalized_events", "security_events"]) expect(names.has(required)).toBe(true);
   });
 
   it("keeps security events immutable", async () => {
@@ -178,6 +180,139 @@ describe.sequential("control-plane contracts", () => {
     const malformed = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/operations", { method: "POST", headers: { ...headers, "idempotency-key": "owner-operation-contract-0002" }, body: JSON.stringify({ deviceId: "dev_handshake01", capability: "command.start" }) }));
     expect(malformed.status).toBe(400);
     await expect(malformed.json()).resolves.toMatchObject({ error: { code: "invalid_request" } });
+  });
+
+  it("recovers a DeviceRoom RPC throw from the durable dispatch row", async () => {
+    const input = {
+      idempotencyKey: "owner-operation-do-throw-0001",
+      deviceId: "dev_handshake01",
+      capability: "command.start",
+      runtime: { kind: "native" as const, providerId: "native.linux", configurationRevision: 1 },
+      accessScope: "full_user" as const,
+      approvalMode: "never" as const,
+      sourceRevisions: [],
+      arguments: { argv: ["true"] },
+    };
+    const actor = { principalId: "prin_board_contract", clientId: "conduit.cli", scopes: ["owner"] };
+    const throwBeforeCustody: OperationDispatcher = {
+      async offer() {
+        throw new Error("simulated DeviceRoom RPC failure before custody");
+      },
+    };
+    const pending = await createOperation(env, actor, input, { kind: "owner" }, throwBeforeCustody);
+    expect(pending).toMatchObject({ state: "queued", dispatch: { state: "pending", attemptCount: 1 } });
+    const operationId = String(pending.operationId);
+    const outbox = await env.DB.prepare("SELECT message_id,next_attempt_at FROM operation_dispatch_outbox WHERE operation_id=?1 LIMIT 1").bind(operationId).first<{ message_id: string; next_attempt_at: string }>();
+    if (outbox === null) throw new Error("dispatch outbox row was not persisted");
+    const absent = await runInDurableObject(env.DEVICE_ROOMS.getByName(input.deviceId), (_instance, state) => state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_frames WHERE message_id=?", outbox.message_id).one().count);
+    expect(absent).toBe(0);
+    const recovered = await reconcileOperationDispatches(env, { now: new Date(Date.parse(outbox.next_attempt_at) + 1) });
+    expect(recovered).toEqual({ examined: 1, offered: 1, pending: 0, expired: 0 });
+    const present = await runInDurableObject(env.DEVICE_ROOMS.getByName(input.deviceId), (_instance, state) => state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_frames WHERE message_id=?", outbox.message_id).one().count);
+    expect(present).toBe(1);
+  });
+
+  it("retries a durably accepted DeviceRoom offer after response loss, hibernation, and Worker restart", async () => {
+    const input = {
+      idempotencyKey: "owner-operation-dispatch-restart-0001",
+      deviceId: "dev_handshake01",
+      capability: "command.start",
+      runtime: { kind: "native" as const, providerId: "native.linux", configurationRevision: 1 },
+      accessScope: "full_user" as const,
+      approvalMode: "never" as const,
+      sourceRevisions: [],
+      arguments: { argv: ["true"] },
+    };
+    const actor = { principalId: "prin_board_contract", clientId: "conduit.cli", scopes: ["owner"] };
+    const loseFirstResponse: OperationDispatcher = {
+      async offer(environment, frame) {
+        await durableObjectOperationDispatcher.offer(environment, frame);
+        throw new Error("simulated DeviceRoom response loss after durable custody");
+      },
+    };
+
+    const pending = await createOperation(env, actor, input, { kind: "owner" }, loseFirstResponse);
+    expect(pending).toMatchObject({ state: "queued", dispatch: { state: "pending", attemptCount: 1 } });
+    const operationId = String(pending.operationId);
+    const outbox = await env.DB.prepare("SELECT message_id,payload_digest,payload_json,expires_at,state,attempt_count,next_attempt_at FROM operation_dispatch_outbox WHERE operation_id=?1 LIMIT 1")
+      .bind(operationId)
+      .first<{ message_id: string; payload_digest: string; payload_json: string; expires_at: string; state: string; attempt_count: number; next_attempt_at: string }>();
+    expect(outbox).toMatchObject({ state: "pending", attempt_count: 1 });
+    if (outbox === null) throw new Error("dispatch outbox row was not persisted");
+    const beforeRestart = await runInDurableObject(env.DEVICE_ROOMS.getByName(input.deviceId), (_instance, state) => state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_frames WHERE message_id=?", outbox.message_id).one().count);
+    expect(beforeRestart).toBe(1);
+    expect(await runDurableObjectAlarm(env.DEVICE_ROOMS.getByName(input.deviceId))).toBe(true);
+    const afterAlarm = await runInDurableObject(env.DEVICE_ROOMS.getByName(input.deviceId), (_instance, state) => state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_frames WHERE message_id=?", outbox.message_id).one().count);
+    expect(afterAlarm).toBe(1);
+
+    await evictDurableObject(env.DEVICE_ROOMS.getByName(input.deviceId));
+    const restartTime = new Date(Date.parse(outbox.next_attempt_at) + 1);
+    const reconciled = await reconcileOperationDispatches(env, { now: restartTime });
+    expect(reconciled).toEqual({ examined: 1, offered: 1, pending: 0, expired: 0 });
+
+    const afterRestart = await runInDurableObject(env.DEVICE_ROOMS.getByName(input.deviceId), (_instance, state) => ({
+      count: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_frames WHERE message_id=?", outbox.message_id).one().count,
+      sequence: state.storage.sql.exec<{ sequence: number }>("SELECT sequence FROM outbound_frames WHERE message_id=?", outbox.message_id).one().sequence,
+    }));
+    expect(afterRestart.count).toBe(1);
+    expect(afterRestart.sequence).toBeGreaterThan(0);
+    const durable = await env.DB.prepare("SELECT state,attempt_count,lease_token,last_error_code FROM operation_dispatch_outbox WHERE operation_id=?1 LIMIT 1")
+      .bind(operationId)
+      .first<{ state: string; attempt_count: number; lease_token: string | null; last_error_code: string | null }>();
+    expect(durable).toEqual({ state: "offered", attempt_count: 2, lease_token: null, last_error_code: null });
+    const journal = await env.DB.prepare("SELECT state FROM operation_journal WHERE id=?1 LIMIT 1").bind(operationId).first<{ state: string }>();
+    expect(journal?.state).toBe("offered");
+
+    const replay = await createOperation(env, actor, input, { kind: "owner" });
+    expect(replay).toMatchObject({ operationId, state: "offered", replay: true });
+    const noDuplicate = await runInDurableObject(env.DEVICE_ROOMS.getByName(input.deviceId), (_instance, state) => state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_frames WHERE message_id=?", outbox.message_id).one().count);
+    expect(noDuplicate).toBe(1);
+
+    await runInDurableObject(env.DEVICE_ROOMS.getByName(input.deviceId), (_instance, state) => {
+      state.storage.transactionSync(() => {
+        state.storage.sql.exec("UPDATE outbound_message_receipts SET state='acknowledged' WHERE message_id=?", outbox.message_id);
+        state.storage.sql.exec("DELETE FROM outbound_frames WHERE message_id=?", outbox.message_id);
+      });
+    });
+    await evictDurableObject(env.DEVICE_ROOMS.getByName(input.deviceId));
+    const replayPayload: unknown = JSON.parse(outbox.payload_json);
+    if (replayPayload === null || typeof replayPayload !== "object" || Array.isArray(replayPayload)) throw new Error("persisted replay payload is invalid");
+    const acknowledgedReplay = await durableObjectOperationDispatcher.offer(env, {
+      deviceId: input.deviceId,
+      messageId: outbox.message_id,
+      correlationId: operationId,
+      payloadDigest: outbox.payload_digest,
+      payload: replayPayload as Record<string, unknown>,
+      expiresAt: outbox.expires_at,
+    });
+    expect(acknowledgedReplay).toEqual({ sequence: String(afterRestart.sequence), delivered: true });
+    const compacted = await runInDurableObject(env.DEVICE_ROOMS.getByName(input.deviceId), (_instance, state) => state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_frames WHERE message_id=?", outbox.message_id).one().count);
+    expect(compacted).toBe(0);
+  });
+
+  it("expires an undispatched operation and releases its Connector concurrency slot once", async () => {
+    const operationId = "op_dispatch_expiry01";
+    const grantId = "grant_dispatch_expiry01";
+    const now = new Date();
+    const expiredAt = new Date(now.getTime() - 1_000).toISOString();
+    const createdAt = new Date(now.getTime() - 2_000).toISOString();
+    const digest = "e".repeat(64);
+    const payload = { operation: { deviceId: "dev_handshake01" } };
+    const messageId = "cmsg_dispatch_expiry01";
+    const limiter = env.CONNECTOR_LIMITERS.getByName(grantId);
+    expect(await limiter.acquire("commands", 1)).toBe(true);
+    expect(await limiter.acquire("commands", 1)).toBe(false);
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO operation_journal(id,idempotency_key,actor_principal_id,client_id,device_id,connector_policy_id,connector_policy_revision,connector_grant_id,concurrency_class,capability,payload_digest,request_json,state,expires_at,created_at,updated_at) VALUES (?1,'dispatch-expiry-idempotency-0001','prin_board_contract','connector.dispatch-expiry','dev_handshake01','cpol_dispatch_expiry01',1,?2,'commands','command.start',?3,'{}','queued',?4,?5,?5)").bind(operationId, grantId, digest, expiredAt, createdAt),
+      env.DB.prepare("INSERT INTO idempotency_records(scope,idempotency_key,payload_digest,operation_id,state,response_status,response_json,expires_at,created_at) VALUES ('scope_dispatch_expiry01','dispatch-expiry-idempotency-0001',?1,?2,'queued',202,NULL,?3,?4)").bind(digest, operationId, expiredAt, createdAt),
+      env.DB.prepare("INSERT INTO operation_dispatch_outbox(operation_id,device_id,message_id,correlation_id,payload_digest,payload_json,state,next_attempt_at,expires_at,created_at,updated_at) VALUES (?1,'dev_handshake01',?2,?1,?3,?4,'pending',?5,?5,?6,?6)").bind(operationId, messageId, await sha256Hex(canonicalJson(payload)), canonicalJson(payload), expiredAt, createdAt),
+    ]);
+    expect(await reconcileOperationDispatches(env, { now })).toEqual({ examined: 1, offered: 0, pending: 0, expired: 1 });
+    expect(await reconcileOperationDispatches(env, { now: new Date(now.getTime() + 1_000) })).toEqual({ examined: 0, offered: 0, pending: 0, expired: 0 });
+    const states = await env.DB.prepare("SELECT (SELECT state FROM operation_journal WHERE id=?1) AS operation_state,(SELECT state FROM operation_dispatch_outbox WHERE operation_id=?1) AS dispatch_state,(SELECT state FROM idempotency_records WHERE operation_id=?1) AS idempotency_state").bind(operationId).first<{ operation_state: string; dispatch_state: string; idempotency_state: string }>();
+    expect(states).toEqual({ operation_state: "expired", dispatch_state: "expired", idempotency_state: "expired" });
+    const active = await runInDurableObject(limiter, (_instance, state) => state.storage.sql.exec<{ active: number }>("SELECT active FROM concurrency WHERE class='commands'").one().active);
+    expect(active).toBe(0);
   });
 
   it("serves typed MCP tools through an OAuth policy and exact limiter", async () => {

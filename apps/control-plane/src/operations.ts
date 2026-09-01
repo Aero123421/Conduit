@@ -1,6 +1,7 @@
 import { parseWireDocument, schemaIds } from "@conduit/schema";
 import { z } from "zod";
 import { canonicalJson, newId, nowIso, operationDigest, sha256Hex } from "./crypto.ts";
+import { attemptOperationDispatch, durableObjectOperationDispatcher, type OperationDispatcher } from "./dispatch.ts";
 import { PublicError } from "./errors.ts";
 import { authorizeConnector, type PolicyRequest } from "./policy.ts";
 import type { ApprovalMode, AuthActor, ControlPlaneEnv, OperationRequest, RuntimeRequest, SourceRevision, AccessScope } from "./types.ts";
@@ -83,7 +84,13 @@ function concurrencyClass(capability: string): "commands" | "agentRuns" | "runti
   return undefined;
 }
 
-export async function createOperation(env: ControlPlaneEnv, actor: AuthActor, rawInput: StartOperationInput, authorization: OperationAuthorization = { kind: "connector" }): Promise<Record<string, unknown>> {
+export async function createOperation(
+  env: ControlPlaneEnv,
+  actor: AuthActor,
+  rawInput: StartOperationInput,
+  authorization: OperationAuthorization = { kind: "connector" },
+  dispatcher: OperationDispatcher = durableObjectOperationDispatcher,
+): Promise<Record<string, unknown>> {
   const input = parseStartOperationInput(rawInput);
   const effectiveActor: AuthActor = authorization.kind === "owner"
     ? { ...actor, policyId: OWNER_FIRST_PARTY_POLICY_ID, policyRevision: OWNER_FIRST_PARTY_POLICY_REVISION }
@@ -127,6 +134,8 @@ export async function createOperation(env: ControlPlaneEnv, actor: AuthActor, ra
   const existing = await env.DB.prepare("SELECT operation_id,payload_digest,response_json,state FROM idempotency_records WHERE scope=?1 AND idempotency_key=?2 LIMIT 1").bind(idempotencyScope, input.idempotencyKey).first<{ operation_id: string; payload_digest: string; response_json: string | null; state: string }>();
   if (existing !== null) {
     if (existing.payload_digest !== stableDigest) throw new PublicError("idempotency_conflict", 409, "Idempotency key is bound to another payload");
+    const retried = await attemptOperationDispatch(env, existing.operation_id, { force: true, dispatcher });
+    if (retried !== null) return { ...retried, replay: true };
     return existing.response_json === null ? { operationId: existing.operation_id, state: existing.state, replay: true } : { ...(JSON.parse(existing.response_json) as Record<string, unknown>), replay: true };
   }
   const limitClass = authorization.kind === "connector" ? concurrencyClass(input.capability) : undefined;
@@ -139,16 +148,18 @@ export async function createOperation(env: ControlPlaneEnv, actor: AuthActor, ra
   }
   const row = { operationId, state: "queued", payloadDigest: digest, expiresAt: request.expiresAt };
   const createdAt = nowIso();
+  const dispatchMessageId = newId("cmsg");
+  const dispatchPayload = { operation: request };
+  const dispatchPayloadDigest = await sha256Hex(canonicalJson(dispatchPayload));
   try {
     await env.DB.batch([
       env.DB.prepare("INSERT INTO operation_journal(id,idempotency_key,actor_principal_id,client_id,device_id,project_id,session_id,assignment_id,run_id,connector_policy_id,connector_policy_revision,connector_grant_id,concurrency_class,capability,payload_digest,request_json,state,expires_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'queued',?17,?18,?18)").bind(operationId, input.idempotencyKey, effectiveActor.principalId, effectiveActor.clientId, input.deviceId, input.projectId ?? null, input.sessionId ?? null, input.assignmentId ?? null, input.runId ?? null, effectiveActor.policyId, effectiveActor.policyRevision, effectiveActor.grantId ?? null, limitClass ?? null, input.capability, digest, canonicalJson(request), request.expiresAt, createdAt),
       env.DB.prepare("INSERT INTO idempotency_records(scope,idempotency_key,payload_digest,operation_id,state,response_status,response_json,expires_at,created_at) VALUES (?1,?2,?3,?4,'queued',202,?5,?6,?7)").bind(idempotencyScope, input.idempotencyKey, stableDigest, operationId, JSON.stringify(row), request.expiresAt, createdAt),
+      env.DB.prepare("INSERT INTO operation_dispatch_outbox(operation_id,device_id,message_id,correlation_id,payload_digest,payload_json,state,next_attempt_at,expires_at,created_at,updated_at) VALUES (?1,?2,?3,?1,?4,?5,'pending',?6,?7,?6,?6)").bind(operationId, input.deviceId, dispatchMessageId, dispatchPayloadDigest, canonicalJson(dispatchPayload), createdAt, request.expiresAt),
     ]);
   } catch (error) {
     if (limitClass !== undefined && effectiveActor.grantId !== undefined) await env.CONNECTOR_LIMITERS.getByName(effectiveActor.grantId).release(limitClass);
     throw error;
   }
-  const delivery = await env.DEVICE_ROOMS.getByName(input.deviceId).offer({ messageId: newId("cmsg"), correlationId: operationId, payloadDigest: await sha256Hex(canonicalJson({ operation: { ...request, payloadDigest: digest } })), payload: { operation: { ...request, payloadDigest: digest } }, expiresAt: request.expiresAt });
-  await env.DB.prepare("UPDATE operation_journal SET state='offered',updated_at=?1,result_json=?2 WHERE id=?3 AND state='queued'").bind(nowIso(), JSON.stringify(delivery), operationId).run();
-  return { ...row, state: "offered", delivery };
+  return await attemptOperationDispatch(env, operationId, { force: true, dispatcher }) ?? row;
 }

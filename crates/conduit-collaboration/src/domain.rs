@@ -294,6 +294,8 @@ pub enum CollaborationError {
     TimeLimit,
     #[error("orchestration cycle is forbidden")]
     CycleForbidden,
+    #[error("orchestration lineage is not authoritative")]
+    InvalidOrchestrationLineage,
     #[error("task dependency cycle is forbidden")]
     TaskDependencyCycle,
     #[error("digest operation failed")]

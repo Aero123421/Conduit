@@ -1,4 +1,8 @@
-use std::{fs, path::Path};
+use std::{
+    fs,
+    io::{Read, Take},
+    path::Path,
+};
 
 use conduit_crypto::{canonical_sha256, sha256_bytes};
 use conduit_domain::{
@@ -121,6 +125,28 @@ impl ContextCompiler {
         if self.max_items == 0 || self.max_compiled_bytes == 0 || self.max_item_bytes == 0 {
             return Err(ContextError::InvalidLimits);
         }
+        if self.max_items > 16_384
+            || self.max_compiled_bytes > 64 * 1024 * 1024
+            || self.max_item_bytes > 8 * 1024 * 1024
+            || request.candidates.len() > 16_384
+        {
+            return Err(ContextError::InputTooLarge);
+        }
+        let max_input_bytes = self.max_compiled_bytes.saturating_mul(16);
+        let mut input_bytes = 0usize;
+        for candidate in &request.candidates {
+            input_bytes = input_bytes
+                .checked_add(candidate.content.len())
+                .ok_or(ContextError::InputTooLarge)?;
+            if input_bytes > max_input_bytes
+                || candidate.content.len() > self.max_item_bytes.saturating_mul(16)
+            {
+                return Err(ContextError::InputTooLarge);
+            }
+            if candidate.sensitivity == "secret" {
+                return Err(ContextError::SensitiveContentForbidden);
+            }
+        }
         request.candidates.sort_by(|left, right| {
             (
                 std::cmp::Reverse(left.important_unread),
@@ -154,15 +180,15 @@ impl ContextCompiler {
                     Some("compiled_byte_limit".into()),
                 )
             } else {
-                let allowance = remaining.min(self.max_item_bytes);
-                if candidate.content.len() <= allowance {
-                    remaining -= candidate.content.len();
+                let content_allowance = remaining.saturating_sub(1).min(self.max_item_bytes);
+                if candidate.content.len() <= content_allowance {
+                    remaining -= candidate.content.len() + 1;
                     compiled.extend_from_slice(candidate.content.as_bytes());
                     compiled.push(b'\n');
                     (InclusionState::Included, Some(candidate.content), None)
-                } else if allowance >= 64 {
-                    let retained = truncate_utf8(&candidate.content, allowance);
-                    remaining -= retained.len();
+                } else if content_allowance >= 64 {
+                    let retained = truncate_utf8(&candidate.content, content_allowance);
+                    remaining -= retained.len() + 1;
                     compiled.extend_from_slice(retained.as_bytes());
                     compiled.push(b'\n');
                     (
@@ -295,6 +321,13 @@ pub fn discover_instructions(
     max_file_bytes: usize,
     max_total_bytes: usize,
 ) -> Result<Vec<InstructionEvidence>, ContextError> {
+    if max_file_bytes == 0
+        || max_total_bytes == 0
+        || max_file_bytes > 8 * 1024 * 1024
+        || max_total_bytes > 64 * 1024 * 1024
+    {
+        return Err(ContextError::InvalidLimits);
+    }
     let root = fs::canonicalize(source_root)?;
     let working = fs::canonicalize(working_directory)?;
     if !working.starts_with(&root) {
@@ -315,20 +348,34 @@ pub fn discover_instructions(
     for (depth, directory) in directories.iter().enumerate() {
         for filename in ["AGENTS.md", "AGENTS.override.md", "CLAUDE.md"] {
             let path = directory.join(filename);
-            if !path.is_file() {
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(ContextError::Io(error)),
+            };
+            if !metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
                 continue;
             }
-            let bytes = fs::read(&path)?;
+            let canonical = fs::canonicalize(&path)?;
+            if !canonical.starts_with(&root) {
+                return Err(ContextError::InstructionOutsideSource);
+            }
             let eligible = match filename {
                 "CLAUDE.md" => adapter_id == "claude-code",
                 _ => adapter_id == "codex" || adapter_id == "opencode" || adapter_id == "pi",
             };
             let available = max_total_bytes.saturating_sub(total);
-            let retained = bytes.len().min(max_file_bytes).min(available);
-            total = total.saturating_add(retained);
+            let retained_limit =
+                max_file_bytes.min(if eligible { available } else { max_file_bytes });
+            let bytes = read_bounded(&canonical, retained_limit)?;
+            let original_len = fs::metadata(&canonical)?.len();
+            let retained = bytes.len();
+            if eligible {
+                total = total.saturating_add(retained);
+            }
             let state = if !eligible {
                 InstructionState::Ineligible
-            } else if retained < bytes.len() {
+            } else if (retained as u64) < original_len {
                 InstructionState::Truncated
             } else {
                 InstructionState::Discovered
@@ -336,14 +383,14 @@ pub fn discover_instructions(
             let relative = path
                 .strip_prefix(&root)
                 .map_err(|_| ContextError::WorkingDirectoryOutsideSource)?;
-            let opaque_path_ref = sha256_bytes(path.as_os_str().as_encoded_bytes());
+            let opaque_path_ref = sha256_bytes(canonical.as_os_str().as_encoded_bytes());
             evidence.push(InstructionEvidence {
                 instruction_id: format!("instruction-{}", &sha256_bytes(&bytes).to_string()[..20]),
                 filename: filename.into(),
                 display_path: relative.to_string_lossy().into_owned(),
                 opaque_path_ref,
                 content_digest: sha256_bytes(&bytes),
-                byte_count: bytes.len() as u64,
+                byte_count: original_len,
                 precedence: (depth * 2 + usize::from(filename == "AGENTS.override.md")) as u32,
                 eligible_adapters: if eligible {
                     vec![adapter_id.to_owned()]
@@ -374,10 +421,24 @@ pub enum ContextError {
     InvalidLimits,
     #[error("working directory is outside the Source root")]
     WorkingDirectoryOutsideSource,
+    #[error("instruction path resolves outside the Source root")]
+    InstructionOutsideSource,
+    #[error("context input exceeds its configured hard bound")]
+    InputTooLarge,
+    #[error("secret content cannot be embedded in a Context Snapshot")]
+    SensitiveContentForbidden,
     #[error("filesystem operation failed: {0}")]
     Io(#[from] std::io::Error),
     #[error("context digest failed")]
     Digest,
+}
+
+fn read_bounded(path: &Path, limit: usize) -> Result<Vec<u8>, ContextError> {
+    let file = fs::File::open(path)?;
+    let mut reader: Take<fs::File> = file.take(limit as u64);
+    let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+    reader.read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 fn truncate_utf8(value: &str, max: usize) -> String {
@@ -487,5 +548,60 @@ mod tests {
                 .all(|item| !item.display_path.starts_with('/'))
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn compiler_counts_separators_inside_the_byte_budget() {
+        let compiler = ContextCompiler {
+            version: "context/1".into(),
+            max_items: 2,
+            max_compiled_bytes: 65,
+            max_item_bytes: 64,
+        };
+        let candidates = ["a".repeat(32), "b".repeat(32)]
+            .into_iter()
+            .enumerate()
+            .map(|(index, content)| ContextCandidate {
+                origin: ContextOrigin::RecentMessage,
+                source_record_id: format!("message-{index}"),
+                revision: 1,
+                priority: index as u16,
+                content,
+                sensitivity: "project_content".into(),
+                important_unread: false,
+            })
+            .collect();
+        let snapshot = compiler
+            .compile(ContextCompileRequest {
+                context_snapshot_id: ContextSnapshotId::parse("ctxs_abcdefgh").unwrap(),
+                run_or_assignment_input_id: "input-1".into(),
+                assignment_id: AssignmentId::parse("asg_abcdefgh").unwrap(),
+                session_id: CollaborationSessionId::parse("csess_abcdefgh").unwrap(),
+                session_revision: 1,
+                mode: ContextMode::Initial,
+                candidates,
+                instruction_catalog_digest: digest(1),
+                skill_catalog_digest: digest(2),
+                created_at: UtcTimestamp::parse("2026-09-01T00:00:00Z").unwrap(),
+            })
+            .unwrap();
+        assert!(snapshot.compiled_bytes <= 65);
+    }
+
+    #[test]
+    fn instruction_symlink_cannot_escape_source() {
+        use std::os::unix::fs::symlink;
+        let root =
+            std::env::temp_dir().join(format!("conduit-context-link-{}", std::process::id()));
+        let outside = root.with_extension("outside");
+        fs::create_dir_all(&root).unwrap();
+        fs::write(&outside, "private").unwrap();
+        symlink(&outside, root.join("AGENTS.md")).unwrap();
+        assert!(matches!(
+            discover_instructions(&root, &root, "codex", 1024, 4096),
+            Err(ContextError::InstructionOutsideSource)
+        ));
+        fs::remove_dir_all(root).unwrap();
+        fs::remove_file(outside).unwrap();
     }
 }

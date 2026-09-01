@@ -3,7 +3,10 @@ import { describe, expect, it } from "vitest";
 import {
   canonicalJson,
   canonicalSha256,
+  parseAnyRunId,
+  parseLocalRunId,
   parseProjectId,
+  parseRunId,
   parseSha256Digest,
   parseU64Decimal,
   parseUtcTimestamp,
@@ -14,6 +17,11 @@ describe("domain values", () => {
     expect(parseProjectId("prj_abcdefgh")).toBe("prj_abcdefgh");
     expect(() => parseProjectId("project_abcdefgh")).toThrow();
     expect(() => parseProjectId("prj_short")).toThrow();
+    expect(parseRunId("run_abcdefgh")).toBe("run_abcdefgh");
+    expect(() => parseRunId("lrun_abcdefgh")).toThrow();
+    expect(parseLocalRunId("lrun_abcdefgh")).toBe("lrun_abcdefgh");
+    expect(parseAnyRunId("run_abcdefgh")).toBe("run_abcdefgh");
+    expect(parseAnyRunId("lrun_abcdefgh")).toBe("lrun_abcdefgh");
   });
 
   it("validates canonical u64 decimals", () => {
@@ -37,6 +45,8 @@ describe("domain values", () => {
       "2026-09-01T12:00:00Z",
     );
     expect(() => parseUtcTimestamp("2026-09-01T21:00:00+09:00")).toThrow();
+    expect(() => parseUtcTimestamp("2026-02-30T00:00:00Z")).toThrow();
+    expect(() => parseUtcTimestamp("2026-09-01T24:00:00Z")).toThrow();
   });
 });
 

@@ -2,9 +2,9 @@
 
 use std::{fmt, str::FromStr};
 
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
-use time::{format_description::well_known::Rfc3339, OffsetDateTime};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum DomainValueError {
@@ -39,7 +39,9 @@ fn validate_prefixed_id(
     }
 
     let mut bytes = suffix.bytes();
-    let first = bytes.next().ok_or(DomainValueError::InvalidLength { kind })?;
+    let first = bytes
+        .next()
+        .ok_or(DomainValueError::InvalidLength { kind })?;
     if !first.is_ascii_alphanumeric()
         || !bytes.all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
     {
@@ -70,7 +72,10 @@ macro_rules! define_id {
 
         impl fmt::Debug for $name {
             fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.debug_tuple(stringify!($name)).field(&self.0).finish()
+                formatter
+                    .debug_tuple(stringify!($name))
+                    .field(&self.0)
+                    .finish()
             }
         }
 
@@ -155,7 +160,10 @@ impl AnyRunId {
 
 impl fmt::Debug for AnyRunId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("AnyRunId").field(&self.as_str()).finish()
+        formatter
+            .debug_tuple("AnyRunId")
+            .field(&self.as_str())
+            .finish()
     }
 }
 
@@ -263,7 +271,10 @@ impl Sha256Digest {
 
 impl fmt::Debug for Sha256Digest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("Sha256Digest").field(&self.to_hex()).finish()
+        formatter
+            .debug_tuple("Sha256Digest")
+            .field(&self.to_hex())
+            .finish()
     }
 }
 
@@ -319,7 +330,10 @@ impl UtcTimestamp {
 
 impl fmt::Debug for UtcTimestamp {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_tuple("UtcTimestamp").field(&self.0).finish()
+        formatter
+            .debug_tuple("UtcTimestamp")
+            .field(&self.0)
+            .finish()
     }
 }
 
@@ -380,8 +394,14 @@ mod tests {
 
     #[test]
     fn accepts_shared_and_local_run_ids() {
-        assert!(matches!(AnyRunId::parse("run_abcdefgh").unwrap(), AnyRunId::Shared(_)));
-        assert!(matches!(AnyRunId::parse("lrun_abcdefgh").unwrap(), AnyRunId::Local(_)));
+        assert!(matches!(
+            AnyRunId::parse("run_abcdefgh").unwrap(),
+            AnyRunId::Shared(_)
+        ));
+        assert!(matches!(
+            AnyRunId::parse("lrun_abcdefgh").unwrap(),
+            AnyRunId::Local(_)
+        ));
     }
 
     #[test]
@@ -415,7 +435,10 @@ mod tests {
 
     #[test]
     fn serializes_contract_representations() {
-        assert_eq!(serde_json::to_string(&U64Decimal::new(42)).unwrap(), "\"42\"");
+        assert_eq!(
+            serde_json::to_string(&U64Decimal::new(42)).unwrap(),
+            "\"42\""
+        );
         let project: ProjectId = serde_json::from_str("\"prj_abcdefgh\"").unwrap();
         assert_eq!(project.as_str(), "prj_abcdefgh");
     }

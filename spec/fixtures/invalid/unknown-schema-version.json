@@ -1,0 +1,16 @@
+{
+  "fixtureVersion": 1,
+  "schemaId": "https://conduit.dev/spec/schemas/auth-v1.schema.json",
+  "validationLayer": "schema",
+  "validatorKind": "json_schema",
+  "instancePath": "/schemaVersion",
+  "expectedInvalidReason": "unknown_schema_version",
+  "instance": {
+    "schemaVersion": 2,
+    "kind": "owner_principal",
+    "id": "prin_owner_01",
+    "displayName": "Owner",
+    "status": "active",
+    "createdAt": "2026-09-01T00:00:00Z"
+  }
+}

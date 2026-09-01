@@ -604,6 +604,8 @@ Controlled evaluation uses clean Runs with matched source, context, environment,
 
 Conduit uses RFC 8785 JSON Canonicalization Scheme for JSON digests.
 
+`spec/fixtures/canonical-json-v1.json` is the cross-language parity fixture for canonical UTF-8 text and SHA-256 output. Rust and TypeScript implementations must produce its exact canonical text before a digest is accepted as compatible.
+
 `payloadDigest` is SHA-256 of canonical payload JSON or referenced plaintext content.
 
 `eventDigest` is SHA-256 of canonical Event core excluding:

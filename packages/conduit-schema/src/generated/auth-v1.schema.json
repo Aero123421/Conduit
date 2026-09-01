@@ -1,0 +1,695 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conduit.dev/spec/schemas/auth-v1.schema.json",
+  "title": "Conduit authentication and authorization records v1",
+  "description": "Machine-checkable records for the single-owner authentication, device identity, MCP grant, connector policy, and rate-limit model.",
+  "oneOf": [
+    { "$ref": "#/$defs/OwnerPrincipal" },
+    { "$ref": "#/$defs/PasskeyRecord" },
+    { "$ref": "#/$defs/OwnerSession" },
+    { "$ref": "#/$defs/OAuthClientRegistration" },
+    { "$ref": "#/$defs/OAuthGrant" },
+    { "$ref": "#/$defs/ConnectorPolicy" },
+    { "$ref": "#/$defs/RateLimitProfile" },
+    { "$ref": "#/$defs/DeviceEnrollment" },
+    { "$ref": "#/$defs/DeviceRecord" },
+    { "$ref": "#/$defs/SecurityEvent" }
+  ],
+  "$defs": {
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "Sha256Hex": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "Base64Url": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "maxLength": 8192
+    },
+    "PrincipalId": {
+      "type": "string",
+      "pattern": "^prin_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "PasskeyId": {
+      "type": "string",
+      "pattern": "^pkey_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "BrowserSessionId": {
+      "type": "string",
+      "pattern": "^bsess_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "OAuthClientId": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 2048
+    },
+    "OAuthGrantId": {
+      "type": "string",
+      "pattern": "^grant_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ConnectorPolicyId": {
+      "type": "string",
+      "pattern": "^cpol_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "RateLimitProfileId": {
+      "type": "string",
+      "pattern": "^rate_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "DeviceId": {
+      "type": "string",
+      "pattern": "^dev_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "DeviceKeyId": {
+      "type": "string",
+      "pattern": "^dkey_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "EnrollmentId": {
+      "type": "string",
+      "pattern": "^enroll_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ProjectId": {
+      "type": "string",
+      "pattern": "^prj_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "SecurityEventId": {
+      "type": "string",
+      "pattern": "^sevt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "EntityStatus": {
+      "type": "string",
+      "enum": ["active", "paused", "reauthorization_required", "revoked", "expired"]
+    },
+    "AccessScope": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "selected_sources",
+        "project_full",
+        "full_user",
+        "full_device",
+        "custom"
+      ]
+    },
+    "ApprovalMode": {
+      "type": "string",
+      "enum": ["always", "outside_scope", "risk_classes", "never"]
+    },
+    "RiskClass": {
+      "type": "string",
+      "enum": [
+        "external_publish",
+        "secret_access",
+        "destructive_delete",
+        "elevation",
+        "production_deploy",
+        "device_admin",
+        "raw_log_export",
+        "lan_access",
+        "credential_export",
+        "runtime_management"
+      ]
+    },
+    "RuntimeKind": {
+      "type": "string",
+      "enum": ["native", "restricted_native", "container", "vm"]
+    },
+    "OperationPermission": {
+      "type": "string",
+      "enum": [
+        "project.read",
+        "session.read",
+        "board.read",
+        "board.write",
+        "assignment.create",
+        "run.read",
+        "run.start",
+        "run.control",
+        "command.start",
+        "runtime.create",
+        "runtime.control",
+        "logs.summary.read",
+        "logs.normalized.read",
+        "logs.raw.read",
+        "artifact.read",
+        "artifact.upload",
+        "approval.resolve",
+        "config.write",
+        "device.manage",
+        "connector.manage",
+        "security.audit.read"
+      ]
+    },
+    "OAuthScope": {
+      "type": "string",
+      "enum": [
+        "conduit.read",
+        "conduit.board.write",
+        "conduit.run.start",
+        "conduit.run.control",
+        "conduit.runtime.manage",
+        "conduit.logs.read",
+        "conduit.logs.raw",
+        "conduit.approval.resolve",
+        "conduit.config.write",
+        "conduit.admin"
+      ]
+    },
+    "SelectorAll": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": { "const": "all" }
+      }
+    },
+    "DeviceSelectorIds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "ids"],
+      "properties": {
+        "mode": { "const": "ids" },
+        "ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/DeviceId" }
+        }
+      }
+    },
+    "ProjectSelectorIds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "ids"],
+      "properties": {
+        "mode": { "const": "ids" },
+        "ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ProjectId" }
+        }
+      }
+    },
+    "DeviceSelector": {
+      "oneOf": [
+        { "$ref": "#/$defs/SelectorAll" },
+        { "$ref": "#/$defs/DeviceSelectorIds" }
+      ]
+    },
+    "ProjectSelector": {
+      "oneOf": [
+        { "$ref": "#/$defs/SelectorAll" },
+        { "$ref": "#/$defs/ProjectSelectorIds" }
+      ]
+    },
+    "ApprovalPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": { "$ref": "#/$defs/ApprovalMode" },
+        "riskClasses": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/RiskClass" }
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "mode": { "const": "risk_classes" } },
+            "required": ["mode"]
+          },
+          "then": {
+            "required": ["riskClasses"],
+            "properties": { "riskClasses": { "minItems": 1 } }
+          }
+        }
+      ]
+    },
+    "RateWindow": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["limit", "windowSeconds"],
+      "properties": {
+        "limit": { "type": "integer", "minimum": 0, "maximum": 1000000 },
+        "windowSeconds": { "type": "integer", "minimum": 1, "maximum": 2592000 }
+      }
+    },
+    "RateLimitProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "id",
+        "revision",
+        "status",
+        "requestWindows",
+        "weightedBudget",
+        "concurrency",
+        "durations",
+        "bytes",
+        "createdAt",
+        "updatedAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "rate_limit_profile" },
+        "id": { "$ref": "#/$defs/RateLimitProfileId" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "status": { "enum": ["active", "disabled"] },
+        "name": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "requestWindows": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "read": { "$ref": "#/$defs/RateWindow" },
+            "boardWrite": { "$ref": "#/$defs/RateWindow" },
+            "commandStart": { "$ref": "#/$defs/RateWindow" },
+            "agentRunStart": { "$ref": "#/$defs/RateWindow" },
+            "runtimeStart": { "$ref": "#/$defs/RateWindow" },
+            "approvalResolve": { "$ref": "#/$defs/RateWindow" },
+            "rawLogRead": { "$ref": "#/$defs/RateWindow" }
+          }
+        },
+        "weightedBudget": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["capacity", "refillPerSecond", "weights"],
+          "properties": {
+            "capacity": { "type": "number", "minimum": 0, "maximum": 1000000000 },
+            "refillPerSecond": { "type": "number", "minimum": 0, "maximum": 1000000 },
+            "weights": {
+              "type": "object",
+              "minProperties": 1,
+              "maxProperties": 128,
+              "propertyNames": { "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+              "additionalProperties": { "type": "number", "minimum": 0, "maximum": 1000000 }
+            }
+          }
+        },
+        "concurrency": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["commands", "agentRuns", "runtimeStarts"],
+          "properties": {
+            "commands": { "type": "integer", "minimum": 0, "maximum": 1024 },
+            "agentRuns": { "type": "integer", "minimum": 0, "maximum": 1024 },
+            "runtimeStarts": { "type": "integer", "minimum": 0, "maximum": 256 }
+          }
+        },
+        "durations": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["commandSeconds", "runSeconds"],
+          "properties": {
+            "commandSeconds": { "type": "integer", "minimum": 1, "maximum": 604800 },
+            "runSeconds": { "type": "integer", "minimum": 1, "maximum": 2592000 }
+          }
+        },
+        "bytes": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "responseBytes",
+            "normalizedLogBytesPerDay",
+            "rawLogBytesPerDay",
+            "artifactUploadBytesPerDay"
+          ],
+          "properties": {
+            "responseBytes": { "type": "integer", "minimum": 1024, "maximum": 16777216 },
+            "normalizedLogBytesPerDay": { "type": "integer", "minimum": 0, "maximum": 1099511627776 },
+            "rawLogBytesPerDay": { "type": "integer", "minimum": 0, "maximum": 1099511627776 },
+            "artifactUploadBytesPerDay": { "type": "integer", "minimum": 0, "maximum": 1099511627776 }
+          }
+        },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "updatedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "ConnectorPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "id",
+        "principalId",
+        "clientId",
+        "revision",
+        "status",
+        "deviceSelector",
+        "projectSelector",
+        "allowedOperations",
+        "allowedRuntimes",
+        "maxAccessScope",
+        "mostPermissiveApprovalMode",
+        "allowRawContent",
+        "allowArtifactUpload",
+        "rateLimitProfileId",
+        "createdAt",
+        "updatedAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "connector_policy" },
+        "id": { "$ref": "#/$defs/ConnectorPolicyId" },
+        "principalId": { "$ref": "#/$defs/PrincipalId" },
+        "clientId": { "$ref": "#/$defs/OAuthClientId" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "status": { "$ref": "#/$defs/EntityStatus" },
+        "deviceSelector": { "$ref": "#/$defs/DeviceSelector" },
+        "projectSelector": { "$ref": "#/$defs/ProjectSelector" },
+        "allowedOperations": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/OperationPermission" }
+        },
+        "allowedRuntimes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/RuntimeKind" }
+        },
+        "maxAccessScope": { "$ref": "#/$defs/AccessScope" },
+        "mostPermissiveApprovalMode": { "$ref": "#/$defs/ApprovalMode" },
+        "requiredApprovalRiskClasses": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/RiskClass" }
+        },
+        "allowRawContent": { "type": "boolean" },
+        "allowArtifactUpload": { "type": "boolean" },
+        "rateLimitProfileId": { "$ref": "#/$defs/RateLimitProfileId" },
+        "expiresAt": { "$ref": "#/$defs/Timestamp" },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "updatedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "OwnerPrincipal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "kind", "id", "displayName", "status", "createdAt"],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "owner_principal" },
+        "id": { "$ref": "#/$defs/PrincipalId" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "status": { "enum": ["active", "recovery_required", "disabled"] },
+        "createdAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "PasskeyRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "id",
+        "principalId",
+        "credentialId",
+        "publicKeyCose",
+        "relyingPartyId",
+        "signCount",
+        "status",
+        "createdAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "passkey_record" },
+        "id": { "$ref": "#/$defs/PasskeyId" },
+        "principalId": { "$ref": "#/$defs/PrincipalId" },
+        "credentialId": { "$ref": "#/$defs/Base64Url" },
+        "publicKeyCose": { "$ref": "#/$defs/Base64Url" },
+        "relyingPartyId": { "type": "string", "minLength": 1, "maxLength": 253 },
+        "label": { "type": "string", "maxLength": 128 },
+        "transports": {
+          "type": "array",
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "type": "string", "maxLength": 32 }
+        },
+        "authenticatorAttachment": { "enum": ["platform", "cross-platform", "unknown"] },
+        "signCount": { "type": "integer", "minimum": 0 },
+        "status": { "enum": ["active", "revoked"] },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "lastUsedAt": { "$ref": "#/$defs/Timestamp" },
+        "revokedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "OwnerSession": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "id",
+        "principalId",
+        "status",
+        "authenticatedAt",
+        "lastActivityAt",
+        "expiresAt",
+        "userVerified"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "owner_session" },
+        "id": { "$ref": "#/$defs/BrowserSessionId" },
+        "principalId": { "$ref": "#/$defs/PrincipalId" },
+        "status": { "enum": ["active", "revoked", "expired"] },
+        "authenticatedAt": { "$ref": "#/$defs/Timestamp" },
+        "freshAuthenticatedAt": { "$ref": "#/$defs/Timestamp" },
+        "lastActivityAt": { "$ref": "#/$defs/Timestamp" },
+        "expiresAt": { "$ref": "#/$defs/Timestamp" },
+        "userVerified": { "type": "boolean" }
+      }
+    },
+    "OAuthClientRegistration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "clientId",
+        "registrationMechanism",
+        "clientName",
+        "redirectUris",
+        "tokenEndpointAuthMethod",
+        "metadataDigest",
+        "status",
+        "createdAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "oauth_client_registration" },
+        "clientId": { "$ref": "#/$defs/OAuthClientId" },
+        "registrationMechanism": {
+          "enum": ["pre_registered", "client_id_metadata_document", "dynamic"]
+        },
+        "clientName": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "metadataUri": { "type": "string", "format": "uri", "maxLength": 2048 },
+        "redirectUris": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "format": "uri", "maxLength": 2048 }
+        },
+        "tokenEndpointAuthMethod": {
+          "enum": ["none", "client_secret_basic", "client_secret_post", "private_key_jwt"]
+        },
+        "metadataDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "status": { "enum": ["active", "metadata_changed", "revoked"] },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "updatedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "OAuthGrant": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "id",
+        "principalId",
+        "clientId",
+        "resource",
+        "scopes",
+        "connectorPolicyId",
+        "connectorPolicyRevision",
+        "tokenFamilyId",
+        "status",
+        "createdAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "oauth_grant" },
+        "id": { "$ref": "#/$defs/OAuthGrantId" },
+        "principalId": { "$ref": "#/$defs/PrincipalId" },
+        "clientId": { "$ref": "#/$defs/OAuthClientId" },
+        "resource": { "type": "string", "format": "uri", "maxLength": 2048 },
+        "scopes": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/OAuthScope" }
+        },
+        "connectorPolicyId": { "$ref": "#/$defs/ConnectorPolicyId" },
+        "connectorPolicyRevision": { "type": "integer", "minimum": 1 },
+        "tokenFamilyId": { "type": "string", "pattern": "^tfam_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "status": { "$ref": "#/$defs/EntityStatus" },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "lastUsedAt": { "$ref": "#/$defs/Timestamp" },
+        "expiresAt": { "$ref": "#/$defs/Timestamp" },
+        "revokedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "Ed25519PublicJwk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kty", "crv", "x"],
+      "properties": {
+        "kty": { "const": "OKP" },
+        "crv": { "const": "Ed25519" },
+        "x": { "$ref": "#/$defs/Base64Url" }
+      }
+    },
+    "DevicePublicKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["keyId", "algorithm", "publicJwk", "fingerprint", "status", "createdAt"],
+      "properties": {
+        "keyId": { "$ref": "#/$defs/DeviceKeyId" },
+        "algorithm": { "const": "Ed25519" },
+        "publicJwk": { "$ref": "#/$defs/Ed25519PublicJwk" },
+        "fingerprint": { "$ref": "#/$defs/Sha256Hex" },
+        "status": { "enum": ["active", "retiring", "revoked"] },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "retireAfter": { "$ref": "#/$defs/Timestamp" },
+        "revokedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "DeviceClaims": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hostnameLabel", "os", "arch", "nodeVersion", "protocolVersion"],
+      "properties": {
+        "hostnameLabel": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "os": { "enum": ["linux", "windows", "macos", "unknown"] },
+        "arch": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "nodeVersion": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "protocolVersion": { "type": "string", "minLength": 1, "maxLength": 64 }
+      }
+    },
+    "DeviceEnrollment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "id",
+        "state",
+        "claims",
+        "requestedKey",
+        "createdAt",
+        "expiresAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "device_enrollment" },
+        "id": { "$ref": "#/$defs/EnrollmentId" },
+        "state": { "enum": ["pending_owner", "approved", "completed", "denied", "expired", "cancelled"] },
+        "claims": { "$ref": "#/$defs/DeviceClaims" },
+        "requestedKey": { "$ref": "#/$defs/DevicePublicKey" },
+        "userCodeHint": { "type": "string", "maxLength": 32 },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "expiresAt": { "$ref": "#/$defs/Timestamp" },
+        "approvedBy": { "$ref": "#/$defs/PrincipalId" },
+        "approvedAt": { "$ref": "#/$defs/Timestamp" },
+        "completedDeviceId": { "$ref": "#/$defs/DeviceId" },
+        "terminalAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "DeviceRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "id",
+        "ownerPrincipalId",
+        "displayName",
+        "claims",
+        "keys",
+        "status",
+        "createdAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "device_record" },
+        "id": { "$ref": "#/$defs/DeviceId" },
+        "ownerPrincipalId": { "$ref": "#/$defs/PrincipalId" },
+        "displayName": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "claims": { "$ref": "#/$defs/DeviceClaims" },
+        "keys": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 8,
+          "items": { "$ref": "#/$defs/DevicePublicKey" }
+        },
+        "status": { "enum": ["active", "revoked", "disabled"] },
+        "connectionEpoch": { "type": "integer", "minimum": 0 },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "lastSeenAt": { "$ref": "#/$defs/Timestamp" },
+        "revokedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "SecurityEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "id",
+        "eventType",
+        "outcome",
+        "createdAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "security_event" },
+        "id": { "$ref": "#/$defs/SecurityEventId" },
+        "eventType": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "outcome": { "enum": ["success", "denied", "failed"] },
+        "reasonCode": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "actorPrincipalId": { "$ref": "#/$defs/PrincipalId" },
+        "clientId": { "$ref": "#/$defs/OAuthClientId" },
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "grantId": { "$ref": "#/$defs/OAuthGrantId" },
+        "policyRevision": { "type": "integer", "minimum": 1 },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "metadata": {
+          "type": "object",
+          "maxProperties": 32,
+          "propertyNames": { "pattern": "^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$" },
+          "additionalProperties": {
+            "type": ["string", "number", "integer", "boolean", "null"],
+            "maxLength": 1024
+          }
+        }
+      }
+    }
+  }
+}

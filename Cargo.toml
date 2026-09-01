@@ -15,9 +15,10 @@ repository = "https://github.com/Aero123421/Conduit"
 
 [workspace.dependencies]
 hex = "0.4.3"
+jsonschema = { version = "0.52.1", default-features = false }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
-serde_jcs = "0.1.0"
+serde_jcs = "0.2.0"
 sha2 = "0.10.9"
 thiserror = "2.0.17"
 time = { version = "0.3.44", features = ["formatting", "parsing", "serde"] }

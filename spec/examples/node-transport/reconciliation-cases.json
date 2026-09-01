@@ -1,0 +1,104 @@
+{
+  "schemaVersion": 1,
+  "contract": "conduit.node-reconciliation-cases/1",
+  "cases": [
+    {
+      "id": "duplicate-same-offer",
+      "startingFacts": ["operation op_A is admitted with digest D", "execution exec_A exists"],
+      "trigger": "the same operation ID, idempotency key, and digest are offered again",
+      "expected": ["return existing admission or operation snapshot", "keep exec_A"],
+      "mustNot": ["create another execution"]
+    },
+    {
+      "id": "idempotency-digest-drift",
+      "startingFacts": ["idempotency key K is bound to digest D1"],
+      "trigger": "a new offer uses K with digest D2",
+      "expected": ["reject idempotency_conflict", "record a security event"],
+      "mustNot": ["execute D2", "replace the D1 binding"]
+    },
+    {
+      "id": "disconnect-after-launch",
+      "startingFacts": ["admission is committed", "runtime exec_A is running", "cloud has not received the admission record"],
+      "trigger": "the WebSocket disconnects",
+      "expected": ["continue according to local policy", "replay admission and runtime observation after reconnect"],
+      "mustNot": ["start exec_A again"]
+    },
+    {
+      "id": "offline-terminal",
+      "startingFacts": ["operation is admitted", "control plane is disconnected"],
+      "trigger": "the runtime finishes successfully",
+      "expected": ["commit a signed terminal receipt locally", "accept it after reconnect"],
+      "mustNot": ["discard the result because an HTTP wait expired"]
+    },
+    {
+      "id": "cloud-working-runtime-missing",
+      "startingFacts": ["control plane expects working", "node journal says running", "runtime provider cannot find the execution", "no terminal receipt exists"],
+      "trigger": "reconciliation",
+      "expected": ["mark recovery_required or uncertain"],
+      "mustNot": ["report completed", "start a replacement automatically"]
+    },
+    {
+      "id": "cloud-failed-runtime-live",
+      "startingFacts": ["control plane recorded a delivery failure", "node proves the runtime is live"],
+      "trigger": "reconciliation",
+      "expected": ["retain the live runtime observation", "display divergence"],
+      "mustNot": ["kill the runtime implicitly", "start a replacement"]
+    },
+    {
+      "id": "approval-while-offline",
+      "startingFacts": ["run reaches an action outside admitted authority", "control plane is disconnected"],
+      "trigger": "agent requests approval",
+      "expected": ["enter waiting_approval", "store the request locally"],
+      "mustNot": ["infer approval from same-user IPC", "continue without authority"]
+    },
+    {
+      "id": "partial-record-delivery",
+      "startingFacts": ["records 41 through 43 exist", "control plane durably has only through 40"],
+      "trigger": "reconciliation",
+      "expected": ["request and replay 41 through 43", "ack after durable ingress"],
+      "mustNot": ["renumber the records"]
+    },
+    {
+      "id": "stale-connection-event",
+      "startingFacts": ["current connection epoch is 8"],
+      "trigger": "a frame arrives from epoch 7",
+      "expected": ["reject before payload processing", "fence the stale socket"],
+      "mustNot": ["materialize its record"]
+    },
+    {
+      "id": "record-hash-conflict",
+      "startingFacts": ["record sequence 55 is stored with hash H1"],
+      "trigger": "the same sequence arrives with hash H2",
+      "expected": ["raise record_hash_conflict", "require device review"],
+      "mustNot": ["choose one record silently"]
+    },
+    {
+      "id": "launch-outcome-unknown",
+      "startingFacts": ["launch intent is committed", "provider cannot attest whether execution exists"],
+      "trigger": "node restart",
+      "expected": ["mark uncertain", "wait for explicit recovery"],
+      "mustNot": ["retry as a fresh start"]
+    },
+    {
+      "id": "journal-pressure",
+      "startingFacts": ["journal is at its hard cap", "no acknowledged record can be safely compacted"],
+      "trigger": "a new effectful operation is offered",
+      "expected": ["reject admission_blocked", "keep diagnosis available"],
+      "mustNot": ["evict an unacknowledged receipt"]
+    },
+    {
+      "id": "admission-wait-expired",
+      "startingFacts": ["operation was admitted before admission expiry", "client wait has elapsed"],
+      "trigger": "run continues",
+      "expected": ["keep the operation admitted", "accept its later terminal receipt"],
+      "mustNot": ["convert it to final expired solely because the client stopped waiting"]
+    },
+    {
+      "id": "local-scratch-found",
+      "startingFacts": ["a local-only Quick Agent Session exists", "it has no cloud Run ID"],
+      "trigger": "node reconnects",
+      "expected": ["report only a bounded local scratch summary", "require explicit owner import"],
+      "mustNot": ["upload project content automatically", "attach it to a Project automatically"]
+    }
+  ]
+}

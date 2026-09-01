@@ -32,7 +32,10 @@ export class ConnectorLimiter extends DurableObject<ControlPlaneEnv> {
         CREATE TABLE IF NOT EXISTS token_bucket(singleton INTEGER PRIMARY KEY CHECK(singleton=1), tokens REAL NOT NULL, updated_at INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS byte_usage(day TEXT PRIMARY KEY, response_bytes INTEGER NOT NULL, normalized_bytes INTEGER NOT NULL, raw_bytes INTEGER NOT NULL, artifact_bytes INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS concurrency(class TEXT PRIMARY KEY, active INTEGER NOT NULL);
+        CREATE TABLE IF NOT EXISTS concurrency_leases(operation_id TEXT PRIMARY KEY, class TEXT NOT NULL, state TEXT NOT NULL CHECK(state IN ('active','released','expired')), expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);
+        CREATE INDEX IF NOT EXISTS concurrency_leases_active_idx ON concurrency_leases(class,state,expires_at);
         INSERT OR IGNORE INTO _sql_schema_migrations(id,applied_at) VALUES (1,datetime('now'));
+        INSERT OR IGNORE INTO _sql_schema_migrations(id,applied_at) VALUES (2,datetime('now'));
       `);
     });
   }
@@ -72,14 +75,23 @@ export class ConnectorLimiter extends DurableObject<ControlPlaneEnv> {
     return decision;
   }
 
-  async acquire(className: "commands" | "agentRuns" | "runtimeStarts", limit: number): Promise<boolean> {
-    const active = this.ctx.storage.sql.exec<{ active: number }>("SELECT active FROM concurrency WHERE class=?", className).toArray()[0]?.active ?? 0;
-    if (active >= limit) return false;
-    this.ctx.storage.sql.exec("INSERT INTO concurrency(class,active) VALUES (?,1) ON CONFLICT(class) DO UPDATE SET active=active+1", className);
-    return true;
+  async acquire(operationId: string, className: "commands" | "agentRuns" | "runtimeStarts", limit: number, expiresAt: string): Promise<boolean> {
+    const expiry = Date.parse(expiresAt);
+    const now = Date.now();
+    if (!Number.isSafeInteger(limit) || limit < 1 || !Number.isFinite(expiry) || expiry <= now || operationId.length < 8 || operationId.length > 160) return false;
+    return this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("UPDATE concurrency_leases SET state='expired',updated_at=? WHERE state='active' AND expires_at<=?", now, now);
+      const existing = this.ctx.storage.sql.exec<{ class: string; state: string; expires_at: number }>("SELECT class,state,expires_at FROM concurrency_leases WHERE operation_id=?", operationId).toArray()[0];
+      if (existing !== undefined) return existing.class === className && existing.state === "active" && existing.expires_at > now;
+      const active = this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM concurrency_leases WHERE class=? AND state='active' AND expires_at>?", className, now).one().count;
+      if (active >= limit) return false;
+      this.ctx.storage.sql.exec("INSERT INTO concurrency_leases(operation_id,class,state,expires_at,created_at,updated_at) VALUES (?,?,'active',?,?,?)", operationId, className, expiry, now, now);
+      return true;
+    });
   }
 
-  async release(className: "commands" | "agentRuns" | "runtimeStarts"): Promise<void> {
-    this.ctx.storage.sql.exec("UPDATE concurrency SET active=MAX(0,active-1) WHERE class=?", className);
+  async release(operationId: string, className: "commands" | "agentRuns" | "runtimeStarts"): Promise<boolean> {
+    const changed = this.ctx.storage.sql.exec<{ operation_id: string }>("UPDATE concurrency_leases SET state='released',updated_at=? WHERE operation_id=? AND class=? AND state='active' RETURNING operation_id", Date.now(), operationId, className).toArray();
+    return changed.length === 1;
   }
 }

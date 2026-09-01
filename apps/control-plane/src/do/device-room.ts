@@ -1,7 +1,7 @@
 import { DurableObject } from "cloudflare:workers";
 import { parseWireDocumentText, schemaIds, type NodeV1PostAuthFrame } from "@conduit/schema";
 import { canonicalJson, newId, nowIso, randomToken, sha256Hex, verifyEd25519 } from "../crypto.ts";
-import type { DeviceRoomOffer } from "../dispatch.ts";
+import { ensureOperationConcurrencyReleased, type DeviceRoomOffer } from "../dispatch.ts";
 import type { ControlPlaneEnv, QueueEventMessage } from "../types.ts";
 
 interface SocketAttachment {
@@ -252,8 +252,8 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
         ]);
       } else {
         const projectedState = frame.payload.state === "completed" ? "completed" : frame.payload.state === "cancelled" ? "cancelled" : frame.payload.state === "rejected" || frame.payload.state === "expired" ? frame.payload.state : frame.payload.state === "uncertain" || frame.payload.state === "lost" || frame.payload.state === "recovery_required" ? "uncertain" : "failed";
-        const updated = await this.env.DB.prepare("UPDATE operation_journal SET state=?1,result_json=?2,updated_at=?3 WHERE id=?4 AND state NOT IN ('completed','failed','cancelled','expired','rejected','uncertain')").bind(projectedState, JSON.stringify(frame.payload), nowIso(), frame.payload.operationId).run();
-        if (updated.meta.changes === 1 && operation.connector_grant_id !== null && operation.concurrency_class !== null) await this.env.CONNECTOR_LIMITERS.getByName(operation.connector_grant_id).release(operation.concurrency_class);
+        await this.env.DB.prepare("UPDATE operation_journal SET state=?1,result_json=?2,updated_at=?3 WHERE id=?4 AND state NOT IN ('completed','failed','cancelled','expired','rejected','uncertain')").bind(projectedState, JSON.stringify(frame.payload), nowIso(), frame.payload.operationId).run();
+        if (operation.connector_grant_id !== null && operation.concurrency_class !== null) await ensureOperationConcurrencyReleased(this.env, frame.payload.operationId);
       }
     }
     if (frame.type === "event.batch" && Array.isArray(frame.payload.events)) {

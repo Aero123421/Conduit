@@ -16,7 +16,7 @@ describe.sequential("control-plane contracts", () => {
 
   it("applies forward D1 migrations", async () => {
     const version = await env.DB.prepare("SELECT version FROM schema_versions WHERE component='control_plane'").first<{ version: number }>();
-    expect(version?.version).toBe(7);
+    expect(version?.version).toBe(8);
     const tables = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table'").all<{ name: string }>();
     const names = new Set(tables.results.map((row) => row.name));
     for (const required of ["owner_principals", "oauth_grants", "connector_policies", "devices", "projects", "collaboration_sessions", "runs", "operation_journal", "operation_dispatch_outbox", "artifacts", "normalized_events", "security_events"]) expect(names.has(required)).toBe(true);
@@ -290,6 +290,24 @@ describe.sequential("control-plane contracts", () => {
     expect(compacted).toBe(0);
   });
 
+  it("repairs the historical crash image where offered custody was not projected", async () => {
+    const operationId = "op_dispatch_offered_crash01";
+    const digest = "f".repeat(64);
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 60_000).toISOString();
+    const createdAt = now.toISOString();
+    const response = { operationId, state: "offered", payloadDigest: digest, expiresAt, delivery: { sequence: "91", delivered: false } };
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO operation_journal(id,idempotency_key,actor_principal_id,client_id,device_id,connector_policy_id,connector_policy_revision,capability,payload_digest,request_json,state,expires_at,created_at,updated_at) VALUES (?1,'dispatch-offered-crash-key-0001','prin_board_contract','conduit.cli','dev_handshake01','cpol_owner_first_party_v1',1,'command.start',?2,'{}','queued',?3,?4,?4)").bind(operationId, digest, expiresAt, createdAt),
+      env.DB.prepare("INSERT INTO idempotency_records(scope,idempotency_key,payload_digest,operation_id,state,response_status,response_json,expires_at,created_at) VALUES ('owner:prin_board_contract:conduit.cli','dispatch-offered-crash-key-0001',?1,?2,'queued',202,NULL,?3,?4)").bind(digest, operationId, expiresAt, createdAt),
+      env.DB.prepare("INSERT INTO operation_dispatch_outbox(operation_id,device_id,message_id,correlation_id,payload_digest,payload_json,state,attempt_count,next_attempt_at,result_json,expires_at,created_at,updated_at) VALUES (?1,'dev_handshake01','cmsg_dispatch_offered_crash01',?1,?2,'{}','offered',1,?3,?4,?3,?5,?5)").bind(operationId, digest, expiresAt, JSON.stringify(response), createdAt),
+    ]);
+    expect(await reconcileOperationDispatches(env, { now })).toEqual({ examined: 1, offered: 1, pending: 0, expired: 0 });
+    const invariant = await env.DB.prepare("SELECT (SELECT state FROM operation_dispatch_outbox WHERE operation_id=?1) AS outbox_state,(SELECT state FROM operation_journal WHERE id=?1) AS operation_state,(SELECT state FROM idempotency_records WHERE operation_id=?1) AS idempotency_state,(SELECT response_json FROM idempotency_records WHERE operation_id=?1) AS response_json").bind(operationId).first<{ outbox_state: string; operation_state: string; idempotency_state: string; response_json: string }>();
+    expect(invariant).toMatchObject({ outbox_state: "offered", operation_state: "offered", idempotency_state: "offered" });
+    expect(JSON.parse(invariant!.response_json)).toEqual(response);
+  });
+
   it("expires an undispatched operation and releases its Connector concurrency slot once", async () => {
     const operationId = "op_dispatch_expiry01";
     const grantId = "grant_dispatch_expiry01";
@@ -300,19 +318,44 @@ describe.sequential("control-plane contracts", () => {
     const payload = { operation: { deviceId: "dev_handshake01" } };
     const messageId = "cmsg_dispatch_expiry01";
     const limiter = env.CONNECTOR_LIMITERS.getByName(grantId);
-    expect(await limiter.acquire("commands", 1)).toBe(true);
-    expect(await limiter.acquire("commands", 1)).toBe(false);
+    const leaseExpiresAt = new Date(now.getTime() + 60_000).toISOString();
+    expect(await limiter.acquire(operationId, "commands", 1, leaseExpiresAt)).toBe(true);
+    expect(await limiter.acquire(operationId, "commands", 1, leaseExpiresAt)).toBe(true);
+    expect(await limiter.acquire(operationId, "agentRuns", 1, leaseExpiresAt)).toBe(false);
+    expect(await limiter.acquire("op_dispatch_competing1", "commands", 1, leaseExpiresAt)).toBe(false);
     await env.DB.batch([
       env.DB.prepare("INSERT INTO operation_journal(id,idempotency_key,actor_principal_id,client_id,device_id,connector_policy_id,connector_policy_revision,connector_grant_id,concurrency_class,capability,payload_digest,request_json,state,expires_at,created_at,updated_at) VALUES (?1,'dispatch-expiry-idempotency-0001','prin_board_contract','connector.dispatch-expiry','dev_handshake01','cpol_dispatch_expiry01',1,?2,'commands','command.start',?3,'{}','queued',?4,?5,?5)").bind(operationId, grantId, digest, expiredAt, createdAt),
       env.DB.prepare("INSERT INTO idempotency_records(scope,idempotency_key,payload_digest,operation_id,state,response_status,response_json,expires_at,created_at) VALUES ('scope_dispatch_expiry01','dispatch-expiry-idempotency-0001',?1,?2,'queued',202,NULL,?3,?4)").bind(digest, operationId, expiredAt, createdAt),
       env.DB.prepare("INSERT INTO operation_dispatch_outbox(operation_id,device_id,message_id,correlation_id,payload_digest,payload_json,state,next_attempt_at,expires_at,created_at,updated_at) VALUES (?1,'dev_handshake01',?2,?1,?3,?4,'pending',?5,?5,?6,?6)").bind(operationId, messageId, await sha256Hex(canonicalJson(payload)), canonicalJson(payload), expiredAt, createdAt),
     ]);
+    const expiredResponse = { operationId, state: "expired", payloadDigest: digest, expiresAt: expiredAt };
+    await env.DB.prepare("UPDATE operation_dispatch_outbox SET state='expired',result_json=?1 WHERE operation_id=?2").bind(JSON.stringify(expiredResponse), operationId).run();
     expect(await reconcileOperationDispatches(env, { now })).toEqual({ examined: 1, offered: 0, pending: 0, expired: 1 });
     expect(await reconcileOperationDispatches(env, { now: new Date(now.getTime() + 1_000) })).toEqual({ examined: 0, offered: 0, pending: 0, expired: 0 });
-    const states = await env.DB.prepare("SELECT (SELECT state FROM operation_journal WHERE id=?1) AS operation_state,(SELECT state FROM operation_dispatch_outbox WHERE operation_id=?1) AS dispatch_state,(SELECT state FROM idempotency_records WHERE operation_id=?1) AS idempotency_state").bind(operationId).first<{ operation_state: string; dispatch_state: string; idempotency_state: string }>();
-    expect(states).toEqual({ operation_state: "expired", dispatch_state: "expired", idempotency_state: "expired" });
-    const active = await runInDurableObject(limiter, (_instance, state) => state.storage.sql.exec<{ active: number }>("SELECT active FROM concurrency WHERE class='commands'").one().active);
-    expect(active).toBe(0);
+    const states = await env.DB.prepare("SELECT (SELECT state FROM operation_journal WHERE id=?1) AS operation_state,(SELECT state FROM operation_dispatch_outbox WHERE operation_id=?1) AS dispatch_state,(SELECT state FROM idempotency_records WHERE operation_id=?1) AS idempotency_state,(SELECT concurrency_released_at FROM operation_journal WHERE id=?1) AS concurrency_released_at").bind(operationId).first<{ operation_state: string; dispatch_state: string; idempotency_state: string; concurrency_released_at: string | null }>();
+    expect(states).toMatchObject({ operation_state: "expired", dispatch_state: "expired", idempotency_state: "expired" });
+    expect(states?.concurrency_released_at).not.toBeNull();
+    expect(await limiter.acquire("op_dispatch_competing1", "commands", 1, leaseExpiresAt)).toBe(true);
+    expect(await limiter.release(operationId, "commands")).toBe(false);
+    const active = await runInDurableObject(limiter, (_instance, state) => state.storage.sql.exec<{ active: number }>("SELECT COUNT(*) AS active FROM concurrency_leases WHERE class='commands' AND state='active'").one().active);
+    expect(active).toBe(1);
+    expect(await limiter.release("op_dispatch_competing1", "commands")).toBe(true);
+    expect(await limiter.release("op_dispatch_competing1", "commands")).toBe(false);
+  });
+
+  it("reclaims an orphaned concurrency lease after its operation expiry", async () => {
+    const limiter = env.CONNECTOR_LIMITERS.getByName("grant_dispatch_orphan01");
+    const future = new Date(Date.now() + 60_000).toISOString();
+    expect(await limiter.acquire("op_dispatch_orphan0001", "runtimeStarts", 1, future)).toBe(true);
+    await runInDurableObject(limiter, (_instance, state) => {
+      state.storage.sql.exec("UPDATE concurrency_leases SET expires_at=? WHERE operation_id='op_dispatch_orphan0001'", Date.now() - 1);
+    });
+    expect(await limiter.acquire("op_dispatch_after_orphan1", "runtimeStarts", 1, future)).toBe(true);
+    const leases = await runInDurableObject(limiter, (_instance, state) => state.storage.sql.exec<{ operation_id: string; state: string }>("SELECT operation_id,state FROM concurrency_leases ORDER BY operation_id").toArray());
+    expect(leases).toEqual([
+      { operation_id: "op_dispatch_after_orphan1", state: "active" },
+      { operation_id: "op_dispatch_orphan0001", state: "expired" },
+    ]);
   });
 
   it("serves typed MCP tools through an OAuth policy and exact limiter", async () => {

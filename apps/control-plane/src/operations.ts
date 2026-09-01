@@ -144,7 +144,7 @@ export async function createOperation(
     const profile = JSON.parse(authorized.rate.profile_json) as Record<string, unknown>;
     const configured = profile.concurrency;
     const limit = configured !== null && typeof configured === "object" && !Array.isArray(configured) ? Number((configured as Record<string, unknown>)[limitClass] ?? 0) : 0;
-    if (!Number.isSafeInteger(limit) || limit < 1 || !await env.CONNECTOR_LIMITERS.getByName(effectiveActor.grantId).acquire(limitClass, limit)) throw new PublicError("resource_limit", 429, `Connector concurrency limit denied: ${limitClass}`);
+    if (!Number.isSafeInteger(limit) || limit < 1 || !await env.CONNECTOR_LIMITERS.getByName(effectiveActor.grantId).acquire(operationId, limitClass, limit, request.expiresAt)) throw new PublicError("resource_limit", 429, `Connector concurrency limit denied: ${limitClass}`);
   }
   const row = { operationId, state: "queued", payloadDigest: digest, expiresAt: request.expiresAt };
   const createdAt = nowIso();
@@ -158,7 +158,7 @@ export async function createOperation(
       env.DB.prepare("INSERT INTO operation_dispatch_outbox(operation_id,device_id,message_id,correlation_id,payload_digest,payload_json,state,next_attempt_at,expires_at,created_at,updated_at) VALUES (?1,?2,?3,?1,?4,?5,'pending',?6,?7,?6,?6)").bind(operationId, input.deviceId, dispatchMessageId, dispatchPayloadDigest, canonicalJson(dispatchPayload), createdAt, request.expiresAt),
     ]);
   } catch (error) {
-    if (limitClass !== undefined && effectiveActor.grantId !== undefined) await env.CONNECTOR_LIMITERS.getByName(effectiveActor.grantId).release(limitClass);
+    if (limitClass !== undefined && effectiveActor.grantId !== undefined) await env.CONNECTOR_LIMITERS.getByName(effectiveActor.grantId).release(operationId, limitClass);
     throw error;
   }
   return await attemptOperationDispatch(env, operationId, { force: true, dispatcher }) ?? row;

@@ -184,12 +184,14 @@ A side-effecting remote request is created in this order:
 4. atomically store intended operation state and a dispatch-outbox row in D1
 5. claim the dispatch row with a bounded lease and submit the exact operation to `DeviceRoom`
 6. store an outbound transport row in Durable Object storage using the dispatch row's stable message ID
-7. mark the D1 dispatch row offered only after `DeviceRoom` confirms durable custody
+7. atomically project the D1 dispatch row, operation journal, and idempotency record to offered only after `DeviceRoom` confirms durable custody
 8. send the stored frame over the current WebSocket if the device is connected
 
 Both custody boundaries persist before sending or acknowledging. A timeout or Worker failure between `DeviceRoom` custody and the D1 offered transition leaves the dispatch row retryable. An explicit same-key/same-digest request and the scheduled reconciler reuse the original operation ID, message ID, correlation ID, and payload digest. `DeviceRoom` returns the original transport sequence for that exact identity; a conflicting digest is rejected.
 
-Dispatch attempts use expiring leases. An abandoned lease is reclaimable after Worker restart. Deterministic bounded backoff schedules ordinary retry, and operation expiry transitions the journal and releases a held Connector concurrency slot exactly once. A dispatch failure never authorizes a new operation or a new message identity.
+Dispatch attempts use expiring leases. An abandoned lease is reclaimable after Worker restart. The offered or expired outbox transition and its journal and idempotency projections execute in one D1 batch, so a Worker failure cannot commit a terminal outbox row while leaving the operation queued. The reconciler also repairs terminal rows written by deployments that predate this invariant.
+
+Connector concurrency is represented by a Durable Object lease keyed by operation ID, class, and operation expiry. Acquire is idempotent for the same operation and release changes only that operation's active lease. D1 records `concurrency_released_at` as the release projection. A failure after Durable Object release but before that marker is safe because retry performs the same operation-bound release. A failure after acquire but before the D1 operation batch leaves an orphan lease that stops counting at operation expiry. Deterministic bounded backoff schedules ordinary retry, and operation expiry releases its lease exactly once without decrementing a different operation's slot. A dispatch failure never authorizes a new operation or a new message identity.
 
 The Durable Object outbound row is persisted before any WebSocket send. A failed send remains queued in SQLite-backed storage. A single Durable Object alarm retries due rows idempotently; reconnect and hibernation reconstruct behavior from storage rather than isolate memory.
 

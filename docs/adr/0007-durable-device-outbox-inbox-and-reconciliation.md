@@ -58,7 +58,9 @@ The operation journal, idempotency record, and a D1 dispatch-outbox row are comm
 
 Dispatch uses a bounded lease. Same-key/same-digest retries and a scheduled reconciler reclaim pending or expired-lease rows and submit the identical offer. `DeviceRoom` persists the offer before returning and treats the same message ID, correlation ID, and digest as an idempotent replay that returns the original transport sequence. A conflicting replay is rejected.
 
-If the Worker fails after Durable Object custody but before the D1 offered transition, retry closes the ambiguous handoff without allocating another operation, message, or transport sequence. Pending dispatch expiry marks the operation expired and releases a held Connector concurrency slot once. The per-Device Durable Object uses one alarm for due WebSocket-send retry; its alarm handler is idempotent and derives all work from SQLite-backed storage after hibernation.
+If the Worker fails after Durable Object custody but before the D1 offered transition, retry closes the ambiguous handoff without allocating another operation, message, or transport sequence. The offered or expired outbox transition and its operation-journal and idempotency projections commit in one D1 batch. The reconciler repairs terminal rows left with queued projections by an older deployment.
+
+Connector concurrency is a `ConnectorLimiter` Durable Object lease keyed by operation ID. Acquire and release are idempotent for that operation; release cannot decrement another operation's slot. The lease expires at the operation expiry so a failure after acquire but before the D1 creation batch cannot hold capacity indefinitely. D1 records a release-projection marker after terminal expiry or receipt handling. If the Worker fails between the Durable Object release and that marker, reconciliation repeats the same operation-bound release safely. The per-Device Durable Object uses one alarm for due WebSocket-send retry; its alarm handler is idempotent and derives all work from SQLite-backed storage after hibernation.
 
 ### Reconciliation before new work
 
@@ -123,6 +125,8 @@ Rejected because stale shared state is not proof that a local runtime is unautho
 - Runtime-provider design must expose deterministic runtime identity and reconciliation.
 - Transport tests require fake devices, fake Durable Object storage, and injected crash windows.
 - Dispatch tests inject response loss after Durable Object persistence, evict the object, run a fresh reconciler, and prove the stable message ID occupies one outbound sequence.
+- Projection tests reconstruct pre-invariant offered and expired crash images and prove reconciliation converges the outbox, journal, idempotency record, and concurrency-release marker.
+- Limiter tests prove duplicate operation-bound release cannot decrement another operation's slot and an orphaned acquire stops counting at operation expiry.
 
 ## Contract
 

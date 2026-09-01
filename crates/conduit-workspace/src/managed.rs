@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
     os::unix::fs::{MetadataExt, PermissionsExt, symlink},
-    path::Path,
+    path::{Component, Path, PathBuf},
 };
 
 use conduit_crypto::{canonical_sha256, sha256_bytes};
@@ -120,6 +120,10 @@ pub enum ManagedError {
     InvalidPath,
     #[error("managed copy destination already exists")]
     DestinationExists,
+    #[error("managed snapshots belong to different Sources")]
+    SourceMismatch,
+    #[error("symlink target escapes the managed Workspace")]
+    SymlinkEscapesWorkspace,
     #[error("snapshot source changed during copy")]
     ExternalEdit,
     #[error("filesystem operation failed: {0}")]
@@ -150,7 +154,18 @@ pub fn snapshot_folder(
         &mut hardlinks,
     )?;
     entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
-    let manifest_digest = canonical_sha256(&entries)?;
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ManifestIdentity<'a> {
+        source_id: &'a SourceId,
+        policy: &'a SnapshotPolicy,
+        entries: &'a [ManifestEntry],
+    }
+    let manifest_digest = canonical_sha256(&ManifestIdentity {
+        source_id: &source_id,
+        policy,
+        entries: &entries,
+    })?;
     let snapshot_id = format!("snap_{}", &manifest_digest.to_string()[..24]);
     Ok(ManagedSnapshot {
         snapshot_id,
@@ -288,46 +303,72 @@ pub fn create_managed_copy(
     if destination.exists() {
         return Err(ManagedError::DestinationExists);
     }
-    fs::create_dir_all(destination)?;
-    for entry in &expected.entries {
-        let from = source.join(&entry.relative_path);
-        let to = destination.join(&entry.relative_path);
-        match entry.kind {
-            ManifestEntryKind::Directory => fs::create_dir_all(&to)?,
-            ManifestEntryKind::File => {
-                if let Some(parent) = to.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                fs::copy(&from, &to)?;
-                if policy.preserve_modes {
-                    fs::set_permissions(&to, fs::Permissions::from_mode(entry.mode))?;
-                }
-            }
-            ManifestEntryKind::Symlink => {
-                if let Some(parent) = to.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                symlink(
-                    entry
-                        .symlink_target
-                        .as_deref()
-                        .ok_or(ManagedError::InvalidPath)?,
-                    &to,
-                )?;
-            }
-        }
-    }
-    let result = snapshot_folder(expected.source_id.clone(), destination, policy)?;
-    if result.manifest_digest != expected.manifest_digest {
+    let observed = snapshot_folder(expected.source_id.clone(), &source, policy)?;
+    if observed.manifest_digest != expected.manifest_digest || observed.entries != expected.entries
+    {
         return Err(ManagedError::ExternalEdit);
     }
-    Ok(result)
+    fs::create_dir_all(destination)?;
+    let copy_result = (|| {
+        let mut copied_hardlinks = BTreeMap::<u64, PathBuf>::new();
+        for entry in &expected.entries {
+            let relative = validated_relative_path(&entry.relative_path)?;
+            let from = source.join(&relative);
+            let to = destination.join(&relative);
+            ensure_beneath(destination, &to)?;
+            match entry.kind {
+                ManifestEntryKind::Directory => fs::create_dir_all(&to)?,
+                ManifestEntryKind::File => {
+                    if let Some(parent) = to.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    if let Some(group) = entry.hardlink_group {
+                        if let Some(first) = copied_hardlinks.get(&group) {
+                            fs::hard_link(first, &to)?;
+                        } else {
+                            fs::copy(&from, &to)?;
+                            copied_hardlinks.insert(group, to.clone());
+                        }
+                    } else {
+                        fs::copy(&from, &to)?;
+                    }
+                    if policy.preserve_modes {
+                        fs::set_permissions(&to, fs::Permissions::from_mode(entry.mode))?;
+                    }
+                }
+                ManifestEntryKind::Symlink => {
+                    if let Some(parent) = to.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    let target = entry
+                        .symlink_target
+                        .as_deref()
+                        .ok_or(ManagedError::InvalidPath)?;
+                    validate_contained_symlink(&relative, target)?;
+                    symlink(target, &to)?;
+                }
+            }
+        }
+        let result = snapshot_folder(expected.source_id.clone(), destination, policy)?;
+        if result.manifest_digest != expected.manifest_digest {
+            return Err(ManagedError::ExternalEdit);
+        }
+        Ok(result)
+    })();
+    if copy_result.is_err() {
+        // A failed copy is never exposed as a usable Run Workspace.
+        let _ = fs::remove_dir_all(destination);
+    }
+    copy_result
 }
 
 pub fn diff_snapshots(
     base: &ManagedSnapshot,
     result: &ManagedSnapshot,
 ) -> Result<FileOperationManifest, ManagedError> {
+    if base.source_id != result.source_id {
+        return Err(ManagedError::SourceMismatch);
+    }
     let old: BTreeMap<_, _> = base
         .entries
         .iter()
@@ -365,7 +406,8 @@ pub fn diff_snapshots(
             )),
             (Some(before), Some(after))
                 if before.content_digest != after.content_digest
-                    || before.symlink_target != after.symlink_target =>
+                    || before.symlink_target != after.symlink_target
+                    || before.mode != after.mode =>
             {
                 operations.push(operation(
                     FileOperationKind::Modified,
@@ -395,7 +437,9 @@ pub fn diff_snapshots(
             .iter()
             .enumerate()
             .filter(|(_, candidate)| {
-                candidate.kind == FileOperationKind::Created && candidate.after_digest == digest
+                candidate.kind == FileOperationKind::Created
+                    && digest.is_some()
+                    && candidate.after_digest == digest
             })
             .map(|(i, _)| i)
             .collect();
@@ -455,6 +499,54 @@ fn excluded(path: &str, prefixes: &[String]) -> bool {
     })
 }
 
+fn validated_relative_path(value: &str) -> Result<PathBuf, ManagedError> {
+    let path = Path::new(value);
+    if value.is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                Component::ParentDir | Component::RootDir | Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ManagedError::InvalidPath);
+    }
+    Ok(path.to_path_buf())
+}
+
+fn ensure_beneath(root: &Path, candidate: &Path) -> Result<(), ManagedError> {
+    if candidate.starts_with(root) {
+        Ok(())
+    } else {
+        Err(ManagedError::InvalidPath)
+    }
+}
+
+fn validate_contained_symlink(link_path: &Path, target: &str) -> Result<(), ManagedError> {
+    let target = Path::new(target);
+    if target.is_absolute() {
+        return Err(ManagedError::SymlinkEscapesWorkspace);
+    }
+    let mut depth = link_path.parent().map_or(0usize, |parent| {
+        parent
+            .components()
+            .filter(|component| matches!(component, Component::Normal(_)))
+            .count()
+    });
+    for component in target.components() {
+        match component {
+            Component::Normal(_) => depth = depth.saturating_add(1),
+            Component::CurDir => {}
+            Component::ParentDir if depth > 0 => depth -= 1,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(ManagedError::SymlinkEscapesWorkspace);
+            }
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,5 +595,22 @@ mod tests {
         );
         fs::remove_dir_all(root).unwrap();
         fs::remove_dir_all(copy).unwrap();
+    }
+
+    #[test]
+    fn managed_copy_rejects_manifest_path_traversal_before_writing() {
+        let root = temp();
+        fs::write(root.join("a.txt"), "one").unwrap();
+        let policy = SnapshotPolicy::default();
+        let mut snapshot =
+            snapshot_folder(SourceId::parse("src_abcdefgh").unwrap(), &root, &policy).unwrap();
+        snapshot.entries[0].relative_path = "../../escape".into();
+        let copy = root.with_extension("copy-traversal");
+        assert!(matches!(
+            create_managed_copy(&root, &copy, &snapshot, &policy),
+            Err(ManagedError::ExternalEdit | ManagedError::InvalidPath)
+        ));
+        assert!(!copy.exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }

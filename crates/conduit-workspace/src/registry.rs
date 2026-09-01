@@ -92,13 +92,10 @@ impl DeviceLocationRegistry {
         if source.display_name.is_empty() || source.display_name.len() > 128 {
             return Err(RegistryError::InvalidSourceLabel);
         }
-        if self
-            .sources
-            .insert(source.source_id.clone(), source)
-            .is_some()
-        {
+        if self.sources.contains_key(&source.source_id) {
             return Err(RegistryError::SourceExists);
         }
+        self.sources.insert(source.source_id.clone(), source);
         Ok(())
     }
 
@@ -205,5 +202,19 @@ mod tests {
         .unwrap();
         assert!(!json.contains("canonical"));
         assert!(!json.contains("/home/"));
+    }
+
+    #[test]
+    fn duplicate_source_does_not_replace_existing_identity() {
+        let mut registry = DeviceLocationRegistry::default();
+        let original = source();
+        registry.register_source(original.clone()).unwrap();
+        let mut replacement = original.clone();
+        replacement.display_name = "replacement".into();
+        assert!(matches!(
+            registry.register_source(replacement),
+            Err(RegistryError::SourceExists)
+        ));
+        assert_eq!(registry.sources.get(&original.source_id), Some(&original));
     }
 }

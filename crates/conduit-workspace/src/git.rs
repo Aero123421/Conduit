@@ -1,8 +1,12 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::Read,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use conduit_crypto::{canonical_sha256, sha256_bytes};
@@ -87,6 +91,10 @@ pub enum GitError {
         operation: &'static str,
         summary: String,
     },
+    #[error("git command timed out: {0}")]
+    CommandTimedOut(&'static str),
+    #[error("git command output exceeded its bound: {0}")]
+    CommandOutputTooLarge(&'static str),
     #[error("git returned invalid UTF-8 for {0}")]
     InvalidOutput(&'static str),
     #[error("repository object format is unsupported: {0}")]
@@ -410,10 +418,10 @@ impl GitRepository {
         let attributes =
             self.optional_text(&["grep", "-Il", "filter=lfs", "--", ".gitattributes"])?;
         let tracked_paths_declared = attributes.is_some();
-        let available = Command::new("git-lfs")
-            .arg("version")
-            .output()
-            .is_ok_and(|o| o.status.success());
+        let mut lfs_version = Command::new("git-lfs");
+        lfs_version.arg("version");
+        let available = bounded_output(&mut lfs_version, "git-lfs-version")
+            .is_ok_and(|output| output.status.success());
         let objects_available = if tracked_paths_declared && available {
             Some(self.run(&["lfs", "fsck", "--objects"])?.status.success())
         } else {
@@ -468,7 +476,8 @@ impl GitRepository {
     }
 
     fn run(&self, args: &[&str]) -> Result<Output, GitError> {
-        Command::new("git")
+        let mut command = Command::new("git");
+        command
             .arg("-c")
             .arg("color.ui=false")
             .arg("-c")
@@ -477,14 +486,8 @@ impl GitRepository {
             .arg(&self.path)
             .args(args)
             .env("GIT_OPTIONAL_LOCKS", "0")
-            .output()
-            .map_err(|error| {
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    GitError::GitUnavailable
-                } else {
-                    GitError::Io(error)
-                }
-            })
+            .env("GIT_TERMINAL_PROMPT", "0");
+        bounded_output(&mut command, "git")
     }
 }
 
@@ -588,6 +591,7 @@ pub struct WorktreeLease {
 pub struct WorktreeManager {
     root: PathBuf,
     leases: BTreeMap<(RunId, SourceId), WorktreeLease>,
+    states: BTreeMap<(RunId, SourceId), LeaseJournalState>,
 }
 
 impl WorktreeManager {
@@ -595,6 +599,7 @@ impl WorktreeManager {
         fs::create_dir_all(root.as_ref())?;
         let root = fs::canonicalize(root)?;
         let mut leases = BTreeMap::new();
+        let mut states = BTreeMap::new();
         for entry in fs::read_dir(&root)? {
             let entry = entry?;
             if !entry.file_name().to_string_lossy().ends_with(".lease.json") {
@@ -602,15 +607,18 @@ impl WorktreeManager {
             }
             let journal: LeaseJournal = serde_json::from_slice(&fs::read(entry.path())?)
                 .map_err(|_| GitError::LeaseJournalCorrupt)?;
-            leases.insert(
-                (
-                    journal.lease.run_id.clone(),
-                    journal.lease.source_id.clone(),
-                ),
-                journal.lease,
+            let key = (
+                journal.lease.run_id.clone(),
+                journal.lease.source_id.clone(),
             );
+            states.insert(key.clone(), journal.state);
+            leases.insert(key, journal.lease);
         }
-        Ok(Self { root, leases })
+        Ok(Self {
+            root,
+            leases,
+            states,
+        })
     }
 
     pub fn create(
@@ -658,13 +666,14 @@ impl WorktreeManager {
             base_commit: base_commit.to_owned(),
         };
         self.persist_lease(&lease, LeaseJournalState::Reserved)?;
-        let output = Command::new("git")
-            .arg("-C")
+        let mut add = Command::new("git");
+        add.arg("-C")
             .arg(&repository.path)
             .args(["worktree", "add", "-b", &branch])
             .arg(&path)
             .arg(base_commit)
-            .output()?;
+            .env("GIT_TERMINAL_PROMPT", "0");
+        let output = bounded_output(&mut add, "worktree-add")?;
         if !output.status.success() {
             let _ = fs::remove_file(self.lease_journal_path(&lease));
             return Err(GitError::CommandFailed {
@@ -672,19 +681,21 @@ impl WorktreeManager {
                 summary: bound(&String::from_utf8_lossy(&output.stderr), 512),
             });
         }
-        let lock = Command::new("git")
+        let mut lock_command = Command::new("git");
+        lock_command
             .arg("-C")
             .arg(&repository.path)
             .args(["worktree", "lock", "--reason", "Conduit active Run"])
-            .arg(&path)
-            .output()?;
+            .arg(&path);
+        let lock = bounded_output(&mut lock_command, "worktree-lock")?;
         if !lock.status.success() {
-            let _ = Command::new("git")
+            let mut remove = Command::new("git");
+            remove
                 .arg("-C")
                 .arg(&repository.path)
                 .args(["worktree", "remove", "--force"])
-                .arg(&path)
-                .output();
+                .arg(&path);
+            let _ = bounded_output(&mut remove, "worktree-remove-after-lock-failure");
             let _ = fs::remove_file(self.lease_journal_path(&lease));
             return Err(GitError::CommandFailed {
                 operation: "worktree-lock",
@@ -693,6 +704,10 @@ impl WorktreeManager {
         }
         self.persist_lease(&lease, LeaseJournalState::Active)?;
         self.leases.insert(key, lease.clone());
+        self.states.insert(
+            (lease.run_id.clone(), lease.source_id.clone()),
+            LeaseJournalState::Active,
+        );
         Ok(lease)
     }
 
@@ -715,24 +730,26 @@ impl WorktreeManager {
         if worktree.observe()?.diagnostics.dirty {
             return Err(GitError::WorkspaceDirty);
         }
-        let unlock = Command::new("git")
+        let mut unlock_command = Command::new("git");
+        unlock_command
             .arg("-C")
             .arg(&repository.path)
             .args(["worktree", "unlock"])
-            .arg(&lease.path)
-            .output()?;
+            .arg(&lease.path);
+        let unlock = bounded_output(&mut unlock_command, "worktree-unlock")?;
         if !unlock.status.success() {
             return Err(GitError::CommandFailed {
                 operation: "worktree-unlock",
                 summary: bound(&String::from_utf8_lossy(&unlock.stderr), 512),
             });
         }
-        let remove = Command::new("git")
+        let mut remove_command = Command::new("git");
+        remove_command
             .arg("-C")
             .arg(&repository.path)
             .args(["worktree", "remove"])
-            .arg(&lease.path)
-            .output()?;
+            .arg(&lease.path);
+        let remove = bounded_output(&mut remove_command, "worktree-remove")?;
         if !remove.status.success() {
             return Err(GitError::CommandFailed {
                 operation: "worktree-remove",
@@ -741,6 +758,7 @@ impl WorktreeManager {
         }
         fs::remove_file(self.lease_journal_path(lease))?;
         self.leases.remove(&key);
+        self.states.remove(&key);
         Ok(())
     }
 
@@ -749,11 +767,46 @@ impl WorktreeManager {
             .leases
             .get(&(run_id.clone(), source_id.clone()))
             .ok_or(GitError::LeaseMissing)?;
-        if lease.path.exists() {
-            Ok(())
-        } else {
-            Err(GitError::WorktreeMissing)
+        if self.states.get(&(run_id.clone(), source_id.clone())) != Some(&LeaseJournalState::Active)
+        {
+            return Err(GitError::WorkspaceDiverged);
         }
+        if !lease.path.exists() {
+            return Err(GitError::WorktreeMissing);
+        }
+        let worktree = GitRepository::open(&lease.path)?;
+        let observed = worktree.observe()?;
+        if observed.diagnostics.branch.as_deref() != Some(lease.branch.as_str()) {
+            return Err(GitError::WorkspaceDiverged);
+        }
+        let Some(head) = observed.diagnostics.head else {
+            return Err(GitError::WorkspaceDiverged);
+        };
+        if !worktree
+            .run(&["merge-base", "--is-ancestor", &lease.base_commit, &head])?
+            .status
+            .success()
+        {
+            return Err(GitError::WorkspaceDiverged);
+        }
+        let inventory =
+            worktree.read_text("worktree-list", &["worktree", "list", "--porcelain"])?;
+        let expected_path = fs::canonicalize(&lease.path)?;
+        let expected = format!("worktree {}", expected_path.display());
+        let block = inventory
+            .split("\n\n")
+            .find(|block: &&str| block.lines().any(|line| line == expected))
+            .ok_or(GitError::WorkspaceDiverged)?;
+        if !block
+            .lines()
+            .any(|line| line == "locked" || line.starts_with("locked "))
+            || !block
+                .lines()
+                .any(|line| line == format!("branch refs/heads/{}", lease.branch))
+        {
+            return Err(GitError::WorkspaceDiverged);
+        }
+        Ok(())
     }
 
     fn lease_journal_path(&self, lease: &WorktreeLease) -> PathBuf {
@@ -786,7 +839,7 @@ impl WorktreeManager {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 enum LeaseJournalState {
     Reserved,
@@ -799,11 +852,93 @@ struct LeaseJournal {
     state: LeaseJournalState,
 }
 
+fn bounded_output(command: &mut Command, operation: &'static str) -> Result<Output, GitError> {
+    const MAX_OUTPUT_BYTES: u64 = 4 * 1024 * 1024;
+    const TIMEOUT: Duration = Duration::from_secs(30);
+    // Put each Git invocation (including hooks and helpers) in its own process group so a
+    // timeout cannot leave descendants running with inherited stdout/stderr pipes.
+    command
+        .process_group(0)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            GitError::GitUnavailable
+        } else {
+            GitError::Io(error)
+        }
+    })?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or(GitError::InvalidOutput(operation))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or(GitError::InvalidOutput(operation))?;
+    let stdout_reader = thread::spawn(move || read_output(stdout, MAX_OUTPUT_BYTES));
+    let stderr_reader = thread::spawn(move || read_output(stderr, MAX_OUTPUT_BYTES));
+    let started = Instant::now();
+    let process_group = child.id();
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if started.elapsed() >= TIMEOUT {
+            terminate_process_group(process_group);
+            let _ = child.wait();
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(GitError::CommandTimedOut(operation));
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    while !stdout_reader.is_finished() || !stderr_reader.is_finished() {
+        if started.elapsed() >= TIMEOUT {
+            terminate_process_group(process_group);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(GitError::CommandTimedOut(operation));
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let (stdout, stdout_too_large) = stdout_reader
+        .join()
+        .map_err(|_| GitError::InvalidOutput(operation))??;
+    let (stderr, stderr_too_large) = stderr_reader
+        .join()
+        .map_err(|_| GitError::InvalidOutput(operation))??;
+    if stdout_too_large || stderr_too_large {
+        return Err(GitError::CommandOutputTooLarge(operation));
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn terminate_process_group(process_group: u32) {
+    let group = format!("-{process_group}");
+    let _ = Command::new("kill").args(["-TERM", &group]).status();
+    thread::sleep(Duration::from_millis(20));
+    let _ = Command::new("kill").args(["-KILL", &group]).status();
+}
+
+fn read_output(stream: impl Read, maximum: u64) -> Result<(Vec<u8>, bool), std::io::Error> {
+    let mut bytes = Vec::new();
+    stream.take(maximum + 1).read_to_end(&mut bytes)?;
+    let too_large = bytes.len() as u64 > maximum;
+    if too_large {
+        bytes.truncate(maximum as usize);
+    }
+    Ok((bytes, too_large))
+}
+
 fn git_version() -> Result<String, GitError> {
-    let output = Command::new("git")
-        .arg("--version")
-        .output()
-        .map_err(|_| GitError::GitUnavailable)?;
+    let mut command = Command::new("git");
+    command.arg("--version");
+    let output = bounded_output(&mut command, "git-version")?;
     if !output.status.success() {
         return Err(GitError::GitUnavailable);
     }
@@ -811,12 +946,26 @@ fn git_version() -> Result<String, GitError> {
 }
 
 fn normalize_remote(value: &str) -> String {
-    let mut remote = value.trim().trim_end_matches('/').to_owned();
+    let mut remote = value
+        .trim()
+        .split(['?', '#'])
+        .next()
+        .unwrap_or_default()
+        .trim_end_matches('/')
+        .to_owned();
     if let Some(scheme) = remote.find("://") {
         let authority_start = scheme + 3;
         if let Some(at) = remote[authority_start..].find('@') {
             remote.replace_range(authority_start..authority_start + at + 1, "");
         }
+    }
+    if !remote.contains("://")
+        && let Some(at) = remote.find('@')
+        && remote[..at]
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    {
+        remote.replace_range(..=at, "");
     }
     if remote.ends_with(".git") {
         remote.truncate(remote.len() - 4);
@@ -953,6 +1102,7 @@ mod tests {
         let lease = manager
             .create(&repo, run.clone(), source.clone(), "primary", &head)
             .unwrap();
+        manager.reconcile(&run, &source).unwrap();
         assert_eq!(
             fs::read_to_string(lease.path.join("README")).unwrap(),
             "base\n"
@@ -1028,5 +1178,17 @@ mod tests {
             Err(GitError::RepositoryObjectMissing(_))
         ));
         fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn remote_normalization_removes_credentials_query_and_fragment() {
+        assert_eq!(
+            normalize_remote("https://user:secret@example.invalid/repo.git?access_token=secret#x"),
+            "https://example.invalid/repo"
+        );
+        assert_eq!(
+            normalize_remote("token@example.invalid:owner/repo.git"),
+            "example.invalid:owner/repo"
+        );
     }
 }

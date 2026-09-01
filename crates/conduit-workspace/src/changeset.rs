@@ -1,4 +1,11 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs::{self, OpenOptions},
+    io::Write,
+    os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
+};
 
 use conduit_crypto::canonical_sha256;
 use conduit_domain::{
@@ -161,7 +168,9 @@ impl SourceChange {
                 if !missing_objects.is_empty() {
                     return Err(ChangeSetError::ObjectMissing);
                 }
-                require_custody(custody_receipts)
+                let state = self.resulting_state_unchecked()?;
+                let state_digest = canonical_sha256(&state)?;
+                require_custody(self.source_id(), state_digest, custody_receipts)
             }
             Self::ManagedFolder {
                 result_snapshot_id,
@@ -184,13 +193,19 @@ impl SourceChange {
                 if *unavailable_content {
                     return Err(ChangeSetError::ObjectMissing);
                 }
-                require_custody(custody_receipts)
+                let state = self.resulting_state_unchecked()?;
+                let state_digest = canonical_sha256(&state)?;
+                require_custody(self.source_id(), state_digest, custody_receipts)
             }
         }
     }
 
     fn resulting_state(&self) -> Result<BaselineSourceState, ChangeSetError> {
         self.acceptable()?;
+        self.resulting_state_unchecked()
+    }
+
+    fn resulting_state_unchecked(&self) -> Result<BaselineSourceState, ChangeSetError> {
         Ok(match self {
             Self::Git {
                 repository_identity_digest,
@@ -293,22 +308,7 @@ impl ChangeSet {
             .source_changes
             .iter()
             .any(|change| change.acceptable().is_err());
-        #[derive(Serialize)]
-        #[serde(rename_all = "camelCase")]
-        struct DigestInput<'a> {
-            change_set_id: &'a ChangeSetId,
-            parent_baseline_id: &'a BaselineId,
-            parent_baseline_revision: u64,
-            producing_run: &'a RunId,
-            parent_change_sets: &'a [ChangeSetId],
-            supersedes: &'a Option<ChangeSetId>,
-            source_changes: &'a [SourceChange],
-            unchanged_sources: &'a [SourceId],
-            application_order: &'a [SourceId],
-            required_checks: &'a [String],
-            artifact_commitments: &'a [Sha256Digest],
-        }
-        let digest = canonical_sha256(&DigestInput {
+        let digest = change_set_digest(&DigestInput {
             change_set_id: &input.change_set_id,
             parent_baseline_id: &input.parent_baseline_id,
             parent_baseline_revision: input.parent_baseline_revision,
@@ -353,6 +353,22 @@ impl ChangeSet {
     }
 
     fn verify_acceptance(&self) -> Result<(), ChangeSetError> {
+        let recomputed = change_set_digest(&DigestInput {
+            change_set_id: &self.change_set_id,
+            parent_baseline_id: &self.parent_baseline_id,
+            parent_baseline_revision: self.parent_baseline_revision,
+            producing_run: &self.producing_run,
+            parent_change_sets: &self.parent_change_sets,
+            supersedes: &self.supersedes,
+            source_changes: &self.source_changes,
+            unchanged_sources: &self.unchanged_sources,
+            application_order: &self.application_order,
+            required_checks: &self.required_checks,
+            artifact_commitments: &self.artifact_commitments,
+        })?;
+        if recomputed != self.digest {
+            return Err(ChangeSetError::DigestMismatch);
+        }
         if self.draft {
             return Err(ChangeSetError::Draft);
         }
@@ -409,7 +425,72 @@ pub struct AcceptancePreparedReceipt {
     pub receipt_digest: Sha256Digest,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptanceFinalizedReceipt {
+    pub operation_id: OperationId,
+    pub baseline_id: BaselineId,
+    pub baseline_vector_digest: Sha256Digest,
+    pub finalized_locations: Vec<LocationId>,
+    pub device_receipts: Vec<DeviceMaterializationReceipt>,
+    pub receipt_digest: Sha256Digest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct DeviceMaterializationReceipt {
+    pub receipt_id: String,
+    pub location_id: LocationId,
+    pub device_id: DeviceId,
+    pub baseline_id: BaselineId,
+    pub baseline_vector_digest: Sha256Digest,
+    pub healthy: bool,
+}
+
+impl AcceptanceFinalizedReceipt {
+    pub fn new(
+        operation_id: OperationId,
+        baseline_id: BaselineId,
+        baseline_vector_digest: Sha256Digest,
+        mut finalized_locations: Vec<LocationId>,
+        mut device_receipts: Vec<DeviceMaterializationReceipt>,
+    ) -> Result<Self, ChangeSetError> {
+        finalized_locations.sort();
+        finalized_locations.dedup();
+        device_receipts.sort();
+        device_receipts.dedup();
+        if finalized_locations.is_empty()
+            || device_receipts.len() != finalized_locations.len()
+            || finalized_locations.iter().any(|location| {
+                !device_receipts.iter().any(|receipt| {
+                    receipt.healthy
+                        && receipt.location_id == *location
+                        && receipt.baseline_id == baseline_id
+                        && receipt.baseline_vector_digest == baseline_vector_digest
+                })
+            })
+        {
+            return Err(ChangeSetError::AcceptanceStateConflict);
+        }
+        let receipt_digest = finalization_digest(
+            &operation_id,
+            &baseline_id,
+            baseline_vector_digest,
+            &finalized_locations,
+            &device_receipts,
+        )?;
+        Ok(Self {
+            operation_id,
+            baseline_id,
+            baseline_vector_digest,
+            finalized_locations,
+            device_receipts,
+            receipt_digest,
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 enum PreparationState {
     Prepared(AcceptancePreparedReceipt),
     Committed(BaselineId),
@@ -421,6 +502,14 @@ enum PreparationState {
 pub struct AcceptanceService {
     current: BaselineRevision,
     preparations: BTreeMap<OperationId, PreparationState>,
+    journal_path: Option<PathBuf>,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AcceptanceJournal {
+    current: BaselineRevision,
+    preparations: BTreeMap<OperationId, PreparationState>,
 }
 
 impl AcceptanceService {
@@ -428,7 +517,71 @@ impl AcceptanceService {
         Self {
             current,
             preparations: BTreeMap::new(),
+            journal_path: None,
         }
+    }
+    pub fn open(
+        current: BaselineRevision,
+        journal_path: impl AsRef<Path>,
+    ) -> Result<Self, ChangeSetError> {
+        let path = journal_path.as_ref().to_path_buf();
+        if path.exists() {
+            if fs::metadata(&path)?.len() > 8 * 1024 * 1024 {
+                return Err(ChangeSetError::JournalCorrupt);
+            }
+            let journal: AcceptanceJournal = serde_json::from_slice(&fs::read(&path)?)
+                .map_err(|_| ChangeSetError::JournalCorrupt)?;
+            verify_baseline(&journal.current)?;
+            if journal.current.baseline_id != current.baseline_id
+                || journal.current.revision < current.revision
+            {
+                return Err(ChangeSetError::BaselineConflict);
+            }
+            return Ok(Self {
+                current: journal.current,
+                preparations: journal.preparations,
+                journal_path: Some(path),
+            });
+        }
+        let service = Self {
+            current,
+            preparations: BTreeMap::new(),
+            journal_path: Some(path),
+        };
+        service.persist()?;
+        Ok(service)
+    }
+
+    fn persist(&self) -> Result<(), ChangeSetError> {
+        let Some(path) = &self.journal_path else {
+            return Ok(());
+        };
+        let bytes = serde_json::to_vec(&AcceptanceJournal {
+            current: self.current.clone(),
+            preparations: self.preparations.clone(),
+        })
+        .map_err(|_| ChangeSetError::JournalCorrupt)?;
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err(ChangeSetError::JournalCorrupt);
+        }
+        let parent = path.parent().ok_or(ChangeSetError::JournalCorrupt)?;
+        fs::create_dir_all(parent)?;
+        static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+        let temporary = path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&temporary)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
     }
     pub fn current(&self) -> &BaselineRevision {
         &self.current
@@ -439,18 +592,34 @@ impl AcceptanceService {
         operation_id: OperationId,
         change_set: &ChangeSet,
         expected_digest: Sha256Digest,
+        preparation_refs: BTreeMap<SourceId, String>,
         reviews: &[Review],
         require_approval: bool,
     ) -> Result<AcceptancePreparedReceipt, ChangeSetError> {
         if change_set.digest() != expected_digest {
             return Err(ChangeSetError::DigestMismatch);
         }
+        verify_baseline(&self.current)?;
         if change_set.parent_baseline_id != self.current.baseline_id
             || change_set.parent_baseline_revision != self.current.revision
         {
             return Err(ChangeSetError::BaselineConflict);
         }
         change_set.verify_acceptance()?;
+        let expected_sources = change_set
+            .source_changes
+            .iter()
+            .map(|change| change.source_id().clone())
+            .collect::<BTreeSet<_>>();
+        if preparation_refs.keys().cloned().collect::<BTreeSet<_>>() != expected_sources
+            || preparation_refs.values().any(|reference| {
+                reference.is_empty()
+                    || reference.len() > 1_024
+                    || !reference.starts_with("refs/conduit/acceptance-prepares/")
+            })
+        {
+            return Err(ChangeSetError::AcceptanceStateConflict);
+        }
         if require_approval
             && !reviews.iter().any(|review| {
                 review.applies_to(change_set) && review.verdict == ReviewVerdict::Approved
@@ -464,44 +633,22 @@ impl AcceptanceService {
                 _ => Err(ChangeSetError::AcceptanceStateConflict),
             };
         }
-        let preparation_refs = change_set
-            .source_changes
-            .iter()
-            .map(|change| {
-                let source = change.source_id().clone();
-                let reference = format!(
-                    "refs/conduit/acceptance-prepares/{}/{source}",
-                    operation_id.as_str()
-                );
-                (source, reference)
-            })
-            .collect();
-        #[derive(Serialize)]
-        struct ReceiptCore<'a> {
-            operation: &'a OperationId,
-            change_set: &'a ChangeSetId,
-            digest: Sha256Digest,
-            baseline: &'a BaselineId,
-            revision: u64,
-        }
-        let receipt_digest = canonical_sha256(&ReceiptCore {
-            operation: &operation_id,
-            change_set: change_set.id(),
-            digest: change_set.digest(),
-            baseline: &self.current.baseline_id,
-            revision: self.current.revision,
-        })?;
-        let receipt = AcceptancePreparedReceipt {
+        let mut receipt = AcceptancePreparedReceipt {
             operation_id: operation_id.clone(),
             change_set_id: change_set.id().clone(),
             change_set_digest: change_set.digest(),
             expected_baseline_id: self.current.baseline_id.clone(),
             expected_revision: self.current.revision,
             preparation_refs,
-            receipt_digest,
+            receipt_digest: Sha256Digest::from_bytes([0; 32]),
         };
+        receipt.receipt_digest = prepared_receipt_digest(&receipt, change_set)?;
         self.preparations
             .insert(operation_id, PreparationState::Prepared(receipt.clone()));
+        if let Err(error) = self.persist() {
+            self.preparations.remove(&receipt.operation_id);
+            return Err(error);
+        }
         Ok(receipt)
     }
 
@@ -525,9 +672,11 @@ impl AcceptanceService {
         {
             return Err(ChangeSetError::BaselineConflict);
         }
+        if prepared_receipt_digest(receipt, change_set)? != receipt.receipt_digest {
+            return Err(ChangeSetError::DigestMismatch);
+        }
         match self.preparations.get(&receipt.operation_id) {
-            Some(PreparationState::Prepared(stored))
-                if stored.receipt_digest == receipt.receipt_digest => {}
+            Some(PreparationState::Prepared(stored)) if stored == receipt => {}
             _ => return Err(ChangeSetError::AcceptanceStateConflict),
         }
         let mut entries: BTreeMap<SourceId, BaselineEntry> = self
@@ -556,7 +705,11 @@ impl AcceptanceService {
             .collect();
         let next = BaselineRevision {
             baseline_id: next_baseline_id.clone(),
-            revision: self.current.revision + 1,
+            revision: self
+                .current
+                .revision
+                .checked_add(1)
+                .ok_or(ChangeSetError::BaselineConflict)?,
             predecessor: Some(self.current.baseline_id.clone()),
             entries,
             vector_digest,
@@ -566,27 +719,87 @@ impl AcceptanceService {
             accepted_at: Some(accepted_at),
             materialization,
         };
+        let previous = self.current.clone();
         self.current = next.clone();
         self.preparations.insert(
             receipt.operation_id.clone(),
             PreparationState::Committed(next_baseline_id),
         );
+        if let Err(error) = self.persist() {
+            self.current = previous;
+            self.preparations.insert(
+                receipt.operation_id.clone(),
+                PreparationState::Prepared(receipt.clone()),
+            );
+            return Err(error);
+        }
         Ok(next)
     }
 
-    pub fn finalize(&mut self, operation_id: &OperationId) -> Result<(), ChangeSetError> {
+    pub fn finalize(&mut self, receipt: &AcceptanceFinalizedReceipt) -> Result<(), ChangeSetError> {
+        if finalization_digest(
+            &receipt.operation_id,
+            &receipt.baseline_id,
+            receipt.baseline_vector_digest,
+            &receipt.finalized_locations,
+            &receipt.device_receipts,
+        )? != receipt.receipt_digest
+        {
+            return Err(ChangeSetError::DigestMismatch);
+        }
         let state = self
             .preparations
-            .get(operation_id)
+            .get(&receipt.operation_id)
             .cloned()
             .ok_or(ChangeSetError::AcceptanceStateConflict)?;
-        match state {
+        match &state {
             PreparationState::Committed(baseline) | PreparationState::Finalized(baseline) => {
-                for value in self.current.materialization.values_mut() {
+                if *baseline != receipt.baseline_id
+                    || self.current.baseline_id != receipt.baseline_id
+                    || self.current.vector_digest != receipt.baseline_vector_digest
+                {
+                    return Err(ChangeSetError::AcceptanceStateConflict);
+                }
+                if receipt.finalized_locations.iter().any(|location| {
+                    !self.current.materialization.contains_key(location)
+                        || !receipt.device_receipts.iter().any(|device_receipt| {
+                            device_receipt.healthy
+                                && device_receipt.location_id == *location
+                                && device_receipt.baseline_id == receipt.baseline_id
+                                && device_receipt.baseline_vector_digest
+                                    == receipt.baseline_vector_digest
+                        })
+                }) {
+                    return Err(ChangeSetError::AcceptanceStateConflict);
+                }
+                let previous = self.current.materialization.clone();
+                for location in &receipt.finalized_locations {
+                    let value = self
+                        .current
+                        .materialization
+                        .get_mut(location)
+                        .ok_or(ChangeSetError::AcceptanceStateConflict)?;
                     *value = MaterializationState::Finalized;
                 }
-                self.preparations
-                    .insert(operation_id.clone(), PreparationState::Finalized(baseline));
+                let fully_finalized = self
+                    .current
+                    .materialization
+                    .values()
+                    .all(|value| *value == MaterializationState::Finalized);
+                self.preparations.insert(
+                    receipt.operation_id.clone(),
+                    if fully_finalized {
+                        PreparationState::Finalized(baseline.clone())
+                    } else {
+                        PreparationState::Committed(baseline.clone())
+                    },
+                );
+                if let Err(error) = self.persist() {
+                    self.current.materialization = previous;
+                    self.preparations
+                        .insert(receipt.operation_id.clone(), state);
+                    return Err(error);
+                }
                 Ok(())
             }
             _ => Err(ChangeSetError::AcceptanceStateConflict),
@@ -594,15 +807,88 @@ impl AcceptanceService {
     }
 
     pub fn abort(&mut self, operation_id: &OperationId) -> Result<(), ChangeSetError> {
-        match self.preparations.get(operation_id) {
-            Some(PreparationState::Prepared(_)) | Some(PreparationState::Aborted) => {
+        match self.preparations.get(operation_id).cloned() {
+            Some(previous @ PreparationState::Prepared(_))
+            | Some(previous @ PreparationState::Aborted) => {
                 self.preparations
                     .insert(operation_id.clone(), PreparationState::Aborted);
+                if let Err(error) = self.persist() {
+                    self.preparations.insert(operation_id.clone(), previous);
+                    return Err(error);
+                }
                 Ok(())
             }
             _ => Err(ChangeSetError::AcceptanceStateConflict),
         }
     }
+}
+
+fn verify_baseline(baseline: &BaselineRevision) -> Result<(), ChangeSetError> {
+    let mut entries = baseline.entries.clone();
+    normalize_entries(&mut entries)?;
+    if entries != baseline.entries || canonical_sha256(&entries)? != baseline.vector_digest {
+        return Err(ChangeSetError::JournalCorrupt);
+    }
+    Ok(())
+}
+
+fn finalization_digest(
+    operation_id: &OperationId,
+    baseline_id: &BaselineId,
+    baseline_vector_digest: Sha256Digest,
+    locations: &[LocationId],
+    receipts: &[DeviceMaterializationReceipt],
+) -> Result<Sha256Digest, ChangeSetError> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Core<'a> {
+        operation_id: &'a OperationId,
+        baseline_id: &'a BaselineId,
+        baseline_vector_digest: Sha256Digest,
+        locations: &'a [LocationId],
+        device_receipts: &'a [DeviceMaterializationReceipt],
+    }
+    canonical_sha256(&Core {
+        operation_id,
+        baseline_id,
+        baseline_vector_digest,
+        locations,
+        device_receipts: receipts,
+    })
+    .map_err(Into::into)
+}
+
+fn prepared_receipt_digest(
+    receipt: &AcceptancePreparedReceipt,
+    change_set: &ChangeSet,
+) -> Result<Sha256Digest, ChangeSetError> {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Core<'a> {
+        operation_id: &'a OperationId,
+        change_set_id: &'a ChangeSetId,
+        change_set_digest: Sha256Digest,
+        expected_baseline_id: &'a BaselineId,
+        expected_revision: u64,
+        preparation_refs: &'a BTreeMap<SourceId, String>,
+        custody_receipts: Vec<&'a CustodyReceipt>,
+    }
+    let mut custody_receipts = change_set
+        .source_changes
+        .iter()
+        .flat_map(SourceChange::receipts)
+        .collect::<Vec<_>>();
+    custody_receipts.sort_by(|left, right| left.receipt_id.cmp(&right.receipt_id));
+    canonical_sha256(&Core {
+        operation_id: &receipt.operation_id,
+        change_set_id: &receipt.change_set_id,
+        change_set_digest: receipt.change_set_digest,
+        expected_baseline_id: &receipt.expected_baseline_id,
+        expected_revision: receipt.expected_revision,
+        preparation_refs: &receipt.preparation_refs,
+        custody_receipts,
+    })
+    .map_err(Into::into)
 }
 
 /// A separate effect from acceptance. Callers bind exact expected target state.
@@ -672,6 +958,10 @@ pub enum ChangeSetError {
     AcceptanceStateConflict,
     #[error("digest computation failed")]
     Digest,
+    #[error("acceptance journal is corrupt")]
+    JournalCorrupt,
+    #[error("acceptance journal filesystem operation failed: {0}")]
+    Io(String),
 }
 
 impl From<conduit_crypto::CanonicalJsonError> for ChangeSetError {
@@ -680,14 +970,61 @@ impl From<conduit_crypto::CanonicalJsonError> for ChangeSetError {
     }
 }
 
-fn require_custody(receipts: &[CustodyReceipt]) -> Result<(), ChangeSetError> {
+impl From<std::io::Error> for ChangeSetError {
+    fn from(error: std::io::Error) -> Self {
+        Self::Io(error.to_string())
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DigestInput<'a> {
+    change_set_id: &'a ChangeSetId,
+    parent_baseline_id: &'a BaselineId,
+    parent_baseline_revision: u64,
+    producing_run: &'a RunId,
+    parent_change_sets: &'a [ChangeSetId],
+    supersedes: &'a Option<ChangeSetId>,
+    source_changes: &'a [SourceChange],
+    unchanged_sources: &'a [SourceId],
+    application_order: &'a [SourceId],
+    required_checks: &'a [String],
+    artifact_commitments: &'a [Sha256Digest],
+}
+
+fn change_set_digest(input: &DigestInput<'_>) -> Result<Sha256Digest, ChangeSetError> {
+    canonical_sha256(input).map_err(Into::into)
+}
+
+fn require_custody(
+    source_id: &SourceId,
+    state_digest: Sha256Digest,
+    receipts: &[CustodyReceipt],
+) -> Result<(), ChangeSetError> {
     let healthy_ref = receipts
         .iter()
-        .any(|receipt| receipt.healthy && receipt.class == CustodyClass::DeviceRef);
+        .filter(|receipt| {
+            receipt.healthy
+                && receipt.source_id == *source_id
+                && receipt.state_digest == state_digest
+                && receipt.class == CustodyClass::DeviceRef
+        })
+        .map(|receipt| &receipt.device_id)
+        .collect::<BTreeSet<_>>();
     let healthy_archive = receipts
         .iter()
-        .any(|receipt| receipt.healthy && receipt.class == CustodyClass::DeviceArchive);
-    if healthy_ref && healthy_archive {
+        .filter(|receipt| {
+            receipt.healthy
+                && receipt.source_id == *source_id
+                && receipt.state_digest == state_digest
+                && receipt.class == CustodyClass::DeviceArchive
+        })
+        .map(|receipt| &receipt.device_id)
+        .collect::<BTreeSet<_>>();
+    if healthy_ref
+        .iter()
+        .any(|device| healthy_archive.contains(device))
+    {
         Ok(())
     } else {
         Err(ChangeSetError::CustodyInsufficient)
@@ -720,7 +1057,8 @@ mod tests {
     fn source(value: &str) -> SourceId {
         SourceId::parse(value).unwrap()
     }
-    fn custody(source_id: SourceId) -> Vec<CustodyReceipt> {
+    fn custody(source_id: SourceId, state: &BaselineSourceState) -> Vec<CustodyReceipt> {
+        let state_digest = canonical_sha256(state).unwrap();
         [CustodyClass::DeviceRef, CustodyClass::DeviceArchive]
             .into_iter()
             .enumerate()
@@ -729,28 +1067,34 @@ mod tests {
                 source_id: source_id.clone(),
                 device_id: DeviceId::parse("dev_abcdefgh").unwrap(),
                 class,
-                state_digest: digest(3),
+                state_digest,
                 healthy: true,
             })
             .collect()
     }
     fn baseline() -> BaselineRevision {
+        let state = BaselineSourceState::Git {
+            repository_identity_digest: digest(1),
+            commit: "a".repeat(40),
+            tree_digest: digest(2),
+        };
         BaselineRevision::initial(
             BaselineId::parse("bln_abcdefgh").unwrap(),
             vec![BaselineEntry {
                 source_id: source("src_abcdefgh"),
-                state: BaselineSourceState::Git {
-                    repository_identity_digest: digest(1),
-                    commit: "a".repeat(40),
-                    tree_digest: digest(2),
-                },
-                custody_receipts: custody(source("src_abcdefgh")),
+                state: state.clone(),
+                custody_receipts: custody(source("src_abcdefgh"), &state),
             }],
         )
         .unwrap()
     }
     fn proposed(id: &str) -> ChangeSet {
         let sid = source("src_abcdefgh");
+        let result_state = BaselineSourceState::Git {
+            repository_identity_digest: digest(1),
+            commit: "b".repeat(40),
+            tree_digest: digest(4),
+        };
         ChangeSet::assemble(ChangeSetInput {
             change_set_id: ChangeSetId::parse(id).unwrap(),
             parent_baseline_id: BaselineId::parse("bln_abcdefgh").unwrap(),
@@ -772,7 +1116,7 @@ mod tests {
                 conflicted: false,
                 missing_objects: vec![],
                 unresolved_untracked: vec![],
-                custody_receipts: custody(sid.clone()),
+                custody_receipts: custody(sid.clone(), &result_state),
             }],
             unchanged_sources: vec![],
             application_order: vec![sid],
@@ -781,6 +1125,24 @@ mod tests {
             artifact_commitments: vec![],
         })
         .unwrap()
+    }
+
+    fn prepared_refs(operation: &OperationId, change: &ChangeSet) -> BTreeMap<SourceId, String> {
+        change
+            .source_changes()
+            .iter()
+            .map(|source_change| {
+                let source_id = source_change.source_id().clone();
+                (
+                    source_id.clone(),
+                    format!(
+                        "refs/conduit/acceptance-prepares/{}/{}",
+                        operation.as_str(),
+                        source_id.as_str()
+                    ),
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -794,6 +1156,7 @@ mod tests {
                     OperationId::parse("op_abcdefgh").unwrap(),
                     &input,
                     input.digest(),
+                    prepared_refs(&OperationId::parse("op_abcdefgh").unwrap(), &input),
                     &[],
                     false
                 )
@@ -819,7 +1182,14 @@ mod tests {
         let mut service = AcceptanceService::new(baseline());
         let op = OperationId::parse("op_abcdefgh").unwrap();
         let receipt = service
-            .prepare(op.clone(), &change, change.digest(), &[], false)
+            .prepare(
+                op.clone(),
+                &change,
+                change.digest(),
+                prepared_refs(&op, &change),
+                &[],
+                false,
+            )
             .unwrap();
         service
             .commit(
@@ -828,7 +1198,7 @@ mod tests {
                 BaselineId::parse("bln_ijklmnop").unwrap(),
                 PrincipalId::parse("prin_abcdefgh").unwrap(),
                 UtcTimestamp::parse("2026-09-01T00:00:00Z").unwrap(),
-                vec![],
+                vec![LocationId::parse("loc_abcdefgh").unwrap()],
             )
             .unwrap();
         assert_eq!(
@@ -837,16 +1207,99 @@ mod tests {
                     OperationId::parse("op_ijklmnop").unwrap(),
                     &competing,
                     competing.digest(),
+                    prepared_refs(&OperationId::parse("op_ijklmnop").unwrap(), &competing),
                     &[],
                     false
                 )
                 .unwrap_err(),
             ChangeSetError::BaselineConflict
         );
-        service.finalize(&op).unwrap();
+        service
+            .finalize(
+                &AcceptanceFinalizedReceipt::new(
+                    op,
+                    BaselineId::parse("bln_ijklmnop").unwrap(),
+                    service.current().vector_digest,
+                    vec![LocationId::parse("loc_abcdefgh").unwrap()],
+                    vec![DeviceMaterializationReceipt {
+                        receipt_id: "device-receipt-1".into(),
+                        location_id: LocationId::parse("loc_abcdefgh").unwrap(),
+                        device_id: DeviceId::parse("dev_abcdefgh").unwrap(),
+                        baseline_id: BaselineId::parse("bln_ijklmnop").unwrap(),
+                        baseline_vector_digest: service.current().vector_digest,
+                        healthy: true,
+                    }],
+                )
+                .unwrap(),
+            )
+            .unwrap();
         assert_eq!(
             service.current().accepted_change_set.as_ref(),
             Some(change.id())
         );
+    }
+
+    #[test]
+    fn acceptance_recomputes_deserialized_change_set_digest() {
+        let mut change = proposed("chg_abcdefgh");
+        if let SourceChange::Git { head_commit, .. } = &mut change.source_changes[0] {
+            *head_commit = Some("c".repeat(40));
+        }
+        let mut service = AcceptanceService::new(baseline());
+        assert_eq!(
+            service
+                .prepare(
+                    OperationId::parse("op_abcdefgh").unwrap(),
+                    &change,
+                    change.digest(),
+                    prepared_refs(&OperationId::parse("op_abcdefgh").unwrap(), &change),
+                    &[],
+                    false,
+                )
+                .unwrap_err(),
+            ChangeSetError::DigestMismatch
+        );
+    }
+
+    #[test]
+    fn prepared_acceptance_survives_restart() {
+        let root = std::env::temp_dir().join(format!(
+            "conduit-acceptance-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        let journal = root.join("acceptance.json");
+        let change = proposed("chg_abcdefgh");
+        let operation = OperationId::parse("op_abcdefgh").unwrap();
+        let receipt = AcceptanceService::open(baseline(), &journal)
+            .unwrap()
+            .prepare(
+                operation.clone(),
+                &change,
+                change.digest(),
+                prepared_refs(&operation, &change),
+                &[],
+                false,
+            )
+            .unwrap();
+        let mut reopened = AcceptanceService::open(baseline(), &journal).unwrap();
+        assert_eq!(
+            reopened
+                .prepare(
+                    operation.clone(),
+                    &change,
+                    change.digest(),
+                    prepared_refs(&operation, &change),
+                    &[],
+                    false
+                )
+                .unwrap(),
+            receipt
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

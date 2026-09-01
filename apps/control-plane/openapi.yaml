@@ -196,7 +196,7 @@ paths:
     post:
       operationId: createConnectorPolicy
       tags: [connectors]
-      parameters: [{ $ref: "#/components/parameters/CsrfToken" }]
+      parameters: [{ $ref: "#/components/parameters/CsrfToken" }, { $ref: "#/components/parameters/IdempotencyKey" }]
       security: [{ ownerSession: [] }]
       requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/ConnectorPolicyInput" } } } }
       responses: { "201": { $ref: "#/components/responses/RevisionedSuccess" } }
@@ -221,6 +221,7 @@ paths:
         - { $ref: "#/components/parameters/GrantId" }
         - { name: action, in: path, required: true, schema: { type: string, enum: [pause, resume, revoke, reauthorize] } }
         - { $ref: "#/components/parameters/CsrfToken" }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
       security: [{ ownerSession: [] }]
       responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
   /.well-known/oauth-protected-resource:

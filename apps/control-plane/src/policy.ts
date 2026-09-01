@@ -1,6 +1,7 @@
 import { boundedString, boundedStringArray, readJsonBounded, record } from "./bounds.ts";
 import { canonicalJson, newId, nowIso, operationDigest } from "./crypto.ts";
 import { PublicError } from "./errors.ts";
+import { completeEffect, reserveEffect } from "./idempotency.ts";
 import type { AccessScope, ApprovalMode, AuthActor, ControlPlaneEnv, RuntimeKind } from "./types.ts";
 import type { LimitAdmission } from "./do/connector-limiter.ts";
 import { requireBrowserSession } from "./auth/browser.ts";
@@ -142,6 +143,9 @@ async function createRateProfile(request: Request, env: ControlPlaneEnv): Promis
 async function createPolicy(request: Request, env: ControlPlaneEnv): Promise<Response> {
   const { repo, session } = await requireBrowserSession(request, env, { csrf: true, fresh: true });
   const body = record(await readJsonBounded(request));
+  const idempotencyKey = boundedString(request.headers.get("idempotency-key"), "Idempotency-Key", 256, 16);
+  const reserved = await reserveEffect(env.DB, `connector-policy:${session.principal_id}`, idempotencyKey, await operationDigest({ create: body }));
+  if (reserved.replay !== undefined) return Response.json(reserved.replay);
   const clientId = boundedString(body.clientId, "clientId", 2048);
   const client = await env.DB.prepare("SELECT status FROM oauth_clients WHERE client_id=?1 LIMIT 1").bind(clientId).first<{ status: string }>();
   if (client?.status !== "active") throw new PublicError("client_not_registered", 400, "OAuth client is not active");
@@ -162,6 +166,7 @@ async function createPolicy(request: Request, env: ControlPlaneEnv): Promise<Res
     env.DB.prepare("INSERT INTO connector_policy_history(policy_id,revision,snapshot_json,changed_by_principal_id,change_reason,created_at) VALUES (?1,1,?2,?3,'created',?4)").bind(id, canonicalJson(snapshot), session.principal_id, now),
   ]);
   await repo.audit("connector_policy.created", { id, clientId, maxScope, approval }, session.principal_id, clientId);
+  await completeEffect(env.DB, reserved.reservation!, snapshot);
   return Response.json(snapshot, { status: 201 });
 }
 
@@ -187,12 +192,14 @@ function policyIfMatch(request: Request): number {
 
 async function updatePolicy(request: Request, env: ControlPlaneEnv, id: string): Promise<Response> {
   const { repo, session } = await requireBrowserSession(request, env, { csrf: true });
-  boundedString(request.headers.get("idempotency-key"), "Idempotency-Key", 256, 16);
+  const idempotencyKey = boundedString(request.headers.get("idempotency-key"), "Idempotency-Key", 256, 16);
   const expected = policyIfMatch(request);
+  const body = record(await readJsonBounded(request));
+  const reserved = await reserveEffect(env.DB, `connector-policy:${session.principal_id}`, idempotencyKey, await operationDigest({ id, expected, body }));
+  if (reserved.replay !== undefined) return Response.json(reserved.replay, { headers: typeof reserved.replay.revision === "number" ? { etag: `"${reserved.replay.revision}"` } : {} });
   const current = await env.DB.prepare("SELECT * FROM connector_policies WHERE id=?1 AND principal_id=?2 LIMIT 1").bind(id, session.principal_id).first<PolicyRow>();
   if (current === null) throw new PublicError("not_found", 404, "Connector policy not found");
   if (current.revision !== expected) throw new PublicError("revision_conflict", 409, "Connector policy revision is stale");
-  const body = record(await readJsonBounded(request));
   const maxScope = body.maxAccessScope === undefined ? current.max_access_scope : boundedString(body.maxAccessScope, "maxAccessScope", 32) as AccessScope;
   const approval = body.mostPermissiveApprovalMode === undefined ? current.most_permissive_approval_mode : boundedString(body.mostPermissiveApprovalMode, "mostPermissiveApprovalMode", 32) as ApprovalMode;
   if ((maxScope !== "custom" && !(maxScope in scopeRank)) || !(approval in approvalRank)) throw new PublicError("invalid_request", 400, "Policy ceiling is invalid");
@@ -215,6 +222,7 @@ async function updatePolicy(request: Request, env: ControlPlaneEnv, id: string):
   ]);
   if (results[0]?.meta.changes !== 1 || results[1]?.meta.changes !== 1) throw new PublicError("revision_conflict", 409, "Connector policy changed concurrently");
   await repo.audit("connector_policy.updated", { id, previousRevision: expected, revision, broadening }, session.principal_id, current.client_id);
+  await completeEffect(env.DB, reserved.reservation!, snapshot);
   return Response.json(snapshot, { headers: { etag: `"${revision}"` } });
 }
 

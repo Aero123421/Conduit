@@ -1,6 +1,7 @@
 import { boundedString, boundedStringArray, readJsonBounded, readTextBounded, record } from "../bounds.ts";
-import { canonicalJson, keyedHash, newId, nowIso, randomToken, sha256Hex } from "../crypto.ts";
+import { canonicalJson, keyedHash, newId, nowIso, operationDigest, randomToken, sha256Hex } from "../crypto.ts";
 import { PublicError } from "../errors.ts";
+import { completeEffect, reserveEffect } from "../idempotency.ts";
 import type { AuthActor, ControlPlaneEnv } from "../types.ts";
 import { requireBrowserSession } from "./browser.ts";
 
@@ -260,6 +261,9 @@ async function revoke(request: Request, env: ControlPlaneEnv): Promise<Response>
 
 async function changeGrantState(request: Request, env: ControlPlaneEnv, grantId: string, action: "pause" | "resume" | "revoke" | "reauthorize"): Promise<Response> {
   const { repo, session } = await requireBrowserSession(request, env, { csrf: true, fresh: action === "resume", allowRecovery: action === "revoke" || action === "reauthorize" });
+  const idempotencyKey = boundedString(request.headers.get("idempotency-key"), "Idempotency-Key", 256, 16);
+  const reserved = await reserveEffect(env.DB, `oauth-grant:${session.principal_id}`, idempotencyKey, await operationDigest({ grantId, action }));
+  if (reserved.replay !== undefined) return Response.json(reserved.replay);
   const grant = await env.DB.prepare("SELECT client_id,connector_policy_id,connector_policy_revision,status,token_family_id FROM oauth_grants WHERE id=?1 AND principal_id=?2 LIMIT 1").bind(grantId, session.principal_id).first<{ client_id: string; connector_policy_id: string; connector_policy_revision: number; status: string; token_family_id: string }>();
   if (grant === null) throw new PublicError("not_found", 404, "OAuth grant not found");
   const transitions: Record<typeof action, readonly string[]> = { pause: ["active"], resume: ["paused"], revoke: ["active", "paused", "reauthorization_required"], reauthorize: ["active", "paused"] };
@@ -275,7 +279,9 @@ async function changeGrantState(request: Request, env: ControlPlaneEnv, grantId:
   const [updated] = await env.DB.batch(statements);
   if (updated?.meta.changes !== 1) throw new PublicError("revision_conflict", 409, "OAuth grant changed concurrently");
   await repo.audit(`oauth_grant.${action}`, { grantId, previousStatus: grant.status, status }, session.principal_id, grant.client_id);
-  return Response.json({ grantId, status });
+  const response = { grantId, status };
+  await completeEffect(env.DB, reserved.reservation!, response);
+  return Response.json(response);
 }
 
 export async function authenticateBearer(request: Request, env: ControlPlaneEnv): Promise<AuthActor> {

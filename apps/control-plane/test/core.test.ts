@@ -245,6 +245,91 @@ describe.sequential("control-plane contracts", () => {
     expect(project).toMatchObject({ result: { structuredContent: { id: "prj_board_contract", name: "Board" } } });
   });
 
+  it("replays an idempotent browser grant transition without a second state change", async () => {
+    const sessionToken = "browser_grant_session_token_0000000001";
+    const csrfToken = "browser_grant_csrf_token_000000000001";
+    const now = new Date().toISOString();
+    await env.DB.prepare("INSERT INTO owner_sessions(id,principal_id,verifier_hash,csrf_hash,kind,status,authenticated_at,fresh_authenticated_at,last_activity_at,expires_at,user_verified) VALUES ('bsess_grant_contract01','prin_board_contract',?1,?2,'owner','active',?3,?3,?3,?4,1)")
+      .bind(await keyedHash("test-only-token-pepper-with-at-least-32-bytes", sessionToken), await keyedHash("test-only-token-pepper-with-at-least-32-bytes", csrfToken), now, new Date(Date.now() + 60_000).toISOString()).run();
+    const request = () => exports.default.fetch(new Request("https://conduit.example.com/api/v1/oauth/grants/grant_mcp_contract01/pause", {
+      method: "POST",
+      headers: {
+        cookie: `__Host-conduit_session=${sessionToken}`,
+        origin: "https://conduit.example.com",
+        "x-csrf-token": csrfToken,
+        "idempotency-key": "grant-transition-contract-0001",
+        "content-type": "application/json",
+      },
+      body: "{}",
+    }));
+    const first = await request();
+    expect(first.status).toBe(200);
+    await expect(first.json()).resolves.toMatchObject({ grantId: "grant_mcp_contract01", status: "paused" });
+    const replay = await request();
+    expect(replay.status).toBe(200);
+    await expect(replay.json()).resolves.toMatchObject({ grantId: "grant_mcp_contract01", status: "paused", replay: true });
+    const audit = await env.DB.prepare("SELECT COUNT(*) AS count FROM security_events WHERE event_type='oauth_grant.pause' AND principal_id='prin_board_contract'").first<{ count: number }>();
+    expect(audit?.count).toBe(1);
+  });
+
+  it("replays an exact connector-policy CAS without a second revision", async () => {
+    const request = () => exports.default.fetch(new Request("https://conduit.example.com/api/v1/connector-policies/cpol_mcp_contract01", {
+      method: "PATCH",
+      headers: {
+        cookie: "__Host-conduit_session=browser_grant_session_token_0000000001",
+        origin: "https://conduit.example.com",
+        "x-csrf-token": "browser_grant_csrf_token_000000000001",
+        "idempotency-key": "policy-transition-contract-0001",
+        "if-match": '"1"',
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ maxAccessScope: "read_only" }),
+    }));
+    const first = await request();
+    expect(first.status).toBe(200);
+    expect(first.headers.get("etag")).toBe('"2"');
+    await expect(first.json()).resolves.toMatchObject({ id: "cpol_mcp_contract01", revision: 2, maxAccessScope: "read_only" });
+    const replay = await request();
+    expect(replay.status).toBe(200);
+    expect(replay.headers.get("etag")).toBe('"2"');
+    await expect(replay.json()).resolves.toMatchObject({ id: "cpol_mcp_contract01", revision: 2, replay: true });
+    const stored = await env.DB.prepare("SELECT revision FROM connector_policies WHERE id='cpol_mcp_contract01'").first<{ revision: number }>();
+    expect(stored?.revision).toBe(2);
+  });
+
+  it("replays connector-policy creation with the original generated effect", async () => {
+    const body = {
+      id: "cpol_create_contract01",
+      clientId: "https://client.example/mcp-contract",
+      deviceSelector: { mode: "all" },
+      projectSelector: { mode: "all" },
+      allowedOperations: ["project.read"],
+      allowedRuntimes: ["native"],
+      maxAccessScope: "read_only",
+      mostPermissiveApprovalMode: "always",
+      rateLimitProfileId: "rate_mcp_contract01",
+    };
+    const request = () => exports.default.fetch(new Request("https://conduit.example.com/api/v1/connector-policies", {
+      method: "POST",
+      headers: {
+        cookie: "__Host-conduit_session=browser_grant_session_token_0000000001",
+        origin: "https://conduit.example.com",
+        "x-csrf-token": "browser_grant_csrf_token_000000000001",
+        "idempotency-key": "policy-create-contract-000001",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    }));
+    const first = await request();
+    expect(first.status).toBe(201);
+    await expect(first.json()).resolves.toMatchObject({ id: "cpol_create_contract01", revision: 1 });
+    const replay = await request();
+    expect(replay.status).toBe(200);
+    await expect(replay.json()).resolves.toMatchObject({ id: "cpol_create_contract01", revision: 1, replay: true });
+    const rows = await env.DB.prepare("SELECT COUNT(*) AS count FROM connector_policies WHERE id='cpol_create_contract01'").first<{ count: number }>();
+    expect(rows?.count).toBe(1);
+  });
+
   it("enforces limiter idempotency and digest conflicts", async () => {
     const limiter = env.CONNECTOR_LIMITERS.getByName("grant-test");
     const base = { operationId: "op_test_00000001", idempotencyKey: "same-operation", payloadDigest: "a".repeat(64), family: "commandStart", weight: 2, requestLimit: 2, windowSeconds: 60, capacity: 10, refillPerSecond: 1, responseBytes: 10, normalizedLogBytes: 0, rawLogBytes: 0, artifactUploadBytes: 0, byteLimits: { response: 1000, normalizedDaily: 1000, rawDaily: 0, artifactDaily: 0 }, nowMs: 1_788_192_000_000 };

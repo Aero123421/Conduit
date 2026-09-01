@@ -1,0 +1,82 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conduit.dev/spec/schemas/node-common-v1.schema.json",
+  "title": "Conduit node transport common types v1",
+  "$defs": {
+    "Timestamp": {"type": "string", "format": "date-time"},
+    "SafeInteger": {"type": "integer", "minimum": 0, "maximum": 9007199254740991},
+    "PositiveSafeInteger": {"type": "integer", "minimum": 1, "maximum": 9007199254740991},
+    "Sha256Hex": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "Base64Url": {"type": "string", "pattern": "^[A-Za-z0-9_-]+$", "minLength": 1, "maxLength": 16384},
+    "MessageId": {"type": "string", "pattern": "^msg_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "ConnectionId": {"type": "string", "pattern": "^conn_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "ReconciliationId": {"type": "string", "pattern": "^recon_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "DeviceId": {"type": "string", "pattern": "^dev_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "DeviceKeyId": {"type": "string", "pattern": "^dkey_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "ControlPlaneKeyId": {"type": "string", "pattern": "^cpkey_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "NodeInstanceId": {"type": "string", "pattern": "^node_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "BootId": {"type": "string", "pattern": "^boot_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "JournalGeneration": {"type": "string", "pattern": "^jgen_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "OperationId": {"type": "string", "pattern": "^op_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "ExecutionId": {"type": "string", "pattern": "^exec_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "RuntimeId": {"type": "string", "pattern": "^rt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "RunId": {"type": "string", "pattern": "^run_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "AssignmentId": {"type": "string", "pattern": "^asg_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "ProjectId": {"type": "string", "pattern": "^prj_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "SessionId": {"type": "string", "pattern": "^csess_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "SourceId": {"type": "string", "pattern": "^src_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "LocationId": {"type": "string", "pattern": "^loc_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "RecordId": {"type": "string", "pattern": "^nrec_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "PrincipalId": {"type": "string", "pattern": "^prin_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"},
+    "RuntimeKind": {"enum": ["native", "restricted_native", "container", "vm"]},
+    "AccessScope": {"enum": ["read_only", "selected_sources", "project_full", "full_user", "full_device", "custom"]},
+    "ApprovalMode": {"enum": ["always", "outside_scope", "risk_classes", "never"]},
+    "OperationState": {"enum": ["admitted", "launching", "running", "waiting_input", "waiting_approval", "finishing", "completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"]},
+    "StableError": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": {"type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$"},
+        "message": {"type": "string", "minLength": 1, "maxLength": 2048},
+        "retryable": {"type": "boolean"},
+        "details": {"type": "object", "maxProperties": 64}
+      }
+    },
+    "Signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["keyId", "algorithm", "signedDigest", "signature"],
+      "properties": {
+        "keyId": {"type": "string", "minLength": 1, "maxLength": 128},
+        "algorithm": {"const": "Ed25519"},
+        "signedDigest": {"$ref": "#/$defs/Sha256Hex"},
+        "signature": {"$ref": "#/$defs/Base64Url"}
+      }
+    },
+    "Range": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start", "end"],
+      "properties": {
+        "start": {"$ref": "#/$defs/PositiveSafeInteger"},
+        "end": {"$ref": "#/$defs/PositiveSafeInteger"}
+      }
+    },
+    "AuthenticatedHeader": {
+      "type": "object",
+      "required": ["schemaVersion", "protocol", "type", "messageId", "connectionId", "connectionEpoch", "sequence", "sentAt", "payload"],
+      "properties": {
+        "schemaVersion": {"const": 1},
+        "protocol": {"const": "conduit.node/1"},
+        "type": {"type": "string"},
+        "messageId": {"$ref": "#/$defs/MessageId"},
+        "connectionId": {"$ref": "#/$defs/ConnectionId"},
+        "connectionEpoch": {"$ref": "#/$defs/PositiveSafeInteger"},
+        "sequence": {"$ref": "#/$defs/PositiveSafeInteger"},
+        "sentAt": {"$ref": "#/$defs/Timestamp"},
+        "payload": {}
+      }
+    }
+  }
+}

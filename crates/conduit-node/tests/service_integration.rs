@@ -23,6 +23,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
+    time::{Duration, Instant},
 };
 use tempfile::tempdir;
 
@@ -38,6 +39,17 @@ fn run(command: &mut Command) {
         "command failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn wait_adapter(child: &mut AdapterChild) -> std::process::ExitStatus {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return status;
+        }
+        assert!(Instant::now() < deadline, "adapter fixture did not exit");
+        std::thread::sleep(Duration::from_millis(5));
+    }
 }
 
 fn repository(path: &Path) -> (String, Sha256Digest) {
@@ -237,7 +249,7 @@ fn structured_agent_fixture_completes_without_inference_and_crash_is_visible() {
         let (_, events) = driver.on_record(&record).unwrap();
         kinds.extend(events.into_iter().map(|event| event.kind));
     }
-    let status = child.try_wait().unwrap().unwrap();
+    let status = wait_adapter(&mut child);
     assert!(status.success());
     assert!(kinds.contains(&AdapterEventKind::AssistantMessageDelta));
     assert!(kinds.contains(&AdapterEventKind::Completed));
@@ -246,7 +258,7 @@ fn structured_agent_fixture_completes_without_inference_and_crash_is_visible() {
     let (spec, _) = AdapterCatalog::launch(AdapterKind::Pi, &request).unwrap();
     let mut crashed = AdapterChild::spawn(&spec).unwrap();
     assert!(crashed.read_record().unwrap().is_none());
-    assert_eq!(crashed.try_wait().unwrap().unwrap().code(), Some(17));
+    assert_eq!(wait_adapter(&mut crashed).code(), Some(17));
     match prior {
         Some(path) => unsafe { std::env::set_var("PATH", path) },
         None => unsafe { std::env::remove_var("PATH") },

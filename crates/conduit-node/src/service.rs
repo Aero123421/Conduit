@@ -744,15 +744,15 @@ impl NodeService {
         {
             let run_id = run_id.as_str().ok_or(TransportError::Malformed)?;
             let operation_id = self
-                .active
-                .values()
-                .find(|active| active.run_id == run_id)
-                .map(|active| active.operation_id.clone())
-                .or_else(|| {
-                    self.agents
-                        .values()
-                        .find(|agent| agent.run_id == run_id)
-                        .map(|agent| agent.operation_id.clone())
+                .node
+                .store()
+                .admissions()?
+                .into_iter()
+                .find_map(|admission| {
+                    serde_json::from_slice::<RuntimeRequest>(&admission.runtime_request)
+                        .ok()
+                        .filter(|runtime| runtime.run_id == run_id)
+                        .map(|_| admission.operation.operation_id)
                 })
                 .ok_or_else(|| ServiceError::Unavailable("quarantine_run_unavailable".into()))?;
             self.reconcile_cancel(client, &operation_id, true)?;
@@ -1649,31 +1649,38 @@ impl NodeService {
         quarantine: bool,
     ) -> Result<(), ServiceError> {
         let (key, run_id, request_digest, current) = if let Some(active) =
-            self.active.remove(operation_id)
+            self.active.get(operation_id)
         {
-            let _ = self.node.signal_runtime(
-                &active.provider_id,
-                &active.handle,
-                if quarantine {
-                    conduit_runtime::RuntimeSignal::ForceStop
-                } else {
-                    conduit_runtime::RuntimeSignal::GracefulStop
-                },
-            );
+            self.stop_reconciled_runtime(&active.provider_id, &active.handle, quarantine)?;
+            let active = self
+                .active
+                .remove(operation_id)
+                .expect("runtime was present while it was stopped");
             (
                 active.key,
                 active.run_id,
                 active.request_digest,
                 active.journal_state,
             )
-        } else if let Some(mut agent) = self.agents.remove(operation_id) {
-            let status = agent
-                .child
-                .terminate()
-                .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+        } else if self.agents.contains_key(operation_id) {
+            let (runtime_id, status) = {
+                let agent = self
+                    .agents
+                    .get_mut(operation_id)
+                    .expect("agent was present while it was stopped");
+                let status = agent
+                    .child
+                    .terminate()
+                    .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                (agent.runtime_id.clone(), status)
+            };
             self.supervisor
-                .mark_external_stopped(&agent.runtime_id, status.code())
+                .mark_external_stopped(&runtime_id, status.code())
                 .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+            let agent = self
+                .agents
+                .remove(operation_id)
+                .expect("agent was present after it was stopped");
             (
                 agent.key,
                 agent.run_id,
@@ -1693,9 +1700,18 @@ impl NodeService {
                     .map_err(|_| TransportError::Malformed)?;
                 return self.replay_run_status(client, &runtime.run_id);
             }
-            return Err(ServiceError::Unavailable(
-                "cancel_operation_custody_unavailable".into(),
-            ));
+            let runtime: RuntimeRequest = serde_json::from_slice(&admission.runtime_request)
+                .map_err(|_| TransportError::Malformed)?;
+            if admission.operation.state != OperationState::Admitted {
+                let handle = self.node.runtime_handle(&admission)?;
+                self.stop_reconciled_runtime(&admission.provider_id, &handle, quarantine)?;
+            }
+            (
+                admission.operation.idempotency_key,
+                runtime.run_id,
+                admission.operation.request_digest,
+                admission.operation.state,
+            )
         };
         let terminal = if quarantine {
             OperationState::RecoveryRequired
@@ -1728,6 +1744,71 @@ impl NodeService {
             0,
         )?;
         Ok(())
+    }
+
+    fn stop_reconciled_runtime(
+        &self,
+        provider_id: &str,
+        handle: &RuntimeHandle,
+        quarantine: bool,
+    ) -> Result<(), ServiceError> {
+        let first_signal = if quarantine {
+            conduit_runtime::RuntimeSignal::ForceStop
+        } else {
+            conduit_runtime::RuntimeSignal::GracefulStop
+        };
+        self.node
+            .signal_runtime(provider_id, handle, first_signal)
+            .map_err(|error| {
+                ServiceError::Unavailable(format!("runtime_stop_unconfirmed:{error}"))
+            })?;
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let receipt = self
+                .node
+                .inspect_runtime(provider_id, handle)
+                .map_err(|error| {
+                    ServiceError::Unavailable(format!("runtime_stop_unconfirmed:{error}"))
+                })?;
+            if matches!(
+                receipt.state,
+                RuntimeState::Stopped | RuntimeState::Failed | RuntimeState::Lost
+            ) {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if !quarantine {
+            self.node
+                .signal_runtime(
+                    provider_id,
+                    handle,
+                    conduit_runtime::RuntimeSignal::ForceStop,
+                )
+                .map_err(|error| {
+                    ServiceError::Unavailable(format!("runtime_force_stop_unconfirmed:{error}"))
+                })?;
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                let receipt = self
+                    .node
+                    .inspect_runtime(provider_id, handle)
+                    .map_err(|error| {
+                        ServiceError::Unavailable(format!("runtime_force_stop_unconfirmed:{error}"))
+                    })?;
+                if matches!(
+                    receipt.state,
+                    RuntimeState::Stopped | RuntimeState::Failed | RuntimeState::Lost
+                ) {
+                    return Ok(());
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+        Err(ServiceError::Unavailable("runtime_stop_unconfirmed".into()))
     }
 
     fn verify_terminal_confirmations(&self, confirmations: &[Value]) -> Result<(), ServiceError> {

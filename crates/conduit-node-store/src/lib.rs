@@ -158,10 +158,16 @@ impl OperationState {
                     Self::Admitted | Self::Rejected | Self::Expired
                 ) | (
                     Self::Admitted,
-                    Self::Starting | Self::Cancelled | Self::Expired
+                    Self::Starting | Self::Cancelled | Self::RecoveryRequired | Self::Expired
                 ) | (
                     Self::Starting,
-                    Self::Running | Self::Failed | Self::TimedOut | Self::Lost | Self::Uncertain
+                    Self::Running
+                        | Self::Failed
+                        | Self::Cancelled
+                        | Self::TimedOut
+                        | Self::Lost
+                        | Self::Uncertain
+                        | Self::RecoveryRequired
                 ) | (
                     Self::Running,
                     Self::WaitingInput
@@ -174,7 +180,12 @@ impl OperationState {
                         | Self::RecoveryRequired
                 ) | (
                     Self::WaitingInput | Self::WaitingApproval,
-                    Self::Running | Self::Cancelled | Self::TimedOut | Self::Lost | Self::Uncertain
+                    Self::Running
+                        | Self::Cancelled
+                        | Self::TimedOut
+                        | Self::Lost
+                        | Self::Uncertain
+                        | Self::RecoveryRequired
                 ) | (
                     Self::Finishing,
                     Self::Completed
@@ -1121,6 +1132,21 @@ mod tests {
     fn digest(b: u8) -> String {
         format!("{b:02x}").repeat(32)
     }
+    #[test]
+    fn reconciliation_can_terminalize_every_pre_terminal_custody_state() {
+        for state in [
+            OperationState::Admitted,
+            OperationState::Starting,
+            OperationState::Running,
+            OperationState::WaitingInput,
+            OperationState::WaitingApproval,
+            OperationState::Finishing,
+        ] {
+            assert!(state.permits(OperationState::Cancelled), "{state:?}");
+            assert!(state.permits(OperationState::RecoveryRequired), "{state:?}");
+        }
+    }
+
     #[test]
     fn exact_once_survives_reopen_and_conflicts() {
         let d = tempdir().unwrap();

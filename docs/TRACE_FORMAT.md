@@ -18,87 +18,91 @@ It covers:
 
 Collection begins with the first executable Linux Native run. The dashboard and evaluation screens may be implemented later.
 
-## Records
+## Record classes
 
 A run produces five record classes.
 
-### Run manifest
+### Run Manifest
 
 One immutable record written after node admission and before runtime or agent start.
 
-The manifest records what was authorized and the exact local inputs known at the start boundary. Later observations do not mutate it.
+It records what was authorized and the exact local inputs known at the start boundary. Later observations do not mutate it.
 
-### Context snapshot
+### Context Snapshot
 
-One immutable record for each initial prompt, follow-up, steer, or resumed turn.
+One immutable record for each initial prompt, answer, follow-up, steer, or resumed turn.
 
 It records the selected Project and Board revisions, references, content digests, and compilation policy. Prompt text is not required in the trace.
 
-### Normalized event
+### Normalized Event
 
 An ordered, bounded device-origin event. Events record observed activity and provider output without requiring vendor-private protocol data.
 
-### Content object
+### Content Object
 
-An immutable local object referenced by a manifest or event when content is too large, binary, separately permissioned, or retained under another policy.
+An immutable local object referenced when content is too large, binary, separately permissioned, or retained under another policy.
 
-### Segment descriptor
+### Segment Descriptor
 
 Metadata for a finalized compressed group of raw stream records or exportable normalized events.
 
-## Immutable run manifest
+## Immutable Run Manifest
 
 The manifest is committed before any runtime start request.
 
-If an executable, source revision, runtime configuration, access decision, or other authority-bound field changes after the manifest is committed, the run does not silently update the manifest. It fails preflight or creates a new run.
-
-Fields are grouped below.
+If an executable, source revision, runtime configuration, access decision, or other authority-bound field changes after commit, the run fails preflight or a new run is created. The manifest is not silently amended.
 
 ### Identity
 
-- manifest schema version
-- manifest ID and digest
-- run ID
-- assignment ID, when present
-- project and collaboration-session IDs, when present
+- schema version
+- Manifest ID and digest
+- Run ID
+- Assignment ID, when present
+- Project and Collaboration Session IDs, when present
 - operation ID and request digest
-- idempotency key digest, not the plaintext key where a digest is sufficient
-- actor principal
-- calling client
+- idempotency-key digest
+- actor principal and calling client
 - Project Agent, when present
 - creation and admission timestamps
 
 ### Device
 
-- device ID
-- device display label
-- node version
-- node protocol version
+- Device ID and bounded display label
+- node version and node-protocol version
 - operating system and architecture
 - node boot ID
 - capability digest
-- selected local policy revision
-- configured storage profile revision
+- local-policy revision
+- storage-profile revision
 
 ### Runtime
 
 - runtime kind and provider ID
-- provider version and capability receipt digest
-- runtime configuration revision
-- selected host identity or guest identity class
+- provider version and capability-receipt digest
+- runtime-configuration revision
+- selected host or guest identity class
 - requested CPU, memory, GPU, storage, and network mode
-- effective isolation claims as individual capabilities
-- environment image, template, or snapshot digest where applicable
+- effective isolation capabilities
+- image, template, or snapshot digest where applicable
 
-The manifest does not write “sandboxed” as a boolean. It records evidence such as filesystem restriction, process-user separation, network namespace, container boundary, VM boundary, elevation availability, and host socket exposure.
+The manifest does not use one `sandboxed` boolean. It records individual capabilities such as:
+
+- distinct operating-system identity
+- filesystem restriction
+- process namespace
+- network isolation
+- container boundary
+- VM boundary
+- elevation availability
+- host control-socket exposure
 
 ### Authority
 
 - requested and effective access scope
 - requested and effective approval mode
 - Connector Policy ID and revision
-- Project policy revision
-- Device policy revision
+- Project-policy revision
+- Device-policy revision
 - approved risk classes or pre-authorizations
 - operation expiry and admitted validity duration
 
@@ -113,17 +117,17 @@ For each Source binding:
 - base commit
 - branch and upstream observations
 - initial dirty-state digest and bounded summary
-- submodule, LFS, sparse-checkout, or partial-clone observations
+- submodule, LFS, sparse-checkout, and partial-clone observations
 - filesystem snapshot or explicit unknown state for non-Git folders
 - bounded display path and opaque device-local path reference
 
 Canonical paths remain device-local.
 
-### Agent adapter
+### Agent Adapter
 
 When an agent is used:
 
-- adapter ID and adapter contract version
+- Adapter ID and contract version
 - adapter implementation version
 - executable identity
 - wrapper and interpreter identities where applicable
@@ -131,35 +135,34 @@ When an agent is used:
 - requested model and effort
 - effective model and effort, when known before start
 - authentication state and evidence source
-- supported capability receipt
+- supported-capability receipt
 - launch-plan digest
 - tool-catalog digest
 - provider-native session mode requested
 
-Executable identity may include file identity, file hash, package identity, and canonical device-local reference. The trace does not expose a private absolute path to the control plane.
+Executable identity can include file identity, file hash, package identity, and an opaque device-local path reference. A private absolute path is not sent to the control plane.
 
 ### Project and Board context
 
 - Project Context revision
 - Collaboration Session revision
 - Assignment Message revision
-- selected Board message IDs
+- selected Board Message IDs
 - selected Artifact and Change Set IDs
 - Context Compiler version and configuration digest
 - context size and item counts
-- capture policy for compiled context
+- context capture policy
 
 ### Instruction catalog
 
-The manifest records files Conduit discovered before agent start. Actual provider loading remains a later event unless the adapter has authoritative pre-start evidence.
+The manifest records instruction files discovered before agent start. Actual provider loading is a later event unless the adapter has authoritative pre-start evidence.
 
 For each item:
 
 - instruction ID
-- kind, such as `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, or adapter-specific equivalent
+- kind such as `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, or an adapter-specific equivalent
 - opaque path reference and bounded display path
-- content digest
-- byte length
+- content digest and byte length
 - discovery source
 - directory scope
 - precedence index
@@ -170,29 +173,29 @@ For each item:
 The manifest also records:
 
 - configured discovery filenames
-- configured per-file or aggregate byte limits
+- configured per-file and aggregate byte limits
 - discovered total bytes
 - discovery errors
 
-For Codex, discovery order matters because guidance is layered and loaded when the run or session starts. Conduit retains the order and truncation evidence rather than only a boolean stating that an `AGENTS.md` existed. citeturn890288search1turn890288search28turn890288search31
+For Codex, discovery order and truncation are retained because guidance is layered when a run or session starts.
 
 ### Skill catalog
 
-For each available skill:
+For each available Skill:
 
 - stable Skill ID
-- parsed Skill name
+- parsed name
 - description digest
 - `SKILL.md` digest and byte length
 - source and version metadata
-- compatibility metadata digest
+- compatibility-metadata digest
 - hashes of referenced scripts, references, templates, or resources where practical
 - discovery scope
 - eligible adapters
-- eligibility state for this run, when determined before start
+- eligibility state for the run, when determined before start
 - catalog position or precedence
 
-The Agent Skills format requires a `SKILL.md` with `name` and `description` metadata and can bundle scripts and other resources. Conduit records the skill as a versioned package rather than treating its name as sufficient identity. citeturn890288search0turn890288search4turn890288search20
+A Skill is identified by package content and version, not only by its name.
 
 ### Capture and retention
 
@@ -203,7 +206,7 @@ The Agent Skills format requires a `SKILL.md` with `name` and `description` meta
 - permitted local raw streams
 - permitted uploads
 - maximum inline payload
-- maximum object and segment sizes
+- maximum Content Object and Segment sizes
 
 ### Evaluation tags
 
@@ -216,27 +219,27 @@ Optional fields:
 - expected checks
 - comparison group
 
-These are explicit experiment labels. Conduit does not infer a controlled experiment from ordinary production runs.
+These are explicit labels. Ordinary production runs are not presented as controlled experiments.
 
-## Context snapshot
+## Context Snapshot
 
-Each user or orchestrator input that may change agent behavior gets a Context Snapshot.
+Each input that may change agent behavior gets a Context Snapshot.
 
 Required fields:
 
 - Context Snapshot ID and digest
-- run ID
+- Run ID
 - turn or input operation ID
-- input mode: initial, answer, follow-up, steer, resume, or queued instruction
+- mode: initial, answer, follow-up, steer, resume, or queued instruction
 - expected controller epoch
 - Project Context revision
 - Collaboration Session revision
-- selected message and artifact references
-- instruction and skill catalog digests
+- selected Message and Artifact references
+- instruction- and Skill-catalog digests
 - Context Compiler version
 - ordered item manifest
 - compiled byte and token estimates where available
-- capture and redaction policy
+- capture and redaction policies
 - final compiled-content digest
 
 Each item states:
@@ -244,34 +247,33 @@ Each item states:
 - item type
 - source record ID and revision
 - precedence
-- content digest
-- byte length
+- content digest and byte length
 - included, summarized, referenced, omitted, or unavailable
 - omission or summarization reason
 - sensitivity class
 
-The compiled prompt body is retained only when capture policy permits it. Its digest is always retained when compilation succeeded.
+The compiled prompt body is retained only when policy permits it. Its digest is retained when compilation succeeds.
 
-A later Board message is not automatically part of a running agent's context. It appears only in a new Context Snapshot created by a typed input operation.
+A later Board Message is not automatically injected into a running agent. It appears only in a new Context Snapshot created by a typed input operation.
 
 ## Event producer and order
 
-The normalized event stream in `conduit.node/1` is device-origin and has one persistent sequence per run.
+The normalized event stream in `conduit.node/1` is device-origin and has one persistent sequence per Run.
 
-The device allocates the sequence before committing the event. Sequence values are unsigned 64-bit integers serialized as decimal strings.
+The device allocates a sequence before committing the event. Sequence values are unsigned 64-bit integers serialized as decimal strings.
 
-Control-plane audit and collaboration events remain separate records. The UI may merge them by causal references and timestamps but does not claim one total order across device and control-plane clocks.
+Control-plane audit and collaboration events remain separate. The UI can merge them by causal references and timestamps but does not claim one total order across device and control-plane clocks.
 
-Device event order is authoritative for local activity. Wall-clock timestamps are observations, not ordering authority.
+Device sequence is authoritative for local activity. Wall-clock timestamps are observations.
 
 ## Event envelope
 
 Every event contains:
 
 - schema version
-- event ID
-- run ID
-- device ID
+- Event ID
+- Run ID
+- Device ID
 - device event sequence
 - event type
 - source component
@@ -279,25 +281,25 @@ Every event contains:
 - optional monotonic time since node boot
 - node boot ID
 - correlation ID
-- parent event or span ID
-- trace ID and span ID where applicable
+- parent Event or Span ID
+- Trace ID and Span ID where applicable
 - evidence level
 - sensitivity class
 - retention class
-- payload or content reference
+- payload or Content Object reference
 - payload digest
 - previous chain hash
-- event chain hash
+- event-chain hash
 
 The control plane adds ingestion metadata outside the committed device event:
 
 - receive time
 - ingestion attempt
 - DeviceRoom sequence
-- queue-delivery identity
+- Queue-delivery identity
 - D1 projection state
 
-Control-plane receive data does not change the device event digest.
+Ingestion metadata does not change the device Event digest.
 
 ## Evidence levels
 
@@ -307,19 +309,19 @@ A documented provider or Conduit component emitted an unambiguous record.
 
 Examples:
 
-- Codex returned a correlated `turn/start` response
-- the test process exited zero
+- Codex returned a correlated prompt-admission response
+- a test process exited zero
 - Git returned a commit ID
 - an adapter emitted a documented Skill invocation event
 
 ### Observed
 
-Conduit observed a concrete local action or state but the provider did not label its intent.
+Conduit observed a concrete local action or state, but the provider did not label its intent.
 
 Examples:
 
 - the agent process opened a `SKILL.md`
-- a skill script executable was invoked
+- a Skill script executable ran
 - a file changed
 - a process existed with a matching birth identity
 
@@ -330,13 +332,13 @@ Conduit derived a likely interpretation from incomplete evidence.
 Examples:
 
 - behavior resembled a Skill procedure
-- a provider event likely represented a subagent but lacked a documented identifier
+- a provider event likely represented a subagent without a documented identifier
 
-Inferred evidence is never promoted to explicit use in reports.
+Inferred evidence is never reported as explicit use.
 
 ### Unknown
 
-The adapter or environment does not provide enough evidence.
+The adapter or environment did not expose enough evidence.
 
 Unknown is retained rather than converted to false.
 
@@ -345,11 +347,11 @@ Unknown is retained rather than converted to false.
 - `public`: safe for ordinary exported examples
 - `metadata`: identifiers, versions, counts, hashes, and bounded labels
 - `project_content`: visible messages, diffs, filenames, test text, and source-derived content
-- `raw_log`: terminal or provider protocol content
-- `credential_reference`: non-secret reference to a credential source or status
-- `secret`: material detected or declared secret; never placed in normal events
+- `raw_log`: terminal or provider-protocol content
+- `credential_reference`: a non-secret reference to credential source or status
+- `secret`: detected or declared secret material
 
-A `secret` payload is not serialized into an event. The event contains a redaction record and, where safe, a non-reversible digest generated with a deployment-specific keyed hash.
+A `secret` payload is not serialized into a normalized event. The event contains a redaction record and, where useful, a non-reversible keyed digest.
 
 ## Retention classes
 
@@ -361,23 +363,23 @@ A `secret` payload is not serialized into an event. The event contains a redacti
 - security and policy decisions
 - source and runtime commitments
 - Change Set and verification commitments
-- explicit uncertainty and recovery records
+- uncertainty and recovery records
 
-R0 is not silently discarded while the associated run identity or control-plane idempotency tombstone is retained.
+R0 is not silently discarded while the associated Run identity or control-plane idempotency tombstone is retained.
 
 ### R1: normalized evidence
 
 - completed visible agent messages
-- tool calls and results
-- command summaries
-- file and Git events
+- Tool Calls and results
+- Command summaries
+- File and Git events
 - test results
 - Artifact metadata
 - instruction and Skill evidence
 
 ### R2: compactable progress
 
-- streaming text deltas after a complete visible message exists
+- streaming text deltas after a complete message exists
 - repeated status notifications
 - high-frequency resource samples
 - duplicate provider progress
@@ -386,15 +388,15 @@ R0 is not silently discarded while the associated run identity or control-plane 
 
 - raw terminal streams
 - raw provider protocol
-- full command output
+- full Command output
 - full prompts or completions
 - screenshots, video, and large binary evidence
 
-R3 uses separate permission, storage, retention, and export paths.
+R3 has separate permission, storage, retention, and export paths.
 
-## Core event registry
+## Core Event registry
 
-The first schema permits namespaced future events, but these core types have fixed meaning.
+The schema permits namespaced future Events. These core names have fixed meaning.
 
 ### Run and workspace
 
@@ -446,7 +448,7 @@ The first schema permits namespaced future events, but these core types have fix
 - `instruction.effective_set`
 - `instruction.violation_observed`
 
-A provider's claimed loading event can be explicit. Filesystem discovery alone is observed discovery, not proof that the model used the instruction.
+Filesystem discovery is not proof that a model used the instruction.
 
 ### Skills
 
@@ -459,7 +461,7 @@ A provider's claimed loading event can be explicit. Filesystem discovery alone i
 - `skill.script_completed`
 - `skill.behavior_inferred`
 
-Skill activation quality depends heavily on the `description` used for routing. Conduit retains the description digest and distinguishes discovery, triggering, and output quality so that description changes can be evaluated separately. citeturn890288search17turn890288search23
+Discovery, routing, loading, procedure adherence, and output quality are measured separately.
 
 ### Subagents
 
@@ -480,7 +482,7 @@ A vendor thread or subprocess is not labeled a subagent without explicit or obse
 - `command.completed`
 - `command.failed`
 
-Tool arguments and command output follow capture and redaction policy. The exact execution commitment is retained even when visible arguments are redacted.
+Tool arguments and Command output follow capture and redaction policy. The exact execution commitment is retained even when visible arguments are redacted.
 
 ### Files, Git, and tests
 
@@ -495,9 +497,9 @@ Tool arguments and command output follow capture and redaction policy. The exact
 - `test.started`
 - `test.completed`
 
-File content is not required in the event. Path references, change type, before/after digests, sizes, and Artifact references are sufficient for metadata-only capture.
+File content is not required in the Event. Path references, change type, before/after digests, sizes, and Artifact references are sufficient for metadata-only capture.
 
-### Approval, policy, and artifacts
+### Approval, policy, and Artifacts
 
 - `approval.requested`
 - `approval.resolved`
@@ -511,46 +513,44 @@ File content is not required in the event. Path references, change type, before/
 
 ## Agent messages
 
-Visible assistant output has two event forms.
+Visible assistant output has two Event forms.
 
-`agent.message_delta` is R2 and may be compacted after a complete message is available.
+`agent.message_delta` is R2 and can be compacted after a complete message is available.
 
 `agent.message_completed` contains:
 
-- provider message ID, when available
+- provider Message ID, when available
 - role
-- bounded visible text or content reference
+- bounded visible text or Content Object reference
 - visible-content digest
 - finish status
-- provider event evidence
+- provider-event evidence
 - Board Message ID when published
 
-Provider-private reasoning is not mapped into visible messages, tool text, or synthetic summaries. If an adapter suppresses a private provider event, it may record a metadata-only count and provider event type without content.
+Provider-private reasoning is not mapped into visible messages, Tool text, or synthetic summaries. An adapter can record a metadata-only suppression count and provider Event type without content.
 
-## Tool and command correlation
+## Tool and Command correlation
 
-A Tool Call, Command, and provider event can represent the same causal operation. Conduit keeps separate IDs and links them.
-
-Example:
+A Tool Call, Command, and provider Event can represent the same causal operation. Conduit keeps separate IDs and links them.
 
 ```text
 tool_call_id    tool_...
 command_id      cmd_...
 provider_id     vendor call ID
-parent_span_id  agent turn span
+parent_span_id  Agent Turn span
 ```
 
-A tool result does not prove a file or external effect occurred. File, Git, test, and Artifact observations remain separate evidence.
+A Tool result does not prove a File or external effect occurred. File, Git, test, and Artifact observations remain separate evidence.
 
 ## Agent claims and verification
 
-An agent can report completion, a test result, or a changed file. Such text is a claim.
+Agent prose is a claim. Observed evidence is stored separately.
 
-Conduit records separately:
+Conduit distinguishes:
 
 - agent-reported claims
 - observed filesystem and Git state
-- observed commands and exits
+- observed Commands and exits
 - retained test reports
 - independent verification checks
 - human acceptance
@@ -568,54 +568,52 @@ Assignment acceptance policy references verification checks. It does not parse s
 
 ## Instruction effectiveness
 
-Instruction reports require both relevance and evidence.
-
-For each rule or file, Conduit can report:
+Instruction reports can record:
 
 - discovered
 - selected by provider discovery rules
 - loaded with explicit or observed evidence
 - truncated or shadowed
-- relevant to a run according to a labeled evaluation or rule detector
+- relevant to a labeled evaluation or rule detector
 - followed
 - violated
 - unable to determine
 
-A file that was discovered but not relevant is not counted as a successful or failed instruction.
+A discovered but irrelevant file is not counted as successful or failed guidance.
 
-When instruction files contain stable rule identifiers such as `AG-TEST-001`, Conduit can link a check directly to a rule. Without identifiers, comparison remains file- or section-level.
+Stable rule identifiers such as `AG-TEST-001` allow checks to link directly to a rule. Without identifiers, comparison remains file- or section-level.
 
 ## Skill effectiveness
 
 Skill reports preserve these separate questions:
 
-1. Was the Skill present in the catalog?
+1. Was the Skill present?
 2. Was it eligible for the adapter and task?
 3. Was it triggered?
 4. Was `SKILL.md` loaded?
 5. Was a bundled script or resource used?
 6. Was the documented procedure followed?
 7. Did verification improve?
-8. Did runtime, token use, retries, or errors change?
+8. Did runtime, usage, retries, or errors change?
 
-Only explicit provider events or observed resource access are strong use evidence. Similar output is inference.
+Only explicit provider Events or observed resource access are strong use evidence. Similar output is inference.
 
-Controlled Skill evaluation uses clean runs with matched source, context, environment, adapter, model, effort, access, and verification. The Agent Skills guidance likewise recommends clean contexts for eval runs so prior state does not contaminate the result. citeturn890288search23
+Controlled evaluation uses clean Runs with matched source, context, environment, adapter, model, effort, access, and verification.
 
 ## Event digest and chain
 
 Conduit uses RFC 8785 JSON Canonicalization Scheme for JSON digests.
 
-`payloadDigest` is SHA-256 of canonical payload JSON or the referenced plaintext content.
+`payloadDigest` is SHA-256 of canonical payload JSON or referenced plaintext content.
 
-`eventDigest` is SHA-256 of the canonical event core excluding:
+`eventDigest` is SHA-256 of canonical Event core excluding:
 
 - `eventDigest`
 - `previousChainHash`
 - `chainHash`
 - control-plane ingestion metadata
 
-The event chain is:
+The chain is:
 
 ```text
 chain[0] = SHA256("conduit.event-chain.v1\n" + manifestDigest)
@@ -626,13 +624,13 @@ chain[n] = SHA256(
 )
 ```
 
-A chain proves ordered device commitment, not that a full-access administrator could not alter local software before an event was generated.
+This proves ordered device commitment. It does not prove that a full-host administrator could not modify local software before an Event was generated.
 
-The node periodically sends event-range commitments to the control plane. Stronger tamper evidence requires those commitments to leave the device before a full-host administrator can rewrite local data.
+The node periodically sends Event-range commitments to the control plane. Stronger tamper evidence requires commitments to leave the Device before a full-host administrator can rewrite local data.
 
-## Normalized event storage
+## Normalized Event storage
 
-The first node implementation stores normalized events in SQLite.
+The first node implementation stores normalized Events in SQLite.
 
 Logical tables:
 
@@ -646,54 +644,52 @@ trace_cursor_generation
 retention_state
 ```
 
-Writing an event and advancing the run's last committed sequence is one transaction.
+Writing an Event and advancing the Run's last committed sequence is one transaction.
 
 Requirements:
 
 - WAL or another crash-safe transactional mode
-- foreign keys and uniqueness on `(run_id, sequence)` and event ID
-- duplicate event accepted only when digest matches
-- event JSON bounded to 65,536 bytes
+- foreign keys and uniqueness on `(run_id, sequence)` and Event ID
+- duplicate accepted only when digest matches
+- Event JSON bounded to 65,536 bytes
 - inline payload bounded to 8,192 bytes
-- content above the inline limit stored by immutable reference
-- terminal receipt and event-chain state committed together
+- larger content stored by immutable reference
+- terminal receipt and chain state committed together
 - schema migrations versioned and fail closed when incompatible
 
-A database integrity failure affecting R0 records prevents new effectful work. A recoverable R2 index failure may degrade observability without claiming complete traces.
+A database integrity failure affecting R0 records prevents new effectful work. A recoverable R2 index failure can degrade observability without claiming a complete trace.
 
-## Content objects
+## Content Objects
 
-A Content Object descriptor records:
+A descriptor records:
 
-- object ID
-- owning run
+- Object ID and owning Run
 - content kind
 - sensitivity and retention class
 - compression
 - uncompressed and stored byte lengths
-- plaintext SHA-256
-- stored-object SHA-256
+- plaintext and stored-object SHA-256
 - encryption and redaction metadata
 - storage provider and opaque locator
 - creation and expiry times
 
-The initial maximum uncompressed Content Object is 8 MiB. Larger output is split into ordered objects or retained as an Artifact.
+The initial maximum uncompressed Content Object is 8 MiB. Larger output is split into ordered Objects or retained as an Artifact.
 
-Default compression is Zstandard for text, JSON, and raw streams when compression reduces size. Already compressed media may remain uncompressed.
+Default compression is Zstandard for text, JSON, and raw streams when it reduces size. Already compressed media can remain uncompressed.
 
-Objects are immutable. Replacing content creates another object ID.
+Objects are immutable. Replacing content creates another Object ID.
 
-## Raw stream segments
+## Raw stream Segments
 
-Raw terminal and provider protocol streams are not stored as event payloads.
+Raw terminal and provider-protocol streams are not Event payloads.
 
-The node writes length-prefixed raw records into an active segment. Each record contains stream ID, local sequence, monotonic time, direction, byte length, and bytes.
+The node writes length-prefixed records into an active Segment. Each record contains Stream ID, local sequence, monotonic time, direction, byte length, and bytes.
 
-A segment finalizes when any configured limit is reached, including:
+A Segment finalizes when any configured limit is reached, including:
 
 - 4 MiB uncompressed data
 - 60 seconds of activity
-- run terminal state
+- Run terminal state
 - explicit flush
 
 Finalization:
@@ -704,35 +700,35 @@ Finalization:
 4. calculate stored-object digest
 5. atomically publish the final object
 6. commit the Segment Descriptor in SQLite
-7. remove the partial file only after the descriptor is durable
+7. remove the partial file after the descriptor is durable
 
-A crash can leave a `.partial` segment. Recovery validates complete records, truncates only an incomplete final record, finalizes the valid prefix, and records a gap if bytes were lost.
+A crash can leave a `.partial` Segment. Recovery validates complete records, truncates only an incomplete final record, finalizes the valid prefix, and records a gap if bytes were lost.
 
-Raw protocol records use a different stream from terminal bytes. Access to one does not imply access to the other.
+Raw provider protocol and terminal bytes use different Streams. Access to one does not imply access to the other.
 
 ## Cursor paging
 
 Trace and log APIs return bounded pages.
 
-The cursor is opaque to clients and binds:
+The opaque cursor binds:
 
-- device ID
-- run ID
-- stream or event provider
+- Device ID
+- Run ID
+- Stream or Event provider
 - next sequence or byte position
 - store generation
 - query filters
 - capture-policy revision
 
-The node signs or MACs the cursor. A cursor cannot be substituted across runs, streams, or filter sets.
+The node signs or MACs the cursor. It cannot be substituted across Runs, Streams, or filter sets.
 
-A stale store generation returns `cursor_stale` with the nearest safe restart position. It does not restart at the beginning without telling the client.
+A stale store generation returns `cursor_stale` with the nearest safe restart position. It does not restart at the beginning silently.
 
 Page limits apply to:
 
 - record count
 - decoded JSON bytes
-- referenced content bytes
+- referenced-content bytes
 - response bytes
 
 MCP and dashboard callers never receive an unbounded trace in one response.
@@ -752,15 +748,15 @@ Possible states:
 - local_store_unavailable
 - upload_incomplete
 
-A corrupted R3 raw segment does not erase normalized R0/R1 evidence. A corrupted R0 manifest or terminal receipt places the run and node journal in recovery-required state.
+A corrupted R3 Segment does not erase normalized R0/R1 evidence. A corrupted R0 Manifest or terminal receipt places the Run and node journal in recovery-required state.
 
-When an event sequence range is unavailable, the node sends `event.gap` as defined in `docs/NODE_PROTOCOL.md`.
+When an Event sequence range is unavailable, the node sends `event.gap` as defined in `docs/NODE_PROTOCOL.md`.
 
 ## Redaction
 
 Redaction occurs before normalized payload persistence and before upload.
 
-Redaction inputs include:
+Inputs include:
 
 - declared secret fields from typed operations
 - adapter-specific credential patterns
@@ -768,17 +764,17 @@ Redaction inputs include:
 - known token formats
 - user-defined patterns
 
-The raw local stream may exist under a separate permission and retention policy. Normalized events do not depend on keeping raw secret content.
+The raw local Stream can exist under a separate permission and retention policy. Normalized Events do not depend on keeping raw secret content.
 
 A redaction record contains:
 
-- redaction rule ID and version
+- rule ID and version
 - field or content class
 - replacement category
 - optional keyed digest
 - evidence level
 
-The redaction log never contains the removed plaintext.
+It never contains removed plaintext.
 
 ## Cloud placement
 
@@ -786,33 +782,31 @@ The control plane stores:
 
 - Run Manifest metadata and digest
 - Context Snapshot metadata and digest
-- latest run phase and terminal receipt
-- selected R0/R1 normalized events needed for Board, approvals, Artifacts, and verification
-- event-range commitments and gap state
-- indexes for search and reports
-- optional uploaded object descriptors
+- latest Run phase and terminal receipt
+- selected R0/R1 Events needed for Board, approvals, Artifacts, and verification
+- Event-range commitments and gap state
+- search and report indexes
+- optional uploaded Object descriptors
 
-The device stores the authoritative complete normalized stream and local raw content until retention or explicit export changes custody.
+The Device stores the authoritative complete normalized Stream and local raw content until retention or explicit export changes custody.
 
-High-frequency R2 events are aggregated before D1 storage. Optional R1/R3 objects may be uploaded to R2 under a separate permission and byte budget.
+High-frequency R2 Events are aggregated before D1 storage. Optional R1/R3 Objects can be uploaded to R2 under a separate permission and byte budget.
 
-Cloudflare Queues can ingest normalized event batches after `DeviceRoom` has durable custody. Queue retry does not create another Conduit event.
+Cloudflare Queues can ingest normalized Event batches after `DeviceRoom` has durable custody. Queue retry does not create another Conduit Event.
 
 ## OpenTelemetry export
 
 The internal schema does not depend on OpenTelemetry.
 
-An exporter maps Conduit records to current semantic conventions where compatible:
+An exporter maps Conduit records to current conventions where compatible:
 
-- one Run or Agent Turn can map to a trace or span hierarchy
-- model request and usage fields map to `gen_ai.*` attributes where stable
-- Tool and Command operations map to child spans or events
-- approvals and handoffs use Conduit namespaced attributes when no stable convention exists
+- a Run or Agent Turn can map to a Trace or Span hierarchy
+- model request and usage fields map to stable `gen_ai.*` attributes
+- Tool and Command operations map to child Spans or Events
+- approvals and handoffs use Conduit-namespaced attributes where no stable convention exists
 - content export remains opt-in
 
-OpenTelemetry's GenAI conventions are evolving and have moved between specification locations. Keeping a versioned Conduit schema avoids changing durable local records whenever export conventions move. citeturn890288search2turn890288search3turn890288search15turn890288search22
-
-The export records:
+The exporter records:
 
 - Conduit schema version
 - exporter version
@@ -825,63 +819,63 @@ Export does not add content that the Conduit capture policy did not retain.
 
 Derived metrics include:
 
-- assignment-to-admission duration
+- Assignment-to-admission duration
 - admission-to-runtime-start duration
-- agent-open and prompt-acceptance duration
-- time to first visible message
+- Agent-open and prompt-acceptance duration
+- time to first visible Message
 - time to first meaningful Tool or Command action
 - working, approval-wait, input-wait, and verification durations
 - total runtime
 - Tool and Command counts and failure counts
-- file and Git change counts
+- File and Git change counts
 - test outcomes
 - retry and abandoned-attempt counts
 - provider token or usage data when explicitly available
 - local and uploaded bytes by retention class
 - CPU, memory, GPU, and storage observations where supported
 
-Missing provider usage remains unknown. It is not estimated from message text unless the report is clearly labeled estimated.
+Missing provider usage remains unknown. It is not estimated from Message text unless labeled estimated.
 
 ## Comparison safeguards
 
-A comparison groups runs only after recording:
+A comparison records:
 
-- assignment or benchmark case
+- Assignment or benchmark case
 - source snapshot and base commit
 - Project and Session context revisions
 - runtime and environment revision
-- device and resource class
-- adapter and executable version
+- Device and resource class
+- Adapter and executable version
 - model and effort
 - access and approval policies
 - instruction and Skill catalog digests
 - verification policy
 
-Ordinary production correlation is labeled observational. A causal claim requires a controlled or matched evaluation design.
+Production correlation is labeled observational. A causal claim requires a controlled or matched evaluation design.
 
 ## Required deterministic tests
 
-1. manifest committed before runtime start
+1. Manifest committed before runtime start
 2. executable or source revision changes after preflight
-3. duplicate event sequence with same digest
-4. duplicate event sequence with different digest
-5. event gap and later valid range
-6. event payload above inline limit
-7. object above maximum split into ordered references
-8. crash during raw segment append
-9. crash between segment publish and SQLite descriptor commit
-10. corrupted compressed segment
-11. cursor substitution across runs
+3. duplicate Event sequence with same digest
+4. duplicate Event sequence with different digest
+5. Event gap and later valid range
+6. Event payload above inline limit
+7. Object above maximum split into ordered references
+8. crash during raw Segment append
+9. crash between Segment publish and SQLite descriptor commit
+10. corrupted compressed Segment
+11. cursor substitution across Runs
 12. stale cursor after retention compaction
 13. secret in Tool arguments and Command output
-14. unknown provider event followed by valid provider events
-15. private-reasoning provider event suppression
+14. unknown provider Event followed by valid provider Events
+15. private-reasoning Event suppression
 16. instruction discovered but not provably loaded
 17. instruction truncation and precedence
 18. Skill discovered, triggered, loaded, resource used, and inferred-only cases
-19. agent claims tests passed but observed test failed
-20. Node disconnect before event commitment upload
-21. Queue delivers the same event batch twice
+19. Agent claims tests passed but observed test failed
+20. Node disconnect before Event commitment upload
+21. Queue delivers the same Event batch twice
 22. OpenTelemetry exporter omits unretained content
 
 ## References

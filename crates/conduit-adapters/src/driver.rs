@@ -95,7 +95,17 @@ impl ProtocolDriver {
                 } else {
                     AdapterState::Ready
                 };
-                Ok(Vec::new())
+                match (self.kind, self.prompt.as_deref()) {
+                    (AdapterKind::ClaudeCode, Some(prompt)) => {
+                        Ok(vec![ProtocolFrame::json(&json!({
+                            "type": "user",
+                            "message": {"role": "user", "content": prompt},
+                            "parent_tool_use_id": null,
+                            "session_id": self.requested_session_id
+                        }))?])
+                    }
+                    _ => Ok(Vec::new()),
+                }
             }
             _ => Err(AdapterError::UnexpectedResponse {
                 phase: self.phase_name(),

@@ -1,8 +1,12 @@
 use std::{
     env, fs,
+    io::Read,
     os::unix::fs::PermissionsExt,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use conduit_core::CapabilityState;
@@ -37,6 +41,24 @@ impl AdapterProfile {
             support: SupportLevel::Degraded,
             evidence: evidence.to_owned(),
         };
+        if self.kind == AdapterKind::Agy {
+            return Operation::ALL
+                .into_iter()
+                .map(|operation| AdapterCapability {
+                    operation,
+                    support: if matches!(
+                        operation,
+                        Operation::Discover | Operation::Probe | Operation::Capability
+                    ) {
+                        SupportLevel::Degraded
+                    } else {
+                        SupportLevel::Unavailable
+                    },
+                    evidence: "no installed or independently verified Agy structured CLI protocol"
+                        .to_owned(),
+                })
+                .collect();
+        }
         let mut values = vec![
             supported(Operation::Discover, "PATH executable identity"),
             supported(Operation::Probe, "bounded --version invocation"),
@@ -92,21 +114,7 @@ impl AdapterProfile {
                 supported(Operation::FollowUp, "stream-json input or --resume"),
                 supported(Operation::Resume, "--resume native session ID"),
             ]),
-            AdapterKind::Agy => values.extend([
-                degraded(
-                    Operation::ModelDiscovery,
-                    "no installed/verified model-list protocol",
-                ),
-                degraded(Operation::Steer, "no verified structured steer operation"),
-                degraded(
-                    Operation::FollowUp,
-                    "new one-shot process only; native resume not verified",
-                ),
-                degraded(
-                    Operation::Resume,
-                    "native resume not verified by installed CLI",
-                ),
-            ]),
+            AdapterKind::Agy => unreachable!("Agy capabilities return above"),
         }
         values.sort_by_key(|capability| capability.operation as u8);
         values
@@ -194,6 +202,13 @@ impl AdapterCatalog {
         request: &LaunchRequest,
     ) -> Result<(LaunchSpec, ProtocolDriver), AdapterError> {
         validate_launch_request(request)?;
+        if kind == AdapterKind::Agy {
+            return Err(AdapterError::UnsupportedOperation {
+                adapter: kind,
+                operation: AdapterOperation::Open,
+                reason: "Agy structured CLI behavior is not independently verified",
+            });
+        }
         let profile = Self::profile(kind);
         let executable = find_executable(profile.executable)
             .ok_or(AdapterError::ExecutableUnavailable(profile.executable))?;
@@ -224,11 +239,11 @@ fn launch_args(kind: AdapterKind, request: &LaunchRequest) -> Result<Vec<String>
         AdapterKind::ClaudeCode => {
             let mut args = vec![
                 "-p".to_owned(),
-                prompt.unwrap_or_default().to_owned(),
                 "--input-format".to_owned(),
                 "stream-json".to_owned(),
                 "--output-format".to_owned(),
                 "stream-json".to_owned(),
+                "--replay-user-messages".to_owned(),
                 "--verbose".to_owned(),
             ];
             if let Some(session_id) = request.native_session_id.as_deref() {
@@ -302,15 +317,50 @@ fn executable_file(path: &Path) -> bool {
 }
 
 fn bounded_version(path: &Path, args: &[&str]) -> Result<String, AdapterError> {
-    let output = Command::new(path).args(args).output()?;
-    if !output.status.success() {
+    let mut command = Command::new(path);
+    command
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().ok_or(AdapterError::InvalidExecutable)?;
+    let stderr = child.stderr.take().ok_or(AdapterError::InvalidExecutable)?;
+    let read_bounded = |stream: Box<dyn Read + Send>| {
+        thread::spawn(move || {
+            let mut bytes = Vec::with_capacity(MAX_VERSION_OUTPUT_BYTES.min(4096));
+            stream
+                .take((MAX_VERSION_OUTPUT_BYTES + 1) as u64)
+                .read_to_end(&mut bytes)
+                .map(|_| bytes)
+        })
+    };
+    let stdout_reader = read_bounded(Box::new(stdout));
+    let stderr_reader = read_bounded(Box::new(stderr));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            terminate_process_group(&mut child);
+            let _ = stdout_reader.join();
+            let _ = stderr_reader.join();
+            return Err(AdapterError::VersionProbeTimeout);
+        }
+        thread::sleep(Duration::from_millis(10));
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| AdapterError::InvalidExecutable)??;
+    let stderr = stderr_reader
+        .join()
+        .map_err(|_| AdapterError::InvalidExecutable)??;
+    if !status.success() {
         return Err(AdapterError::InvalidExecutable);
     }
-    let bytes = if output.stdout.is_empty() {
-        &output.stderr
-    } else {
-        &output.stdout
-    };
+    let bytes = if stdout.is_empty() { &stderr } else { &stdout };
     if bytes.len() > MAX_VERSION_OUTPUT_BYTES {
         return Err(AdapterError::FrameTooLarge {
             actual: bytes.len(),
@@ -325,6 +375,15 @@ fn bounded_version(path: &Path, args: &[&str]) -> Result<String, AdapterError> {
     Ok(version)
 }
 
+fn terminate_process_group(child: &mut std::process::Child) {
+    let process_group = -(child.id() as i32);
+    // SAFETY: the child was created as the leader of its own process group.
+    unsafe {
+        libc::kill(process_group, libc::SIGKILL);
+    }
+    let _ = child.wait();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,10 +393,19 @@ mod tests {
         for kind in AdapterKind::ALL {
             let profile = AdapterCatalog::profile(kind);
             assert!(!profile.executable.is_empty());
-            assert!(profile.capabilities().iter().any(|capability| {
-                capability.operation == AdapterOperation::Open
-                    && capability.support == SupportLevel::Supported
-            }));
+            let open = profile
+                .capabilities()
+                .into_iter()
+                .find(|capability| capability.operation == AdapterOperation::Open)
+                .unwrap();
+            assert_eq!(
+                open.support,
+                if kind == AdapterKind::Agy {
+                    SupportLevel::Unavailable
+                } else {
+                    SupportLevel::Supported
+                }
+            );
         }
     }
 
@@ -348,6 +416,40 @@ mod tests {
             .into_iter()
             .find(|value| value.operation == AdapterOperation::Resume)
             .unwrap();
-        assert_eq!(capability.support, SupportLevel::Degraded);
+        assert_eq!(capability.support, SupportLevel::Unavailable);
+    }
+
+    #[test]
+    fn claude_prompt_is_never_exposed_in_process_arguments() {
+        let request = LaunchRequest {
+            cwd: PathBuf::from("/tmp"),
+            prompt: Some("private prompt".to_owned()),
+            native_session_id: None,
+            model: None,
+            effort: None,
+            session_data_dir: None,
+        };
+        let args = launch_args(AdapterKind::ClaudeCode, &request).unwrap();
+        assert!(!args.iter().any(|argument| argument == "private prompt"));
+        let mut driver = ProtocolDriver::new(AdapterKind::ClaudeCode, &request).unwrap();
+        let frames = driver.start().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert!(String::from_utf8_lossy(&frames[0].0).contains("private prompt"));
+    }
+
+    #[test]
+    fn agy_launch_fails_closed_without_a_verified_protocol() {
+        let request = LaunchRequest {
+            cwd: PathBuf::from("/tmp"),
+            prompt: Some("hello".to_owned()),
+            native_session_id: None,
+            model: None,
+            effort: None,
+            session_data_dir: None,
+        };
+        assert!(matches!(
+            AdapterCatalog::launch(AdapterKind::Agy, &request),
+            Err(AdapterError::UnsupportedOperation { .. })
+        ));
     }
 }

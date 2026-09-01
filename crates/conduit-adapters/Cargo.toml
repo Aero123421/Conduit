@@ -8,6 +8,7 @@ repository.workspace = true
 
 [dependencies]
 conduit-core = { path = "../conduit-core" }
+libc = "0.2.177"
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

@@ -77,6 +77,25 @@ pub enum AdapterOperation {
     Close,
 }
 
+impl AdapterOperation {
+    pub const ALL: [Self; 14] = [
+        Self::Discover,
+        Self::Probe,
+        Self::Capability,
+        Self::AuthenticationStatus,
+        Self::ModelDiscovery,
+        Self::Open,
+        Self::Send,
+        Self::Steer,
+        Self::FollowUp,
+        Self::Resume,
+        Self::Cancel,
+        Self::State,
+        Self::Replay,
+        Self::Close,
+    ];
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AdapterCapability {
@@ -212,6 +231,8 @@ pub enum AdapterError {
     ExecutableUnavailable(&'static str),
     #[error("adapter path is not an executable file")]
     InvalidExecutable,
+    #[error("adapter version probe exceeded its 3 second deadline")]
+    VersionProbeTimeout,
     #[error("working directory must be absolute")]
     RelativeWorkingDirectory,
     #[error("session data directory must be absolute")]

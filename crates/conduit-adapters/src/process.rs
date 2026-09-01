@@ -1,7 +1,9 @@
 use std::{
-    io::{BufRead, BufReader, Write},
+    io::{BufRead, BufReader, Read, Write},
     os::unix::process::CommandExt,
     process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
 };
 
 use crate::{
@@ -18,6 +20,7 @@ pub struct AdapterChild {
     child: Child,
     stdin: Option<ChildStdin>,
     stdout: BufReader<ChildStdout>,
+    stderr_drain: Option<JoinHandle<()>>,
 }
 
 impl AdapterChild {
@@ -28,18 +31,31 @@ impl AdapterChild {
             .current_dir(&spec.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::inherit());
+            .stderr(Stdio::piped());
         command.process_group(0);
         let mut child = command.spawn()?;
         let stdin = child.stdin.take().ok_or(AdapterError::InvalidExecutable)?;
         let stdout = child.stdout.take().ok_or(AdapterError::InvalidExecutable)?;
+        let mut stderr = child.stderr.take().ok_or(AdapterError::InvalidExecutable)?;
+        let stderr_drain = thread::spawn(move || {
+            let mut buffer = [0_u8; 8 * 1024];
+            while let Ok(read) = stderr.read(&mut buffer) {
+                if read == 0 {
+                    break;
+                }
+            }
+        });
         let mut adapter = Self {
             child,
             stdin: Some(stdin),
             stdout: BufReader::new(stdout),
+            stderr_drain: Some(stderr_drain),
         };
         for frame in &spec.initial_frames {
             adapter.write(frame)?;
+        }
+        if matches!(spec.protocol, crate::AdapterProtocol::ClaudeStreamJson) {
+            adapter.close_stdin();
         }
         Ok(adapter)
     }
@@ -109,10 +125,30 @@ impl AdapterChild {
     pub fn terminate(&mut self) -> Result<std::process::ExitStatus, AdapterError> {
         self.stdin.take();
         if let Some(status) = self.child.try_wait()? {
+            self.join_stderr();
             return Ok(status);
         }
-        self.child.kill()?;
-        self.child.wait().map_err(AdapterError::from)
+        signal_group(self.child.id(), libc::SIGTERM);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(status) = self.child.try_wait()? {
+                self.join_stderr();
+                return Ok(status);
+            }
+            if Instant::now() >= deadline {
+                signal_group(self.child.id(), libc::SIGKILL);
+                let status = self.child.wait()?;
+                self.join_stderr();
+                return Ok(status);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn join_stderr(&mut self) {
+        if let Some(thread) = self.stderr_drain.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -120,9 +156,18 @@ impl Drop for AdapterChild {
     fn drop(&mut self) {
         self.stdin.take();
         if self.child.try_wait().ok().flatten().is_none() {
-            let _ = self.child.kill();
+            signal_group(self.child.id(), libc::SIGKILL);
             let _ = self.child.wait();
         }
+        self.join_stderr();
+    }
+}
+
+fn signal_group(pid: u32, signal: i32) {
+    // SAFETY: AdapterChild creates the child as a process-group leader and the
+    // negative PID therefore targets only that supervised adapter group.
+    unsafe {
+        libc::kill(-(pid as i32), signal);
     }
 }
 

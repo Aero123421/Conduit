@@ -568,6 +568,15 @@ impl ProtocolDriver {
                     return Ok(outcome);
                 }
                 if let Some(existing) = self.pending_codex_approvals.get(&key) {
+                    let existing_method = existing.method;
+                    let existing_params_digest = existing.params_digest.clone();
+                    let same_commitment =
+                        existing_method == method && existing_params_digest == params_digest;
+                    if !same_commitment {
+                        self.pending_codex_approvals.remove(&key);
+                        self.phase = Phase::Terminal;
+                        self.state = AdapterState::Failed;
+                    }
                     return Ok((
                         Vec::new(),
                         vec![AdapterEvent::bounded(
@@ -575,15 +584,16 @@ impl ProtocolDriver {
                             method,
                             self.native_session_id(),
                             Some(&correlation_id),
-                            Some(
-                                "duplicate outstanding server request id was ignored; original request remains pending",
-                            ),
+                            Some(if same_commitment {
+                                "exact duplicate outstanding server request id was ignored; original request remains pending"
+                            } else {
+                                "outstanding server request id was reused with a changed commitment; the adapter failed without responding"
+                            }),
                             Some(json!({
-                                "existingMethod": existing.method,
-                                "existingParametersDigest": existing.params_digest,
+                                "existingMethod": existing_method,
+                                "existingParametersDigest": existing_params_digest,
                                 "duplicateParametersDigest": params_digest,
-                                "sameCommitment": existing.method == method
-                                    && existing.params_digest == params_digest
+                                "sameCommitment": same_commitment
                             })),
                         )],
                     ));
@@ -1236,6 +1246,15 @@ impl ProtocolDriver {
                 if let Some(pending) = self.pending_acp_permission.as_ref()
                     && server_request_key(&pending.request_id).as_deref() == Some(key.as_str())
                 {
+                    let existing_method = pending.method;
+                    let existing_params_digest = pending.params_digest.clone();
+                    let same_commitment =
+                        existing_method == method && existing_params_digest == params_digest;
+                    if !same_commitment {
+                        self.pending_acp_permission.take();
+                        self.phase = Phase::Terminal;
+                        self.state = AdapterState::Failed;
+                    }
                     return Ok((
                         Vec::new(),
                         vec![AdapterEvent::bounded(
@@ -1243,15 +1262,16 @@ impl ProtocolDriver {
                             method,
                             self.native_session_id(),
                             Some(&correlation_id),
-                            Some(
-                                "duplicate outstanding ACP permission id was ignored; original request remains pending",
-                            ),
+                            Some(if same_commitment {
+                                "exact duplicate outstanding ACP permission id was ignored; original request remains pending"
+                            } else {
+                                "outstanding ACP permission id was reused with a changed commitment; the adapter failed without responding"
+                            }),
                             Some(json!({
-                                "existingMethod": pending.method,
-                                "existingParametersDigest": pending.params_digest,
+                                "existingMethod": existing_method,
+                                "existingParametersDigest": existing_params_digest,
                                 "duplicateParametersDigest": params_digest,
-                                "sameCommitment": pending.method == method
-                                    && pending.params_digest == params_digest
+                                "sameCommitment": same_commitment
                             })),
                         )],
                     ));
@@ -1411,10 +1431,30 @@ impl ProtocolDriver {
             }
             Phase::AcpSession if id.as_deref() == Some("2") => {
                 let result = require_result(value, self.phase_name())?;
-                let session_id = result
-                    .get("sessionId")
-                    .and_then(Value::as_str)
-                    .or(self.requested_session_id.as_deref())
+                let response_session_id = result.get("sessionId").and_then(Value::as_str);
+                if let Some(requested_session_id) = self.requested_session_id.as_deref()
+                    && response_session_id.is_some_and(|observed| observed != requested_session_id)
+                {
+                    self.phase = Phase::Terminal;
+                    self.state = AdapterState::Failed;
+                    return Ok((
+                        Vec::new(),
+                        vec![AdapterEvent::bounded(
+                            AdapterEventKind::AdapterError,
+                            "session/load",
+                            Some(requested_session_id),
+                            id.as_deref(),
+                            Some(
+                                "ACP session/load response attempted to replace the requested session binding",
+                            ),
+                            Some(json!({"observedSessionId": response_session_id})),
+                        )],
+                    ));
+                }
+                let session_id = self
+                    .requested_session_id
+                    .as_deref()
+                    .or(response_session_id)
                     .ok_or(AdapterError::UnexpectedResponse {
                         phase: self.phase_name(),
                         reason: "ACP session response omitted sessionId",
@@ -1481,6 +1521,20 @@ impl ProtocolDriver {
                 None,
                 Some("unrecognized bounded ACP notification"),
                 None,
+            )];
+        }
+        let expected_session_id = self.native_session_id().map(str::to_owned);
+        let observed_session_id = value.pointer("/params/sessionId").and_then(Value::as_str);
+        if expected_session_id.as_deref() != observed_session_id {
+            self.phase = Phase::Terminal;
+            self.state = AdapterState::Failed;
+            return vec![AdapterEvent::bounded(
+                AdapterEventKind::AdapterError,
+                method,
+                expected_session_id.as_deref(),
+                None,
+                Some("ACP session/update did not match the active session binding"),
+                Some(json!({"observedSessionId": observed_session_id})),
             )];
         }
         let update = value.pointer("/params/update");
@@ -1554,6 +1608,15 @@ impl ProtocolDriver {
                 if let Some(pending) = self.pending_pi_dialog.as_ref()
                     && server_request_key(&pending.request_id).as_deref() == Some(key)
                 {
+                    let existing_method = pending.method.clone();
+                    let existing_params_digest = pending.params_digest.clone();
+                    let same_commitment =
+                        existing_method == method && existing_params_digest == params_digest;
+                    if !same_commitment {
+                        self.pending_pi_dialog.take();
+                        self.phase = Phase::Terminal;
+                        self.state = AdapterState::Failed;
+                    }
                     return Ok((
                         Vec::new(),
                         vec![AdapterEvent::bounded(
@@ -1561,15 +1624,16 @@ impl ProtocolDriver {
                             &format!("extension_ui_request.{method}"),
                             self.native_session_id(),
                             Some(correlation_id),
-                            Some(
-                                "duplicate outstanding Pi UI request id was ignored; original dialog remains pending",
-                            ),
+                            Some(if same_commitment {
+                                "exact duplicate outstanding Pi UI request id was ignored; original dialog remains pending"
+                            } else {
+                                "outstanding Pi UI request id was reused with a changed commitment; the adapter failed without responding"
+                            }),
                             Some(json!({
-                                "existingMethod": pending.method,
-                                "existingParametersDigest": pending.params_digest,
+                                "existingMethod": existing_method,
+                                "existingParametersDigest": existing_params_digest,
                                 "duplicateParametersDigest": params_digest,
-                                "sameCommitment": pending.method == method
-                                    && pending.params_digest == params_digest
+                                "sameCommitment": same_commitment
                             })),
                         )],
                     ));
@@ -3334,7 +3398,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_duplicate_approval_ids_leave_original_pending_without_a_response() {
+    fn codex_changed_pending_approval_id_reuse_terminally_fails_without_a_response() {
         let mut driver = ProtocolDriver::new_with_approval_context(
             AdapterKind::Codex,
             &request(),
@@ -3362,21 +3426,19 @@ mod tests {
         assert!(frames.is_empty());
         assert_eq!(changed[0].kind, AdapterEventKind::AdapterError);
         assert_eq!(changed[0].data.as_ref().unwrap()["sameCommitment"], false);
+        assert_eq!(driver.state(), AdapterState::Failed);
+        assert_eq!(driver.phase, Phase::Terminal);
 
-        let response = driver
-            .resolve_codex_approval(
-                &json!("dup"),
-                "item/commandExecution/requestApproval",
-                &digest,
-                false,
-                unix_ms(),
-            )
-            .unwrap();
-        let response: Value = serde_json::from_slice(&response.0).unwrap();
-        assert_eq!(response["id"], "dup");
-        assert_eq!(
-            response.pointer("/result/decision"),
-            Some(&json!("decline"))
+        assert!(
+            driver
+                .resolve_codex_approval(
+                    &json!("dup"),
+                    "item/commandExecution/requestApproval",
+                    &digest,
+                    false,
+                    unix_ms(),
+                )
+                .is_err()
         );
     }
 
@@ -3679,7 +3741,7 @@ mod tests {
     }
 
     #[test]
-    fn pi_duplicate_dialog_ids_leave_original_pending_without_a_response() {
+    fn pi_changed_pending_dialog_id_reuse_terminally_fails_without_a_response() {
         let mut driver = ProtocolDriver::new_with_approval_context(
             AdapterKind::Pi,
             &request(),
@@ -3702,11 +3764,10 @@ mod tests {
             .unwrap();
         assert!(frames.is_empty());
         assert_eq!(changed[0].data.as_ref().unwrap()["sameCommitment"], false);
+        assert_eq!(driver.state(), AdapterState::Failed);
+        assert_eq!(driver.phase, Phase::Terminal);
 
-        let response = driver.approval_response(&json!("dialog-1"), false).unwrap();
-        let response: Value = serde_json::from_slice(&response.0).unwrap();
-        assert_eq!(response["id"], "dialog-1");
-        assert_eq!(response["cancelled"], true);
+        assert!(driver.approval_response(&json!("dialog-1"), false).is_err());
     }
 
     #[test]
@@ -3830,6 +3891,8 @@ mod tests {
             .unwrap();
         assert!(frames.is_empty());
         assert_eq!(changed[0].data.as_ref().unwrap()["sameCommitment"], false);
+        assert_eq!(typed.state(), AdapterState::Failed);
+        assert_eq!(typed.phase, Phase::Terminal);
 
         assert!(
             typed
@@ -3844,22 +3907,66 @@ mod tests {
                 )
                 .is_err()
         );
-        let response = typed
-            .resolve_acp_permission(
-                &json!(77),
-                "session/request_permission",
-                "session-1",
-                "tool-1",
-                approval_data["parametersDigest"].as_str().unwrap(),
-                true,
-                approval_data["expiresAtUnixMs"].as_u64().unwrap(),
+        assert!(
+            typed
+                .resolve_acp_permission(
+                    &json!(77),
+                    "session/request_permission",
+                    "session-1",
+                    "tool-1",
+                    approval_data["parametersDigest"].as_str().unwrap(),
+                    true,
+                    approval_data["expiresAtUnixMs"].as_u64().unwrap(),
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn acp_load_session_response_cannot_replace_the_requested_session_binding() {
+        let mut resume_request = request();
+        resume_request.native_session_id = Some("session-requested".into());
+        let mut mismatched = ProtocolDriver::new(AdapterKind::OpenCode, &resume_request).unwrap();
+        mismatched.start().unwrap();
+        let (frames, _) = mismatched
+            .on_record(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true}}}\n")
+            .unwrap();
+        let load: Value = serde_json::from_slice(&frames[0].0).unwrap();
+        assert_eq!(load["method"], "session/load");
+        assert_eq!(
+            load.pointer("/params/sessionId"),
+            Some(&json!("session-requested"))
+        );
+        let (frames, events) = mismatched
+            .on_record(
+                b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"session-other\"}}\n",
             )
             .unwrap();
-        let response: Value = serde_json::from_slice(&response.0).unwrap();
-        assert_eq!(
-            response.pointer("/result/outcome/outcome"),
-            Some(&json!("cancelled"))
-        );
+        assert!(frames.is_empty());
+        assert_eq!(events[0].kind, AdapterEventKind::AdapterError);
+        assert_eq!(mismatched.state(), AdapterState::Failed);
+        assert_eq!(mismatched.phase, Phase::Terminal);
+        assert_eq!(mismatched.native_session_id(), Some("session-requested"));
+
+        let mut legitimate = ProtocolDriver::new(AdapterKind::OpenCode, &resume_request).unwrap();
+        legitimate.start().unwrap();
+        legitimate
+            .on_record(b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true}}}\n")
+            .unwrap();
+        let (frames, events) = legitimate
+            .on_record(b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":null}\n")
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(events[0].kind, AdapterEventKind::Session);
+        assert_eq!(legitimate.native_session_id(), Some("session-requested"));
+
+        let (frames, events) = legitimate
+            .on_record(b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"sessionId\":\"session-other\",\"update\":{\"sessionUpdate\":\"tool_call\",\"toolCallId\":\"tool-other\",\"title\":\"unsafe\"}}}\n")
+            .unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(events[0].kind, AdapterEventKind::AdapterError);
+        assert_eq!(legitimate.state(), AdapterState::Failed);
+        assert_eq!(legitimate.phase, Phase::Terminal);
     }
 
     #[test]

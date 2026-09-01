@@ -557,8 +557,10 @@ Device or caller to remove a Cloud minimum.
 
 If the connection is lost before the receipt is received, the run remains
 `waiting_approval` unless a prior approval already covers the exact operation.
-Only one Codex approval is pending per Agent. An outstanding duplicate is
-ignored while the original commitment remains pending. After settlement, the
+Only one Codex approval is pending per Agent. An exact outstanding duplicate is
+ignored while the original commitment remains pending. Reusing that ID with a
+changed method or parameters terminally fails the Adapter and invalidates the
+pending provider response. After settlement, the
 Adapter retains a bounded, non-evicting process-lifetime tombstone keyed by the
 normalized provider request ID, method, and canonical parameters digest. An
 exact duplicate replays the identical recorded response bytes; a changed
@@ -591,6 +593,9 @@ without its tool-call identity, is cancelled. A missing typed bridge returns
 `{ "outcome": { "outcome": "cancelled" } }`; effective `never` may select an
 offered `allow_once` option but not a reusable option. A typed pending request is
 bound to method, session, tool call, canonical parameters digest, and expiry.
+`session/load` cannot replace the requested native session ID, and every
+`session/update` must carry that exact active session ID before its tool or text
+event is attributed to the run.
 Pi extension dialog requests preserve their request ID in
 `extension_ui_response`; without a typed bridge they are cancelled. ACP and Pi
 share the same process-lifetime terminal tombstone rule as Codex. Exact

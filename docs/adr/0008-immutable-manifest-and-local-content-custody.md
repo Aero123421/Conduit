@@ -115,9 +115,10 @@ provider callbacks to remain observable. The current conservative classifier
 can pre-authorize only a known effect whose class is disjoint from that set;
 unknown effects prompt.
 
-Only one interactive Codex approval may be pending for an Agent. A duplicate
-pending ID does not receive a second terminal response; another fresh ID is
-declined and tombstoned. The Node transactionally
+Only one interactive Codex approval may be pending for an Agent. An exact
+duplicate pending ID does not receive a second terminal response; changed reuse
+of that ID invalidates the pending response and terminally fails the Adapter.
+Another fresh ID is declined and tombstoned. The Node transactionally
 journals the request commitment and `waiting_approval` transition before it can
 queue the transport frame. The frame has a deterministic message ID; re-queue
 after a crash is idempotent. Resolution is journaled as the exact provider

@@ -59,6 +59,12 @@ interface ValidatedControlReplay {
 }
 
 const MAX_CONTROL_REPLAY_FRAMES = 32;
+const EFFECTFUL_CONTROL_TYPES = new Set<NodeV1PostAuthFrame["type"]>([
+  "operation.offer",
+  "operation.input",
+  "operation.cancel",
+  "operation.approval",
+]);
 
 export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
   constructor(ctx: DurableObjectState, env: ControlPlaneEnv) {
@@ -375,6 +381,14 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       if (receipt.payload_digest !== payloadDigest || receipt.correlation_id !== (correlationId ?? null)) throw new TypeError("control message id is bound to another payload");
       return { sequence: String(receipt.sequence), delivered: receipt.state === "acknowledged" || receipt.state === "sent" };
     }
+    const connection = this.ctx.storage.sql.exec<{ epoch: number; reconciliation_state: string }>("SELECT epoch,reconciliation_state FROM connection_state WHERE singleton=1").toArray()[0];
+    const onlineReconciliation = connection?.reconciliation_state !== "complete" && this.ctx.getWebSockets().some((candidate) => {
+      const item = candidate.deserializeAttachment() as SocketAttachment | null;
+      return item?.stage === "authenticated" && item.reconciling && item.epoch === String(connection?.epoch);
+    });
+    if (EFFECTFUL_CONTROL_TYPES.has(type) && onlineReconciliation) {
+      throw new TypeError("effectful control delivery waits for reconciliation completion");
+    }
     const current = this.ctx.storage.sql.exec<{ durable_sequence: number }>("SELECT durable_sequence FROM transport_positions WHERE direction='control_to_node'").one().durable_sequence;
     const sequence = current + 1;
     const state = this.ctx.storage.sql.exec<{ device_id: string; epoch: number }>("SELECT device_id,epoch FROM connection_state WHERE singleton=1").toArray()[0];
@@ -398,7 +412,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     const wire = JSON.parse(frame.frame_json) as { type?: unknown };
     return this.ctx.getWebSockets().find((candidate) => {
       const item = candidate.deserializeAttachment() as SocketAttachment | null;
-      const ready = wire.type !== "operation.offer" || connection?.reconciliation_state === "complete" && !item?.reconciling;
+      const ready = !EFFECTFUL_CONTROL_TYPES.has(wire.type as NodeV1PostAuthFrame["type"]) || connection?.reconciliation_state === "complete" && !item?.reconciling;
       return item?.stage === "authenticated" && item.epoch === String(connection?.epoch) && ready;
     });
   }

@@ -258,6 +258,33 @@ describe.sequential("control-plane contracts", () => {
 
     const second = await connect("node-boot-control-replay-0002");
     expect(second.accepted).toMatchObject({ controlNextSequence: "44", nodeStoredThroughSequence: "3" });
+    const concurrentOperation = {
+      ...originalOffer.payload.operation,
+      operationId: "op_control_replay_concurrent",
+      idempotencyKey: "control-replay-concurrent-idempotency",
+    };
+    const concurrentPayload = { operation: concurrentOperation };
+    const deferredError = await runInDurableObject(env.DEVICE_ROOMS.getByName(deviceId), async (instance) => {
+      try {
+        await instance.offer({
+          deviceId,
+          messageId: "cmsg_control_replay_concurrent",
+          correlationId: concurrentOperation.operationId,
+          payloadDigest: await sha256Hex(canonicalJson(concurrentPayload)),
+          payload: concurrentPayload,
+          expiresAt: concurrentOperation.expiresAt,
+        });
+        return "allocated";
+      } catch (error) {
+        return error instanceof Error ? error.message : String(error);
+      }
+    });
+    expect(deferredError).toBe("effectful control delivery waits for reconciliation completion");
+    expect(await runInDurableObject(env.DEVICE_ROOMS.getByName(deviceId), (_instance, state) => ({
+      controlStored: state.storage.sql.exec<{ durable_sequence: number }>("SELECT durable_sequence FROM transport_positions WHERE direction='control_to_node'").one().durable_sequence,
+      concurrentFrames: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_frames WHERE message_id='cmsg_control_replay_concurrent'").one().count,
+      concurrentReceipts: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_message_receipts WHERE message_id='cmsg_control_replay_concurrent'").one().count,
+    }))).toEqual({ controlStored: 43, concurrentFrames: 0, concurrentReceipts: 0 });
     await second.send(4, "reconcile.summary", { nodeBootId: "node-boot-control-replay-0002", journalGeneration: "1", capabilityDigest: "4".repeat(64), lastControlSequenceApplied: "3", lastNodeSequenceAcknowledged: "3", lastNodeSequenceRetained: "4", runs: [], retainedEventRanges: [], unresolvedCount: 0, truncated: false, storageHealth: "healthy" }, second.accepted.connectionId);
     const reconnectMessages = [parseWireDocumentText(schemaIds.nodeV1, await second.next()), parseWireDocumentText(schemaIds.nodeV1, await second.next())];
     const replayPlan = reconnectMessages.find((frame) => frame.type === "reconcile.plan");

@@ -72,6 +72,8 @@ The public Worker forwards the WebSocket upgrade response without rebuilding awa
 
 The authenticated Node retains `controlNextSequence - 1` as the preexisting frontier. Until reconciliation completes, strict contiguous replay may apply effectful frames only through that frontier. New effectful frames fail closed. Received-but-unapplied `operation.offer` duplicates are reprojected through the idempotent operation journal after restart; applied duplicates are only acknowledged.
 
+While an authenticated socket is reconciling, new operation offers, input, cancellation, and approval effects remain in their producer outbox without a control transport sequence. Sequence allocation resumes after reconciliation completes. Offline delivery may allocate before the next handshake because that sequence is then included in the next authenticated frontier. The state check and new sequence allocation occur without an intervening asynchronous boundary inside the Durable Object turn.
+
 ### No automatic rerun from ambiguity
 
 Recovery distinguishes:

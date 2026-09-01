@@ -1,0 +1,822 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conduit.dev/spec/schemas/node-protocol-v1.schema.json",
+  "title": "Conduit node transport protocol v1",
+  "description": "Authenticated handshake, durable transport frames, operation admission, event replay, and reconciliation messages.",
+  "oneOf": [
+    { "$ref": "#/$defs/DeviceHello" },
+    { "$ref": "#/$defs/DeviceChallenge" },
+    { "$ref": "#/$defs/DeviceProof" },
+    { "$ref": "#/$defs/TransportAccepted" },
+    { "$ref": "#/$defs/PostAuthFrame" }
+  ],
+  "$defs": {
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "U64Decimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$"
+    },
+    "Sha256Hex": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "Base64Url": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9_-]+$",
+      "maxLength": 16384
+    },
+    "DeviceId": {
+      "type": "string",
+      "pattern": "^dev_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "DeviceKeyId": {
+      "type": "string",
+      "pattern": "^dkey_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ConnectionId": {
+      "type": "string",
+      "pattern": "^conn_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "MessageId": {
+      "type": "string",
+      "pattern": "^[cn]msg_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "OperationId": {
+      "type": "string",
+      "pattern": "^op_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "RunId": {
+      "type": "string",
+      "pattern": "^(run|lrun)_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "AssignmentId": {
+      "type": "string",
+      "pattern": "^asg_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ProjectId": {
+      "type": "string",
+      "pattern": "^prj_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "SessionId": {
+      "type": "string",
+      "pattern": "^csess_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "PrincipalId": {
+      "type": "string",
+      "pattern": "^prin_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ApprovalId": {
+      "type": "string",
+      "pattern": "^appr_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "EventId": {
+      "type": "string",
+      "pattern": "^evt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ArtifactId": {
+      "type": "string",
+      "pattern": "^art_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "RuntimeKind": {
+      "type": "string",
+      "enum": ["native", "restricted_native", "container", "vm"]
+    },
+    "AccessScope": {
+      "type": "string",
+      "enum": ["read_only", "selected_sources", "project_full", "full_user", "full_device", "custom"]
+    },
+    "ApprovalMode": {
+      "type": "string",
+      "enum": ["always", "outside_scope", "risk_classes", "never"]
+    },
+    "OperationState": {
+      "type": "string",
+      "enum": [
+        "reserved",
+        "admitted",
+        "starting",
+        "running",
+        "waiting_input",
+        "waiting_approval",
+        "finishing",
+        "completed",
+        "failed",
+        "cancelled",
+        "timed_out",
+        "lost",
+        "uncertain",
+        "recovery_required",
+        "rejected",
+        "expired"
+      ]
+    },
+    "TerminalState": {
+      "type": "string",
+      "enum": ["completed", "failed", "cancelled", "timed_out", "lost", "uncertain", "recovery_required", "rejected", "expired"]
+    },
+    "Direction": {
+      "type": "string",
+      "enum": ["control_to_node", "node_to_control"]
+    },
+    "EvidenceLevel": {
+      "type": "string",
+      "enum": ["explicit", "observed", "inferred", "unknown"]
+    },
+    "SensitivityClass": {
+      "type": "string",
+      "enum": ["public", "metadata", "project_content", "raw_log", "credential_reference", "secret"]
+    },
+    "DeviceHello": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "deviceId",
+        "keyId",
+        "supportedProtocols",
+        "capabilityDigest",
+        "clientNonce",
+        "nodeBootId"
+      ],
+      "properties": {
+        "type": { "const": "device.hello" },
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "keyId": { "$ref": "#/$defs/DeviceKeyId" },
+        "supportedProtocols": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 16,
+          "uniqueItems": true,
+          "items": { "type": "string", "pattern": "^conduit\\.node/[0-9]+$", "maxLength": 64 }
+        },
+        "capabilityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "clientNonce": { "$ref": "#/$defs/Base64Url" },
+        "nodeBootId": { "type": "string", "minLength": 16, "maxLength": 128 }
+      }
+    },
+    "DeviceChallenge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "connectionId",
+        "serverNonce",
+        "serverTime",
+        "expiresInMs",
+        "selectedProtocol"
+      ],
+      "properties": {
+        "type": { "const": "device.challenge" },
+        "connectionId": { "$ref": "#/$defs/ConnectionId" },
+        "serverNonce": { "$ref": "#/$defs/Base64Url" },
+        "serverTime": { "$ref": "#/$defs/Timestamp" },
+        "expiresInMs": { "type": "integer", "minimum": 1000, "maximum": 300000 },
+        "selectedProtocol": { "const": "conduit.node/1" }
+      }
+    },
+    "DeviceProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "connectionId", "deviceId", "keyId", "signature"],
+      "properties": {
+        "type": { "const": "device.proof" },
+        "connectionId": { "$ref": "#/$defs/ConnectionId" },
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "keyId": { "$ref": "#/$defs/DeviceKeyId" },
+        "signature": { "$ref": "#/$defs/Base64Url" }
+      }
+    },
+    "TransportAccepted": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "connectionId",
+        "deviceId",
+        "connectionEpoch",
+        "selectedProtocol",
+        "controlNextSequence",
+        "nodeStoredThroughSequence",
+        "reconciliationRequired"
+      ],
+      "properties": {
+        "type": { "const": "transport.accepted" },
+        "connectionId": { "$ref": "#/$defs/ConnectionId" },
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "connectionEpoch": { "$ref": "#/$defs/U64Decimal" },
+        "selectedProtocol": { "const": "conduit.node/1" },
+        "controlNextSequence": { "$ref": "#/$defs/U64Decimal" },
+        "nodeStoredThroughSequence": { "$ref": "#/$defs/U64Decimal" },
+        "reconciliationRequired": { "type": "boolean" }
+      }
+    },
+    "TransportAckPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["direction", "throughSequence"],
+      "properties": {
+        "direction": { "$ref": "#/$defs/Direction" },
+        "throughSequence": { "$ref": "#/$defs/U64Decimal" }
+      }
+    },
+    "TransportReplayRequiredPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["direction", "expectedSequence"],
+      "properties": {
+        "direction": { "$ref": "#/$defs/Direction" },
+        "expectedSequence": { "$ref": "#/$defs/U64Decimal" },
+        "receivedSequence": { "$ref": "#/$defs/U64Decimal" }
+      }
+    },
+    "SourceRevision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceId", "locationId", "locationRevision", "mode"],
+      "properties": {
+        "sourceId": { "type": "string", "pattern": "^src_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "locationId": { "type": "string", "pattern": "^loc_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "locationRevision": { "type": "integer", "minimum": 1 },
+        "mode": { "enum": ["read_only", "direct", "worktree", "managed_copy"] },
+        "baseCommit": { "type": "string", "pattern": "^[A-Fa-f0-9]{7,64}$" },
+        "dirtyDigest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    },
+    "RuntimeRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "providerId", "configurationRevision"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/RuntimeKind" },
+        "providerId": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "configurationRevision": { "type": "integer", "minimum": 1 },
+        "cpuLimit": { "type": "number", "exclusiveMinimum": 0, "maximum": 1024 },
+        "memoryBytes": { "type": "integer", "minimum": 0 },
+        "storageBytes": { "type": "integer", "minimum": 0 },
+        "gpuCount": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "networkMode": { "enum": ["open", "restricted", "offline", "lan_explicit"] }
+      }
+    },
+    "OperationEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "operationId",
+        "idempotencyKey",
+        "actorPrincipalId",
+        "clientId",
+        "deviceId",
+        "capability",
+        "sourceRevisions",
+        "runtime",
+        "accessScope",
+        "approvalMode",
+        "connectorPolicyId",
+        "connectorPolicyRevision",
+        "arguments",
+        "payloadDigest",
+        "issuedAt",
+        "expiresAt",
+        "validForMs"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 256 },
+        "actorPrincipalId": { "$ref": "#/$defs/PrincipalId" },
+        "clientId": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "projectId": { "$ref": "#/$defs/ProjectId" },
+        "sessionId": { "$ref": "#/$defs/SessionId" },
+        "assignmentId": { "$ref": "#/$defs/AssignmentId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "capability": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "sourceRevisions": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/SourceRevision" }
+        },
+        "runtime": { "$ref": "#/$defs/RuntimeRequest" },
+        "accessScope": { "$ref": "#/$defs/AccessScope" },
+        "approvalMode": { "$ref": "#/$defs/ApprovalMode" },
+        "connectorPolicyId": { "type": "string", "pattern": "^cpol_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "connectorPolicyRevision": { "type": "integer", "minimum": 1 },
+        "arguments": {
+          "type": "object",
+          "maxProperties": 128
+        },
+        "payloadDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "issuedAt": { "$ref": "#/$defs/Timestamp" },
+        "expiresAt": { "$ref": "#/$defs/Timestamp" },
+        "validForMs": { "type": "integer", "minimum": 1, "maximum": 86400000 }
+      }
+    },
+    "OperationOfferPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation"],
+      "properties": {
+        "operation": { "$ref": "#/$defs/OperationEnvelope" }
+      }
+    },
+    "OperationAdmissionPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId",
+        "idempotencyKey",
+        "requestDigest",
+        "decision",
+        "journalState",
+        "localPolicyRevision",
+        "receiptDigest"
+      ],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 256 },
+        "requestDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "decision": { "enum": ["admitted", "rejected", "expired", "duplicate_replay", "uncertain"] },
+        "journalState": { "$ref": "#/$defs/OperationState" },
+        "selectedRuntimeProvider": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "effectiveAccessScope": { "$ref": "#/$defs/AccessScope" },
+        "effectiveApprovalMode": { "$ref": "#/$defs/ApprovalMode" },
+        "localPolicyRevision": { "type": "integer", "minimum": 1 },
+        "receiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "reasonCode": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" }
+      }
+    },
+    "OperationStatusPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "state", "observedAt"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "state": { "$ref": "#/$defs/OperationState" },
+        "phase": { "type": "string", "maxLength": 128 },
+        "runtimeHandleDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "observedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "OperationTerminalPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "operationId",
+        "state",
+        "requestDigest",
+        "receiptDigest",
+        "lastRunEventSequence",
+        "observedAt"
+      ],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "state": { "$ref": "#/$defs/TerminalState" },
+        "requestDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "receiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "lastRunEventSequence": { "$ref": "#/$defs/U64Decimal" },
+        "resultSummary": {
+          "type": "object",
+          "maxProperties": 64
+        },
+        "artifactIds": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ArtifactId" }
+        },
+        "reasonCode": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "observedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "OperationTargetPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "targetRunId", "targetControllerEpoch", "expectedState"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "targetRunId": { "$ref": "#/$defs/RunId" },
+        "targetControllerEpoch": { "$ref": "#/$defs/U64Decimal" },
+        "expectedState": { "$ref": "#/$defs/OperationState" },
+        "mode": { "type": "string", "maxLength": 64 },
+        "content": { "type": "string", "maxLength": 32768 },
+        "targetDigest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    },
+    "OperationApprovalPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approvalId",
+        "operationId",
+        "runId",
+        "operationDigest",
+        "decision",
+        "controllerEpoch",
+        "issuedAt",
+        "expiresAt",
+        "validForMs",
+        "receiptDigest"
+      ],
+      "properties": {
+        "approvalId": { "$ref": "#/$defs/ApprovalId" },
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "operationDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "decision": { "enum": ["approved", "denied"] },
+        "reuseScope": { "enum": ["once", "operation_retry", "run"] },
+        "controllerEpoch": { "$ref": "#/$defs/U64Decimal" },
+        "issuedAt": { "$ref": "#/$defs/Timestamp" },
+        "expiresAt": { "$ref": "#/$defs/Timestamp" },
+        "validForMs": { "type": "integer", "minimum": 1, "maximum": 3600000 },
+        "receiptDigest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    },
+    "NormalizedEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "runId",
+        "eventId",
+        "sequence",
+        "eventType",
+        "source",
+        "evidenceLevel",
+        "sensitivity",
+        "observedAt",
+        "contentDigest",
+        "payload"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "eventId": { "$ref": "#/$defs/EventId" },
+        "sequence": { "$ref": "#/$defs/U64Decimal" },
+        "eventType": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "source": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "correlationId": { "type": "string", "maxLength": 128 },
+        "parentEventId": { "$ref": "#/$defs/EventId" },
+        "evidenceLevel": { "$ref": "#/$defs/EvidenceLevel" },
+        "sensitivity": { "$ref": "#/$defs/SensitivityClass" },
+        "observedAt": { "$ref": "#/$defs/Timestamp" },
+        "contentDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "payload": {
+          "type": "object",
+          "maxProperties": 128
+        },
+        "contentReference": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["provider", "objectId", "sha256", "bytes"],
+          "properties": {
+            "provider": { "enum": ["device_log", "device_artifact", "r2"] },
+            "objectId": { "type": "string", "minLength": 1, "maxLength": 256 },
+            "sha256": { "$ref": "#/$defs/Sha256Hex" },
+            "bytes": { "type": "integer", "minimum": 0 }
+          }
+        }
+      }
+    },
+    "EventBatchPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "fromSequence", "throughSequence", "events"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/RunId" },
+        "fromSequence": { "$ref": "#/$defs/U64Decimal" },
+        "throughSequence": { "$ref": "#/$defs/U64Decimal" },
+        "events": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/NormalizedEvent" }
+        }
+      }
+    },
+    "EventGapPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "runId",
+        "missingFrom",
+        "missingThrough",
+        "reason",
+        "terminalReceiptAvailable"
+      ],
+      "properties": {
+        "runId": { "$ref": "#/$defs/RunId" },
+        "missingFrom": { "$ref": "#/$defs/U64Decimal" },
+        "missingThrough": { "$ref": "#/$defs/U64Decimal" },
+        "reason": { "enum": ["retention_expired", "storage_loss", "journal_repair", "unknown"] },
+        "nearestBefore": { "$ref": "#/$defs/U64Decimal" },
+        "nearestAfter": { "$ref": "#/$defs/U64Decimal" },
+        "lastCommitment": { "$ref": "#/$defs/Sha256Hex" },
+        "terminalReceiptAvailable": { "type": "boolean" },
+        "verificationReceiptAvailable": { "type": "boolean" }
+      }
+    },
+    "RunSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "operationId", "state", "requestDigest", "lastEventSequence"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/RunId" },
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "state": { "$ref": "#/$defs/OperationState" },
+        "requestDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "runtimeHandleDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "lastEventSequence": { "$ref": "#/$defs/U64Decimal" },
+        "terminalReceiptDigest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    },
+    "RetainedEventRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "fromSequence", "throughSequence"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/RunId" },
+        "fromSequence": { "$ref": "#/$defs/U64Decimal" },
+        "throughSequence": { "$ref": "#/$defs/U64Decimal" }
+      }
+    },
+    "ReconcileSummaryPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "nodeBootId",
+        "journalGeneration",
+        "capabilityDigest",
+        "lastControlSequenceApplied",
+        "lastNodeSequenceAcknowledged",
+        "lastNodeSequenceRetained",
+        "runs",
+        "retainedEventRanges",
+        "unresolvedCount",
+        "truncated",
+        "storageHealth"
+      ],
+      "properties": {
+        "nodeBootId": { "type": "string", "minLength": 16, "maxLength": 128 },
+        "journalGeneration": { "$ref": "#/$defs/U64Decimal" },
+        "capabilityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "lastControlSequenceApplied": { "$ref": "#/$defs/U64Decimal" },
+        "lastNodeSequenceAcknowledged": { "$ref": "#/$defs/U64Decimal" },
+        "lastNodeSequenceRetained": { "$ref": "#/$defs/U64Decimal" },
+        "runs": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/RunSummary" }
+        },
+        "retainedEventRanges": {
+          "type": "array",
+          "maxItems": 512,
+          "items": { "$ref": "#/$defs/RetainedEventRange" }
+        },
+        "unresolvedCount": { "type": "integer", "minimum": 0 },
+        "nextCursor": { "type": "string", "maxLength": 256 },
+        "truncated": { "type": "boolean" },
+        "storageHealth": { "enum": ["healthy", "degraded", "read_only", "exhausted", "corrupt"] }
+      }
+    },
+    "SequenceRange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["from", "through"],
+      "properties": {
+        "from": { "$ref": "#/$defs/U64Decimal" },
+        "through": { "$ref": "#/$defs/U64Decimal" }
+      }
+    },
+    "RunEventRangeRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["runId", "from", "through"],
+      "properties": {
+        "runId": { "$ref": "#/$defs/RunId" },
+        "from": { "$ref": "#/$defs/U64Decimal" },
+        "through": { "$ref": "#/$defs/U64Decimal" }
+      }
+    },
+    "ReconcilePlanPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reconciliationId",
+        "controlReplay",
+        "nodeReplay",
+        "eventReplay",
+        "statusRunIds",
+        "cancelOperationIds"
+      ],
+      "properties": {
+        "reconciliationId": { "type": "string", "pattern": "^rec_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "controlReplay": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/SequenceRange" }
+        },
+        "nodeReplay": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "$ref": "#/$defs/SequenceRange" }
+        },
+        "eventReplay": {
+          "type": "array",
+          "maxItems": 512,
+          "items": { "$ref": "#/$defs/RunEventRangeRequest" }
+        },
+        "statusRunIds": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/RunId" }
+        },
+        "cancelOperationIds": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/OperationId" }
+        },
+        "confirmTerminalReceiptDigests": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/Sha256Hex" }
+        },
+        "quarantineRunIds": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/RunId" }
+        }
+      }
+    },
+    "ReconcileCompletePayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "reconciliationId",
+        "lastControlSequenceApplied",
+        "lastNodeSequenceAcknowledged",
+        "unresolvedRunIds"
+      ],
+      "properties": {
+        "reconciliationId": { "type": "string", "pattern": "^rec_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "lastControlSequenceApplied": { "$ref": "#/$defs/U64Decimal" },
+        "lastNodeSequenceAcknowledged": { "$ref": "#/$defs/U64Decimal" },
+        "unresolvedRunIds": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/RunId" }
+        }
+      }
+    },
+    "DeviceHealthPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["observedAt", "nodeState", "journalState", "storageState"],
+      "properties": {
+        "observedAt": { "$ref": "#/$defs/Timestamp" },
+        "nodeState": { "enum": ["ready", "busy", "degraded", "reconciling", "protocol_incompatible"] },
+        "journalState": { "enum": ["healthy", "degraded", "read_only", "corrupt"] },
+        "storageState": { "enum": ["healthy", "low", "exhausted", "unavailable"] },
+        "activeCommands": { "type": "integer", "minimum": 0 },
+        "activeAgentRuns": { "type": "integer", "minimum": 0 },
+        "activeRuntimes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "ProtocolErrorPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "retryable"],
+      "properties": {
+        "code": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "retryable": { "type": "boolean" },
+        "expectedSequence": { "$ref": "#/$defs/U64Decimal" },
+        "retryAfterMs": { "type": "integer", "minimum": 0, "maximum": 86400000 },
+        "details": {
+          "type": "object",
+          "maxProperties": 16,
+          "additionalProperties": {
+            "type": ["string", "integer", "number", "boolean", "null"]
+          }
+        }
+      }
+    },
+    "PostAuthFrame": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol",
+        "messageId",
+        "deviceId",
+        "connectionEpoch",
+        "direction",
+        "sequence",
+        "type",
+        "payloadDigest",
+        "payload"
+      ],
+      "properties": {
+        "protocol": { "const": "conduit.node/1" },
+        "messageId": { "$ref": "#/$defs/MessageId" },
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "connectionEpoch": { "$ref": "#/$defs/U64Decimal" },
+        "direction": { "$ref": "#/$defs/Direction" },
+        "sequence": { "$ref": "#/$defs/U64Decimal" },
+        "type": {
+          "enum": [
+            "transport.ack",
+            "transport.replay_required",
+            "transport.error",
+            "reconcile.summary",
+            "reconcile.plan",
+            "reconcile.complete",
+            "operation.offer",
+            "operation.admission",
+            "operation.status",
+            "operation.terminal",
+            "operation.input",
+            "operation.cancel",
+            "operation.approval",
+            "event.batch",
+            "event.gap",
+            "device.health"
+          ]
+        },
+        "correlationId": { "type": "string", "maxLength": 128 },
+        "payloadDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "payload": { "type": "object" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "transport.ack" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/TransportAckPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "transport.replay_required" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/TransportReplayRequiredPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "transport.error" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/ProtocolErrorPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "reconcile.summary" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/ReconcileSummaryPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "reconcile.plan" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/ReconcilePlanPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "reconcile.complete" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/ReconcileCompletePayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "operation.offer" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/OperationOfferPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "operation.admission" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/OperationAdmissionPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "operation.status" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/OperationStatusPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "operation.terminal" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/OperationTerminalPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "enum": ["operation.input", "operation.cancel"] } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/OperationTargetPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "operation.approval" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/OperationApprovalPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "event.batch" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/EventBatchPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "event.gap" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/EventGapPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "device.health" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/DeviceHealthPayload" } } }
+        }
+      ]
+    }
+  }
+}

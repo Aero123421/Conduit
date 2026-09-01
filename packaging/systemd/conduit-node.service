@@ -1,0 +1,28 @@
+[Unit]
+Description=Conduit Linux node
+Documentation=https://github.com/Aero123421/Conduit
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=@BINDIR@/conduit-node serve
+Restart=on-failure
+RestartSec=2s
+TimeoutStopSec=30s
+UMask=0077
+NoNewPrivileges=true
+ProtectProc=invisible
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+SystemCallArchitectures=native
+# Runtime providers may create user/mount namespaces. `conduit doctor` reports
+# the effective provider confinement; the user service does not claim a static
+# filesystem sandbox for dynamically registered workspaces.
+RestrictNamespaces=false
+
+[Install]
+WantedBy=default.target

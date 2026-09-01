@@ -1,0 +1,24 @@
+schema_version = 1
+control_plane_url = "https://conduit.example.com"
+
+[node]
+display_name = "linux-device"
+frame_max_bytes = 65536
+reconnect_min_ms = 500
+reconnect_max_ms = 30000
+
+[storage.hot]
+path = "${XDG_STATE_HOME}/conduit/hot"
+minimum_free_bytes = 1073741824
+
+[storage.archive]
+path = "${XDG_DATA_HOME}/conduit/archive"
+
+[storage.backup]
+path = "${XDG_DATA_HOME}/conduit/backups"
+
+[storage.cache]
+path = "${XDG_CACHE_HOME}/conduit"
+
+[local_policy]
+default = "deny"

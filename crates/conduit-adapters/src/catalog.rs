@@ -156,7 +156,11 @@ impl AdapterCatalog {
         let executable = find_executable(profile.executable);
         let (version, state, reason_code) = match executable.as_ref() {
             Some(path) => match bounded_version(path, profile.version_args) {
-                Ok(version) => (Some(version), CapabilityState::Effective, None),
+                Ok(version) => (
+                    Some(version),
+                    CapabilityState::Degraded,
+                    Some("version_verified_live_protocol_not_probed".to_owned()),
+                ),
                 Err(_) => (
                     None,
                     CapabilityState::Degraded,

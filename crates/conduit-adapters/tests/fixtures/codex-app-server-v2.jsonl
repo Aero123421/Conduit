@@ -1,0 +1,5 @@
+{"id":1,"result":{"serverInfo":{"name":"codex","version":"fixture"}}}
+{"id":2,"result":{"thread":{"id":"codex-thread-fixture"}}}
+{"id":3,"result":{"turn":{"id":"codex-turn-fixture"}}}
+{"method":"item/completed","params":{"item":{"id":"codex-item-fixture","type":"agentMessage","text":"visible fixture response"}}}
+{"method":"turn/completed","params":{"turn":{"id":"codex-turn-fixture","status":{"type":"completed"}}}}

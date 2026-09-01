@@ -1,6 +1,9 @@
 //! Process-independent Linux configuration, capability, and public-error contracts.
 
-use std::{env, path::PathBuf};
+use std::{
+    env,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -163,7 +166,7 @@ fn xdg_or_home(
     Ok(path)
 }
 
-fn require_absolute(variable: &'static str, path: &PathBuf) -> Result<(), PathConfigError> {
+fn require_absolute(variable: &'static str, path: &Path) -> Result<(), PathConfigError> {
     if path.is_absolute() {
         Ok(())
     } else {

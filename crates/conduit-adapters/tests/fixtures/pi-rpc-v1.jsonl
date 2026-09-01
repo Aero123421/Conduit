@@ -1,0 +1,6 @@
+{"id":"conduit-1","type":"response","command":"prompt","success":true}
+{"type":"agent_start"}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"visible fixture response"}}
+{"type":"tool_execution_start","toolCallId":"pi-tool-fixture","toolName":"read","args":{}}
+{"type":"tool_execution_end","toolCallId":"pi-tool-fixture","toolName":"read","isError":false}
+{"type":"agent_end"}

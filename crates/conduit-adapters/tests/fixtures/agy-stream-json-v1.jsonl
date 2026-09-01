@@ -1,0 +1,5 @@
+{"type":"init","session_id":"agy-session-fixture","model":"agy"}
+{"type":"message","role":"assistant","content":"visible fixture response","delta":true}
+{"type":"tool_use","tool_name":"run_shell_command","tool_id":"agy-tool-fixture","parameters":{"command":"redacted fixture"}}
+{"type":"tool_result","tool_id":"agy-tool-fixture","status":"success","output":"bounded result"}
+{"type":"result","status":"success"}

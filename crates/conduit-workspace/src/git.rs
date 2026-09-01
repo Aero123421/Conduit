@@ -6,7 +6,7 @@ use std::{
 };
 
 use conduit_crypto::{canonical_sha256, sha256_bytes};
-use conduit_domain::{RunId, Sha256Digest, SourceId};
+use conduit_domain::{ChangeSetId, OperationId, RunId, Sha256Digest, SourceId};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
@@ -97,6 +97,8 @@ pub enum GitError {
     WorktreeBranchInUse,
     #[error("managed worktree path already exists")]
     WorktreePathConflict,
+    #[error("Conduit ref compare-and-swap failed")]
+    RefConflict,
     #[error("writer lease already exists")]
     LeaseConflict,
     #[error("writer lease was not found")]
@@ -316,6 +318,51 @@ impl GitRepository {
         }
     }
 
+    fn read_ref(&self, reference: &str) -> Result<Option<String>, GitError> {
+        validate_conduit_ref(reference)?;
+        Ok(self
+            .optional_text(&["rev-parse", "--verify", reference])?
+            .map(|value| value.trim().to_owned()))
+    }
+
+    fn update_ref_cas(
+        &self,
+        reference: &str,
+        new_value: &str,
+        expected_old: Option<&str>,
+    ) -> Result<(), GitError> {
+        validate_conduit_ref(reference)?;
+        if !valid_oid(new_value) || expected_old.is_some_and(|value| !valid_oid(value)) {
+            return Err(GitError::RepositoryObjectMissing(bound(new_value, 128)));
+        }
+        self.verify_object(&format!("{new_value}^{{commit}}"))?;
+        let zero = "0".repeat(new_value.len());
+        let output = self.run(&[
+            "update-ref",
+            reference,
+            new_value,
+            expected_old.unwrap_or(&zero),
+        ])?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(GitError::RefConflict)
+        }
+    }
+
+    fn delete_ref_cas(&self, reference: &str, expected_old: &str) -> Result<(), GitError> {
+        validate_conduit_ref(reference)?;
+        if !valid_oid(expected_old) {
+            return Err(GitError::RepositoryObjectMissing(bound(expected_old, 128)));
+        }
+        let output = self.run(&["update-ref", "-d", reference, expected_old])?;
+        if output.status.success() {
+            Ok(())
+        } else {
+            Err(GitError::RefConflict)
+        }
+    }
+
     fn remote_identities(&self) -> Result<Vec<String>, GitError> {
         let Some(text) = self.optional_text(&["remote", "-v"])? else {
             return Ok(Vec::new());
@@ -438,6 +485,93 @@ impl GitRepository {
                     GitError::Io(error)
                 }
             })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GitAcceptanceRefReceipt {
+    pub operation_id: OperationId,
+    pub source_id: SourceId,
+    pub head_commit: String,
+    pub preparation_ref: String,
+}
+
+pub struct GitAcceptanceRefs;
+
+impl GitAcceptanceRefs {
+    pub fn prepare(
+        repository: &GitRepository,
+        operation_id: OperationId,
+        source_id: SourceId,
+        head_commit: &str,
+    ) -> Result<GitAcceptanceRefReceipt, GitError> {
+        let preparation_ref = format!(
+            "refs/conduit/acceptance-prepares/{}/{}",
+            operation_id.as_str(),
+            source_id.as_str()
+        );
+        match repository.read_ref(&preparation_ref)? {
+            Some(existing) if existing == head_commit => {}
+            Some(_) => return Err(GitError::RefConflict),
+            None => repository.update_ref_cas(&preparation_ref, head_commit, None)?,
+        }
+        Ok(GitAcceptanceRefReceipt {
+            operation_id,
+            source_id,
+            head_commit: head_commit.to_owned(),
+            preparation_ref,
+        })
+    }
+
+    pub fn finalize(
+        repository: &GitRepository,
+        receipt: &GitAcceptanceRefReceipt,
+        session_id: &str,
+        change_set_id: &ChangeSetId,
+        expected_accepted_head: Option<&str>,
+    ) -> Result<(), GitError> {
+        validate_domain_component(session_id)?;
+        let retained_ref = format!(
+            "refs/conduit/changesets/{}/{}",
+            change_set_id.as_str(),
+            receipt.source_id.as_str()
+        );
+        match repository.read_ref(&retained_ref)? {
+            Some(existing) if existing == receipt.head_commit => {}
+            Some(_) => return Err(GitError::RefConflict),
+            None => repository.update_ref_cas(&retained_ref, &receipt.head_commit, None)?,
+        }
+        let accepted_ref = format!(
+            "refs/conduit/sessions/{}/{}/accepted",
+            session_id,
+            receipt.source_id.as_str()
+        );
+        match repository.read_ref(&accepted_ref)? {
+            Some(existing) if existing == receipt.head_commit => {}
+            _ => repository.update_ref_cas(
+                &accepted_ref,
+                &receipt.head_commit,
+                expected_accepted_head,
+            )?,
+        }
+        if repository.read_ref(&receipt.preparation_ref)?.is_some() {
+            repository.delete_ref_cas(&receipt.preparation_ref, &receipt.head_commit)?;
+        }
+        Ok(())
+    }
+
+    pub fn abort(
+        repository: &GitRepository,
+        receipt: &GitAcceptanceRefReceipt,
+    ) -> Result<(), GitError> {
+        match repository.read_ref(&receipt.preparation_ref)? {
+            Some(existing) if existing == receipt.head_commit => {
+                repository.delete_ref_cas(&receipt.preparation_ref, &receipt.head_commit)
+            }
+            None => Ok(()),
+            Some(_) => Err(GitError::RefConflict),
+        }
     }
 }
 
@@ -716,6 +850,35 @@ fn valid_object_expression(value: &str) -> bool {
     matches!(object.len(), 40 | 64) && object.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
+fn valid_oid(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn validate_conduit_ref(reference: &str) -> Result<(), GitError> {
+    if reference.starts_with("refs/conduit/")
+        && reference.len() <= 512
+        && reference
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_'))
+    {
+        Ok(())
+    } else {
+        Err(GitError::RefConflict)
+    }
+}
+
+fn validate_domain_component(value: &str) -> Result<(), GitError> {
+    if (8..=128).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        Ok(())
+    } else {
+        Err(GitError::RefConflict)
+    }
+}
+
 fn bound(value: &str, max: usize) -> String {
     if value.len() <= max {
         return value.to_owned();
@@ -826,6 +989,43 @@ mod tests {
         assert!(matches!(
             repo.verify_direct_attribution(&preflight, attributed),
             Err(GitError::WorkspaceDiverged)
+        ));
+        fs::remove_dir_all(path).unwrap();
+    }
+
+    #[test]
+    fn acceptance_refs_use_cas_and_keep_changeset_custody() {
+        let (path, repo, head) = repository();
+        let receipt = GitAcceptanceRefs::prepare(
+            &repo,
+            OperationId::parse("op_abcdefgh").unwrap(),
+            SourceId::parse("src_abcdefgh").unwrap(),
+            &head,
+        )
+        .unwrap();
+        GitAcceptanceRefs::finalize(
+            &repo,
+            &receipt,
+            "csess_abcdefgh",
+            &ChangeSetId::parse("chg_abcdefgh").unwrap(),
+            None,
+        )
+        .unwrap();
+        assert!(repo.read_ref(&receipt.preparation_ref).unwrap().is_none());
+        assert_eq!(
+            repo.read_ref("refs/conduit/changesets/chg_abcdefgh/src_abcdefgh")
+                .unwrap()
+                .as_deref(),
+            Some(head.as_str())
+        );
+        assert!(matches!(
+            GitAcceptanceRefs::prepare(
+                &repo,
+                OperationId::parse("op_ijklmnop").unwrap(),
+                SourceId::parse("src_abcdefgh").unwrap(),
+                &"f".repeat(head.len()),
+            ),
+            Err(GitError::RepositoryObjectMissing(_))
         ));
         fs::remove_dir_all(path).unwrap();
     }

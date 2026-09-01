@@ -301,6 +301,32 @@ impl Node {
             .map_err(|error| NodeError::Runtime(error.to_string()))
     }
 
+    pub fn archive_runtime(
+        &self,
+        provider_id: &str,
+        handle: &RuntimeHandle,
+        target: &std::path::Path,
+    ) -> Result<conduit_runtime::SnapshotReceipt, NodeError> {
+        self.providers
+            .get(provider_id)
+            .ok_or_else(|| NodeError::Rejected("runtime_provider_unavailable".into()))?
+            .archive(handle, target)
+            .map_err(|error| NodeError::Runtime(error.to_string()))
+    }
+
+    pub fn restore_runtime(
+        &self,
+        provider_id: &str,
+        archive: &std::path::Path,
+        request: &RuntimeRequest,
+    ) -> Result<conduit_runtime::PreparedRuntime, NodeError> {
+        self.providers
+            .get(provider_id)
+            .ok_or_else(|| NodeError::Rejected("runtime_provider_unavailable".into()))?
+            .restore(archive, request)
+            .map_err(|error| NodeError::Runtime(error.to_string()))
+    }
+
     pub fn destroy_runtime(
         &self,
         provider_id: &str,

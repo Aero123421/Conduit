@@ -393,6 +393,26 @@ fn ipc_runtime_backup_storage_and_enrollment_services_are_real() {
     );
     ipc.handle(&request("runtime.stop", json!({"targetId":"rt_fixture01"})))
         .unwrap();
+    let archive_error = ipc
+        .handle(&request(
+            "runtime.archive",
+            json!({
+                "targetId":"rt_fixture01",
+                "archivePath":directory.path().join("runtime-archive.tar"),
+            }),
+        ))
+        .unwrap_err();
+    assert!(archive_error.contains("runtime archive"));
+    let restore_error = ipc
+        .handle(&request(
+            "runtime.restore",
+            json!({
+                "targetId":"rt_fixture01",
+                "archivePath":directory.path().join("runtime-archive.tar"),
+            }),
+        ))
+        .unwrap_err();
+    assert!(restore_error.contains("runtime archive restore"));
 
     let backup = ipc.handle(&request("backup.create", json!({}))).unwrap();
     assert!(backup["backupId"].as_str().unwrap().starts_with("backup_"));

@@ -211,13 +211,60 @@ impl LocalIpcService {
 
     fn runtime_archive(&self, request: &IpcRequest) -> Result<Value, String> {
         let admission = self.runtime_target(request)?;
+        let target = request
+            .params
+            .get("archivePath")
+            .or_else(|| request.params.get("targetPath"))
+            .or_else(|| request.params.get("destination"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| "runtime_archive_path_required".to_owned())?;
         let handle = self
             .node
             .runtime_handle(&admission)
             .map_err(|error| error.to_string())?;
+        let receipt = self
+            .node
+            .archive_runtime(&admission.provider_id, &handle, &target)
+            .map_err(|error| error.to_string())?;
+        let mut value = serde_json::to_value(receipt).map_err(|error| error.to_string())?;
+        value["archivePath"] = Value::String(target.to_string_lossy().into_owned());
+        Ok(value)
+    }
+
+    fn runtime_restore(&self, request: &IpcRequest) -> Result<Value, String> {
+        let archive = request
+            .params
+            .get("archivePath")
+            .or_else(|| request.params.get("sourcePath"))
+            .and_then(Value::as_str)
+            .map(PathBuf::from)
+            .ok_or_else(|| "runtime_archive_path_required".to_owned())?;
+        let (runtime, durable_provider) = if let Some(value) = request.params.get("runtimeRequest")
+        {
+            (
+                serde_json::from_value::<RuntimeRequest>(value.clone())
+                    .map_err(|_| "runtime_request_invalid".to_owned())?,
+                None,
+            )
+        } else {
+            let admission = self.runtime_target(request)?;
+            (
+                serde_json::from_slice::<RuntimeRequest>(&admission.runtime_request)
+                    .map_err(|_| "durable_runtime_request_corrupt".to_owned())?,
+                Some(admission.provider_id),
+            )
+        };
+        let provider_id = request
+            .params
+            .get("providerId")
+            .and_then(Value::as_str)
+            .map(normalize_runtime_provider)
+            .or(durable_provider)
+            .unwrap_or_else(|| normalize_runtime_provider(&runtime.provider_selector));
         serde_json::to_value(
             self.node
-                .collect_runtime(&admission.provider_id, &handle)
+                .restore_runtime(&provider_id, &archive, &runtime)
                 .map_err(|error| error.to_string())?,
         )
         .map_err(|error| error.to_string())
@@ -529,7 +576,7 @@ impl IpcHandler for LocalIpcService {
             "runtime.resume" => self.runtime_signal(request, RuntimeSignal::Resume),
             "runtime.snapshot" => self.runtime_snapshot(request),
             "runtime.archive" => self.runtime_archive(request),
-            "runtime.restore" => Err("runtime_restore_requires_provider_snapshot_import".into()),
+            "runtime.restore" => self.runtime_restore(request),
             "runtime.destroy" => self.runtime_destroy(request),
             "logs.search" => self.logs_search(request),
             method if method.starts_with("logs.show/") => {
@@ -578,6 +625,15 @@ fn write_owner_only(path: &Path, bytes: &[u8]) -> Result<(), String> {
     file.sync_all().map_err(|error| error.to_string())?;
     fs::rename(temporary, path).map_err(|error| error.to_string())?;
     Ok(())
+}
+
+fn normalize_runtime_provider(value: &str) -> String {
+    match value {
+        "docker.container" => "docker".into(),
+        "podman.container" => "podman".into(),
+        "incus.kvm" => "incus_kvm".into(),
+        other => other.to_owned(),
+    }
 }
 
 fn now() -> String {

@@ -62,3 +62,47 @@ fn every_required_adapter_fixture_reaches_a_truthful_terminal_state() {
         );
     }
 }
+
+#[test]
+fn pi_retry_queue_and_tool_error_remain_visible_until_agent_settles() {
+    let mut driver = ProtocolDriver::new(AdapterKind::Pi, &request()).unwrap();
+    driver.start().unwrap();
+    driver
+        .on_record(b"{\"id\":\"conduit-1\",\"type\":\"response\",\"command\":\"prompt\",\"success\":true}\n")
+        .unwrap();
+    driver.on_record(b"{\"type\":\"agent_start\"}\n").unwrap();
+
+    let (_, tool_events) = driver
+        .on_record(
+            b"{\"type\":\"tool_execution_end\",\"toolCallId\":\"tool-error-1\",\"toolName\":\"read\",\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"fixture tool error\"}]},\"isError\":true}\n",
+        )
+        .unwrap();
+    assert_eq!(tool_events[0].kind, AdapterEventKind::ToolResult);
+    assert_eq!(tool_events[0].correlation_id.as_deref(), Some("tool-error-1"));
+    assert_eq!(tool_events[0].text.as_deref(), Some("fixture tool error"));
+    assert_eq!(
+        tool_events[0]
+            .data
+            .as_ref()
+            .and_then(|data| data.get("isError"))
+            .and_then(serde_json::Value::as_bool),
+        Some(true)
+    );
+
+    let (_, queue_events) = driver
+        .on_record(
+            b"{\"type\":\"queue_update\",\"steering\":[],\"followUp\":[\"summarize after retry\"]}\n",
+        )
+        .unwrap();
+    assert_eq!(queue_events[0].kind, AdapterEventKind::State);
+    assert_eq!(driver.state(), AdapterState::Working);
+
+    driver
+        .on_record(b"{\"type\":\"agent_end\",\"messages\":[],\"willRetry\":true}\n")
+        .unwrap();
+    assert_eq!(driver.state(), AdapterState::Working);
+    driver
+        .on_record(b"{\"type\":\"agent_settled\"}\n")
+        .unwrap();
+    assert_eq!(driver.state(), AdapterState::Completed);
+}

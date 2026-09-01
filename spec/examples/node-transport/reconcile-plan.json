@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "protocol": "conduit.node/1",
+  "type": "reconcile.plan",
+  "messageId": "msg_reconplan01",
+  "connectionId": "conn_example0001",
+  "connectionEpoch": 7,
+  "sequence": 1,
+  "sentAt": "2026-09-01T09:00:03Z",
+  "payload": {
+    "core": {
+      "reconciliationId": "recon_example0001",
+      "controlPlaneThroughRecordSeq": 40,
+      "replayRanges": [{"start": 41, "end": 43}],
+      "queryOperationIds": [],
+      "operationIdsToReoffer": [],
+      "expectedOperations": [
+        {
+          "operationId": "op_example0001",
+          "payloadDigest": "798daac77f5206a93dcf75c6466bf0361138a67800550505de29b3adefc1641a",
+          "expectedState": "working"
+        }
+      ],
+      "holdNewWork": true
+    },
+    "planDigest": "e65c65857d9de3b6c46ad90f7b68bb39897971f1cb32feb2015442f259fc1d89",
+    "controlPlaneSignature": {
+      "keyId": "cpkey_example0001",
+      "algorithm": "Ed25519",
+      "signedDigest": "e65c65857d9de3b6c46ad90f7b68bb39897971f1cb32feb2015442f259fc1d89",
+      "signature": "uNb5p5NhK--dSplG1l6EbtAyn0EkAYgs7Dfcrv4ybTkSMpeTQfWBuyGOnOaud06WmYkvnFk93qaSuADh9hmACQ"
+    }
+  }
+}

@@ -43,6 +43,8 @@ interface StoredDispatchReceipt {
   expires_at: string;
 }
 
+const MAX_CONTROL_REPLAY_FRAMES = 32;
+
 export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
   constructor(ctx: DurableObjectState, env: ControlPlaneEnv) {
     super(ctx, env);
@@ -152,7 +154,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     if (body.protocol !== "conduit.node/1" || body.deviceId !== attachment.deviceId || body.connectionEpoch !== attachment.epoch || body.direction !== "node_to_control" || typeof body.sequence !== "string" || !/^\d+$/.test(body.sequence) || typeof body.messageId !== "string" || typeof body.type !== "string" || typeof body.payloadDigest !== "string" || body.payload === null || typeof body.payload !== "object" || Array.isArray(body.payload)) {
       ws.close(1008, "frame_malformed"); return;
     }
-    if (attachment.reconciling && body.type !== "reconcile.summary" && body.type !== "reconcile.complete" && body.type !== "transport.ack") { await this.enqueueControlFrame("transport.error", { code: "reconciliation_required", retryable: true }, undefined, new Date(Date.now() + 300_000).toISOString(), ws); return; }
+    if (attachment.reconciling && body.type !== "reconcile.summary" && body.type !== "reconcile.complete" && body.type !== "transport.ack" && body.type !== "transport.replay_required") { await this.enqueueControlFrame("transport.error", { code: "reconciliation_required", retryable: true }, undefined, new Date(Date.now() + 300_000).toISOString(), ws); return; }
     const digest = await sha256Hex(canonicalJson(body.payload));
     if (digest !== body.payloadDigest) { ws.close(1008, "payload_digest_mismatch"); return; }
     const sequence = BigInt(body.sequence);
@@ -167,6 +169,8 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     }
     if (sequence !== BigInt(position) + 1n) { await this.enqueueControlFrame("transport.replay_required", { direction: "node_to_control", expectedSequence: String(position + 1), receivedSequence: String(sequence) }, undefined, new Date(Date.now() + 300_000).toISOString(), ws); return; }
     const frame = body as unknown as NodeV1PostAuthFrame;
+    const replayFrames = frame.type === "transport.replay_required" ? await this.validateControlReplayRequest(ws, frame) : undefined;
+    if (frame.type === "transport.replay_required" && replayFrames === null) return;
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec("INSERT INTO inbound_frames(sequence,message_id,correlation_id,payload_digest,frame_json,created_at) VALUES (?,?,?,?,?,?)", Number(sequence), frame.messageId, frame.correlationId ?? null, frame.payloadDigest, JSON.stringify(frame), nowIso());
       this.ctx.storage.sql.exec("UPDATE transport_positions SET durable_sequence=? WHERE direction='node_to_control'", Number(sequence));
@@ -174,6 +178,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     });
     if (frame.type === "reconcile.summary") await this.planReconciliation(ws, attachment, frame);
     if (frame.type === "reconcile.complete") await this.completeReconciliation(ws, attachment, frame);
+    if (replayFrames !== undefined && replayFrames !== null) for (const replay of replayFrames) await this.sendStoredFrame(replay, ws);
     if (frame.type === "transport.ack") {
       const acknowledged = BigInt(frame.payload.throughSequence);
       const controlPosition = this.ctx.storage.sql.exec<{ durable_sequence: number; acknowledged_sequence: number }>("SELECT durable_sequence,acknowledged_sequence FROM transport_positions WHERE direction='control_to_node'").one();
@@ -187,6 +192,30 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       await this.enqueueControlFrame("transport.ack", { direction: "node_to_control", throughSequence: frame.sequence }, undefined, new Date(Date.now() + 300_000).toISOString(), ws);
     }
     this.ctx.waitUntil(this.project(frame));
+  }
+
+  private async validateControlReplayRequest(ws: WebSocket, frame: Extract<NodeV1PostAuthFrame, { type: "transport.replay_required" }>): Promise<StoredOutboundFrame[] | null> {
+    if (frame.payload.direction !== "control_to_node") { ws.close(1008, "replay_direction_invalid"); return null; }
+    const expected = BigInt(frame.payload.expectedSequence);
+    const position = this.ctx.storage.sql.exec<{ durable_sequence: number; acknowledged_sequence: number }>("SELECT durable_sequence,acknowledged_sequence FROM transport_positions WHERE direction='control_to_node'").one();
+    const through = frame.payload.receivedSequence === undefined ? BigInt(position.durable_sequence) : BigInt(frame.payload.receivedSequence);
+    if (expected < 1n || expected > through || through > BigInt(position.durable_sequence) || through > BigInt(Number.MAX_SAFE_INTEGER)) { ws.close(1008, "replay_range_invalid"); return null; }
+    if (expected <= BigInt(position.acknowledged_sequence)) { ws.close(1008, "replay_range_acknowledged"); return null; }
+    if (through - expected + 1n > BigInt(MAX_CONTROL_REPLAY_FRAMES)) { ws.close(1008, "replay_range_too_large"); return null; }
+    const rows = this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE sequence BETWEEN ? AND ? ORDER BY sequence", Number(expected), Number(through)).toArray();
+    if (rows.length !== Number(through - expected + 1n)) { ws.close(1011, "replay_range_unavailable"); return null; }
+    for (let index = 0; index < rows.length; index += 1) {
+      const row = rows[index]!;
+      let persisted: unknown;
+      try { persisted = parseWireDocumentText(schemaIds.nodeV1, row.frame_json); } catch { ws.close(1011, "replay_record_invalid"); return null; }
+      if (persisted === null || typeof persisted !== "object" || Array.isArray(persisted)) { ws.close(1011, "replay_record_invalid"); return null; }
+      const wire = persisted as Record<string, unknown>;
+      const expectedSequence = expected + BigInt(index);
+      if (!Number.isSafeInteger(row.sequence) || BigInt(row.sequence) !== expectedSequence || !["queued", "sent"].includes(row.state) || wire.protocol !== "conduit.node/1" || wire.direction !== "control_to_node" || wire.sequence !== String(expectedSequence) || wire.messageId !== row.message_id || (wire.correlationId ?? null) !== row.correlation_id || wire.payloadDigest !== row.payload_digest || wire.payload === null || typeof wire.payload !== "object" || Array.isArray(wire.payload) || await sha256Hex(canonicalJson(wire.payload)) !== row.payload_digest || Date.parse(row.expires_at) <= Date.now()) {
+        ws.close(1011, "replay_record_invalid"); return null;
+      }
+    }
+    return rows;
   }
 
   private async planReconciliation(ws: WebSocket, attachment: SocketAttachment, frame: Extract<NodeV1PostAuthFrame, { type: "reconcile.summary" }>): Promise<void> {

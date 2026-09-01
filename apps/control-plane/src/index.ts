@@ -22,7 +22,7 @@ function withSecurityHeaders(response: Response, requestId: string): Response {
   headers.set("referrer-policy", "no-referrer");
   headers.set("x-frame-options", "DENY");
   headers.set("x-request-id", requestId);
-  return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
+  return new Response(response.body, { status: response.status, statusText: response.statusText, headers, webSocket: response.webSocket });
 }
 
 async function fetchHandler(request: Request, env: ControlPlaneEnv, ctx: ExecutionContext): Promise<Response> {

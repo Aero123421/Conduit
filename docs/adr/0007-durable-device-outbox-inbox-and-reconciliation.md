@@ -68,6 +68,8 @@ After authentication, a node sends a bounded reconciliation summary. The control
 
 New remote operation offers wait until initial reconciliation completes.
 
+The public Worker forwards the WebSocket upgrade response without rebuilding away its `webSocket` endpoint. A reconnect summary whose control position is behind declares a control replay range. Node-origin `transport.replay_required` is accepted only for a bounded, unacknowledged, contiguous range present in the Durable Object outbox. `DeviceRoom` validates every stored row before custody of the request, then resends the original sequence, message ID, correlation ID, payload, and digest on the current authenticated epoch. ACK compaction updates durable receipt tombstones and deletes live frames in one SQLite transaction.
+
 ### No automatic rerun from ambiguity
 
 Recovery distinguishes:

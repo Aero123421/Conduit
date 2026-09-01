@@ -121,7 +121,7 @@ describe.sequential("control-plane contracts", () => {
       env.DB.prepare("INSERT INTO devices(id,enrollment_id,display_label,os,arch,node_version,protocol_version,status,created_at,updated_at) VALUES (?1,?2,'test','linux','x86_64','0.1.0','conduit.node/1','active',?3,?3)").bind(deviceId, enrollmentId, now),
       env.DB.prepare("INSERT INTO device_keys(id,device_id,public_jwk_json,fingerprint,status,created_at) VALUES (?1,?2,?3,?4,'active',?5)").bind(keyId, deviceId, JSON.stringify(publicJwk), "c".repeat(64), now),
     ]);
-    const response = await env.DEVICE_ROOMS.getByName(deviceId).fetch(new Request(`https://conduit.example.com/v1/devices/${deviceId}/connect`, { headers: { upgrade: "websocket" } }));
+    const response = await exports.default.fetch(new Request(`https://conduit.example.com/v1/devices/${deviceId}/connect`, { headers: { upgrade: "websocket" } }));
     expect(response.status).toBe(101);
     const socket = response.webSocket!;
     socket.accept();
@@ -164,6 +164,118 @@ describe.sequential("control-plane contracts", () => {
     }));
     expect(transportState).toEqual({ outbound: 0, acknowledged: 3, reconciliation: "complete" });
     socket.close(1000, "test_complete");
+  });
+
+  it("replays an unacknowledged control offer with the same identity after reconnect", async () => {
+    const deviceId = "dev_control_replay01";
+    const keyId = "dkey_control_replay01";
+    const enrollmentId = "enroll_control_replay01";
+    const keyPair = await crypto.subtle.generateKey("Ed25519", true, ["sign", "verify"]) as CryptoKeyPair;
+    const publicJwk = await crypto.subtle.exportKey("jwk", keyPair.publicKey);
+    const now = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO device_enrollments(id,state,device_code_hash,user_code_hash,claims_json,requested_key_id,requested_public_jwk_json,requested_fingerprint,possession_challenge,possession_signature,assigned_device_id,created_at,expires_at,terminal_at) VALUES (?1,'completed',?2,?3,'{}',?4,?5,?6,'challenge','signature',?7,?8,?9,?8)").bind(enrollmentId, "1".repeat(64), "2".repeat(64), keyId, JSON.stringify(publicJwk), "3".repeat(64), deviceId, now, new Date(Date.now() + 300_000).toISOString()),
+      env.DB.prepare("INSERT INTO devices(id,enrollment_id,display_label,os,arch,node_version,protocol_version,status,created_at,updated_at) VALUES (?1,?2,'replay-test','linux','x86_64','0.1.0','conduit.node/1','active',?3,?3)").bind(deviceId, enrollmentId, now),
+      env.DB.prepare("INSERT INTO device_keys(id,device_id,public_jwk_json,fingerprint,status,created_at) VALUES (?1,?2,?3,?4,'active',?5)").bind(keyId, deviceId, JSON.stringify(publicJwk), "3".repeat(64), now),
+    ]);
+
+    const connect = async (bootId: string) => {
+      const response = await exports.default.fetch(new Request(`https://conduit.example.com/v1/devices/${deviceId}/connect`, { headers: { upgrade: "websocket" } }));
+      expect(response.status).toBe(101);
+      expect(response.webSocket).not.toBeNull();
+      const socket = response.webSocket!;
+      socket.accept();
+      const queued: string[] = [];
+      const waiters: Array<(message: string) => void> = [];
+      socket.addEventListener("message", (event) => { const waiter = waiters.shift(); if (waiter === undefined) queued.push(String(event.data)); else waiter(String(event.data)); });
+      const next = () => queued.length > 0 ? Promise.resolve(queued.shift()!) : new Promise<string>((resolve) => waiters.push(resolve));
+      const clientNonce = base64url(crypto.getRandomValues(new Uint8Array(24)));
+      const challengePending = next();
+      socket.send(JSON.stringify({ type: "device.hello", deviceId, keyId, supportedProtocols: ["conduit.node/1"], capabilityDigest: "4".repeat(64), clientNonce, nodeBootId: bootId }));
+      const challenge = parseWireDocumentText(schemaIds.nodeV1, await challengePending);
+      if (challenge.type !== "device.challenge") throw new Error("expected device.challenge");
+      const transcript = canonicalJson({ domain: "conduit.device-auth.v1", origin: "https://conduit.example.com", clientNonce, connectionId: challenge.connectionId, deviceId, keyId, protocol: challenge.selectedProtocol, serverNonce: challenge.serverNonce, serverTime: challenge.serverTime });
+      const signature = base64url(new Uint8Array(await crypto.subtle.sign("Ed25519", keyPair.privateKey, new TextEncoder().encode(transcript))));
+      const acceptedPending = next();
+      socket.send(JSON.stringify({ type: "device.proof", connectionId: challenge.connectionId, deviceId, keyId, signature }));
+      const accepted = parseWireDocumentText(schemaIds.nodeV1, await acceptedPending);
+      if (accepted.type !== "transport.accepted") throw new Error("expected transport.accepted");
+      const send = async (sequence: number, type: string, payload: Record<string, unknown>, correlationId?: string) => {
+        socket.send(JSON.stringify({ protocol: "conduit.node/1", messageId: `nmsg_control_replay_${sequence.toString().padStart(2, "0")}`, deviceId, connectionEpoch: accepted.connectionEpoch, direction: "node_to_control", sequence: String(sequence), type, ...(correlationId === undefined ? {} : { correlationId }), payloadDigest: await sha256Hex(canonicalJson(payload)), payload }));
+      };
+      return { socket, next, send, accepted };
+    };
+
+    const first = await connect("node-boot-control-replay-0001");
+    expect(first.accepted).toMatchObject({ controlNextSequence: "1", nodeStoredThroughSequence: "0" });
+    await first.send(1, "reconcile.summary", { nodeBootId: "node-boot-control-replay-0001", journalGeneration: "1", capabilityDigest: "4".repeat(64), lastControlSequenceApplied: "0", lastNodeSequenceAcknowledged: "0", lastNodeSequenceRetained: "1", runs: [], retainedEventRanges: [], unresolvedCount: 0, truncated: false, storageHealth: "healthy" }, first.accepted.connectionId);
+    const initialPlan = parseWireDocumentText(schemaIds.nodeV1, await first.next());
+    const initialSummaryAck = parseWireDocumentText(schemaIds.nodeV1, await first.next());
+    if (initialPlan.type !== "reconcile.plan") throw new Error("expected initial reconcile.plan");
+    expect(initialSummaryAck).toMatchObject({ type: "transport.ack", sequence: "2" });
+    await first.send(2, "reconcile.complete", { reconciliationId: initialPlan.payload.reconciliationId, lastControlSequenceApplied: "2", lastNodeSequenceAcknowledged: "1", unresolvedRunIds: [] }, initialPlan.payload.reconciliationId);
+    expect(parseWireDocumentText(schemaIds.nodeV1, await first.next())).toMatchObject({ type: "transport.ack", sequence: "3" });
+    await first.send(3, "transport.ack", { direction: "control_to_node", throughSequence: "3" });
+    await expect.poll(async () => runInDurableObject(env.DEVICE_ROOMS.getByName(deviceId), (_instance, state) => state.storage.sql.exec<{ acknowledged_sequence: number }>("SELECT acknowledged_sequence FROM transport_positions WHERE direction='control_to_node'").one().acknowledged_sequence)).toBe(3);
+
+    const issuedAt = new Date();
+    const operation = {
+      schemaVersion: 1,
+      operationId: "op_control_replay0001",
+      idempotencyKey: "control-replay-idempotency-0001",
+      actorPrincipalId: "prin_control_replay01",
+      clientId: "conduit.test",
+      deviceId,
+      capability: "command.start",
+      sourceRevisions: [],
+      runtime: { kind: "native", providerId: "native.linux", configurationRevision: 1 },
+      accessScope: "full_user",
+      approvalMode: "never",
+      connectorPolicyId: "cpol_control_replay01",
+      connectorPolicyRevision: 1,
+      arguments: { argv: ["true"] },
+      payloadDigest: "5".repeat(64),
+      issuedAt: issuedAt.toISOString(),
+      expiresAt: new Date(issuedAt.getTime() + 300_000).toISOString(),
+      validForMs: 300_000,
+    };
+    const offerPayload = { operation };
+    const messageId = "cmsg_control_replay_offer01";
+    const delivery = await env.DEVICE_ROOMS.getByName(deviceId).offer({ deviceId, messageId, correlationId: operation.operationId, payloadDigest: await sha256Hex(canonicalJson(offerPayload)), payload: offerPayload, expiresAt: operation.expiresAt });
+    expect(delivery).toEqual({ sequence: "4", delivered: true });
+    const originalOffer = parseWireDocumentText(schemaIds.nodeV1, await first.next());
+    expect(originalOffer).toMatchObject({ type: "operation.offer", sequence: "4", messageId, payload: offerPayload });
+    if (originalOffer.type !== "operation.offer") throw new Error("expected operation.offer");
+    first.socket.close(1000, "fault_disconnect_before_ack");
+    await evictDurableObject(env.DEVICE_ROOMS.getByName(deviceId));
+
+    const second = await connect("node-boot-control-replay-0002");
+    expect(second.accepted).toMatchObject({ controlNextSequence: "5", nodeStoredThroughSequence: "3" });
+    await second.send(4, "reconcile.summary", { nodeBootId: "node-boot-control-replay-0002", journalGeneration: "1", capabilityDigest: "4".repeat(64), lastControlSequenceApplied: "3", lastNodeSequenceAcknowledged: "3", lastNodeSequenceRetained: "4", runs: [], retainedEventRanges: [], unresolvedCount: 0, truncated: false, storageHealth: "healthy" }, second.accepted.connectionId);
+    const reconnectMessages = [parseWireDocumentText(schemaIds.nodeV1, await second.next()), parseWireDocumentText(schemaIds.nodeV1, await second.next())];
+    const replayPlan = reconnectMessages.find((frame) => frame.type === "reconcile.plan");
+    expect(replayPlan).toMatchObject({ type: "reconcile.plan", sequence: "5", payload: { controlReplay: [{ from: "4", through: "4" }] } });
+    const planFrame = reconnectMessages.find((frame) => frame.type === "reconcile.plan");
+    if (planFrame?.type !== "reconcile.plan") throw new Error("expected reconnect reconcile.plan");
+    await second.send(5, "transport.replay_required", { direction: "control_to_node", expectedSequence: "4", receivedSequence: "5" });
+    const replayedOffer = parseWireDocumentText(schemaIds.nodeV1, await second.next());
+    const replayedPlan = parseWireDocumentText(schemaIds.nodeV1, await second.next());
+    const replayRequestAck = parseWireDocumentText(schemaIds.nodeV1, await second.next());
+    expect(replayedOffer).toMatchObject({ type: "operation.offer", sequence: originalOffer.sequence, messageId: originalOffer.messageId, payloadDigest: originalOffer.payloadDigest, payload: originalOffer.payload, connectionEpoch: second.accepted.connectionEpoch });
+    expect(replayedPlan).toMatchObject({ type: "reconcile.plan", sequence: planFrame.sequence, messageId: planFrame.messageId, payloadDigest: planFrame.payloadDigest });
+    expect(replayRequestAck).toMatchObject({ type: "transport.ack", sequence: "7", payload: { direction: "node_to_control", throughSequence: "5" } });
+
+    await second.send(6, "transport.ack", { direction: "control_to_node", throughSequence: "5" });
+    await expect.poll(async () => runInDurableObject(env.DEVICE_ROOMS.getByName(deviceId), (_instance, state) => ({
+      frameCount: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_frames WHERE message_id=?", messageId).one().count,
+      receipt: state.storage.sql.exec<{ message_id: string; sequence: number; payload_digest: string; state: string }>("SELECT message_id,sequence,payload_digest,state FROM outbound_message_receipts WHERE message_id=?", messageId).toArray()[0],
+    }))).toEqual({ frameCount: 0, receipt: { message_id: messageId, sequence: 4, payload_digest: originalOffer.payloadDigest, state: "acknowledged" } });
+
+    const rejected = new Promise<{ code: number; reason: string }>((resolve) => second.socket.addEventListener("close", (event) => resolve({ code: event.code, reason: event.reason }), { once: true }));
+    await second.send(7, "transport.replay_required", { direction: "control_to_node", expectedSequence: "4", receivedSequence: "4" });
+    await expect(rejected).resolves.toEqual({ code: 1008, reason: "replay_range_acknowledged" });
+    const invalidPersisted = await runInDurableObject(env.DEVICE_ROOMS.getByName(deviceId), (_instance, state) => state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM inbound_frames WHERE sequence=7").one().count);
+    expect(invalidPersisted).toBe(0);
   });
 
   it("admits owner CLI effects through the first-party policy boundary", async () => {

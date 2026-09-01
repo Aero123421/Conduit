@@ -152,6 +152,8 @@ A sequence replay is accepted only when message ID and payload digest match the 
 
 A higher-than-expected sequence is not applied. The receiver returns `transport.replay_required` with the expected sequence. It does not skip an effectful message to process later frames.
 
+A node-origin `transport.replay_required` may request only `control_to_node` sequences that are above the cumulative acknowledged position and no later than the Durable Object's stored control position. `expectedSequence` is the first requested sequence and `receivedSequence`, when present, is the inclusive end. The range is bounded and every sequence must still exist in the durable control outbox. `DeviceRoom` validates the complete range before accepting the request, then resends the stored frames with their original sequence, message ID, correlation ID, payload, and payload digest. Only the connection epoch is rebound to the authenticated replacement connection. An acknowledged, missing, conflicting, expired, or oversized range fails closed and is not recorded as an accepted node frame.
+
 ## Cumulative acknowledgement
 
 Both directions use cumulative acknowledgements.
@@ -406,6 +408,8 @@ The summary contains:
 When the device has more records than fit in one summary, it sends counts and cursors. It does not truncate without declaring truncation.
 
 The control plane compares the summary with D1 intended state and `DeviceRoom` transport state, then sends `reconcile.plan`.
+
+When `lastControlSequenceApplied` is behind the Durable Object position, the plan declares the inclusive control replay range. If the node observes the plan or another later frame before the missing range, it sends `transport.replay_required`; the Durable Object serves that range directly from SQLite-backed `outbound_frames`. A Worker restart, Durable Object eviction, WebSocket replacement, or lost pre-disconnect acknowledgement does not allocate new transport identities. Cumulative acknowledgement compacts the live outbox rows only after durable receipt tombstones have been updated.
 
 The plan can request:
 

@@ -1,0 +1,53 @@
+{
+  "schemaVersion": 1,
+  "protocol": "conduit.node/1",
+  "type": "reconcile.state",
+  "messageId": "msg_reconstate1",
+  "connectionId": "conn_example0001",
+  "connectionEpoch": 7,
+  "sequence": 2,
+  "sentAt": "2026-09-01T09:00:02Z",
+  "payload": {
+    "core": {
+      "reconciliationId": "recon_example0001",
+      "nodeInstanceId": "node_example0001",
+      "bootId": "boot_example0001",
+      "journalGeneration": "jgen_example0001",
+      "recordRange": {
+        "firstAvailableRecordSeq": 1,
+        "lastRecordSeq": 43,
+        "lastCloudAckedRecordSeq": 40
+      },
+      "nonTerminalOperations": [
+        {
+          "operationId": "op_example0001",
+          "payloadDigest": "798daac77f5206a93dcf75c6466bf0361138a67800550505de29b3adefc1641a",
+          "state": "running",
+          "executionId": "exec_example0001",
+          "runtimeId": "rt_example0001",
+          "updatedAt": "2026-09-01T09:00:00Z"
+        }
+      ],
+      "activeRuntimes": [
+        {
+          "runId": "run_example0001",
+          "executionId": "exec_example0001",
+          "runtimeId": "rt_example0001",
+          "providerKind": "native",
+          "state": "running",
+          "attestationLevel": "authoritative",
+          "observedAt": "2026-09-01T09:00:00Z"
+        }
+      ],
+      "localScratchRunCount": 1,
+      "truncated": false
+    },
+    "summaryDigest": "6bf7b914e2936ccece14940b5c5b5775ae6c510074d827ea9b64a1e7b0760c17",
+    "deviceSignature": {
+      "keyId": "dkey_example0001",
+      "algorithm": "Ed25519",
+      "signedDigest": "6bf7b914e2936ccece14940b5c5b5775ae6c510074d827ea9b64a1e7b0760c17",
+      "signature": "17_UPhRwlhZWhM30cKzQr8bQBVUxrFNKQxOJE8Vq2MxhaMnzhcIuyFt2vhuPw3xffrKIJYDZtQ-NpFnbOTO6Dw"
+    }
+  }
+}

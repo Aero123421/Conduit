@@ -66,11 +66,16 @@ account.
     requires the vendor CLI to be logged in.
 13. **Container limits:** Docker/Podman provider conformance validates typed
     command construction, CPU/memory/PID/storage/network bounds and rejects
-    management-socket or whole-home mounts. Live daemon evidence is separate.
-14. **Quick VM lifecycle:** Incus conformance covers create, stop, snapshot,
-    restore and custody-gated destroy command/receipt semantics. Run it live only
-    after `conduit doctor` reports Incus, KVM, storage, network and guest-agent
-    prerequisites effective.
+    management-socket or whole-home mounts. The opt-in live test uses an already
+    local image, offline networking, exact argv, bounded collection and
+    custody-gated destroy; it never pulls an image.
+14. **Quick VM lifecycle:** Incus conformance covers metadata-bound prepare
+    validation, inspect, stop, archive/import restore, reconciliation and
+    custody-gated destroy command/receipt semantics. Guest start, snapshot
+    digest custody and output collection remain accurately unavailable until a
+    versioned guest-process identity/custody contract exists. Run provider-live
+    checks only after `conduit doctor` reports Incus, KVM, storage and offline
+    network prerequisites effective.
 15. **`full_user + never` and `full_device + never`:** local-policy tests require
     those exact combinations to be explicitly enabled and retain admission and
     audit receipts. The Device-local deny remains final.

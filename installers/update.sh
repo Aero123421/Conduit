@@ -75,13 +75,10 @@ fi
 "$conduit_source_bin/conduit-node" --help >/dev/null
 
 conduit_upgrades_dir="$conduit_state_dir/upgrades"
-conduit_backups_dir="$conduit_data_home/conduit-backups"
 conduit_assert_not_symlink "$conduit_upgrades_dir"
-conduit_assert_not_symlink "$conduit_backups_dir"
-install -d -m 0700 "$conduit_upgrades_dir" "$conduit_backups_dir"
-chmod 0700 "$conduit_upgrades_dir" "$conduit_backups_dir"
+install -d -m 0700 "$conduit_upgrades_dir"
+chmod 0700 "$conduit_upgrades_dir"
 conduit_require_owner_only "$conduit_upgrades_dir" directory
-conduit_require_owner_only "$conduit_backups_dir" directory
 conduit_lock="$conduit_state_dir/update.lock"
 if ! mkdir -m 0700 "$conduit_lock" 2>/dev/null; then
   echo "another Conduit update is already in progress: $conduit_lock" >&2
@@ -91,9 +88,8 @@ trap 'rmdir -- "$conduit_lock" 2>/dev/null' EXIT
 
 conduit_transaction_id="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 conduit_transaction="$conduit_upgrades_dir/$conduit_transaction_id"
-conduit_backup_destination="$conduit_backups_dir/$conduit_transaction_id"
 mkdir -m 0700 "$conduit_transaction"
-mkdir -m 0700 "$conduit_backup_destination"
+conduit_backup_manifest=""
 
 conduit_active=0
 conduit_service_stopped=0
@@ -170,10 +166,7 @@ else
 fi
 
 if ((conduit_active)); then
-  conduit_backup_json="$conduit_backup_destination"
-  conduit_backup_json="${conduit_backup_json//\\/\\\\}"
-  conduit_backup_json="${conduit_backup_json//\"/\\\"}"
-  conduit_backup_create="$($conduit_bindir/conduit --output json backup create --data "{\"destination\":\"$conduit_backup_json\"}")"
+  conduit_backup_create="$($conduit_bindir/conduit --output json backup create --data '{}')"
   printf '%s\n' "$conduit_backup_create" > "$conduit_transaction/backup-create.json"
   chmod 0600 "$conduit_transaction/backup-create.json"
   conduit_backup_id="$(sed -nE 's/.*"backupId"[[:space:]]*:[[:space:]]*"([^"[:space:]]+)".*/\1/p' "$conduit_transaction/backup-create.json")"
@@ -181,6 +174,12 @@ if ((conduit_active)); then
     echo "live Node backup did not return a valid backupId" >&2
     exit 4
   }
+  conduit_backup_manifest="$(sed -nE 's/.*"manifestPath"[[:space:]]*:[[:space:]]*"([^"[:cntrl:]]+)".*/\1/p' "$conduit_transaction/backup-create.json")"
+  [[ "$conduit_backup_manifest" == /* && -f "$conduit_backup_manifest" && ! -L "$conduit_backup_manifest" ]] || {
+    echo "live Node backup did not return an existing absolute regular manifestPath" >&2
+    exit 4
+  }
+  conduit_require_owner_only "$conduit_backup_manifest" file
   conduit_backup_verify="$($conduit_bindir/conduit --output json backup verify --data "{\"backupId\":\"$conduit_backup_id\"}")"
   printf '%s\n' "$conduit_backup_verify" > "$conduit_transaction/backup-verify.json"
   chmod 0600 "$conduit_transaction/backup-verify.json"
@@ -191,6 +190,11 @@ if ((conduit_active)); then
   conduit_verified_backup_id="$(sed -nE 's/.*"backupId"[[:space:]]*:[[:space:]]*"([^"[:space:]]+)".*/\1/p' "$conduit_transaction/backup-verify.json")"
   [[ "$conduit_verified_backup_id" == "$conduit_backup_id" ]] || {
     echo "backup verification receipt did not match the created backup" >&2
+    exit 4
+  }
+  conduit_verified_manifest="$(sed -nE 's/.*"manifestPath"[[:space:]]*:[[:space:]]*"([^"[:cntrl:]]+)".*/\1/p' "$conduit_transaction/backup-verify.json")"
+  [[ "$conduit_verified_manifest" == "$conduit_backup_manifest" ]] || {
+    echo "backup verification manifest did not match the created backup" >&2
     exit 4
   }
 fi
@@ -259,6 +263,6 @@ trap - EXIT INT TERM
 rmdir -- "$conduit_lock"
 echo "updated Conduit from $conduit_current_version to $conduit_candidate_version"
 if ((conduit_active)); then
-  echo "verified pre-upgrade backup retained at $conduit_backup_destination"
+  echo "verified pre-upgrade backup manifest retained at $conduit_backup_manifest"
 fi
 echo "rollback evidence retained at $conduit_transaction"

@@ -194,20 +194,27 @@ whole home directory is never copied as a credential shortcut.
 Create and verify a Device-local backup before an upgrade:
 
 ```sh
-conduit --output json backup create --data '{"destination":"/absolute/backup/root"}'
+conduit --output json backup create --data '{}'
 conduit --output json backup verify --data '{"backupId":"backup_..."}'
 ```
 
-A backup includes versioned Node metadata, migration state, encrypted credential
-records, and custody metadata. Workspace contents, Git objects, VM disks, and
-raw content are included only when the selected backup policy names them. A
-verified manifest records every included object digest. It never records clear
-credentials.
+A backup is written only below the active, owner-only `backup` storage root. Its
+signed schema-v1 manifest binds the Device identity, Backup ID, fixed database
+basename, byte length, SHA-256 digest, and journal generation. The SQLite copy
+includes versioned Node metadata, migration state, encrypted credential records,
+and custody metadata. Credential key files, workspace contents, Git objects, VM
+disks, and raw content are separate custody objects and are not implied by the
+journal manifest. The manifest never records clear credentials.
 
-Restore is an offline, explicit operation. Stop the user service, preserve the
-current state as a rollback copy, verify the backup and schema compatibility,
-then restore and restart. If compatibility, integrity, free-space, ownership, or
-custody checks fail, the old state remains authoritative.
+Restore is an explicit staged operation. While the current Node is healthy, run
+`backup restore` with the verified Backup ID; it copies the signed manifest and
+database to owner-only pending paths and returns `pending_restart` with
+`applied: false`. Restart the user service to apply it. Startup re-verifies the
+Device signature, manifest schema, fixed basename, size, digest, ownership and
+SQLite integrity before replacing anything. It preserves the current database,
+WAL and SHM as a rollback generation, opens/migrates the candidate, and restores
+the former generation atomically if candidate startup fails. A failed check
+leaves the old state authoritative.
 
 For a binary upgrade, retain the previous binaries until the new Node has opened
 its databases, completed migrations, reconciled active records, and returned a
@@ -234,11 +241,12 @@ installed-CLI IPC receipt before committing.
 If migration or startup fails after replacement, the updater stops the
 candidate, preserves its failed data, restores the pre-update data copy,
 binaries, unit, and generated configuration, and health-checks the old service.
-Verified backups are retained below `$XDG_DATA_HOME/conduit-backups`; transaction
-receipts, previous binaries, rollback data, and any failed data are owner-only
-below `$XDG_STATE_HOME/conduit/upgrades`. The updater rejects a candidate with a
-lower semantic version. There is no force-downgrade switch: restore a backup
-whose schema is explicitly compatible with the target release.
+Verified backups remain below the configured Node `backup` storage root and the
+updater records the returned manifest path in its owner-only transaction
+evidence. Transaction receipts, previous binaries, rollback data, and any
+failed data are below `$XDG_STATE_HOME/conduit/upgrades`. The updater rejects a
+candidate with a lower semantic version. There is no force-downgrade switch:
+restore a backup whose schema is explicitly compatible with the target release.
 
 `installers/uninstall.sh` stops and disables the user service and removes only
 the two binaries and managed unit. XDG configuration, data, state, cache,

@@ -172,7 +172,11 @@ impl TransportSession {
     pub fn control_frame_allowed(&self, kind: &str, sequence: u64) -> bool {
         !matches!(
             kind,
-            "operation.offer" | "operation.input" | "operation.cancel" | "operation.approval"
+            "operation.offer"
+                | "operation.input"
+                | "operation.cancel"
+                | "runtime.control"
+                | "operation.approval"
         ) || self.reconciliation_complete
             || self.preexisting_control_replay_allowed(sequence)
     }

@@ -138,12 +138,11 @@ fn native_quick_operation_is_exact_once_and_durable() {
             .disposition,
         "admitted"
     );
-    assert_eq!(
-        node.admit(&request, "native", "full_device", "always")
-            .unwrap()
-            .disposition,
-        "duplicate_replay"
-    );
+    assert!(matches!(
+        node.admit(&request, "native", "full_device", "always"),
+        Err(conduit_node::NodeError::Rejected(reason))
+            if reason == "full_device_capability_unavailable"
+    ));
     let started = node.start(&request.idempotency_key).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {

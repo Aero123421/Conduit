@@ -2201,9 +2201,18 @@ impl ProtocolDriver {
         text: Option<&str>,
     ) -> Result<Vec<ProtocolFrame>, AdapterError> {
         let command = match operation {
-            AdapterOperation::Send => "prompt",
-            AdapterOperation::Steer => "steer",
-            AdapterOperation::FollowUp => "follow_up",
+            AdapterOperation::Send => {
+                self.state = AdapterState::Starting;
+                "prompt"
+            }
+            AdapterOperation::Steer => {
+                self.state = AdapterState::Starting;
+                "steer"
+            }
+            AdapterOperation::FollowUp => {
+                self.state = AdapterState::Starting;
+                "follow_up"
+            }
             AdapterOperation::Cancel => "abort",
             AdapterOperation::State => "get_state",
             AdapterOperation::Replay => "get_messages",
@@ -3660,6 +3669,28 @@ mod tests {
         assert_eq!(driver.state(), AdapterState::Working);
         driver.on_record(b"{\"type\":\"agent_settled\"}\n").unwrap();
         assert_eq!(driver.state(), AdapterState::Completed);
+    }
+
+    #[test]
+    fn pi_follow_up_reopens_a_settled_long_lived_session() {
+        let request = LaunchRequest {
+            cwd: PathBuf::from("/tmp"),
+            prompt: None,
+            native_session_id: None,
+            model: None,
+            effort: None,
+            session_data_dir: None,
+        };
+        let mut driver = ProtocolDriver::new(AdapterKind::Pi, &request).unwrap();
+        driver.start().unwrap();
+        driver.on_record(b"{\"type\":\"agent_settled\"}\n").unwrap();
+        assert_eq!(driver.state(), AdapterState::Completed);
+        let frames = driver
+            .command(AdapterOperation::FollowUp, Some("continue"))
+            .unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(driver.state(), AdapterState::Starting);
+        assert!(String::from_utf8_lossy(&frames[0].0).contains("follow_up"));
     }
 
     #[test]

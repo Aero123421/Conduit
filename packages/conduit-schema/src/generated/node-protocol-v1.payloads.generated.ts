@@ -47,6 +47,21 @@ export type RiskClass =
   | "credential_export"
   | "runtime_management";
 export type Timestamp = string;
+export type OperationStatusPayload = {
+  operationId: OperationId;
+  runId?: RunId;
+  requestDigest: Sha256Hex;
+  state: OperationState;
+  controllerEpoch: U64Decimal;
+  revision: U64Decimal;
+  phase?: string;
+  targetRuntimeId?: string;
+  targetDigest?: Sha256Hex;
+  runtimeTargetDigest?: Sha256Hex;
+  selectedRuntimeProvider?: string;
+  runtimeHandleDigest?: Sha256Hex;
+  observedAt: Timestamp;
+};
 export type TerminalState =
   | "completed"
   | "failed"
@@ -58,6 +73,36 @@ export type TerminalState =
   | "rejected"
   | "expired";
 export type ArtifactId = string;
+export type RuntimeControlPayload = {
+  operationId: OperationId;
+  idempotencyKey: string;
+  targetRunId: RunId;
+  targetRuntimeId: string;
+  targetHandleDigest: Sha256Hex;
+  targetControllerEpoch: U64Decimal;
+  targetDigest: Sha256Hex;
+  expectedState:
+    | "planned"
+    | "preparing"
+    | "prepared"
+    | "starting"
+    | "running"
+    | "paused"
+    | "stopping"
+    | "stopped"
+    | "failed"
+    | "lost"
+    | "uncertain"
+    | "recovery_required"
+    | "destroying"
+    | "destroyed";
+  expectedRevision: U64Decimal;
+  control: "input" | "steer" | "pause" | "resume" | "cancel" | "stop" | "snapshot" | "restore" | "destroy";
+  content?: string;
+  snapshotName?: string;
+  discardAuthorized?: boolean;
+  custodyComplete?: boolean;
+};
 export type ApprovalId = string;
 
 export interface NodeProtocolPayloadCatalogV1 {
@@ -73,6 +118,8 @@ export interface NodeProtocolPayloadCatalogV1 {
   "operation.terminal": OperationTerminalPayload;
   "operation.input": OperationTargetPayload;
   "operation.cancel": OperationTargetPayload;
+  "runtime.control": RuntimeControlPayload;
+  "runtime.control_result": RuntimeControlResultPayload;
   "operation.approval_request": OperationApprovalRequestPayload;
   "operation.approval": OperationApprovalPayload;
   "event.batch": EventBatchPayload;
@@ -247,14 +294,6 @@ export interface OperationAdmissionPayload {
   receiptDigest: Sha256Hex;
   reasonCode?: string;
 }
-export interface OperationStatusPayload {
-  operationId: OperationId;
-  runId?: RunId;
-  state: OperationState;
-  phase?: string;
-  runtimeHandleDigest?: Sha256Hex;
-  observedAt: Timestamp;
-}
 export interface OperationTerminalPayload {
   operationId: OperationId;
   runId?: RunId;
@@ -274,12 +313,43 @@ export interface OperationTerminalPayload {
 }
 export interface OperationTargetPayload {
   operationId: OperationId;
+  idempotencyKey: string;
   targetRunId: RunId;
   targetControllerEpoch: U64Decimal;
   expectedState: OperationState;
+  expectedRevision: U64Decimal;
   mode?: string;
   content?: string;
-  targetDigest?: Sha256Hex;
+  targetDigest: Sha256Hex;
+}
+export interface RuntimeControlResultPayload {
+  operationId: OperationId;
+  targetRunId: RunId;
+  targetRuntimeId: string;
+  targetDigest: Sha256Hex;
+  control: "input" | "steer" | "pause" | "resume" | "cancel" | "stop" | "snapshot" | "restore" | "destroy";
+  state:
+    | "planned"
+    | "preparing"
+    | "prepared"
+    | "starting"
+    | "running"
+    | "paused"
+    | "stopping"
+    | "stopped"
+    | "failed"
+    | "lost"
+    | "uncertain"
+    | "recovery_required"
+    | "destroying"
+    | "destroyed";
+  revision: U64Decimal;
+  processCountDelta: 0;
+  result?: {
+    [k: string]: unknown;
+  };
+  receiptDigest: Sha256Hex;
+  observedAt: Timestamp;
 }
 export interface OperationApprovalRequestPayload {
   approvalId: ApprovalId;

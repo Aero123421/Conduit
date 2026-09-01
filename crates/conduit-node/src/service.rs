@@ -11,10 +11,12 @@ use conduit_adapters::{
     ProtocolDriver,
 };
 use conduit_domain::{DeviceId, Sha256Digest};
-use conduit_node_store::{DeviceIdentity, Direction, OperationState, ReceiveResult, StoreError};
+use conduit_node_store::{
+    ControlEffectResult, DeviceIdentity, Direction, OperationState, ReceiveResult, StoreError,
+};
 use conduit_runtime::{
-    IoMode, LaunchPlan, NetworkMode, ProcessSupervisor, ResourceLimits, RuntimeHandle, RuntimeKind,
-    RuntimeRequest, RuntimeSignal, RuntimeState,
+    DestroyRequest, IoMode, LaunchPlan, NetworkMode, ProcessSupervisor, ResourceLimits,
+    RuntimeHandle, RuntimeKind, RuntimeRequest, RuntimeSignal, RuntimeState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -87,6 +89,11 @@ impl LocalPolicy {
         operation: &WireOperation,
         launch_profile: &str,
     ) -> Result<(), ServiceError> {
+        if operation.access_scope == "full_device" {
+            return Err(ServiceError::Unavailable(
+                "full_device_capability_unavailable".into(),
+            ));
+        }
         let provider = normalize_provider(&operation.runtime.provider_id);
         if !self
             .capabilities
@@ -250,6 +257,45 @@ struct WireOperationApproval {
     valid_for_ms: u64,
     receipt_digest: String,
 }
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireOperationControl {
+    operation_id: String,
+    idempotency_key: String,
+    target_run_id: String,
+    target_controller_epoch: String,
+    target_digest: String,
+    expected_state: String,
+    expected_revision: String,
+    #[serde(default)]
+    mode: Option<String>,
+    #[serde(default)]
+    content: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireRuntimeControl {
+    operation_id: String,
+    idempotency_key: String,
+    target_run_id: String,
+    target_runtime_id: String,
+    target_handle_digest: String,
+    target_controller_epoch: String,
+    target_digest: String,
+    expected_state: String,
+    expected_revision: String,
+    control: String,
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    snapshot_name: Option<String>,
+    #[serde(default)]
+    discard_authorized: Option<bool>,
+    #[serde(default)]
+    custody_complete: Option<bool>,
+}
 fn default_actor_id() -> String {
     "local-owner".into()
 }
@@ -288,6 +334,8 @@ struct Active {
     provider_id: String,
     handle: RuntimeHandle,
     journal_state: OperationState,
+    controller_epoch: u64,
+    revision: u64,
 }
 
 struct AgentActive {
@@ -308,7 +356,39 @@ struct AgentActive {
     effective_required_approval_risk_classes: Vec<String>,
     local_policy_revision: u64,
     controller_epoch: u64,
+    revision: u64,
     event_sequence: u64,
+    settlement_policy: AgentSettlementPolicy,
+    session_state: AgentSessionState,
+    idle_timeout_ms: u64,
+    lease_expires_at_unix_ms: Option<u64>,
+}
+
+#[derive(Clone)]
+struct RuntimeCustody {
+    start_operation_id: String,
+    run_id: String,
+    request_digest: String,
+    provider_id: String,
+    handle: RuntimeHandle,
+    state: RuntimeState,
+    controller_epoch: u64,
+    revision: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentSettlementPolicy {
+    CloseOnSettle,
+    Persistent,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentSessionState {
+    Running,
+    WaitingInput,
+    ClosingCompleted,
+    ClosingCancelled,
+    ClosingTimedOut,
 }
 
 struct PendingAgentApproval {
@@ -350,6 +430,7 @@ pub struct NodeService {
     message_counter: u64,
     active: HashMap<String, Active>,
     agents: HashMap<String, AgentActive>,
+    runtime_custody: HashMap<String, RuntimeCustody>,
     pending_reconciliation: Option<PendingReconciliation>,
 }
 impl NodeService {
@@ -409,11 +490,44 @@ impl NodeService {
                         provider_id: item.provider_id,
                         handle: item.handle,
                         journal_state: item.journal_state,
+                        controller_epoch: 1,
+                        revision: 1,
                     },
                 )
             })
             .collect();
         let message_counter = node.store().transport_positions()?.node_sent_through;
+        let mut runtime_custody = HashMap::new();
+        for admission in node.store().admissions()? {
+            let Ok(runtime) = serde_json::from_slice::<RuntimeRequest>(&admission.runtime_request)
+            else {
+                continue;
+            };
+            let Some(runtime_id) = admission.operation.runtime_id.as_deref() else {
+                continue;
+            };
+            if runtime_id != runtime.runtime_id {
+                continue;
+            }
+            let handle = node.runtime_handle(&admission)?;
+            let state = node
+                .inspect_runtime(&admission.provider_id, &handle)
+                .map(|receipt| receipt.state)
+                .unwrap_or(RuntimeState::Uncertain);
+            runtime_custody.insert(
+                runtime.runtime_id.clone(),
+                RuntimeCustody {
+                    start_operation_id: admission.operation.operation_id,
+                    run_id: runtime.run_id,
+                    request_digest: admission.operation.request_digest,
+                    provider_id: admission.provider_id,
+                    handle,
+                    state,
+                    controller_epoch: 1,
+                    revision: 1,
+                },
+            );
+        }
         Ok(Self {
             node,
             identity,
@@ -428,6 +542,7 @@ impl NodeService {
             message_counter,
             active,
             agents: HashMap::new(),
+            runtime_custody,
             pending_reconciliation: None,
         })
     }
@@ -540,13 +655,6 @@ impl NodeService {
                 .queue_outbound(&ack_id, "transport.ack", None, ack, 0)?;
             return Ok(());
         }
-        if matches!(result, ReceiveResult::DuplicatePending)
-            && matches!(frame.kind.as_str(), "operation.input" | "operation.cancel")
-        {
-            return Err(ServiceError::Unavailable(
-                "ambiguous_control_effect_pending_recovery".into(),
-            ));
-        }
         if !client.session.control_frame_allowed(&frame.kind, seq) {
             return Err(ServiceError::Unavailable("reconciliation_required".into()));
         }
@@ -607,7 +715,20 @@ impl NodeService {
                 }
             }
             "operation.input" | "operation.cancel" => {
-                if let Err(reason) = self.control_agent(&frame.kind, &frame.payload) {
+                if let Err(reason) = self.control_agent(client, &frame.kind, &frame.payload) {
+                    let payload = json!({"code":"capability_unavailable","retryable":false,"details":{"messageType":frame.kind,"reason":bounded(reason,192)}});
+                    let id = self.message_id();
+                    client.session.queue_outbound(
+                        &id,
+                        "transport.error",
+                        frame.correlation_id.clone(),
+                        payload,
+                        0,
+                    )?;
+                }
+            }
+            "runtime.control" => {
+                if let Err(reason) = self.control_runtime(client, &frame.payload) {
                     let payload = json!({"code":"capability_unavailable","retryable":false,"details":{"messageType":frame.kind,"reason":bounded(reason,192)}});
                     let id = self.message_id();
                     client.session.queue_outbound(
@@ -1048,6 +1169,11 @@ impl NodeService {
             return Err(ServiceError::Unavailable("operation_offer_expired".into()));
         }
         let is_agent = op.capability == "agent.run.start";
+        let (settlement_policy, idle_timeout_ms, lease_expires_at_unix_ms) = if is_agent {
+            agent_session_policy(&op.arguments)?
+        } else {
+            (AgentSettlementPolicy::CloseOnSettle, 0, None)
+        };
         let profile_id = if is_agent {
             op.arguments
                 .get("adapterId")
@@ -1379,7 +1505,24 @@ impl NodeService {
                         self.queue_start_failure(client, &op, &error.to_string())?;
                         return Ok(());
                     }
-                    let status = json!({"operationId":op.operation_id,"runId":run_id,"state":"running","phase":"adapter_started","observedAt":now()});
+                    self.node.store().record_agent_session(
+                        &op.idempotency_key,
+                        agent_settlement_policy_name(settlement_policy),
+                        1,
+                        lease_expires_at_unix_ms,
+                    )?;
+                    let status = running_status_payload(
+                        &op.operation_id,
+                        &run_id,
+                        &op.payload_digest,
+                        &runtime_id,
+                        selected,
+                        &handle,
+                        1,
+                        1,
+                        true,
+                        "adapter_started",
+                    )?;
                     let msg = self.message_id();
                     client.session.queue_outbound(
                         &msg,
@@ -1388,6 +1531,19 @@ impl NodeService {
                         status,
                         0,
                     )?;
+                    self.runtime_custody.insert(
+                        runtime_id.clone(),
+                        RuntimeCustody {
+                            start_operation_id: op.operation_id.clone(),
+                            run_id: run_id.clone(),
+                            request_digest: op.payload_digest.clone(),
+                            provider_id: selected.to_owned(),
+                            handle: handle.clone(),
+                            state: RuntimeState::Running,
+                            controller_epoch: 1,
+                            revision: 1,
+                        },
+                    );
                     self.agents.insert(
                         op.operation_id.clone(),
                         AgentActive {
@@ -1409,7 +1565,12 @@ impl NodeService {
                                 effective_required_approval_risk_classes.clone(),
                             local_policy_revision: self.local_policy.revision,
                             controller_epoch: 1,
+                            revision: 1,
                             event_sequence: 0,
+                            settlement_policy,
+                            session_state: AgentSessionState::Running,
+                            idle_timeout_ms,
+                            lease_expires_at_unix_ms,
                         },
                     );
                     return Ok(());
@@ -1505,7 +1666,24 @@ impl NodeService {
                     Some(&process_identity),
                     None,
                 )?;
-                let status = json!({"operationId":op.operation_id,"runId":run_id,"state":"running","phase":"adapter_started","observedAt":now()});
+                self.node.store().record_agent_session(
+                    &op.idempotency_key,
+                    agent_settlement_policy_name(settlement_policy),
+                    1,
+                    lease_expires_at_unix_ms,
+                )?;
+                let status = running_status_payload(
+                    &op.operation_id,
+                    &run_id,
+                    &op.payload_digest,
+                    &runtime_id,
+                    "native",
+                    &custody.handle,
+                    1,
+                    1,
+                    true,
+                    "adapter_started",
+                )?;
                 let msg = self.message_id();
                 client.session.queue_outbound(
                     &msg,
@@ -1514,6 +1692,19 @@ impl NodeService {
                     status,
                     0,
                 )?;
+                self.runtime_custody.insert(
+                    runtime_id.clone(),
+                    RuntimeCustody {
+                        start_operation_id: op.operation_id.clone(),
+                        run_id: run_id.clone(),
+                        request_digest: op.payload_digest.clone(),
+                        provider_id: "native".into(),
+                        handle: custody.handle.clone(),
+                        state: RuntimeState::Running,
+                        controller_epoch: 1,
+                        revision: 1,
+                    },
+                );
                 self.agents.insert(
                     op.operation_id.clone(),
                     AgentActive {
@@ -1534,7 +1725,12 @@ impl NodeService {
                         effective_required_approval_risk_classes,
                         local_policy_revision: self.local_policy.revision,
                         controller_epoch: 1,
+                        revision: 1,
                         event_sequence: 0,
+                        settlement_policy,
+                        session_state: AgentSessionState::Running,
+                        idle_timeout_ms,
+                        lease_expires_at_unix_ms,
                     },
                 );
                 return Ok(());
@@ -1546,7 +1742,18 @@ impl NodeService {
                     return Ok(());
                 }
             };
-            let status = json!({"operationId":op.operation_id,"runId":run_id,"state":"running","phase":"runtime_started","observedAt":now()});
+            let status = running_status_payload(
+                &op.operation_id,
+                &run_id,
+                &op.payload_digest,
+                &runtime_id,
+                selected,
+                &started.handle,
+                1,
+                1,
+                false,
+                "runtime_started",
+            )?;
             let msg = self.message_id();
             client.session.queue_outbound(
                 &msg,
@@ -1555,6 +1762,19 @@ impl NodeService {
                 status,
                 0,
             )?;
+            self.runtime_custody.insert(
+                runtime_id.clone(),
+                RuntimeCustody {
+                    start_operation_id: op.operation_id.clone(),
+                    run_id: run_id.clone(),
+                    request_digest: op.payload_digest.clone(),
+                    provider_id: selected.into(),
+                    handle: started.handle.clone(),
+                    state: RuntimeState::Running,
+                    controller_epoch: 1,
+                    revision: 1,
+                },
+            );
             self.active.insert(
                 op.operation_id.clone(),
                 Active {
@@ -1565,6 +1785,8 @@ impl NodeService {
                     provider_id: selected.into(),
                     handle: started.handle,
                     journal_state: OperationState::Running,
+                    controller_epoch: 1,
+                    revision: 1,
                 },
             );
         }
@@ -1620,6 +1842,9 @@ impl NodeService {
             let state = self
                 .node
                 .inspect_runtime(&active.provider_id, &active.handle)?;
+            if let Some(custody) = self.runtime_custody.get_mut(&active.handle.runtime_id) {
+                custody.state = state.state;
+            }
             if state.state == RuntimeState::Stopped {
                 let terminal = if state.exit_code == Some(0) {
                     OperationState::Completed
@@ -1658,75 +1883,579 @@ impl NodeService {
         Ok(())
     }
 
-    fn control_agent(&mut self, kind: &str, payload: &Value) -> Result<(), String> {
-        let run_id = payload
-            .get("targetRunId")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "operation_target_run_required".to_owned())?;
-        let expected = payload
-            .get("expectedState")
-            .and_then(Value::as_str)
-            .ok_or_else(|| "operation_expected_state_required".to_owned())?;
+    fn control_agent(
+        &mut self,
+        client: &mut WssClient,
+        kind: &str,
+        payload: &Value,
+    ) -> Result<(), String> {
+        let control: WireOperationControl = serde_json::from_value(payload.clone())
+            .map_err(|_| "operation_control_malformed".to_owned())?;
+        let expected_revision = control
+            .expected_revision
+            .parse::<u64>()
+            .map_err(|_| "operation_expected_revision_invalid".to_owned())?;
+        let controller_epoch = control
+            .target_controller_epoch
+            .parse::<u64>()
+            .map_err(|_| "operation_controller_epoch_invalid".to_owned())?;
+        let request_digest = hex::encode(Sha256::digest(
+            serde_jcs::to_vec(payload).map_err(|_| "operation_control_malformed".to_owned())?,
+        ));
         let (_, agent) = self
             .agents
             .iter_mut()
-            .find(|(_, agent)| agent.run_id == run_id)
+            .find(|(_, agent)| agent.run_id == control.target_run_id)
             .ok_or_else(|| "target_agent_run_unavailable".to_owned())?;
-        let observed = adapter_operation_state(agent.driver.state());
-        if expected != observed {
-            return Err(format!(
-                "target_state_stale:expected={expected}:observed={observed}"
-            ));
+        let handle_digest =
+            runtime_handle_digest(&agent.handle).map_err(|error| error.to_string())?;
+        let target_digest = custody_target_digest(
+            true,
+            &agent.run_id,
+            &agent.operation_id,
+            &agent.request_digest,
+            &agent.runtime_id,
+            &handle_digest,
+            agent.controller_epoch,
+        )
+        .map_err(|error| error.to_string())?;
+        let observed = match agent.session_state {
+            AgentSessionState::Running => adapter_operation_state(agent.driver.state()),
+            AgentSessionState::WaitingInput => "waiting_input",
+            AgentSessionState::ClosingCompleted
+            | AgentSessionState::ClosingCancelled
+            | AgentSessionState::ClosingTimedOut => "finishing",
+        };
+        if control.operation_id == agent.operation_id
+            || control.target_digest != target_digest
+            || controller_epoch != agent.controller_epoch
+        {
+            return Err("operation_control_target_mismatch".into());
         }
-        if kind == "operation.cancel" {
-            match agent.driver.command(AdapterOperation::Cancel, None) {
-                Ok(frames) => {
-                    for frame in frames {
-                        agent
-                            .child
-                            .write(&frame)
-                            .map_err(|error| error.to_string())?;
+        let command = if kind == "operation.cancel" {
+            "cancel"
+        } else {
+            control.mode.as_deref().unwrap_or("input")
+        };
+        if self
+            .node
+            .store()
+            .control_effect(&control.idempotency_key)
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            if expected_revision != agent.revision {
+                return Err(format!(
+                    "target_revision_stale:expected={expected_revision}:observed={}",
+                    agent.revision,
+                ));
+            }
+            if control.expected_state != observed {
+                return Err(format!(
+                    "target_state_stale:expected={}:observed={observed}",
+                    control.expected_state
+                ));
+            }
+        }
+        match self
+            .node
+            .store()
+            .reserve_control_effect(
+                &control.operation_id,
+                &control.idempotency_key,
+                &request_digest,
+                &control.target_run_id,
+                Some(&agent.runtime_id),
+                &control.target_digest,
+                controller_epoch,
+                expected_revision,
+                command,
+            )
+            .map_err(|error| error.to_string())?
+        {
+            ControlEffectResult::Replay(record) => {
+                let receipt = record
+                    .receipt
+                    .ok_or_else(|| "control_receipt_missing".to_owned())?;
+                let replay: Value = serde_json::from_slice(&receipt)
+                    .map_err(|_| "control_receipt_corrupt".to_owned())?;
+                let status = replay
+                    .get("targetStatus")
+                    .cloned()
+                    .ok_or_else(|| "control_status_receipt_missing".to_owned())?;
+                let terminal = replay
+                    .get("controlTerminal")
+                    .cloned()
+                    .ok_or_else(|| "control_terminal_receipt_missing".to_owned())?;
+                let status_message_id = format!("nmsg_x{}s", &request_digest[..23]);
+                client
+                    .session
+                    .queue_outbound(
+                        &status_message_id,
+                        "operation.status",
+                        Some(agent.operation_id.clone()),
+                        status,
+                        0,
+                    )
+                    .map_err(|error| error.to_string())?;
+                let terminal_message_id = format!("nmsg_x{}t", &request_digest[..23]);
+                client
+                    .session
+                    .queue_outbound(
+                        &terminal_message_id,
+                        "operation.terminal",
+                        Some(control.operation_id),
+                        terminal,
+                        0,
+                    )
+                    .map_err(|error| error.to_string())?;
+                return Ok(());
+            }
+            ControlEffectResult::Uncertain(_) => {
+                return Err("ambiguous_control_effect_pending_recovery".into());
+            }
+            ControlEffectResult::Reserved(_) => {}
+        }
+
+        let prior_session_state = agent.session_state;
+        let mut close = false;
+        let mut cancelled = false;
+        if command == "cancel" {
+            cancelled = true;
+            if prior_session_state == AgentSessionState::WaitingInput {
+                agent.child.terminate().map_err(|error| error.to_string())?;
+            } else {
+                match agent.driver.command(AdapterOperation::Cancel, None) {
+                    Ok(frames) => {
+                        for frame in frames {
+                            agent
+                                .child
+                                .write(&frame)
+                                .map_err(|error| error.to_string())?;
+                        }
                     }
-                    if matches!(
-                        agent.driver.state(),
-                        AdapterState::Ready | AdapterState::Starting
-                    ) {
+                    Err(conduit_adapters::AdapterError::UnsupportedOperation { .. }) => {
                         agent.child.terminate().map_err(|error| error.to_string())?;
                     }
+                    Err(error) => return Err(error.to_string()),
                 }
-                Err(conduit_adapters::AdapterError::UnsupportedOperation { .. }) => {
-                    // One-shot adapters advertise cancellation through process
-                    // custody rather than a vendor protocol message.
-                    agent.child.terminate().map_err(|error| error.to_string())?;
-                }
-                Err(error) => return Err(error.to_string()),
+                agent.child.terminate().map_err(|error| error.to_string())?;
             }
-            return Ok(());
+        } else if command == "close" {
+            let frames = agent
+                .driver
+                .command(AdapterOperation::Close, None)
+                .map_err(|error| error.to_string())?;
+            for frame in frames {
+                agent
+                    .child
+                    .write(&frame)
+                    .map_err(|error| error.to_string())?;
+            }
+            agent.child.terminate().map_err(|error| error.to_string())?;
+            close = true;
+        } else {
+            let operation = match command {
+                "input" => AdapterOperation::Send,
+                "follow_up" => AdapterOperation::FollowUp,
+                "steer" => AdapterOperation::Steer,
+                _ => return Err("operation_input_mode_unknown".into()),
+            };
+            let frames = agent
+                .driver
+                .command(operation, control.content.as_deref())
+                .map_err(|error| error.to_string())?;
+            for frame in frames {
+                agent
+                    .child
+                    .write(&frame)
+                    .map_err(|error| error.to_string())?;
+            }
+            if prior_session_state == AgentSessionState::WaitingInput {
+                self.node
+                    .store()
+                    .transition_operation(
+                        &agent.key,
+                        OperationState::WaitingInput,
+                        OperationState::Running,
+                        None,
+                        None,
+                        None,
+                    )
+                    .map_err(|error| error.to_string())?;
+                agent.session_state = AgentSessionState::Running;
+            }
         }
-        let mode = payload
-            .get("mode")
-            .and_then(Value::as_str)
-            .unwrap_or("input");
-        let content = payload.get("content").and_then(Value::as_str);
-        let operation = match mode {
-            "input" => AdapterOperation::Send,
-            "follow_up" => AdapterOperation::FollowUp,
-            "steer" => AdapterOperation::Steer,
-            "resume" => {
-                return Err("resume_requires_new_agent_run_with_native_session_id".to_owned());
-            }
-            _ => return Err("operation_input_mode_unknown".into()),
+        let session_from = match prior_session_state {
+            AgentSessionState::Running => "running",
+            AgentSessionState::WaitingInput => "waiting_input",
+            AgentSessionState::ClosingCompleted
+            | AgentSessionState::ClosingCancelled
+            | AgentSessionState::ClosingTimedOut => return Err("agent_session_closing".into()),
         };
-        let frames = agent
-            .driver
-            .command(operation, content)
-            .map_err(|error| error.to_string())?;
-        for frame in frames {
+        let session_to = if cancelled {
+            "cancelled"
+        } else if close {
+            "closed"
+        } else {
+            "running"
+        };
+        let next_lease = if session_to == "running" {
             agent
-                .child
-                .write(&frame)
+                .lease_expires_at_unix_ms
+                .map(|lease| lease.min(unix_ms_now().saturating_add(agent.idle_timeout_ms)))
+        } else {
+            None
+        };
+        let session = self
+            .node
+            .store()
+            .transition_agent_session(
+                &agent.key,
+                session_from,
+                agent.revision,
+                session_to,
+                next_lease,
+            )
+            .map_err(|error| error.to_string())?;
+        agent.revision = session.revision;
+        agent.lease_expires_at_unix_ms = session.lease_expires_at_unix_ms;
+        if close || cancelled {
+            agent.session_state = if cancelled {
+                AgentSessionState::ClosingCancelled
+            } else {
+                AgentSessionState::ClosingCompleted
+            };
+            self.node
+                .store()
+                .begin_agent_finalization(&agent.key)
                 .map_err(|error| error.to_string())?;
         }
+        let state = if close {
+            "finishing"
+        } else if cancelled {
+            "cancelled"
+        } else {
+            "running"
+        };
+        let mut receipt = json!({
+            "operationId": agent.operation_id,
+            "runId": agent.run_id,
+            "requestDigest": agent.request_digest,
+            "state": state,
+            "controllerEpoch": agent.controller_epoch.to_string(),
+            "revision": agent.revision.to_string(),
+            "phase": format!("control_{command}"),
+            "observedAt": now(),
+        });
+        if state == "running" {
+            receipt = running_status_payload(
+                &agent.operation_id,
+                &agent.run_id,
+                &agent.request_digest,
+                &agent.runtime_id,
+                &agent.provider_id,
+                &agent.handle,
+                agent.controller_epoch,
+                agent.revision,
+                true,
+                &format!("control_{command}"),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        let terminal = control_terminal_payload(
+            &control.operation_id,
+            &agent.run_id,
+            &request_digest,
+            agent.event_sequence,
+        )
+        .map_err(|error| error.to_string())?;
+        let durable_receipt = json!({
+            "targetStatus": receipt.clone(),
+            "controlTerminal": terminal.clone(),
+        });
+        let encoded = serde_jcs::to_vec(&durable_receipt)
+            .map_err(|_| "control_receipt_invalid".to_owned())?;
+        self.node
+            .store()
+            .complete_control_effect(&control.idempotency_key, true, &encoded)
+            .map_err(|error| error.to_string())?;
+        let status_message_id = format!("nmsg_x{}s", &request_digest[..23]);
+        client
+            .session
+            .queue_outbound(
+                &status_message_id,
+                "operation.status",
+                Some(agent.operation_id.clone()),
+                receipt,
+                0,
+            )
+            .map_err(|error| error.to_string())?;
+        let terminal_message_id = format!("nmsg_x{}t", &request_digest[..23]);
+        client
+            .session
+            .queue_outbound(
+                &terminal_message_id,
+                "operation.terminal",
+                Some(control.operation_id),
+                terminal,
+                0,
+            )
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn control_runtime(&mut self, client: &mut WssClient, payload: &Value) -> Result<(), String> {
+        let control: WireRuntimeControl = serde_json::from_value(payload.clone())
+            .map_err(|_| "runtime_control_malformed".to_owned())?;
+        let controller_epoch = control
+            .target_controller_epoch
+            .parse::<u64>()
+            .map_err(|_| "runtime_controller_epoch_invalid".to_owned())?;
+        let expected_revision = control
+            .expected_revision
+            .parse::<u64>()
+            .map_err(|_| "runtime_expected_revision_invalid".to_owned())?;
+        let request_digest = hex::encode(Sha256::digest(
+            serde_jcs::to_vec(payload).map_err(|_| "runtime_control_malformed".to_owned())?,
+        ));
+        let custody = self
+            .runtime_custody
+            .get(&control.target_runtime_id)
+            .cloned()
+            .ok_or_else(|| "target_runtime_unavailable".to_owned())?;
+        let handle_digest =
+            runtime_handle_digest(&custody.handle).map_err(|error| error.to_string())?;
+        let target_digest = custody_target_digest(
+            false,
+            &custody.run_id,
+            &custody.start_operation_id,
+            &custody.request_digest,
+            &custody.handle.runtime_id,
+            &handle_digest,
+            custody.controller_epoch,
+        )
+        .map_err(|error| error.to_string())?;
+        if control.operation_id == custody.start_operation_id
+            || control.target_run_id != custody.run_id
+            || control.target_handle_digest != handle_digest
+            || control.target_digest != target_digest
+            || controller_epoch != custody.controller_epoch
+        {
+            return Err("runtime_control_target_mismatch".into());
+        }
+        if matches!(control.control.as_str(), "snapshot" | "restore")
+            && control.snapshot_name.is_none()
+        {
+            return Err("runtime_snapshot_name_required".into());
+        }
+        if self
+            .node
+            .store()
+            .control_effect(&control.idempotency_key)
+            .map_err(|error| error.to_string())?
+            .is_none()
+        {
+            if expected_revision != custody.revision {
+                return Err(format!(
+                    "runtime_revision_stale:expected={expected_revision}:observed={}",
+                    custody.revision,
+                ));
+            }
+            let observed = self
+                .node
+                .inspect_runtime(&custody.provider_id, &custody.handle)
+                .map_err(|error| error.to_string())?;
+            if runtime_state_name(observed.state) != control.expected_state {
+                return Err(format!(
+                    "runtime_state_stale:expected={}:observed={}",
+                    control.expected_state,
+                    runtime_state_name(observed.state),
+                ));
+            }
+        }
+        match self
+            .node
+            .store()
+            .reserve_control_effect(
+                &control.operation_id,
+                &control.idempotency_key,
+                &request_digest,
+                &control.target_run_id,
+                Some(&control.target_runtime_id),
+                &control.target_digest,
+                controller_epoch,
+                expected_revision,
+                &control.control,
+            )
+            .map_err(|error| error.to_string())?
+        {
+            ControlEffectResult::Replay(record) => {
+                let receipt = record
+                    .receipt
+                    .ok_or_else(|| "runtime_control_receipt_missing".to_owned())?;
+                let replay: Value = serde_json::from_slice(&receipt)
+                    .map_err(|_| "runtime_control_receipt_corrupt".to_owned())?;
+                let message_id = format!("nmsg_x{}", &request_digest[..24]);
+                client
+                    .session
+                    .queue_outbound(
+                        &message_id,
+                        "runtime.control_result",
+                        Some(control.operation_id),
+                        replay,
+                        0,
+                    )
+                    .map_err(|error| error.to_string())?;
+                return Ok(());
+            }
+            ControlEffectResult::Uncertain(_) => {
+                return Err("ambiguous_control_effect_pending_recovery".into());
+            }
+            ControlEffectResult::Reserved(_) => {}
+        }
+        let observed = self
+            .node
+            .inspect_runtime(&custody.provider_id, &custody.handle)
+            .map_err(|error| error.to_string())?;
+
+        let mut result = json!({});
+        let next_state = match control.control.as_str() {
+            "input" | "steer" => {
+                let agent = self
+                    .agents
+                    .values_mut()
+                    .find(|agent| agent.runtime_id == control.target_runtime_id)
+                    .ok_or_else(|| "runtime_input_requires_active_agent".to_owned())?;
+                let operation = if control.control == "steer" {
+                    AdapterOperation::Steer
+                } else {
+                    AdapterOperation::Send
+                };
+                let frames = agent
+                    .driver
+                    .command(operation, control.content.as_deref())
+                    .map_err(|error| error.to_string())?;
+                for frame in frames {
+                    agent
+                        .child
+                        .write(&frame)
+                        .map_err(|error| error.to_string())?;
+                }
+                observed.state
+            }
+            "pause" => {
+                self.node
+                    .signal_runtime(&custody.provider_id, &custody.handle, RuntimeSignal::Pause)
+                    .map_err(|error| error.to_string())?
+                    .state
+            }
+            "resume" => {
+                self.node
+                    .signal_runtime(&custody.provider_id, &custody.handle, RuntimeSignal::Resume)
+                    .map_err(|error| error.to_string())?
+                    .state
+            }
+            "cancel" => {
+                self.node
+                    .signal_runtime(
+                        &custody.provider_id,
+                        &custody.handle,
+                        RuntimeSignal::ForceStop,
+                    )
+                    .map_err(|error| error.to_string())?
+                    .state
+            }
+            "stop" => {
+                self.node
+                    .signal_runtime(
+                        &custody.provider_id,
+                        &custody.handle,
+                        RuntimeSignal::GracefulStop,
+                    )
+                    .map_err(|error| error.to_string())?
+                    .state
+            }
+            "snapshot" => {
+                let name = control
+                    .snapshot_name
+                    .as_deref()
+                    .ok_or_else(|| "runtime_snapshot_name_required".to_owned())?;
+                let receipt = self
+                    .node
+                    .snapshot_runtime(&custody.provider_id, &custody.handle, name)
+                    .map_err(|error| error.to_string())?;
+                result = serde_json::to_value(receipt)
+                    .map_err(|_| "runtime_snapshot_receipt_invalid".to_owned())?;
+                observed.state
+            }
+            "restore" => {
+                let name = control
+                    .snapshot_name
+                    .as_deref()
+                    .ok_or_else(|| "runtime_snapshot_name_required".to_owned())?;
+                self.node
+                    .restore_runtime_snapshot(&custody.provider_id, &custody.handle, name)
+                    .map_err(|error| error.to_string())?
+                    .state
+            }
+            "destroy" => {
+                let receipt = self
+                    .node
+                    .destroy_runtime(
+                        &custody.provider_id,
+                        &custody.handle,
+                        &DestroyRequest {
+                            discard_authorized: control.discard_authorized.unwrap_or(false),
+                            custody_complete: control.custody_complete.unwrap_or(false),
+                        },
+                    )
+                    .map_err(|error| error.to_string())?;
+                result = serde_json::to_value(receipt)
+                    .map_err(|_| "runtime_destroy_receipt_invalid".to_owned())?;
+                RuntimeState::Destroyed
+            }
+            _ => return Err("runtime_control_unknown".into()),
+        };
+        let revision = custody.revision.saturating_add(1);
+        if let Some(record) = self.runtime_custody.get_mut(&control.target_runtime_id) {
+            record.state = next_state;
+            record.revision = revision;
+        }
+        let mut receipt = json!({
+            "operationId": control.operation_id,
+            "targetRunId": control.target_run_id,
+            "targetRuntimeId": control.target_runtime_id,
+            "targetDigest": control.target_digest,
+            "control": control.control,
+            "state": runtime_state_name(next_state),
+            "revision": revision.to_string(),
+            "processCountDelta": 0,
+            "result": result,
+            "observedAt": now(),
+        });
+        let receipt_digest = hex::encode(Sha256::digest(
+            serde_jcs::to_vec(&receipt)
+                .map_err(|_| "runtime_control_receipt_invalid".to_owned())?,
+        ));
+        receipt["receiptDigest"] = Value::String(receipt_digest);
+        let encoded = serde_jcs::to_vec(&receipt)
+            .map_err(|_| "runtime_control_receipt_invalid".to_owned())?;
+        self.node
+            .store()
+            .complete_control_effect(&control.idempotency_key, true, &encoded)
+            .map_err(|error| error.to_string())?;
+        let message_id = format!("nmsg_x{}", &request_digest[..24]);
+        client
+            .session
+            .queue_outbound(
+                &message_id,
+                "runtime.control_result",
+                Some(control.operation_id),
+                receipt,
+                0,
+            )
+            .map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -1745,10 +2474,15 @@ impl NodeService {
             last_sequence: u64,
             exit_code: Option<i32>,
         }
+        struct PendingStatus {
+            operation_id: String,
+            payload: Value,
+        }
         let ids = self.agents.keys().cloned().collect::<Vec<_>>();
         let mut events = Vec::new();
         let mut terminals = Vec::new();
         let mut approvals = Vec::new();
+        let mut statuses = Vec::new();
         for id in &ids {
             let Some(agent) = self.agents.get_mut(id) else {
                 continue;
@@ -1936,6 +2670,123 @@ impl NodeService {
                 }
             }
             let adapter_state = agent.driver.state();
+            if adapter_state == AdapterState::Completed
+                && agent.session_state == AgentSessionState::Running
+            {
+                match agent.settlement_policy {
+                    AgentSettlementPolicy::CloseOnSettle => {
+                        if let Ok(frames) = agent.driver.command(AdapterOperation::Close, None) {
+                            for frame in frames {
+                                agent.child.write(&frame).map_err(|error| {
+                                    ServiceError::Unavailable(error.to_string())
+                                })?;
+                            }
+                        }
+                        let session = self.node.store().transition_agent_session(
+                            &agent.key,
+                            "running",
+                            agent.revision,
+                            "closed",
+                            None,
+                        )?;
+                        agent.revision = session.revision;
+                        agent.session_state = AgentSessionState::ClosingCompleted;
+                        self.node.store().begin_agent_finalization(&agent.key)?;
+                        agent
+                            .child
+                            .terminate()
+                            .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                    }
+                    AgentSettlementPolicy::Persistent => {
+                        let idle_deadline = unix_ms_now().saturating_add(agent.idle_timeout_ms);
+                        let lease_deadline = agent
+                            .lease_expires_at_unix_ms
+                            .map_or(idle_deadline, |lease| lease.min(idle_deadline));
+                        self.node.store().transition_operation(
+                            &agent.key,
+                            OperationState::Running,
+                            OperationState::WaitingInput,
+                            None,
+                            None,
+                            None,
+                        )?;
+                        let session = self.node.store().transition_agent_session(
+                            &agent.key,
+                            "running",
+                            agent.revision,
+                            "waiting_input",
+                            Some(lease_deadline),
+                        )?;
+                        agent.revision = session.revision;
+                        agent.session_state = AgentSessionState::WaitingInput;
+                        agent.lease_expires_at_unix_ms = Some(lease_deadline);
+                        let handle_digest = runtime_handle_digest(&agent.handle)?;
+                        let target_digest = custody_target_digest(
+                            true,
+                            &agent.run_id,
+                            &agent.operation_id,
+                            &agent.request_digest,
+                            &agent.runtime_id,
+                            &handle_digest,
+                            agent.controller_epoch,
+                        )?;
+                        let runtime_target_digest = custody_target_digest(
+                            false,
+                            &agent.run_id,
+                            &agent.operation_id,
+                            &agent.request_digest,
+                            &agent.runtime_id,
+                            &handle_digest,
+                            agent.controller_epoch,
+                        )?;
+                        statuses.push(PendingStatus {
+                            operation_id: agent.operation_id.clone(),
+                            payload: json!({
+                                "operationId": agent.operation_id,
+                                "runId": agent.run_id,
+                                "requestDigest": agent.request_digest,
+                                "state": "waiting_input",
+                                "controllerEpoch": agent.controller_epoch.to_string(),
+                                "revision": agent.revision.to_string(),
+                                "phase": "agent_settled",
+                                "targetRuntimeId": agent.runtime_id,
+                                "targetDigest": target_digest,
+                                "runtimeTargetDigest": runtime_target_digest,
+                                "selectedRuntimeProvider": agent.provider_id,
+                                "runtimeHandleDigest": handle_digest,
+                                "observedAt": now(),
+                            }),
+                        });
+                    }
+                }
+            } else if agent.session_state == AgentSessionState::WaitingInput
+                && agent
+                    .lease_expires_at_unix_ms
+                    .is_some_and(|deadline| unix_ms_now() >= deadline)
+            {
+                let session = self.node.store().transition_agent_session(
+                    &agent.key,
+                    "waiting_input",
+                    agent.revision,
+                    "timed_out",
+                    None,
+                )?;
+                agent.revision = session.revision;
+                agent.session_state = AgentSessionState::ClosingTimedOut;
+                self.node.store().begin_agent_finalization(&agent.key)?;
+                let exit = agent
+                    .child
+                    .terminate()
+                    .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                terminals.push(PendingTerminal {
+                    id: id.clone(),
+                    state: OperationState::TimedOut,
+                    reason: Some("agent_session_idle_timeout".into()),
+                    last_sequence: agent.event_sequence,
+                    exit_code: exit.code(),
+                });
+                continue;
+            }
             let exit = if adapter_state == AdapterState::Failed {
                 Some(
                     agent
@@ -1950,26 +2801,38 @@ impl NodeService {
                     .map_err(|error| ServiceError::Unavailable(error.to_string()))?
             };
             if let Some(exit) = exit {
-                let (state, reason) = match (adapter_state, exit.success()) {
-                    (AdapterState::Completed, true) => (OperationState::Completed, None),
-                    (AdapterState::Cancelled, _) => {
-                        (OperationState::Cancelled, Some("adapter_cancelled".into()))
+                let (state, reason) = match agent.session_state {
+                    AgentSessionState::ClosingCancelled => {
+                        (OperationState::Cancelled, Some("agent_cancelled".into()))
                     }
-                    (AdapterState::Failed, _) => (
-                        OperationState::Failed,
-                        Some("adapter_protocol_error".into()),
+                    AgentSessionState::ClosingTimedOut => (
+                        OperationState::TimedOut,
+                        Some("agent_session_idle_timeout".into()),
                     ),
-                    _ => (
-                        OperationState::Failed,
-                        Some(
-                            if exit.success() {
-                                "adapter_protocol_incomplete"
-                            } else {
-                                "adapter_crash"
+                    AgentSessionState::ClosingCompleted => (OperationState::Completed, None),
+                    AgentSessionState::Running | AgentSessionState::WaitingInput => {
+                        match (adapter_state, exit.success()) {
+                            (AdapterState::Completed, true) => (OperationState::Completed, None),
+                            (AdapterState::Cancelled, _) => {
+                                (OperationState::Cancelled, Some("adapter_cancelled".into()))
                             }
-                            .into(),
-                        ),
-                    ),
+                            (AdapterState::Failed, _) => (
+                                OperationState::Failed,
+                                Some("adapter_protocol_error".into()),
+                            ),
+                            _ => (
+                                OperationState::Failed,
+                                Some(
+                                    if exit.success() {
+                                        "adapter_protocol_incomplete"
+                                    } else {
+                                        "adapter_crash"
+                                    }
+                                    .into(),
+                                ),
+                            ),
+                        }
+                    }
                 };
                 terminals.push(PendingTerminal {
                     id: id.clone(),
@@ -1988,6 +2851,16 @@ impl NodeService {
             if approval_projection_allowed(&pending.operation_id, &terminal_ids) {
                 self.queue_agent_approval(client, pending)?;
             }
+        }
+        for pending in statuses {
+            let message_id = self.message_id();
+            client.session.queue_outbound(
+                &message_id,
+                "operation.status",
+                Some(pending.operation_id),
+                pending.payload,
+                0,
+            )?;
         }
         for pending in events {
             let payload = visible_adapter_payload(&pending.event);
@@ -2037,6 +2910,9 @@ impl NodeService {
         }
         for pending in terminals {
             if let Some(agent) = self.agents.get(&pending.id) {
+                if let Some(custody) = self.runtime_custody.get_mut(&agent.runtime_id) {
+                    custody.state = RuntimeState::Stopped;
+                }
                 if matches!(agent.provider_id.as_str(), "native" | "restricted_native") {
                     self.supervisor
                         .mark_external_stopped(&agent.runtime_id, pending.exit_code)
@@ -2154,6 +3030,7 @@ impl NodeService {
         let state = match terminal {
             OperationState::Completed => "completed",
             OperationState::Cancelled => "cancelled",
+            OperationState::TimedOut => "timed_out",
             _ => "failed",
         };
         let mut payload = json!({"operationId":operation_id,"runId":run_id,"state":state,"requestDigest":request_digest,"lastRunEventSequence":last_sequence.to_string(),"observedAt":now()});
@@ -2237,13 +3114,44 @@ impl NodeService {
             )?;
             return Ok(());
         }
-        let status = json!({
-            "operationId": admission.operation.operation_id,
-            "runId": run_id,
-            "state": admission.operation.state,
-            "phase": "reconciled_status",
-            "observedAt": now(),
-        });
+        let status = if let Some(active) = self.active.get(&admission.operation.operation_id) {
+            running_status_payload(
+                &active.operation_id,
+                &active.run_id,
+                &active.request_digest,
+                &active.handle.runtime_id,
+                &active.provider_id,
+                &active.handle,
+                active.controller_epoch,
+                active.revision,
+                false,
+                "reconciled_status",
+            )?
+        } else if let Some(agent) = self.agents.get(&admission.operation.operation_id) {
+            running_status_payload(
+                &agent.operation_id,
+                &agent.run_id,
+                &agent.request_digest,
+                &agent.runtime_id,
+                &agent.provider_id,
+                &agent.handle,
+                agent.controller_epoch,
+                agent.revision,
+                true,
+                "reconciled_status",
+            )?
+        } else {
+            json!({
+                "operationId": admission.operation.operation_id,
+                "runId": run_id,
+                "requestDigest": admission.operation.request_digest,
+                "state": admission.operation.state,
+                "controllerEpoch": "1",
+                "revision": "1",
+                "phase": "reconciled_status",
+                "observedAt": now(),
+            })
+        };
         let message_id = self.message_id();
         client.session.queue_outbound(
             &message_id,
@@ -2484,6 +3392,25 @@ fn adapter_operation_state(state: AdapterState) -> &'static str {
         AdapterState::Cancelled => "cancelled",
         AdapterState::Failed => "failed",
         AdapterState::RecoveryRequired => "recovery_required",
+    }
+}
+
+fn runtime_state_name(state: RuntimeState) -> &'static str {
+    match state {
+        RuntimeState::Planned => "planned",
+        RuntimeState::Preparing => "preparing",
+        RuntimeState::Prepared => "prepared",
+        RuntimeState::Starting => "starting",
+        RuntimeState::Running => "running",
+        RuntimeState::Paused => "paused",
+        RuntimeState::Stopping => "stopping",
+        RuntimeState::Stopped => "stopped",
+        RuntimeState::Failed => "failed",
+        RuntimeState::Lost => "lost",
+        RuntimeState::Uncertain => "uncertain",
+        RuntimeState::RecoveryRequired => "recovery_required",
+        RuntimeState::Destroying => "destroying",
+        RuntimeState::Destroyed => "destroyed",
     }
 }
 
@@ -2794,11 +3721,292 @@ fn effective_approval_risk_classes(
     Ok((classes, names.into_iter().collect()))
 }
 
+fn runtime_handle_digest(handle: &RuntimeHandle) -> Result<String, ServiceError> {
+    Ok(hex::encode(Sha256::digest(
+        serde_jcs::to_vec(handle).map_err(|_| TransportError::Malformed)?,
+    )))
+}
+
+fn custody_target_digest(
+    agent_session: bool,
+    run_id: &str,
+    start_operation_id: &str,
+    request_digest: &str,
+    runtime_id: &str,
+    handle_digest: &str,
+    controller_epoch: u64,
+) -> Result<String, ServiceError> {
+    let domain = if agent_session {
+        "conduit.agent-session-target.v1"
+    } else {
+        "conduit.runtime-custody-target.v1"
+    };
+    let commitment = json!({
+        "domain": domain,
+        "runId": run_id,
+        "startOperationId": start_operation_id,
+        "requestDigest": request_digest,
+        "runtimeId": runtime_id,
+        "handleDigest": handle_digest,
+        "controllerEpoch": controller_epoch.to_string(),
+    });
+    Ok(hex::encode(Sha256::digest(
+        serde_jcs::to_vec(&commitment).map_err(|_| TransportError::Malformed)?,
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn running_status_payload(
+    operation_id: &str,
+    run_id: &str,
+    request_digest: &str,
+    runtime_id: &str,
+    provider_id: &str,
+    handle: &RuntimeHandle,
+    controller_epoch: u64,
+    revision: u64,
+    agent_session: bool,
+    phase: &str,
+) -> Result<Value, ServiceError> {
+    let handle_digest = runtime_handle_digest(handle)?;
+    let target_digest = custody_target_digest(
+        agent_session,
+        run_id,
+        operation_id,
+        request_digest,
+        runtime_id,
+        &handle_digest,
+        controller_epoch,
+    )?;
+    let runtime_target_digest = custody_target_digest(
+        false,
+        run_id,
+        operation_id,
+        request_digest,
+        runtime_id,
+        &handle_digest,
+        controller_epoch,
+    )?;
+    Ok(json!({
+        "operationId": operation_id,
+        "runId": run_id,
+        "requestDigest": request_digest,
+        "state": "running",
+        "controllerEpoch": controller_epoch.to_string(),
+        "revision": revision.to_string(),
+        "phase": phase,
+        "targetRuntimeId": runtime_id,
+        "targetDigest": target_digest,
+        "runtimeTargetDigest": runtime_target_digest,
+        "selectedRuntimeProvider": provider_id,
+        "runtimeHandleDigest": handle_digest,
+        "observedAt": now(),
+    }))
+}
+
+fn control_terminal_payload(
+    operation_id: &str,
+    run_id: &str,
+    request_digest: &str,
+    last_event_sequence: u64,
+) -> Result<Value, ServiceError> {
+    let mut payload = json!({
+        "operationId": operation_id,
+        "runId": run_id,
+        "state": "completed",
+        "requestDigest": request_digest,
+        "lastRunEventSequence": last_event_sequence.to_string(),
+        "resultSummary": {"controlApplied": true},
+        "observedAt": now(),
+    });
+    let digest = hex::encode(Sha256::digest(
+        serde_jcs::to_vec(&payload).map_err(|_| TransportError::Malformed)?,
+    ));
+    payload["receiptDigest"] = Value::String(digest);
+    Ok(payload)
+}
+
+fn agent_session_policy(
+    arguments: &Value,
+) -> Result<(AgentSettlementPolicy, u64, Option<u64>), ServiceError> {
+    match arguments
+        .get("settlementPolicy")
+        .and_then(Value::as_str)
+        .unwrap_or("close_on_settle")
+    {
+        "close_on_settle" => Ok((AgentSettlementPolicy::CloseOnSettle, 0, None)),
+        "persistent" => {
+            let lease_ms = arguments
+                .get("sessionLeaseMs")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| ServiceError::Unavailable("agent_session_lease_required".into()))?;
+            let idle_timeout_ms = arguments
+                .get("idleTimeoutMs")
+                .and_then(Value::as_u64)
+                .unwrap_or(lease_ms);
+            if !(1_000..=86_400_000).contains(&lease_ms)
+                || !(1_000..=lease_ms).contains(&idle_timeout_ms)
+            {
+                return Err(ServiceError::Unavailable(
+                    "agent_session_lease_invalid".into(),
+                ));
+            }
+            Ok((
+                AgentSettlementPolicy::Persistent,
+                idle_timeout_ms,
+                Some(unix_ms_now().saturating_add(lease_ms)),
+            ))
+        }
+        _ => Err(ServiceError::Unavailable(
+            "agent_settlement_policy_invalid".into(),
+        )),
+    }
+}
+
+fn agent_settlement_policy_name(policy: AgentSettlementPolicy) -> &'static str {
+    match policy {
+        AgentSettlementPolicy::CloseOnSettle => "close_on_settle",
+        AgentSettlementPolicy::Persistent => "persistent",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use conduit_node_store::NodeStore;
+    use conduit_runtime::{
+        CapabilityReceipt, CollectionReceipt, DestroyReceipt, ExpectedRuntime, PreparedRuntime,
+        ReconciliationReceipt, RuntimeError, RuntimeProvider, RuntimeStateReceipt, SnapshotReceipt,
+    };
     use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ControlOnlyProvider {
+        prepare_calls: AtomicUsize,
+        start_calls: AtomicUsize,
+        signal_calls: AtomicUsize,
+    }
+
+    impl RuntimeProvider for ControlOnlyProvider {
+        fn provider_id(&self) -> &str {
+            "control_only"
+        }
+        fn probe(&self) -> Result<CapabilityReceipt, RuntimeError> {
+            Ok(CapabilityReceipt {
+                provider_id: self.provider_id().into(),
+                provider_version: None,
+                capabilities: vec![],
+            })
+        }
+        fn prepare(&self, _request: &RuntimeRequest) -> Result<PreparedRuntime, RuntimeError> {
+            self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+            Err(RuntimeError::CapabilityUnavailable(
+                "start forbidden in control test".into(),
+            ))
+        }
+        fn start(
+            &self,
+            _prepared: &PreparedRuntime,
+            _launch: &LaunchPlan,
+        ) -> Result<RuntimeStateReceipt, RuntimeError> {
+            self.start_calls.fetch_add(1, Ordering::SeqCst);
+            Err(RuntimeError::CapabilityUnavailable(
+                "start forbidden in control test".into(),
+            ))
+        }
+        fn inspect(&self, handle: &RuntimeHandle) -> Result<RuntimeStateReceipt, RuntimeError> {
+            Ok(RuntimeStateReceipt {
+                handle: handle.clone(),
+                state: RuntimeState::Running,
+                exit_code: None,
+                evidence: vec![],
+            })
+        }
+        fn signal(
+            &self,
+            handle: &RuntimeHandle,
+            signal: RuntimeSignal,
+        ) -> Result<RuntimeStateReceipt, RuntimeError> {
+            self.signal_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(RuntimeStateReceipt {
+                handle: handle.clone(),
+                state: if matches!(signal, RuntimeSignal::Pause) {
+                    RuntimeState::Paused
+                } else {
+                    RuntimeState::Running
+                },
+                exit_code: None,
+                evidence: vec![],
+            })
+        }
+        fn snapshot(
+            &self,
+            _handle: &RuntimeHandle,
+            _name: &str,
+        ) -> Result<SnapshotReceipt, RuntimeError> {
+            Err(RuntimeError::CapabilityUnavailable("snapshot".into()))
+        }
+        fn collect(&self, _handle: &RuntimeHandle) -> Result<CollectionReceipt, RuntimeError> {
+            Err(RuntimeError::CapabilityUnavailable("collect".into()))
+        }
+        fn destroy(
+            &self,
+            handle: &RuntimeHandle,
+            _request: &DestroyRequest,
+        ) -> Result<DestroyReceipt, RuntimeError> {
+            Ok(DestroyReceipt {
+                runtime_id: handle.runtime_id.clone(),
+                destroyed: true,
+                evidence: "test".into(),
+            })
+        }
+        fn reconcile(
+            &self,
+            _records: &[ExpectedRuntime],
+        ) -> Result<Vec<ReconciliationReceipt>, RuntimeError> {
+            Ok(vec![])
+        }
+    }
+
+    fn completed_long_lived_driver(kind: AdapterKind, cwd: &Path) -> ProtocolDriver {
+        let request = LaunchRequest {
+            cwd: cwd.to_path_buf(),
+            prompt: Some("settle without exiting".into()),
+            native_session_id: None,
+            model: None,
+            effort: None,
+            session_data_dir: Some(cwd.join("sessions")),
+        };
+        let mut driver = ProtocolDriver::new(kind, &request).unwrap();
+        driver.start().unwrap();
+        match kind {
+            AdapterKind::Codex => {
+                for record in [
+                    b"{\"id\":1,\"result\":{\"serverInfo\":{\"name\":\"codex\",\"version\":\"test\"}}}\n".as_slice(),
+                    b"{\"id\":2,\"result\":{\"thread\":{\"id\":\"thread-test\"}}}\n".as_slice(),
+                    b"{\"id\":3,\"result\":{\"turn\":{\"id\":\"turn-test\"}}}\n".as_slice(),
+                    b"{\"method\":\"turn/completed\",\"params\":{\"turn\":{\"id\":\"turn-test\",\"status\":{\"type\":\"completed\"}}}}\n".as_slice(),
+                ] {
+                    driver.on_record(record).unwrap();
+                }
+            }
+            AdapterKind::Pi => {
+                driver.on_record(b"{\"type\":\"agent_settled\"}\n").unwrap();
+            }
+            AdapterKind::OpenCode => {
+                for record in [
+                    b"{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":1,\"agentCapabilities\":{\"loadSession\":true}}}\n".as_slice(),
+                    b"{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"sessionId\":\"acp-session-test\"}}\n".as_slice(),
+                    b"{\"jsonrpc\":\"2.0\",\"id\":3,\"result\":{\"stopReason\":\"end_turn\"}}\n".as_slice(),
+                ] {
+                    driver.on_record(record).unwrap();
+                }
+            }
+            _ => unreachable!(),
+        }
+        assert_eq!(driver.state(), AdapterState::Completed);
+        driver
+    }
 
     fn control_envelope(sequence: u64, kind: &str, payload: Value) -> Envelope {
         Envelope {
@@ -2893,17 +4101,335 @@ mod tests {
         assert_eq!(denied.revision, 8);
         assert!(matches!(
             denied.evaluate(&operation("full_device", "never", 1.0), "safe"),
-            Err(ServiceError::Unavailable(reason)) if reason == "local_policy_explicit_full_access_never_required"
+            Err(ServiceError::Unavailable(reason)) if reason == "full_device_capability_unavailable"
         ));
         assert!(matches!(
             denied.evaluate(&operation("project_full", "never", 8.0), "safe"),
             Err(ServiceError::Unavailable(reason)) if reason == "local_policy_resource_ceiling"
         ));
-        assert!(
-            policy(true)
-                .evaluate(&operation("full_device", "never", 1.0), "safe")
-                .is_ok()
+        assert!(matches!(
+            policy(true).evaluate(&operation("full_device", "never", 1.0), "safe"),
+            Err(ServiceError::Unavailable(reason)) if reason == "full_device_capability_unavailable"
+        ));
+    }
+
+    #[test]
+    fn runtime_control_is_exactly_once_and_never_starts_a_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = NodeStore::open(directory.path().join("store")).unwrap();
+        let identity = Arc::new(
+            DeviceIdentity::load_or_create(directory.path().join("identity/device.ed25519"))
+                .unwrap(),
         );
+        let provider = Arc::new(ControlOnlyProvider {
+            prepare_calls: AtomicUsize::new(0),
+            start_calls: AtomicUsize::new(0),
+            signal_calls: AtomicUsize::new(0),
+        });
+        let mut node = Node::new(store.clone());
+        node.register_provider(provider.clone());
+        let local = Arc::new(LocalServices::open(directory.path().join("local"), [3; 32]).unwrap());
+        let supervisor = ProcessSupervisor::open(directory.path().join("supervisor")).unwrap();
+        let mut service = NodeService::new(
+            Arc::new(node),
+            identity,
+            "wss://control.example.invalid/connect".into(),
+            "dev_policy_01".into(),
+            "aa".repeat(32),
+            "node-boot-control-0001".into(),
+            NodePolicyConfig {
+                local_policy: LocalPolicy {
+                    revision: 1,
+                    capabilities: vec![],
+                    providers: vec![],
+                    access_scopes: vec![],
+                    approval_modes: vec![],
+                    required_approval_risk_classes: vec![],
+                    launch_profiles: vec![],
+                    max_cpu: None,
+                    max_memory_bytes: None,
+                    max_storage_bytes: None,
+                    allow_full_access_without_approval: false,
+                },
+                profiles: HashMap::new(),
+            },
+            local,
+            supervisor,
+        )
+        .unwrap();
+        let handle = RuntimeHandle {
+            runtime_id: "rt_control_existing01".into(),
+            provider_id: "control_only".into(),
+            spec_digest: "22".repeat(32),
+            object_id: "existing-object".into(),
+            process_identity: Some("pid:4242:start:7".into()),
+        };
+        let run_id = "run_control_existing01";
+        let start_operation_id = "op_control_start0001";
+        let request_digest = "11".repeat(32);
+        service.runtime_custody.insert(
+            handle.runtime_id.clone(),
+            RuntimeCustody {
+                start_operation_id: start_operation_id.into(),
+                run_id: run_id.into(),
+                request_digest: request_digest.clone(),
+                provider_id: "control_only".into(),
+                handle: handle.clone(),
+                state: RuntimeState::Running,
+                controller_epoch: 1,
+                revision: 1,
+            },
+        );
+        let handle_digest = runtime_handle_digest(&handle).unwrap();
+        let target_digest = custody_target_digest(
+            false,
+            run_id,
+            start_operation_id,
+            &request_digest,
+            &handle.runtime_id,
+            &handle_digest,
+            1,
+        )
+        .unwrap();
+        let payload = json!({
+            "operationId":"op_control_pause0001",
+            "idempotencyKey":"runtime-control-pause-idempotency-0001",
+            "targetRunId":run_id,
+            "targetRuntimeId":handle.runtime_id,
+            "targetHandleDigest":handle_digest,
+            "targetControllerEpoch":"1",
+            "targetDigest":target_digest,
+            "expectedState":"running",
+            "expectedRevision":"1",
+            "control":"pause"
+        });
+        let session =
+            crate::transport::TransportSession::new(store.clone(), "dev_policy_01".into(), 1)
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let mut client = WssClient::from_test_stream(stream, session, true);
+
+        service.control_runtime(&mut client, &payload).unwrap();
+        service.control_runtime(&mut client, &payload).unwrap();
+
+        assert_eq!(provider.prepare_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.start_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(provider.signal_calls.load(Ordering::SeqCst), 1);
+        let record = store
+            .control_effect("runtime-control-pause-idempotency-0001")
+            .unwrap()
+            .unwrap();
+        assert_eq!(record.state, "applied");
+        let receipt: Value = serde_json::from_slice(record.receipt.as_deref().unwrap()).unwrap();
+        assert_eq!(receipt["processCountDelta"], 0);
+        assert_eq!(receipt["state"], "paused");
+    }
+
+    #[test]
+    fn close_on_settle_terminalizes_exit_never_codex_pi_and_acp() {
+        for (index, kind) in [AdapterKind::Codex, AdapterKind::Pi, AdapterKind::OpenCode]
+            .into_iter()
+            .enumerate()
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let store = NodeStore::open(directory.path().join("store")).unwrap();
+            let identity = Arc::new(
+                DeviceIdentity::load_or_create(directory.path().join("identity/device.ed25519"))
+                    .unwrap(),
+            );
+            let node = Arc::new(Node::new(store.clone()));
+            let local = Arc::new(
+                LocalServices::open(directory.path().join("local"), [index as u8 + 1; 32]).unwrap(),
+            );
+            let supervisor = ProcessSupervisor::open(directory.path().join("supervisor")).unwrap();
+            let mut service = NodeService::new(
+                node,
+                identity,
+                "wss://control.example.invalid/connect".into(),
+                "dev_policy_01".into(),
+                "aa".repeat(32),
+                format!("node-boot-settle-{index:08}"),
+                NodePolicyConfig {
+                    local_policy: LocalPolicy {
+                        revision: 1,
+                        capabilities: vec![],
+                        providers: vec![],
+                        access_scopes: vec![],
+                        approval_modes: vec![],
+                        required_approval_risk_classes: vec![],
+                        launch_profiles: vec![],
+                        max_cpu: None,
+                        max_memory_bytes: None,
+                        max_storage_bytes: None,
+                        allow_full_access_without_approval: false,
+                    },
+                    profiles: HashMap::new(),
+                },
+                local,
+                supervisor.clone(),
+            )
+            .unwrap();
+            let run_id = format!("run_settle_never_{index:08}");
+            let runtime_id = format!("rt_settle_never_{index:08}");
+            let operation_id = format!("op_settle_never_{index:08}");
+            let key = format!("settle-never-idempotency-{index:08}");
+            let request_digest = format!("{:02x}", index + 1).repeat(32);
+            let driver = completed_long_lived_driver(kind, directory.path());
+            let child_spec = conduit_adapters::LaunchSpec {
+                executable: PathBuf::from("/bin/sh"),
+                args: vec!["-c".into(), "while :; do sleep 60; done".into()],
+                cwd: directory.path().to_path_buf(),
+                protocol: match kind {
+                    AdapterKind::Codex => conduit_adapters::AdapterProtocol::CodexAppServerV2,
+                    AdapterKind::Pi => conduit_adapters::AdapterProtocol::PiRpcJsonl,
+                    AdapterKind::OpenCode => {
+                        conduit_adapters::AdapterProtocol::AgentClientProtocolV1
+                    }
+                    _ => unreachable!(),
+                },
+                initial_frames: vec![],
+            };
+            let child = AdapterChild::spawn_uninitialized(&child_spec).unwrap();
+            let runtime = RuntimeRequest {
+                runtime_id: runtime_id.clone(),
+                run_id: run_id.clone(),
+                kind: RuntimeKind::Native,
+                provider_selector: "native".into(),
+                spec_digest: "44".repeat(32),
+                image: None,
+                resources: ResourceLimits {
+                    cpu: None,
+                    memory_bytes: None,
+                    pid_limit: None,
+                    storage_bytes: None,
+                },
+                network: NetworkMode::Open,
+                workspaces: vec![],
+            };
+            let launch = LaunchPlan {
+                executable: child_spec.executable.clone(),
+                argv: child_spec.args.clone(),
+                cwd: child_spec.cwd.clone(),
+                environment: BTreeMap::new(),
+                io_mode: IoMode::Pipes,
+                timeout_ms: None,
+            };
+            let prepared = supervisor
+                .reserve(&runtime, "native", child_spec.executable.clone(), false)
+                .unwrap();
+            let custody = supervisor
+                .adopt_external(&prepared, &launch, child.id())
+                .unwrap();
+            let runtime_bytes = serde_jcs::to_vec(&runtime).unwrap();
+            let launch_bytes = serde_jcs::to_vec(&launch).unwrap();
+            store
+                .admit_operation(
+                    &operation_id,
+                    &key,
+                    &request_digest,
+                    b"{}",
+                    1,
+                    "native",
+                    "read_only",
+                    "always",
+                    &runtime_bytes,
+                    &launch_bytes,
+                    b"{}",
+                )
+                .unwrap();
+            store
+                .transition_operation(
+                    &key,
+                    OperationState::Admitted,
+                    OperationState::Starting,
+                    Some(&runtime_id),
+                    None,
+                    None,
+                )
+                .unwrap();
+            store
+                .transition_operation(
+                    &key,
+                    OperationState::Starting,
+                    OperationState::Running,
+                    Some(&runtime_id),
+                    custody.handle.process_identity.as_deref(),
+                    None,
+                )
+                .unwrap();
+            store
+                .record_agent_session(&key, "close_on_settle", 1, None)
+                .unwrap();
+            service.runtime_custody.insert(
+                runtime_id.clone(),
+                RuntimeCustody {
+                    start_operation_id: operation_id.clone(),
+                    run_id: run_id.clone(),
+                    request_digest: request_digest.clone(),
+                    provider_id: "native".into(),
+                    handle: custody.handle.clone(),
+                    state: RuntimeState::Running,
+                    controller_epoch: 1,
+                    revision: 1,
+                },
+            );
+            service.agents.insert(
+                operation_id.clone(),
+                AgentActive {
+                    key: key.clone(),
+                    operation_id: operation_id.clone(),
+                    run_id: run_id.clone(),
+                    request_digest,
+                    runtime_id: runtime_id.clone(),
+                    provider_id: "native".into(),
+                    handle: custody.handle,
+                    child,
+                    driver,
+                    adapter_kind: kind,
+                    actor_principal_id: "prin_settle_never01".into(),
+                    client_id: "conduit.settle-test".into(),
+                    access_scope: "read_only".into(),
+                    approval_mode: "always".into(),
+                    effective_required_approval_risk_classes: vec![],
+                    local_policy_revision: 1,
+                    controller_epoch: 1,
+                    revision: 1,
+                    event_sequence: 0,
+                    settlement_policy: AgentSettlementPolicy::CloseOnSettle,
+                    session_state: AgentSessionState::Running,
+                    idle_timeout_ms: 0,
+                    lease_expires_at_unix_ms: None,
+                },
+            );
+            let session =
+                crate::transport::TransportSession::new(store.clone(), "dev_policy_01".into(), 1)
+                    .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let (_peer, _) = listener.accept().unwrap();
+            let mut client = WssClient::from_test_stream(stream, session, true);
+
+            service.poll_agents(&mut client).unwrap();
+
+            assert!(!service.agents.contains_key(&operation_id), "{kind:?}");
+            assert_eq!(
+                store.operation(&key).unwrap().unwrap().state,
+                OperationState::Completed,
+                "{kind:?}",
+            );
+            assert_eq!(
+                store.agent_session(&key).unwrap().unwrap().state,
+                "closed",
+                "{kind:?}",
+            );
+            assert_eq!(
+                supervisor.inspect(&runtime_id).unwrap().state,
+                RuntimeState::Stopped,
+                "{kind:?}",
+            );
+        }
     }
 
     #[test]
@@ -3139,10 +4665,13 @@ mod tests {
             45,
             "operation.cancel",
             json!({
-                "operationId":"op_service_replay_00000004",
+                "operationId":"op_service_control_00000045",
+                "idempotencyKey":"service-control-idempotency-00000045",
                 "targetRunId":"run_service_replay01",
                 "targetControllerEpoch":"1",
-                "expectedState":"running"
+                "targetDigest":"11".repeat(32),
+                "expectedState":"running",
+                "expectedRevision":"1"
             }),
         );
         let cancel_bytes = serde_json::to_vec(&cancel).unwrap();
@@ -3152,16 +4681,14 @@ mod tests {
         );
         let (pending_cancel, pending) = client.session.receive(&cancel_bytes).unwrap();
         assert_eq!(pending, ReceiveResult::DuplicatePending);
-        assert!(matches!(
-            service.dispatch(&mut client, pending_cancel, pending),
-            Err(ServiceError::Unavailable(reason))
-                if reason == "ambiguous_control_effect_pending_recovery"
-        ));
+        service
+            .dispatch(&mut client, pending_cancel, pending)
+            .unwrap();
         assert_eq!(
             store
                 .inbound_applied_through(Direction::ControlToNode)
                 .unwrap(),
-            44
+            45
         );
     }
 
@@ -3372,7 +4899,12 @@ mod tests {
                 effective_required_approval_risk_classes: vec![],
                 local_policy_revision: 1,
                 controller_epoch: 1,
+                revision: 1,
                 event_sequence: 0,
+                settlement_policy: AgentSettlementPolicy::CloseOnSettle,
+                session_state: AgentSessionState::Running,
+                idle_timeout_ms: 0,
+                lease_expires_at_unix_ms: None,
             },
         );
         let session =
@@ -3620,7 +5152,12 @@ mod tests {
                 effective_required_approval_risk_classes: vec![],
                 local_policy_revision: 1,
                 controller_epoch: 1,
+                revision: 1,
                 event_sequence: 1,
+                settlement_policy: AgentSettlementPolicy::CloseOnSettle,
+                session_state: AgentSessionState::Running,
+                idle_timeout_ms: 0,
+                lease_expires_at_unix_ms: None,
             },
         );
 

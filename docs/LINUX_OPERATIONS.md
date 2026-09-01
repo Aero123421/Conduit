@@ -139,9 +139,9 @@ projection before starting work.
 
 Native runs as the service user with an exact executable and argument vector,
 process-group custody, bounded environment projection, and timeout/cancellation
-reconciliation. Full User and Full Device are explicit policy choices; they are
-not implicit fallbacks. The optional root helper is installed separately and
-accepts typed allowlisted requests over local IPC only.
+reconciliation. Full User is an explicit policy choice, not an implicit
+fallback. Full Device admission currently fails closed because the typed root
+helper and receipt boundary are not implemented or packaged.
 
 ### Restricted Native
 

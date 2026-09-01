@@ -360,15 +360,26 @@
     "OperationStatusPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["operationId", "state", "observedAt"],
+      "required": ["operationId", "requestDigest", "state", "controllerEpoch", "revision", "observedAt"],
       "properties": {
         "operationId": { "$ref": "#/$defs/OperationId" },
         "runId": { "$ref": "#/$defs/RunId" },
+        "requestDigest": { "$ref": "#/$defs/Sha256Hex" },
         "state": { "$ref": "#/$defs/OperationState" },
+        "controllerEpoch": { "$ref": "#/$defs/U64Decimal" },
+        "revision": { "$ref": "#/$defs/U64Decimal" },
         "phase": { "type": "string", "maxLength": 128 },
+        "targetRuntimeId": { "type": "string", "pattern": "^rt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "targetDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "runtimeTargetDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "selectedRuntimeProvider": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
         "runtimeHandleDigest": { "$ref": "#/$defs/Sha256Hex" },
         "observedAt": { "$ref": "#/$defs/Timestamp" }
-      }
+      },
+      "allOf": [{
+        "if": { "properties": { "state": { "const": "running" } }, "required": ["state"] },
+        "then": { "required": ["runId", "targetRuntimeId", "targetDigest", "runtimeTargetDigest", "selectedRuntimeProvider", "runtimeHandleDigest"] }
+      }]
     },
     "OperationTerminalPayload": {
       "type": "object",
@@ -395,15 +406,60 @@
     "OperationTargetPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["operationId", "targetRunId", "targetControllerEpoch", "expectedState"],
+      "required": ["operationId", "idempotencyKey", "targetRunId", "targetControllerEpoch", "targetDigest", "expectedState", "expectedRevision"],
       "properties": {
         "operationId": { "$ref": "#/$defs/OperationId" },
+        "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 256 },
         "targetRunId": { "$ref": "#/$defs/RunId" },
         "targetControllerEpoch": { "$ref": "#/$defs/U64Decimal" },
         "expectedState": { "$ref": "#/$defs/OperationState" },
+        "expectedRevision": { "$ref": "#/$defs/U64Decimal" },
         "mode": { "type": "string", "maxLength": 64 },
         "content": { "type": "string", "maxLength": 32768 },
         "targetDigest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    },
+    "RuntimeControlPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "idempotencyKey", "targetRunId", "targetRuntimeId", "targetHandleDigest", "targetControllerEpoch", "targetDigest", "expectedState", "expectedRevision", "control"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 256 },
+        "targetRunId": { "$ref": "#/$defs/RunId" },
+        "targetRuntimeId": { "type": "string", "pattern": "^rt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "targetHandleDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "targetControllerEpoch": { "$ref": "#/$defs/U64Decimal" },
+        "targetDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "expectedState": { "enum": ["planned", "preparing", "prepared", "starting", "running", "paused", "stopping", "stopped", "failed", "lost", "uncertain", "recovery_required", "destroying", "destroyed"] },
+        "expectedRevision": { "$ref": "#/$defs/U64Decimal" },
+        "control": { "enum": ["input", "steer", "pause", "resume", "cancel", "stop", "snapshot", "restore", "destroy"] },
+        "content": { "type": "string", "maxLength": 32768 },
+        "snapshotName": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$" },
+        "discardAuthorized": { "type": "boolean" },
+        "custodyComplete": { "type": "boolean" }
+      },
+      "allOf": [{
+        "if": { "properties": { "control": { "enum": ["snapshot", "restore"] } }, "required": ["control"] },
+        "then": { "required": ["snapshotName"] }
+      }]
+    },
+    "RuntimeControlResultPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "targetRunId", "targetRuntimeId", "targetDigest", "control", "state", "revision", "processCountDelta", "receiptDigest", "observedAt"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "targetRunId": { "$ref": "#/$defs/RunId" },
+        "targetRuntimeId": { "type": "string", "pattern": "^rt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "targetDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "control": { "enum": ["input", "steer", "pause", "resume", "cancel", "stop", "snapshot", "restore", "destroy"] },
+        "state": { "enum": ["planned", "preparing", "prepared", "starting", "running", "paused", "stopping", "stopped", "failed", "lost", "uncertain", "recovery_required", "destroying", "destroyed"] },
+        "revision": { "$ref": "#/$defs/U64Decimal" },
+        "processCountDelta": { "const": 0 },
+        "result": { "type": "object", "maxProperties": 32 },
+        "receiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "observedAt": { "$ref": "#/$defs/Timestamp" }
       }
     },
     "OperationApprovalRequestPayload": {
@@ -710,6 +766,8 @@
             "operation.terminal",
             "operation.input",
             "operation.cancel",
+            "runtime.control",
+            "runtime.control_result",
             "operation.approval",
             "operation.approval_request",
             "event.batch",
@@ -765,6 +823,14 @@
         {
           "if": { "properties": { "type": { "enum": ["operation.input", "operation.cancel"] } }, "required": ["type"] },
           "then": { "properties": { "payload": { "$ref": "#/$defs/OperationTargetPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "runtime.control" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/RuntimeControlPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "runtime.control_result" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/RuntimeControlResultPayload" } } }
         },
         {
           "if": { "properties": { "type": { "const": "operation.approval_request" } }, "required": ["type"] },

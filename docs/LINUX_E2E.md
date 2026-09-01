@@ -78,9 +78,10 @@ account.
     identity remains degraded and restart recovery fails closed. Run
     provider-live checks only after `conduit doctor` reports Incus, KVM,
     storage and offline network prerequisites effective.
-15. **`full_user + never` and `full_device + never`:** local-policy tests require
-    those exact combinations to be explicitly enabled and retain admission and
-    audit receipts. The Device-local deny remains final.
+15. **Broad access:** local-policy tests require `full_user + never` to be
+    explicitly enabled and retain admission and audit receipts. `full_device`
+    must return `full_device_capability_unavailable` until the privileged helper
+    is implemented and packaged. The Device-local deny remains final.
 16. **MCP parity and ceilings:** Miniflare negotiates the strict modern MCP
     envelope over authenticated HTTP, lists the typed long-operation tools and
     invokes a read tool through OAuth resource binding, immutable policy

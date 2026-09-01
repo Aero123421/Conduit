@@ -30,8 +30,10 @@ Remote work additionally requires an owner-only launch profile file containing
 a positive, Device-local policy revision and explicit allowlists for capability,
 provider, access scope, approval mode, and launch profile. Connector policy
 revision is retained in the immutable offer but never substitutes for this local
-decision. `full_user` or `full_device` combined with `never` requires a separate
-explicit local-policy opt-in.
+decision. `full_user` combined with `never` requires a separate explicit
+local-policy opt-in. `full_device` fails closed with
+`full_device_capability_unavailable` until the privileged helper and its receipt
+boundary are implemented and packaged.
 
 Docker, Podman, Incus, KVM, bubblewrap, and systemd user scopes are diagnosed
 but never installed or globally configured by the network-facing service.
@@ -55,9 +57,12 @@ missing guest execution capability fails closed. Reviewer operations require a
 read-only Access Scope, read-only Source revisions, and an enforcing non-Native
 provider. Visible normalized adapter events are committed to the Device-local trace store and
 event journal. Hidden reasoning, raw stderr, and credentials are not captured.
-Input, follow-up, steer, cancel, and launch-time native-session resume use typed
-adapter operations and fail closed when the selected protocol does not support
-the requested control.
+Input, follow-up, steer, close, cancel, and launch-time native-session resume use
+typed adapter operations and fail closed when the selected protocol does not
+support the requested control. Settlement defaults to `close_on_settle`, which
+archives/closes a long-lived adapter and releases its Runtime. An explicitly
+requested persistent session instead enters durable `waiting_input` under a
+bounded Device lease and idle timeout.
 
 Agy uses its documented headless stream contract: prompts are NDJSON `user`
 events on stdin, output is `init`/`step_update`/`result` NDJSON, and resume uses

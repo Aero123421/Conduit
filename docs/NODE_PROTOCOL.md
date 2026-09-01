@@ -503,6 +503,42 @@ Input targets:
 
 A stale or terminal target rejects the input. Text posted to the board is not automatically injected into a running agent unless a structured input operation is created.
 
+Every input or cancellation also carries an expected Device-local revision and
+an Agent target digest. The digest is SHA-256 over canonical JSON containing
+`domain=conduit.agent-session-target.v1`, the Run ID, start Operation ID, start
+request digest, Runtime ID, Runtime-handle digest, and controller epoch. A
+running Agent status publishes that digest plus a separate Runtime custody
+digest using `domain=conduit.runtime-custody-target.v1`. The latter authorizes
+only typed Runtime controls; neither digest authorizes starting a replacement
+process.
+
+Input and cancellation effects are reserved in the Device control-effect
+journal before adapter I/O. A completed retry replays both the target Run status
+and the control Operation terminal receipt. A crash leaving an effect pending is
+reported uncertain rather than repeated.
+
+Long-lived Codex, Pi, and ACP processes use an explicit settlement policy.
+`close_on_settle` is the default: protocol settlement closes or archives the
+session, terminates the supervised process, terminalizes the Run, and releases
+Runtime custody. `persistent` moves the Run to durable `waiting_input` under a
+bounded session lease and idle deadline. A follow-up performs a revision-CAS
+transition back to `running`. Explicit close, cancel, or idle expiry finalizes
+the Run and releases the process even when the provider would otherwise never
+exit.
+
+## Existing Runtime controls
+
+`runtime.control` never enters `operation.offer`. It binds the control Operation
+ID and idempotency key to an existing Run, Runtime ID, exact handle digest,
+Runtime custody digest, controller epoch, expected Runtime state, and expected
+Device revision. The typed controls are input, steer, pause, resume, cancel,
+stop, snapshot, restore, and destroy. A result records the resulting state and
+`processCountDelta=0`; pause, resume, stop, snapshot, and destroy call only the
+existing Provider handle. Restore names an existing snapshot on that same
+handle; Providers without an in-place restore primitive fail closed. Archive
+restore that creates a different Runtime remains a start operation and cannot
+be smuggled through this control frame.
+
 ## Approval delivery
 
 The node emits an approval request containing an exact operation commitment. The control plane resolves it according to `docs/AUTHORIZATION.md` and sends `operation.approval`.

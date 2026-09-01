@@ -37,6 +37,8 @@ export type PostAuthFrame = {
     | "operation.terminal"
     | "operation.input"
     | "operation.cancel"
+    | "runtime.control"
+    | "runtime.control_result"
     | "operation.approval"
     | "operation.approval_request"
     | "event.batch"

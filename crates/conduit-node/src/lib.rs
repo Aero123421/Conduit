@@ -99,6 +99,11 @@ impl Node {
         approval_policy: &str,
     ) -> Result<AdmissionReceipt, NodeError> {
         verify_operation_commitment(&offer.manifest, &offer.request_digest)?;
+        if access_scope == "full_device" {
+            return Err(NodeError::Rejected(
+                "full_device_capability_unavailable".into(),
+            ));
+        }
         if !self.providers.contains_key(provider_id) {
             return Err(NodeError::Rejected("runtime_provider_unavailable".into()));
         }
@@ -360,6 +365,19 @@ impl Node {
             .get(provider_id)
             .ok_or_else(|| NodeError::Rejected("runtime_provider_unavailable".into()))?
             .snapshot(handle, name)
+            .map_err(|error| NodeError::Runtime(error.to_string()))
+    }
+
+    pub fn restore_runtime_snapshot(
+        &self,
+        provider_id: &str,
+        handle: &RuntimeHandle,
+        name: &str,
+    ) -> Result<RuntimeStateReceipt, NodeError> {
+        self.providers
+            .get(provider_id)
+            .ok_or_else(|| NodeError::Rejected("runtime_provider_unavailable".into()))?
+            .restore_snapshot(handle, name)
             .map_err(|error| NodeError::Runtime(error.to_string()))
     }
 

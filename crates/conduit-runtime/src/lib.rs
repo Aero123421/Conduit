@@ -235,6 +235,15 @@ pub trait RuntimeProvider: Send + Sync {
     ) -> Result<RuntimeStateReceipt, RuntimeError>;
     fn snapshot(&self, handle: &RuntimeHandle, name: &str)
     -> Result<SnapshotReceipt, RuntimeError>;
+    fn restore_snapshot(
+        &self,
+        _handle: &RuntimeHandle,
+        _name: &str,
+    ) -> Result<RuntimeStateReceipt, RuntimeError> {
+        Err(RuntimeError::CapabilityUnavailable(
+            "in-place Runtime snapshot restore".into(),
+        ))
+    }
     fn collect(&self, handle: &RuntimeHandle) -> Result<CollectionReceipt, RuntimeError>;
     fn archive(
         &self,

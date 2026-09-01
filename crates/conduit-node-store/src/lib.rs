@@ -26,7 +26,7 @@ use thiserror::Error;
 pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 pub const MAX_FRAME_BYTES: usize = 65_536;
 pub const MAX_EVENT_BYTES: usize = 60_000;
-const STORE_SCHEMA_VERSION: u32 = 8;
+const STORE_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -251,6 +251,38 @@ pub enum AdmissionResult {
     Admitted(AdmissionRecord),
     Replay(AdmissionRecord),
     Uncertain(AdmissionRecord),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlEffectRecord {
+    pub operation_id: String,
+    pub idempotency_key: String,
+    pub request_digest: String,
+    pub target_run_id: String,
+    pub target_runtime_id: Option<String>,
+    pub target_digest: String,
+    pub controller_epoch: u64,
+    pub expected_revision: u64,
+    pub command: String,
+    pub state: String,
+    pub receipt: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlEffectResult {
+    Reserved(ControlEffectRecord),
+    Replay(ControlEffectRecord),
+    Uncertain(ControlEffectRecord),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentSessionRecord {
+    pub idempotency_key: String,
+    pub policy: String,
+    pub controller_epoch: u64,
+    pub revision: u64,
+    pub state: String,
+    pub lease_expires_at_unix_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -731,7 +763,10 @@ impl NodeStore {
         let operation = query_operation(&tx, idempotency_key)?.ok_or(StoreError::NotFound)?;
         if !matches!(
             operation.state,
-            OperationState::Running | OperationState::WaitingApproval | OperationState::Finishing
+            OperationState::Running
+                | OperationState::WaitingInput
+                | OperationState::WaitingApproval
+                | OperationState::Finishing
         ) {
             return Err(StoreError::InvalidTransition {
                 from: operation.state.as_str().into(),
@@ -746,7 +781,7 @@ impl NodeStore {
         if operation.state != OperationState::Finishing {
             let changed = tx
                 .execute(
-                    "UPDATE operations SET state='finishing',updated_at=unixepoch() WHERE idempotency_key=?1 AND state IN ('running','waiting_approval')",
+                    "UPDATE operations SET state='finishing',updated_at=unixepoch() WHERE idempotency_key=?1 AND state IN ('running','waiting_input','waiting_approval')",
                     [idempotency_key],
                 )
                 .map_err(map_sql)?;
@@ -937,6 +972,180 @@ impl NodeStore {
     pub fn operation(&self, key: &str) -> Result<Option<OperationRecord>, StoreError> {
         let conn = self.conn()?;
         query_operation(&conn, key)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn reserve_control_effect(
+        &self,
+        operation_id: &str,
+        idempotency_key: &str,
+        request_digest: &str,
+        target_run_id: &str,
+        target_runtime_id: Option<&str>,
+        target_digest: &str,
+        controller_epoch: u64,
+        expected_revision: u64,
+        command: &str,
+    ) -> Result<ControlEffectResult, StoreError> {
+        validate_digest(request_digest)?;
+        validate_digest(target_digest)?;
+        if operation_id.is_empty()
+            || idempotency_key.len() < 16
+            || idempotency_key.len() > 256
+            || target_run_id.is_empty()
+            || command.is_empty()
+            || command.len() > 64
+            || controller_epoch == 0
+            || expected_revision == 0
+        {
+            return Err(StoreError::Invalid("invalid control effect fields".into()));
+        }
+        let mut connection = self.conn()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        if let Some(existing) = query_control_effect(&transaction, idempotency_key)? {
+            if existing.operation_id != operation_id
+                || existing.request_digest != request_digest
+                || existing.target_run_id != target_run_id
+                || existing.target_runtime_id.as_deref() != target_runtime_id
+                || existing.target_digest != target_digest
+                || existing.controller_epoch != controller_epoch
+                || existing.expected_revision != expected_revision
+                || existing.command != command
+            {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            transaction.commit().map_err(map_sql)?;
+            return Ok(
+                if existing.state == "applied" || existing.state == "failed" {
+                    ControlEffectResult::Replay(existing)
+                } else {
+                    ControlEffectResult::Uncertain(existing)
+                },
+            );
+        }
+        transaction.execute(
+            "INSERT INTO control_effect_journal(operation_id,idempotency_key,request_digest,target_run_id,target_runtime_id,target_digest,controller_epoch,expected_revision,command,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,'pending')",
+            params![operation_id,idempotency_key,request_digest,target_run_id,target_runtime_id,target_digest,controller_epoch,expected_revision,command],
+        ).map_err(map_sql)?;
+        let record = query_control_effect(&transaction, idempotency_key)?
+            .ok_or_else(|| StoreError::Corrupt("reserved control effect missing".into()))?;
+        transaction.commit().map_err(map_sql)?;
+        Ok(ControlEffectResult::Reserved(record))
+    }
+
+    pub fn complete_control_effect(
+        &self,
+        idempotency_key: &str,
+        succeeded: bool,
+        receipt: &[u8],
+    ) -> Result<ControlEffectRecord, StoreError> {
+        if receipt.len() > MAX_EVENT_BYTES {
+            return Err(StoreError::TooLarge {
+                limit: MAX_EVENT_BYTES,
+            });
+        }
+        let mut connection = self.conn()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        let existing =
+            query_control_effect(&transaction, idempotency_key)?.ok_or(StoreError::NotFound)?;
+        let next = if succeeded { "applied" } else { "failed" };
+        match existing.state.as_str() {
+            "pending" => {
+                transaction.execute(
+                    "UPDATE control_effect_journal SET state=?2,receipt=?3,updated_at=unixepoch() WHERE idempotency_key=?1 AND state='pending'",
+                    params![idempotency_key,next,receipt],
+                ).map_err(map_sql)?;
+            }
+            "applied" | "failed"
+                if existing.state == next && existing.receipt.as_deref() == Some(receipt) => {}
+            "applied" | "failed" => return Err(StoreError::IdempotencyConflict),
+            _ => return Err(StoreError::Corrupt("unknown control effect state".into())),
+        }
+        let record =
+            query_control_effect(&transaction, idempotency_key)?.ok_or(StoreError::NotFound)?;
+        transaction.commit().map_err(map_sql)?;
+        Ok(record)
+    }
+
+    pub fn control_effect(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<ControlEffectRecord>, StoreError> {
+        let connection = self.conn()?;
+        query_control_effect(&connection, idempotency_key)
+    }
+
+    pub fn record_agent_session(
+        &self,
+        idempotency_key: &str,
+        policy: &str,
+        controller_epoch: u64,
+        lease_expires_at_unix_ms: Option<u64>,
+    ) -> Result<AgentSessionRecord, StoreError> {
+        if !matches!(policy, "close_on_settle" | "persistent") || controller_epoch == 0 {
+            return Err(StoreError::Invalid("invalid Agent session policy".into()));
+        }
+        let connection = self.conn()?;
+        connection.execute(
+            "INSERT OR IGNORE INTO agent_sessions(idempotency_key,policy,controller_epoch,revision,state,lease_expires_at_unix_ms) VALUES(?1,?2,?3,1,'running',?4)",
+            params![idempotency_key,policy,controller_epoch,lease_expires_at_unix_ms],
+        ).map_err(map_sql)?;
+        let record =
+            query_agent_session(&connection, idempotency_key)?.ok_or(StoreError::NotFound)?;
+        if record.policy != policy || record.controller_epoch != controller_epoch {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        Ok(record)
+    }
+
+    pub fn transition_agent_session(
+        &self,
+        idempotency_key: &str,
+        expected_state: &str,
+        expected_revision: u64,
+        next_state: &str,
+        lease_expires_at_unix_ms: Option<u64>,
+    ) -> Result<AgentSessionRecord, StoreError> {
+        let allowed = matches!(
+            (expected_state, next_state),
+            (
+                "running",
+                "running" | "waiting_input" | "closed" | "cancelled"
+            ) | (
+                "waiting_input",
+                "waiting_input" | "running" | "closed" | "cancelled" | "timed_out"
+            )
+        );
+        if !allowed {
+            return Err(StoreError::InvalidTransition {
+                from: expected_state.into(),
+                to: next_state.into(),
+            });
+        }
+        let connection = self.conn()?;
+        let changed = connection.execute(
+            "UPDATE agent_sessions SET state=?4,revision=revision+1,lease_expires_at_unix_ms=?5,updated_at=unixepoch() WHERE idempotency_key=?1 AND state=?2 AND revision=?3",
+            params![idempotency_key,expected_state,expected_revision,next_state,lease_expires_at_unix_ms],
+        ).map_err(map_sql)?;
+        if changed != 1 {
+            return Err(StoreError::InvalidTransition {
+                from: expected_state.into(),
+                to: next_state.into(),
+            });
+        }
+        query_agent_session(&connection, idempotency_key)?.ok_or(StoreError::NotFound)
+    }
+
+    pub fn agent_session(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<AgentSessionRecord>, StoreError> {
+        let connection = self.conn()?;
+        query_agent_session(&connection, idempotency_key)
     }
 
     pub fn append_outbound(
@@ -1432,6 +1641,47 @@ fn query_agent_approval(
     .map_err(map_sql)
 }
 
+fn query_control_effect(
+    connection: &Connection,
+    idempotency_key: &str,
+) -> Result<Option<ControlEffectRecord>, StoreError> {
+    connection.query_row(
+        "SELECT operation_id,idempotency_key,request_digest,target_run_id,target_runtime_id,target_digest,controller_epoch,expected_revision,command,state,receipt FROM control_effect_journal WHERE idempotency_key=?1",
+        [idempotency_key],
+        |row| Ok(ControlEffectRecord {
+            operation_id: row.get(0)?,
+            idempotency_key: row.get(1)?,
+            request_digest: row.get(2)?,
+            target_run_id: row.get(3)?,
+            target_runtime_id: row.get(4)?,
+            target_digest: row.get(5)?,
+            controller_epoch: row.get(6)?,
+            expected_revision: row.get(7)?,
+            command: row.get(8)?,
+            state: row.get(9)?,
+            receipt: row.get(10)?,
+        }),
+    ).optional().map_err(map_sql)
+}
+
+fn query_agent_session(
+    connection: &Connection,
+    idempotency_key: &str,
+) -> Result<Option<AgentSessionRecord>, StoreError> {
+    connection.query_row(
+        "SELECT idempotency_key,policy,controller_epoch,revision,state,lease_expires_at_unix_ms FROM agent_sessions WHERE idempotency_key=?1",
+        [idempotency_key],
+        |row| Ok(AgentSessionRecord {
+            idempotency_key: row.get(0)?,
+            policy: row.get(1)?,
+            controller_epoch: row.get(2)?,
+            revision: row.get(3)?,
+            state: row.get(4)?,
+            lease_expires_at_unix_ms: row.get(5)?,
+        }),
+    ).optional().map_err(map_sql)
+}
+
 fn integrity(conn: &Connection) -> Result<(), StoreError> {
     let result: String = conn
         .query_row("PRAGMA quick_check", [], |r| r.get(0))
@@ -1566,6 +1816,21 @@ CREATE TABLE IF NOT EXISTS credential_profiles(profile_id TEXT PRIMARY KEY, revi
 CREATE TABLE IF NOT EXISTS storage_objects(object_id TEXT PRIMARY KEY, class TEXT NOT NULL, path BLOB NOT NULL, size_bytes INTEGER NOT NULL, pinned INTEGER NOT NULL DEFAULT 0, custody_count INTEGER NOT NULL DEFAULT 1, contains_credentials INTEGER NOT NULL DEFAULT 0, collected INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS content_objects(digest TEXT PRIMARY KEY, size_bytes INTEGER NOT NULL, path BLOB NOT NULL);
 CREATE TABLE IF NOT EXISTS reconciliation_plans(plan_id TEXT PRIMARY KEY, connection_epoch INTEGER NOT NULL, payload_digest TEXT NOT NULL, plan BLOB NOT NULL, state TEXT NOT NULL, completed_at INTEGER);
+CREATE TABLE IF NOT EXISTS control_effect_journal(
+ operation_id TEXT NOT NULL, idempotency_key TEXT PRIMARY KEY, request_digest TEXT NOT NULL,
+ target_run_id TEXT NOT NULL, target_runtime_id TEXT, target_digest TEXT NOT NULL,
+ controller_epoch INTEGER NOT NULL, expected_revision INTEGER NOT NULL, command TEXT NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('pending','applied','failed')), receipt BLOB,
+ created_at INTEGER NOT NULL DEFAULT(unixepoch()), updated_at INTEGER NOT NULL DEFAULT(unixepoch()),
+ CHECK(length(request_digest)=64), CHECK(length(target_digest)=64), CHECK(length(command) BETWEEN 1 AND 64),
+ CHECK(controller_epoch>0), CHECK(expected_revision>0), CHECK(receipt IS NULL OR length(receipt)<=60000));
+CREATE TABLE IF NOT EXISTS agent_sessions(
+ idempotency_key TEXT PRIMARY KEY REFERENCES operations(idempotency_key) ON DELETE RESTRICT,
+ policy TEXT NOT NULL CHECK(policy IN ('close_on_settle','persistent')),
+ controller_epoch INTEGER NOT NULL, revision INTEGER NOT NULL, state TEXT NOT NULL,
+ lease_expires_at_unix_ms INTEGER, created_at INTEGER NOT NULL DEFAULT(unixepoch()),
+ updated_at INTEGER NOT NULL DEFAULT(unixepoch()), CHECK(controller_epoch>0), CHECK(revision>0),
+ CHECK(state IN ('running','waiting_input','closed','cancelled','timed_out')));
 CREATE TABLE IF NOT EXISTS agent_approval_journal(
  approval_id TEXT PRIMARY KEY,
  idempotency_key TEXT NOT NULL REFERENCES operations(idempotency_key) ON DELETE RESTRICT,
@@ -1587,7 +1852,7 @@ CREATE TABLE IF NOT EXISTS agent_approval_journal(
  CHECK(resolution_authority IS NULL OR (length(resolution_authority)>=1 AND length(resolution_authority)<=256)));
 CREATE INDEX IF NOT EXISTS agent_approval_pending_idx ON agent_approval_journal(state,expires_at_unix_ms);
 CREATE UNIQUE INDEX IF NOT EXISTS agent_approval_provider_request_unique_idx ON agent_approval_journal(idempotency_key,provider_request_id);
-INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9);
 COMMIT;"#).map_err(map_sql)
 }
 
@@ -1652,6 +1917,173 @@ mod tests {
             ),
             Err(StoreError::IdempotencyConflict)
         ));
+    }
+
+    #[test]
+    fn control_effect_journal_replays_receipt_and_fences_ambiguous_effect() {
+        let directory = tempdir().unwrap();
+        let store = NodeStore::open(directory.path()).unwrap();
+        let key = "runtime-control-idempotency-0001";
+        assert!(matches!(
+            store
+                .reserve_control_effect(
+                    "op_control_0001",
+                    key,
+                    &digest(1),
+                    "run_control_0001",
+                    Some("rt_control_0001"),
+                    &digest(2),
+                    7,
+                    3,
+                    "pause",
+                )
+                .unwrap(),
+            ControlEffectResult::Reserved(_)
+        ));
+        assert!(matches!(
+            store
+                .reserve_control_effect(
+                    "op_control_0001",
+                    key,
+                    &digest(1),
+                    "run_control_0001",
+                    Some("rt_control_0001"),
+                    &digest(2),
+                    7,
+                    3,
+                    "pause",
+                )
+                .unwrap(),
+            ControlEffectResult::Uncertain(_)
+        ));
+        store
+            .complete_control_effect(key, true, b"receipt-a")
+            .unwrap();
+        drop(store);
+        let store = NodeStore::open(directory.path()).unwrap();
+        let replay = store
+            .reserve_control_effect(
+                "op_control_0001",
+                key,
+                &digest(1),
+                "run_control_0001",
+                Some("rt_control_0001"),
+                &digest(2),
+                7,
+                3,
+                "pause",
+            )
+            .unwrap();
+        assert!(
+            matches!(replay, ControlEffectResult::Replay(record) if record.receipt.as_deref() == Some(b"receipt-a"))
+        );
+        assert!(matches!(
+            store.reserve_control_effect(
+                "op_control_0001",
+                key,
+                &digest(1),
+                "run_control_0001",
+                Some("rt_control_0001"),
+                &digest(2),
+                7,
+                4,
+                "pause",
+            ),
+            Err(StoreError::IdempotencyConflict)
+        ));
+    }
+
+    #[test]
+    fn persistent_agent_session_lease_supports_follow_up_close_cancel_and_idle_timeout() {
+        for (suffix, terminal) in [
+            ("follow-close", "closed"),
+            ("cancel", "cancelled"),
+            ("idle", "timed_out"),
+        ] {
+            let directory = tempdir().unwrap();
+            let store = NodeStore::open(directory.path()).unwrap();
+            let key = format!("agent-session-{suffix}-idempotency");
+            store
+                .reserve_operation(
+                    &format!("op_agent_{suffix}0001"),
+                    &key,
+                    &digest(1),
+                    b"{}",
+                    1,
+                )
+                .unwrap();
+            store
+                .transition_operation(
+                    &key,
+                    OperationState::Reserved,
+                    OperationState::Admitted,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            store
+                .transition_operation(
+                    &key,
+                    OperationState::Admitted,
+                    OperationState::Starting,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            store
+                .transition_operation(
+                    &key,
+                    OperationState::Starting,
+                    OperationState::Running,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            store
+                .record_agent_session(&key, "persistent", 3, Some(50_000))
+                .unwrap();
+            store
+                .transition_operation(
+                    &key,
+                    OperationState::Running,
+                    OperationState::WaitingInput,
+                    None,
+                    None,
+                    None,
+                )
+                .unwrap();
+            let waiting = store
+                .transition_agent_session(&key, "running", 1, "waiting_input", Some(40_000))
+                .unwrap();
+            assert_eq!(waiting.revision, 2);
+            if suffix == "follow-close" {
+                store
+                    .transition_operation(
+                        &key,
+                        OperationState::WaitingInput,
+                        OperationState::Running,
+                        None,
+                        None,
+                        None,
+                    )
+                    .unwrap();
+                let resumed = store
+                    .transition_agent_session(&key, "waiting_input", 2, "running", Some(45_000))
+                    .unwrap();
+                assert_eq!(resumed.revision, 3);
+                store
+                    .transition_agent_session(&key, "running", 3, terminal, None)
+                    .unwrap();
+            } else {
+                store
+                    .transition_agent_session(&key, "waiting_input", 2, terminal, None)
+                    .unwrap();
+            }
+            assert_eq!(store.agent_session(&key).unwrap().unwrap().state, terminal);
+        }
     }
 
     #[test]

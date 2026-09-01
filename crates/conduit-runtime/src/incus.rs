@@ -642,6 +642,39 @@ impl RuntimeProvider for IncusProvider {
             bytes: Some(bytes),
         })
     }
+    fn restore_snapshot(
+        &self,
+        h: &RuntimeHandle,
+        name: &str,
+    ) -> Result<RuntimeStateReceipt, RuntimeError> {
+        if h.provider_id != self.provider_id()
+            || name.is_empty()
+            || name.len() > 64
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Err(RuntimeError::Invalid(
+                "invalid snapshot restore target".into(),
+            ));
+        }
+        let current = self.inspect(h)?;
+        if current.state != RuntimeState::Stopped {
+            return Err(RuntimeError::Invalid(
+                "Incus VM must stop before snapshot restore".into(),
+            ));
+        }
+        let output = self.run(
+            &["restore".into(), h.object_id.clone(), name.into()],
+            Duration::from_secs(300),
+        )?;
+        if !output.status.success() {
+            return Err(RuntimeError::Provider {
+                code: "incus_snapshot_restore_failed".into(),
+            });
+        }
+        self.inspect(h)
+    }
     fn collect(&self, h: &RuntimeHandle) -> Result<CollectionReceipt, RuntimeError> {
         if h.provider_id != self.provider_id() {
             return Err(RuntimeError::IdentityMismatch);
@@ -1114,6 +1147,7 @@ case "${1:-}" in
     esac ;;
   stop) printf '%s' Stopped > "$root/status" ;;
   snapshot) exit 0 ;;
+  restore) exit 0 ;;
   export)
     for last do :; done
     printf '%s' 'bounded-vm-custody' > "$last" ;;
@@ -1190,6 +1224,10 @@ esac
             .unwrap();
         let snapshot = provider.snapshot(&stopped.handle, "reviewed").unwrap();
         assert_eq!(snapshot.bytes, Some(18));
+        let restored = provider
+            .restore_snapshot(&stopped.handle, "reviewed")
+            .unwrap();
+        assert_eq!(restored.state, RuntimeState::Stopped);
         let collection = provider.collect(&stopped.handle).unwrap();
         assert!(collection.custody_complete);
         let argv = fs::read_to_string(directory.path().join("argv")).unwrap();

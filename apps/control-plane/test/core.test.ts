@@ -330,6 +330,55 @@ describe.sequential("control-plane contracts", () => {
     expect(rows?.count).toBe(1);
   });
 
+  it("operates Task links, owner grant reads, and owner CLI token lifecycle", async () => {
+    const ownerToken = "conduit_owner_board_contract_token_00000001";
+    const now = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO tasks(id,project_id,title,description,status,revision,created_at,updated_at) VALUES ('task_link_contract01','prj_board_contract','Linked task','','open',1,?1,?1)").bind(now),
+      env.DB.prepare("INSERT INTO tasks(id,project_id,title,description,status,revision,created_at,updated_at) VALUES ('task_dependency_contract01','prj_board_contract','Dependency','','open',1,?1,?1)").bind(now),
+    ]);
+    const taskRequest = () => exports.default.fetch(new Request("https://conduit.example.com/api/v1/tasks/task_link_contract01/links", {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${ownerToken}`,
+        "content-type": "application/json",
+        "idempotency-key": "task-link-contract-key-0001",
+        "if-match": '"1"',
+      },
+      body: JSON.stringify({ dependsOnTaskId: "task_dependency_contract01" }),
+    }));
+    const linked = await taskRequest();
+    expect(linked.status).toBe(200);
+    expect(linked.headers.get("etag")).toBe('"2"');
+    await expect(linked.json()).resolves.toMatchObject({ taskId: "task_link_contract01", dependsOnTaskId: "task_dependency_contract01", revision: 2 });
+    const replay = await taskRequest();
+    await expect(replay.json()).resolves.toMatchObject({ revision: 2, replay: true });
+    const edge = await env.DB.prepare("SELECT COUNT(*) AS count FROM task_dependencies WHERE task_id='task_link_contract01' AND depends_on_task_id='task_dependency_contract01'").first<{ count: number }>();
+    expect(edge?.count).toBe(1);
+
+    const browserHeaders = { cookie: "__Host-conduit_session=browser_grant_session_token_0000000001" };
+    const grants = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/oauth/grants", { headers: browserHeaders }));
+    expect(grants.status).toBe(200);
+    await expect(grants.json()).resolves.toMatchObject({ items: expect.arrayContaining([expect.objectContaining({ id: "grant_mcp_contract01" })]) });
+    const grant = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/oauth/grants/grant_mcp_contract01", { headers: browserHeaders }));
+    const grantBody = await grant.json<Record<string, unknown>>();
+    expect(grantBody).toMatchObject({ id: "grant_mcp_contract01" });
+    expect(grantBody).not.toHaveProperty("principal_id");
+
+    const status = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/auth/status", { headers: { authorization: `Bearer ${ownerToken}` } }));
+    await expect(status.json()).resolves.toMatchObject({ authenticated: true, principalId: "prin_board_contract", tokenId: "otk_board_contract" });
+    const logoutRequest = () => exports.default.fetch(new Request("https://conduit.example.com/api/v1/auth/logout", {
+      method: "POST",
+      headers: { authorization: `Bearer ${ownerToken}`, "content-type": "application/json", "idempotency-key": "owner-logout-contract-0001" },
+      body: "{}",
+    }));
+    const logout = await logoutRequest();
+    expect(logout.status).toBe(200);
+    await expect(logout.json()).resolves.toMatchObject({ authenticated: false, tokenId: "otk_board_contract" });
+    const logoutReplay = await logoutRequest();
+    await expect(logoutReplay.json()).resolves.toMatchObject({ authenticated: false, tokenId: "otk_board_contract", replay: true });
+  });
+
   it("enforces limiter idempotency and digest conflicts", async () => {
     const limiter = env.CONNECTOR_LIMITERS.getByName("grant-test");
     const base = { operationId: "op_test_00000001", idempotencyKey: "same-operation", payloadDigest: "a".repeat(64), family: "commandStart", weight: 2, requestLimit: 2, windowSeconds: 60, capacity: 10, refillPerSecond: 1, responseBytes: 10, normalizedLogBytes: 0, rawLogBytes: 0, artifactUploadBytes: 0, byteLimits: { response: 1000, normalizedDaily: 1000, rawDaily: 0, artifactDaily: 0 }, nowMs: 1_788_192_000_000 };

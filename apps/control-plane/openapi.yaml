@@ -29,6 +29,15 @@ paths:
     post: { operationId: ownerLoginOptions, tags: [auth], security: [], responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
   /api/v1/auth/login/verify:
     post: { operationId: ownerLoginVerify, tags: [auth], security: [], requestBody: { $ref: "#/components/requestBodies/JsonBody" }, responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /api/v1/auth/status:
+    get: { operationId: ownerCliStatus, tags: [auth], security: [{ ownerCli: [] }], responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "401": { $ref: "#/components/responses/AuthRequired" } } }
+  /api/v1/auth/logout:
+    post:
+      operationId: ownerCliLogout
+      tags: [auth]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      security: [{ ownerCli: [] }]
+      responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "401": { $ref: "#/components/responses/AuthRequired" } }
   /api/v1/auth/step-up/options:
     post: { operationId: ownerStepUpOptions, tags: [auth], security: [{ ownerSession: [] }], responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
   /api/v1/auth/step-up/verify:
@@ -114,6 +123,24 @@ paths:
   /api/v1/runs/{id}: { $ref: "#/components/pathItems/MutableItem" }
   /api/v1/tasks: { $ref: "#/components/pathItems/MutableCollection" }
   /api/v1/tasks/{id}: { $ref: "#/components/pathItems/MutableItem" }
+  /api/v1/tasks/{taskId}/links:
+    post:
+      operationId: linkTask
+      tags: [domain]
+      parameters:
+        - { name: taskId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+        - { $ref: "#/components/parameters/IfMatch" }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.board.write] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object, additionalProperties: false, required: [dependsOnTaskId], properties: { dependsOnTaskId: { $ref: "#/components/schemas/Id" } } }
+                - { type: object, additionalProperties: false, required: [linkKind, targetId], properties: { linkKind: { type: string, enum: [message, assignment, run, change_set, artifact] }, targetId: { $ref: "#/components/schemas/Id" } } }
+      responses: { "200": { $ref: "#/components/responses/RevisionedSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
   /api/v1/approvals: { $ref: "#/components/pathItems/ReadCollection" }
   /api/v1/approvals/{id}: { $ref: "#/components/pathItems/ReadItem" }
   /api/v1/artifacts: { $ref: "#/components/pathItems/MutableCollection" }
@@ -212,6 +239,20 @@ paths:
     post: { operationId: registerFirstPartyOAuthClient, tags: [connectors], parameters: [{ $ref: "#/components/parameters/CsrfToken" }], security: [{ ownerSession: [] }], requestBody: { $ref: "#/components/requestBodies/JsonBody" }, responses: { "201": { $ref: "#/components/responses/JsonSuccess" } } }
   /api/v1/oauth/clients/{clientId}/approve:
     post: { operationId: approveOAuthClient, tags: [connectors], parameters: [{ $ref: "#/components/parameters/ClientId" }, { $ref: "#/components/parameters/CsrfToken" }], security: [{ ownerSession: [] }], responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /api/v1/oauth/grants:
+    get:
+      operationId: listOAuthGrants
+      tags: [connectors]
+      parameters: [{ $ref: "#/components/parameters/PageLimit" }, { $ref: "#/components/parameters/PageCursor" }]
+      security: [{ ownerSession: [] }]
+      responses: { "200": { $ref: "#/components/responses/PageSuccess" } }
+  /api/v1/oauth/grants/{grantId}:
+    get:
+      operationId: getOAuthGrant
+      tags: [connectors]
+      parameters: [{ $ref: "#/components/parameters/GrantId" }]
+      security: [{ ownerSession: [] }]
+      responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "404": { description: Grant not found } }
   /api/v1/oauth/grants/{grantId}/{action}:
     post:
       operationId: changeOAuthGrantState

@@ -497,8 +497,7 @@ fn auth(command: AuthCommand) -> Result<Invocation, CliError> {
             Invocation::input(Method::Post, "/api/v1/auth/login/options", input).public()
         }
         AuthCommand::Register(input) => {
-            Invocation::input(Method::Post, "/api/v1/auth/passkeys/verify", input)
-                .browser_session()
+            Invocation::input(Method::Post, "/api/v1/auth/passkeys/verify", input).browser_session()
         }
         AuthCommand::RegisterOptions(input) => {
             Invocation::input(Method::Post, "/api/v1/auth/passkeys/options", input)
@@ -510,8 +509,15 @@ fn auth(command: AuthCommand) -> Result<Invocation, CliError> {
             invocation.body = Some(json!({ "issueCliToken": true }));
             invocation
         }
-        AuthCommand::Logout(_) => return Err(CliError::Usage("the control plane has no owner CLI logout endpoint; remove the bounded local token instead".to_owned())),
-        AuthCommand::Status => return Err(CliError::Usage("the control plane has no owner CLI status endpoint".to_owned())),
+        AuthCommand::Logout(args) => {
+            if args.id.is_some() || args.revision.is_some() {
+                return Err(CliError::Usage(
+                    "auth logout does not accept a target ID or revision".to_owned(),
+                ));
+            }
+            Invocation::mutation(Method::Post, "/api/v1/auth/logout", args)?.owner_bearer()
+        }
+        AuthCommand::Status => Invocation::get("/api/v1/auth/status").owner_bearer(),
         AuthCommand::Recover(input) => {
             Invocation::input(Method::Post, "/api/v1/auth/recovery", input).public()
         }
@@ -682,10 +688,10 @@ fn task(command: TaskCommand) -> Result<Invocation, CliError> {
         TaskCommand::List => Invocation::get("/api/v1/tasks"),
         TaskCommand::Show(args) => Invocation::get(id_route("/api/v1/tasks", &args.id)?),
         TaskCommand::Update(args) => item_mutation(Method::Patch, "/api/v1/tasks", "", args)?,
-        TaskCommand::Link(_) => {
-            return Err(CliError::Usage(
-                "the canonical control-plane API does not expose Task links yet".to_owned(),
-            ));
+        TaskCommand::Link(args) => {
+            let invocation = item_mutation(Method::Post, "/api/v1/tasks", "/links", args)?;
+            require_revision(&invocation, "task link")?;
+            invocation
         }
     })
 }
@@ -702,12 +708,7 @@ fn logs(command: LogsCommand) -> Result<Invocation, CliError> {
 
 fn eval(command: EvalCommand) -> Result<Invocation, CliError> {
     Ok(match command {
-        EvalCommand::Start(_) => {
-            return Err(CliError::Usage(
-                "the canonical control-plane API does not expose evaluation creation yet"
-                    .to_owned(),
-            ));
-        }
+        EvalCommand::Start(args) => operation("evaluation.start", args, OperationBinding::None)?,
         EvalCommand::Show(args) => Invocation::get(id_route("/api/v1/evidence", &args.id)?),
         EvalCommand::Compare(input) => {
             Invocation::input(Method::Get, "/api/v1/evidence", input).query()
@@ -721,16 +722,9 @@ fn connector(command: ConnectorCommand) -> Result<Invocation, CliError> {
             Invocation::mutation(Method::Post, "/api/v1/connector-policies", args)?
                 .browser_session()
         }
-        ConnectorCommand::List => {
-            return Err(CliError::Usage(
-                "the canonical control-plane API does not expose OAuth grant listing yet"
-                    .to_owned(),
-            ));
-        }
-        ConnectorCommand::Show(_) => {
-            return Err(CliError::Usage(
-                "the canonical control-plane API does not expose OAuth grant reads yet".to_owned(),
-            ));
+        ConnectorCommand::List => Invocation::get("/api/v1/oauth/grants").browser_session(),
+        ConnectorCommand::Show(args) => {
+            Invocation::get(id_route("/api/v1/oauth/grants", &args.id)?).browser_session()
         }
         ConnectorCommand::Pause(args) => grant_action(args, "pause")?,
         ConnectorCommand::Resume(args) => grant_action(args, "resume")?,
@@ -1159,19 +1153,37 @@ mod tests {
     }
 
     #[test]
-    fn removed_compatibility_commands_fail_before_transport() {
-        for args in [
-            ["conduit", "auth", "status"].as_slice(),
-            ["conduit", "connector", "list"].as_slice(),
-            ["conduit", "task", "link"].as_slice(),
-            ["conduit", "eval", "start"].as_slice(),
-        ] {
-            let cli = Cli::try_parse_from(args).unwrap();
-            assert!(matches!(
-                cli.command.into_invocation(),
-                Err(CliError::Usage(_))
-            ));
-        }
+    fn complete_non_visual_commands_use_canonical_routes() {
+        let status = invocation(&["conduit", "auth", "status"]);
+        assert_eq!(status.route, "/api/v1/auth/status");
+        assert_eq!(status.auth, AuthRequirement::OwnerBearer);
+
+        let logout = invocation(&["conduit", "auth", "logout"]);
+        assert_eq!(logout.route, "/api/v1/auth/logout");
+        assert_eq!(logout.auth, AuthRequirement::OwnerBearer);
+
+        let link = invocation(&[
+            "conduit",
+            "task",
+            "link",
+            "task_contract01",
+            "--revision",
+            "3",
+        ]);
+        assert_eq!(link.route, "/api/v1/tasks/task_contract01/links");
+        assert_eq!(link.revision, Some(3));
+
+        let evaluation = invocation(&["conduit", "eval", "start"]);
+        assert_eq!(evaluation.route, "/api/v1/operations");
+        assert_eq!(evaluation.body.unwrap()["capability"], "evaluation.start");
+
+        let grants = invocation(&["conduit", "connector", "list"]);
+        assert_eq!(grants.route, "/api/v1/oauth/grants");
+        assert_eq!(grants.auth, AuthRequirement::BrowserSession);
+        assert_eq!(
+            invocation(&["conduit", "connector", "show", "grant_contract01"]).route,
+            "/api/v1/oauth/grants/grant_contract01"
+        );
     }
 
     #[test]

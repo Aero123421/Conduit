@@ -7,8 +7,9 @@ import {
   type RegistrationResponseJSON,
 } from "@simplewebauthn/server";
 import { boundedString, boundedStringArray, readJsonBounded, record } from "../bounds.ts";
-import { fromBase64url, keyedHash, newId, randomToken, sha256Hex } from "../crypto.ts";
+import { fromBase64url, keyedHash, newId, nowIso, operationDigest, randomToken, sha256Hex } from "../crypto.ts";
 import { PublicError } from "../errors.ts";
+import { completeEffect, reserveEffect } from "../idempotency.ts";
 import type { ControlPlaneEnv } from "../types.ts";
 import { AuthRepository, readCookie, sessionCookie, type SessionRow } from "../repositories/auth.ts";
 
@@ -180,14 +181,55 @@ async function authenticationVerify(request: Request, env: ControlPlaneEnv, step
   return responseJson({ principalId: passkey.principal_id, csrfToken: session.csrf, fresh: true, ...(ownerAccessToken === undefined ? {} : { ownerAccessToken, ownerAccessTokenExpiresAt }) }, 200, { "set-cookie": sessionCookie(session.token, session.expiresAt) });
 }
 
-export async function authenticateOwnerCli(request: Request, env: ControlPlaneEnv): Promise<{ principalId: string; clientId: string; scopes: string[] }> {
+interface OwnerCliToken {
+  id: string;
+  principal_id: string;
+  label: string;
+  status: string;
+  expires_at: string;
+}
+
+async function ownerCliToken(request: Request, env: ControlPlaneEnv): Promise<OwnerCliToken> {
   const authorization = request.headers.get("authorization");
   if (authorization === null || !authorization.startsWith("Bearer conduit_owner_")) throw new PublicError("authentication_required", 401, "Owner CLI bearer token is required");
   const token = boundedString(authorization.slice(7), "owner bearer token", 512);
-  const row = await env.DB.prepare("SELECT id,principal_id,status FROM owner_api_tokens WHERE verifier_hash=?1 AND expires_at>?2 LIMIT 1").bind(await keyedHash(env.TOKEN_PEPPER, token), new Date().toISOString()).first<{ id: string; principal_id: string; status: string }>();
-  if (row === null || row.status !== "active") throw new PublicError("authentication_required", 401, "Owner CLI bearer token is invalid or expired");
+  const row = await env.DB.prepare("SELECT id,principal_id,label,status,expires_at FROM owner_api_tokens WHERE verifier_hash=?1 AND expires_at>?2 LIMIT 1").bind(await keyedHash(env.TOKEN_PEPPER, token), new Date().toISOString()).first<OwnerCliToken>();
+  if (row === null) throw new PublicError("authentication_required", 401, "Owner CLI bearer token is invalid or expired");
+  return row;
+}
+
+export async function authenticateOwnerCli(request: Request, env: ControlPlaneEnv): Promise<{ principalId: string; clientId: string; scopes: string[]; tokenId: string }> {
+  const row = await ownerCliToken(request, env);
+  if (row.status !== "active") throw new PublicError("authentication_required", 401, "Owner CLI bearer token is invalid or expired");
   await env.DB.prepare("UPDATE owner_api_tokens SET last_used_at=?1 WHERE id=?2").bind(new Date().toISOString(), row.id).run();
-  return { principalId: row.principal_id, clientId: "conduit.cli", scopes: ["conduit.admin"] };
+  return { principalId: row.principal_id, clientId: "conduit.cli", scopes: ["conduit.admin"], tokenId: row.id };
+}
+
+async function ownerCliStatus(request: Request, env: ControlPlaneEnv): Promise<Response> {
+  const actor = await authenticateOwnerCli(request, env);
+  const row = await env.DB.prepare("SELECT label,status,created_at,last_used_at,expires_at FROM owner_api_tokens WHERE id=?1 AND principal_id=?2 LIMIT 1").bind(actor.tokenId, actor.principalId).first<Record<string, unknown>>();
+  if (row === null) throw new PublicError("authentication_required", 401, "Owner CLI bearer token is invalid");
+  return responseJson({ authenticated: true, principalId: actor.principalId, tokenId: actor.tokenId, ...row });
+}
+
+async function ownerCliLogout(request: Request, env: ControlPlaneEnv): Promise<Response> {
+  const row = await ownerCliToken(request, env);
+  const key = boundedString(request.headers.get("idempotency-key"), "Idempotency-Key", 256, 16);
+  const digest = await operationDigest({ action: "owner_cli.logout", tokenId: row.id });
+  if (row.status !== "active") {
+    const prior = await env.DB.prepare("SELECT payload_digest,state,response_json FROM effect_idempotency_records WHERE scope=?1 AND idempotency_key=?2 LIMIT 1").bind(`owner-cli-token:${row.id}`, key).first<{ payload_digest: string; state: string; response_json: string | null }>();
+    if (prior?.payload_digest === digest && prior.state === "completed" && prior.response_json !== null) return responseJson({ ...(JSON.parse(prior.response_json) as Record<string, unknown>), replay: true });
+    throw new PublicError("authentication_required", 401, "Owner CLI bearer token is already inactive");
+  }
+  const reserved = await reserveEffect(env.DB, `owner-cli-token:${row.id}`, key, digest);
+  if (reserved.replay !== undefined) return responseJson(reserved.replay);
+  const now = nowIso();
+  const result = await env.DB.prepare("UPDATE owner_api_tokens SET status='revoked',revoked_at=?1 WHERE id=?2 AND status='active'").bind(now, row.id).run();
+  if (result.meta.changes !== 1) throw new PublicError("authentication_required", 401, "Owner CLI bearer token changed before logout");
+  const response = { authenticated: false, tokenId: row.id, revokedAt: now };
+  await env.DB.prepare("INSERT INTO security_events(id,event_type,principal_id,client_id,metadata_json,created_at) VALUES (?1,'owner_api_token.revoked',?2,'conduit.cli',?3,?4)").bind(newId("sevt"), row.principal_id, JSON.stringify({ tokenId: row.id }), now).run();
+  await completeEffect(env.DB, reserved.reservation!, response);
+  return responseJson(response);
 }
 
 async function recovery(request: Request, env: ControlPlaneEnv): Promise<Response> {
@@ -212,6 +254,8 @@ async function revokePasskey(request: Request, env: ControlPlaneEnv, passkeyId: 
 }
 
 export async function handleBrowserAuth(request: Request, env: ControlPlaneEnv, path: string): Promise<Response | null> {
+  if (request.method === "GET" && path === "/v1/auth/status") return ownerCliStatus(request, env);
+  if (request.method === "POST" && path === "/v1/auth/logout") return ownerCliLogout(request, env);
   if (request.method === "POST" && path === "/v1/auth/setup/options") return registrationOptions(request, env, "setup");
   if (request.method === "POST" && path === "/v1/auth/setup/verify") return registrationVerify(request, env, "setup");
   if (request.method === "POST" && path === "/v1/auth/login/options") return authenticationOptions(request, env, false);

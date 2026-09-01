@@ -1,4 +1,4 @@
-import { boundedString, readJsonBounded, record } from "./bounds.ts";
+import { boundedLimit, boundedString, readJsonBounded, record } from "./bounds.ts";
 import { authenticateBearer } from "./auth/oauth.ts";
 import { authenticateOwnerCli, requireBrowserSession } from "./auth/browser.ts";
 import { uploadArtifact } from "./artifacts.ts";
@@ -18,7 +18,7 @@ const readPermissions: Partial<Record<ResourceName, string>> = {
 const writePermissions: Partial<Record<ResourceName, string>> = { projects: "config.write", sources: "config.write", locations: "config.write", sessions: "board.write", messages: "board.write", project_agents: "config.write", assignments: "assignment.create", runs: "run.start", tasks: "board.write", artifacts: "artifact.upload" };
 
 export const CLI_CONTROL_PLANE_ROUTE_MANIFEST = [
-  ["POST", "/v1/auth/setup/options"], ["POST", "/v1/auth/setup/verify"], ["POST", "/v1/auth/login/options"], ["POST", "/v1/auth/login/verify"], ["POST", "/v1/auth/passkeys/options"], ["POST", "/v1/auth/passkeys/verify"], ["POST", "/v1/auth/recovery"], ["POST", "/v1/auth/passkeys/passkey_contract01/revoke"],
+  ["POST", "/v1/auth/setup/options"], ["POST", "/v1/auth/setup/verify"], ["POST", "/v1/auth/login/options"], ["POST", "/v1/auth/login/verify"], ["POST", "/v1/auth/passkeys/options"], ["POST", "/v1/auth/passkeys/verify"], ["POST", "/v1/auth/recovery"], ["POST", "/v1/auth/passkeys/passkey_contract01/revoke"], ["GET", "/v1/auth/status"], ["POST", "/v1/auth/logout"],
   ["GET", "/v1/devices"], ["GET", "/v1/devices/dev_contract01"], ["POST", "/v1/devices/dev_contract01/revoke"],
   ["POST", "/v1/projects"], ["GET", "/v1/projects"], ["GET", "/v1/projects/prj_contract01"], ["PATCH", "/v1/projects/prj_contract01"], ["POST", "/v1/sources"],
   ["POST", "/v1/sessions"], ["GET", "/v1/sessions"], ["GET", "/v1/sessions/csess_contract01"], ["PATCH", "/v1/sessions/csess_contract01"],
@@ -26,9 +26,9 @@ export const CLI_CONTROL_PLANE_ROUTE_MANIFEST = [
   ["POST", "/v1/project_agents"], ["GET", "/v1/project_agents"], ["GET", "/v1/project_agents/pagent_contract01"], ["PATCH", "/v1/project_agents/pagent_contract01"],
   ["POST", "/v1/assignments"], ["GET", "/v1/assignments/asg_contract01"], ["POST", "/v1/assignments/asg_contract01/transitions"],
   ["GET", "/v1/runs"], ["GET", "/v1/runs/run_contract01"], ["GET", "/v1/runs/run_contract01/events"], ["POST", "/v1/operations"],
-  ["POST", "/v1/tasks"], ["GET", "/v1/tasks"], ["GET", "/v1/tasks/task_contract01"], ["PATCH", "/v1/tasks/task_contract01"],
+  ["POST", "/v1/tasks"], ["GET", "/v1/tasks"], ["GET", "/v1/tasks/task_contract01"], ["PATCH", "/v1/tasks/task_contract01"], ["POST", "/v1/tasks/task_contract01/links"],
   ["GET", "/v1/evidence/evid_contract01"], ["GET", "/v1/evidence"],
-  ["POST", "/v1/connector-policies"], ["PATCH", "/v1/connector-policies/cpol_contract01"],
+  ["POST", "/v1/connector-policies"], ["PATCH", "/v1/connector-policies/cpol_contract01"], ["GET", "/v1/oauth/grants"], ["GET", "/v1/oauth/grants/grant_contract01"],
   ["POST", "/v1/oauth/grants/grant_contract01/pause"], ["POST", "/v1/oauth/grants/grant_contract01/resume"], ["POST", "/v1/oauth/grants/grant_contract01/revoke"], ["POST", "/v1/oauth/grants/grant_contract01/reauthorize"],
   ["POST", "/v1/artifacts"], ["GET", "/v1/artifacts"], ["GET", "/v1/artifacts/art_contract01"], ["PUT", "/v1/artifacts/art_contract01/content"],
 ] as const;
@@ -175,6 +175,67 @@ async function postBoardMessage(request: Request, env: ControlPlaneEnv): Promise
   return Response.json(response, { status: 201, headers: { etag: '"1"' } });
 }
 
+async function readOAuthGrants(request: Request, env: ControlPlaneEnv, grantId?: string): Promise<Response> {
+  const { session } = await requireBrowserSession(request, env);
+  if (grantId !== undefined) {
+    const id = boundedString(grantId, "grantId", 128, 1);
+    const row = await env.DB.prepare("SELECT id,client_id,resource,scopes_json,connector_policy_id,connector_policy_revision,status,created_at,last_used_at,expires_at,revoked_at FROM oauth_grants WHERE id=?1 AND principal_id=?2 LIMIT 1").bind(id, session.principal_id).first<Record<string, unknown>>();
+    if (row === null) throw new PublicError("not_found", 404, "OAuth grant not found");
+    return Response.json(row);
+  }
+  const url = new URL(request.url);
+  const limit = boundedLimit(url.searchParams.get("limit"));
+  const cursor = boundedString(url.searchParams.get("cursor") ?? "", "cursor", 256, 0);
+  const rows = await env.DB.prepare("SELECT id,client_id,resource,scopes_json,connector_policy_id,connector_policy_revision,status,created_at,last_used_at,expires_at,revoked_at FROM oauth_grants WHERE principal_id=?1 AND id>?2 ORDER BY id LIMIT ?3").bind(session.principal_id, cursor, limit).all<Record<string, unknown>>();
+  return Response.json({ items: rows.results });
+}
+
+async function linkTask(request: Request, env: ControlPlaneEnv, rawTaskId: string): Promise<Response> {
+  const taskId = boundedString(rawTaskId, "taskId", 128, 1);
+  const body = record(await readJsonBounded(request));
+  const allowed = new Set(["dependsOnTaskId", "linkKind", "targetId"]);
+  if (Object.keys(body).some((field) => !allowed.has(field))) throw new PublicError("invalid_request", 400, "Task link contains an unknown field");
+  const dependency = body.dependsOnTaskId === undefined ? undefined : boundedString(body.dependsOnTaskId, "dependsOnTaskId", 128, 1);
+  const linkKind = body.linkKind === undefined ? undefined : boundedString(body.linkKind, "linkKind", 32, 1);
+  const targetId = body.targetId === undefined ? undefined : boundedString(body.targetId, "targetId", 128, 1);
+  const isDependency = dependency !== undefined && linkKind === undefined && targetId === undefined;
+  const isLink = dependency === undefined && linkKind !== undefined && targetId !== undefined;
+  if (!isDependency && !isLink) throw new PublicError("invalid_request", 400, "Supply exactly dependsOnTaskId or linkKind with targetId");
+  if (linkKind !== undefined && !["message", "assignment", "run", "change_set", "artifact"].includes(linkKind)) throw new PublicError("invalid_request", 400, "Task link kind is invalid");
+
+  const auth = await actorFor(request, env, true);
+  await authorizeResource(request, env, auth.actor, auth.connector, "tasks", true, new URL(request.url), body);
+  const expectedRevision = parseIfMatch(request);
+  const key = idempotencyKey(request);
+  const reserved = await reserveEffect(env.DB, auth.actor.grantId ?? `${auth.actor.clientId}:${auth.actor.principalId}`, key, await operationDigest({ taskId, expectedRevision, dependency: dependency ?? null, linkKind: linkKind ?? null, targetId: targetId ?? null }));
+  if (reserved.replay !== undefined) return Response.json(reserved.replay, { headers: typeof reserved.replay.revision === "number" ? { etag: `"${reserved.replay.revision}"` } : {} });
+  const current = await env.DB.prepare("SELECT revision FROM tasks WHERE id=?1 LIMIT 1").bind(taskId).first<{ revision: number }>();
+  if (current === null) throw new PublicError("not_found", 404, "Task not found");
+  if (current.revision !== expectedRevision) throw new PublicError("revision_conflict", 409, "Target revision is stale");
+
+  if (dependency !== undefined) {
+    const target = await env.DB.prepare("SELECT id FROM tasks WHERE id=?1 LIMIT 1").bind(dependency).first<{ id: string }>();
+    if (target === null) throw new PublicError("not_found", 404, "Dependency Task not found");
+    const cycle = await env.DB.prepare("WITH RECURSIVE reachable(id) AS (VALUES (?1) UNION SELECT td.depends_on_task_id FROM task_dependencies td JOIN reachable r ON td.task_id=r.id) SELECT id FROM reachable WHERE id=?2 LIMIT 1").bind(dependency, taskId).first<{ id: string }>();
+    if (cycle !== null) throw new PublicError("invalid_request", 409, "Task dependency would create a cycle");
+    const existing = await env.DB.prepare("SELECT 1 AS found FROM task_dependencies WHERE task_id=?1 AND depends_on_task_id=?2 LIMIT 1").bind(taskId, dependency).first<{ found: number }>();
+    if (existing !== null) throw new PublicError("invalid_request", 409, "Task dependency already exists");
+  } else {
+    const existing = await env.DB.prepare("SELECT 1 AS found FROM task_links WHERE task_id=?1 AND link_kind=?2 AND target_id=?3 LIMIT 1").bind(taskId, linkKind!, targetId!).first<{ found: number }>();
+    if (existing !== null) throw new PublicError("invalid_request", 409, "Task link already exists");
+  }
+
+  const now = nowIso();
+  const statements = [env.DB.prepare("UPDATE tasks SET revision=revision+1,updated_at=?1 WHERE id=?2 AND revision=?3").bind(now, taskId, expectedRevision)];
+  if (dependency !== undefined) statements.push(env.DB.prepare("INSERT INTO task_dependencies(task_id,depends_on_task_id,created_at) SELECT ?1,?2,?3 WHERE EXISTS (SELECT 1 FROM tasks WHERE id=?1 AND revision=?4)").bind(taskId, dependency, now, expectedRevision + 1));
+  else statements.push(env.DB.prepare("INSERT INTO task_links(task_id,link_kind,target_id,created_at) SELECT ?1,?2,?3,?4 WHERE EXISTS (SELECT 1 FROM tasks WHERE id=?1 AND revision=?5)").bind(taskId, linkKind!, targetId!, now, expectedRevision + 1));
+  const [updated, inserted] = await env.DB.batch(statements);
+  if (updated?.meta.changes !== 1 || inserted?.meta.changes !== 1) throw new PublicError("revision_conflict", 409, "Task changed before link commit");
+  const response = { taskId, revision: expectedRevision + 1, ...(dependency === undefined ? { linkKind, targetId } : { dependsOnTaskId: dependency }) };
+  await completeEffect(env.DB, reserved.reservation!, response);
+  return Response.json(response, { headers: { etag: `"${expectedRevision + 1}"` } });
+}
+
 export async function handleApi(request: Request, env: ControlPlaneEnv, path: string): Promise<Response | null> {
   if (request.method === "POST" && path === "/v1/messages") return postBoardMessage(request, env);
   const artifactUpload = path.match(/^\/v1\/artifacts\/([^/]+)\/content$/);
@@ -185,6 +246,11 @@ export async function handleApi(request: Request, env: ControlPlaneEnv, path: st
   if (request.method === "POST" && assignmentTransition?.[1] !== undefined) return transition(request, env, "assignment", assignmentTransition[1]);
   const runTransition = path.match(/^\/v1\/runs\/([^/]+)\/transitions$/);
   if (request.method === "POST" && runTransition?.[1] !== undefined) return transition(request, env, "run", runTransition[1]);
+  const taskLink = path.match(/^\/v1\/tasks\/([^/]+)\/links$/);
+  if (request.method === "POST" && taskLink?.[1] !== undefined) return linkTask(request, env, taskLink[1]);
+  if (request.method === "GET" && path === "/v1/oauth/grants") return readOAuthGrants(request, env);
+  const oauthGrant = path.match(/^\/v1\/oauth\/grants\/([^/]+)$/);
+  if (request.method === "GET" && oauthGrant?.[1] !== undefined) return readOAuthGrants(request, env, oauthGrant[1]);
   if (request.method === "POST" && path === "/v1/operations") {
     const auth = await actorFor(request, env, true);
     const body = record(await readJsonBounded(request)) as unknown as StartOperationInput;

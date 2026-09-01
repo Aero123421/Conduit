@@ -168,7 +168,7 @@ paths:
       operationId: uploadArtifactContent
       tags: [domain]
       parameters: [{ $ref: "#/components/parameters/ArtifactId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
-      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.artifact.upload] }]
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.run.start] }]
       requestBody: { required: true, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
       responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "413": { description: Upload exceeds admitted bound } }
   /api/v1/operations:
@@ -264,8 +264,9 @@ components:
         responses: { "200": { $ref: "#/components/responses/PageSuccess" } }
       post:
         tags: [domain]
+        description: The connector grant must carry the scope mapped to this resource's exact policy operation (for example config, Board, Run, or artifact admission).
         parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
-        security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.config.write] }]
+        security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [] }]
         requestBody: { $ref: "#/components/requestBodies/JsonBody" }
         responses: { "201": { $ref: "#/components/responses/RevisionedSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
     ReadItem:
@@ -282,8 +283,9 @@ components:
         responses: { "200": { $ref: "#/components/responses/RevisionedSuccess" } }
       patch:
         tags: [domain]
+        description: The connector grant must carry the scope mapped to this resource's exact policy operation; the immutable policy revision is checked on every call.
         parameters: [{ $ref: "#/components/parameters/IfMatch" }, { $ref: "#/components/parameters/IdempotencyKey" }]
-        security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.config.write] }]
+        security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [] }]
         requestBody: { $ref: "#/components/requestBodies/JsonBody" }
         responses: { "200": { $ref: "#/components/responses/RevisionedSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
   parameters:
@@ -321,7 +323,6 @@ components:
             conduit.board.write: Write policy-filtered Board messages.
             conduit.run.start: Request typed execution admission.
             conduit.approval.resolve: Resolve an exact bound approval.
-            conduit.artifact.upload: Upload an admitted bounded artifact.
   requestBodies:
     JsonBody: { required: true, content: { application/json: { schema: { type: object, maxProperties: 128, additionalProperties: true } } } }
     FormBody: { required: true, content: { application/x-www-form-urlencoded: { schema: { type: object, maxProperties: 32, additionalProperties: { type: string, maxLength: 4096 } } } } }
@@ -364,20 +365,32 @@ components:
     OperationIntent:
       type: object
       additionalProperties: false
-      required: [operationType, deviceId, runtimeRequest, accessScope, approvalMode, arguments, expiresAt]
+      required: [deviceId, capability, runtime, accessScope, approvalMode, sourceRevisions, arguments]
       properties:
-        operationType: { type: string, enum: [quick.command.start, agent.run.start, runtime.vm.start, assignment.input, assignment.steer, run.pause, run.resume, run.cancel, run.recover] }
+        capability: { type: string, pattern: '^[a-z][a-z0-9_.-]{0,127}$' }
         deviceId: { $ref: "#/components/schemas/Id" }
         projectId: { type: [string, "null"], maxLength: 128 }
         sessionId: { type: [string, "null"], maxLength: 128 }
         assignmentId: { type: [string, "null"], maxLength: 128 }
         runId: { type: [string, "null"], maxLength: 128 }
         sourceRevisions: { type: array, maxItems: 64, items: { type: object, maxProperties: 16 } }
-        runtimeRequest: { type: object, maxProperties: 64 }
-        accessScope: { type: string, enum: [read_only, project_write, project_full, full_user, full_device, custom] }
-        approvalMode: { type: string, enum: [always, on_risk, never] }
+        runtime:
+          type: object
+          additionalProperties: false
+          required: [kind, providerId, configurationRevision]
+          properties:
+            kind: { type: string, enum: [native, restricted_native, container, vm] }
+            providerId: { type: string, pattern: '^[a-z][a-z0-9_.-]{0,127}$' }
+            configurationRevision: { type: integer, minimum: 1 }
+            cpuLimit: { type: number, exclusiveMinimum: 0, maximum: 1024 }
+            memoryBytes: { type: integer, minimum: 0 }
+            storageBytes: { type: integer, minimum: 0 }
+            gpuCount: { type: integer, minimum: 0, maximum: 64 }
+            networkMode: { type: string, enum: [open, restricted, offline, lan_explicit] }
+        accessScope: { type: string, enum: [read_only, selected_sources, project_full, full_user, full_device, custom] }
+        approvalMode: { type: string, enum: [always, outside_scope, risk_classes, never] }
         arguments: { type: object, maxProperties: 128 }
-        expiresAt: { type: string, format: date-time }
+        expiresInSeconds: { type: integer, minimum: 30, maximum: 3600 }
         idempotencyKey: { type: string, minLength: 16, maxLength: 256 }
     OperationReceipt:
       type: object
@@ -395,8 +408,8 @@ components:
         projectSelector: { type: object, maxProperties: 16 }
         allowedOperations: { type: array, maxItems: 128, items: { type: string, maxLength: 128 } }
         allowedRuntimes: { type: array, maxItems: 4, uniqueItems: true, items: { type: string, enum: [native, restricted_native, container, vm] } }
-        maxAccessScope: { type: string, enum: [read_only, project_write, project_full, full_user, full_device, custom] }
-        mostPermissiveApprovalMode: { type: string, enum: [always, on_risk, never] }
+        maxAccessScope: { type: string, enum: [read_only, selected_sources, project_full, full_user, full_device, custom] }
+        mostPermissiveApprovalMode: { type: string, enum: [always, outside_scope, risk_classes, never] }
         allowRawContent: { type: boolean }
         allowArtifactUpload: { type: boolean }
     JsonRpcRequest:

@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "protocol": "conduit.node/1",
+  "type": "device.proof",
+  "messageId": "msg_proof00001",
+  "payload": {
+    "connectionId": "conn_example0001",
+    "deviceId": "dev_example0001",
+    "keyId": "dkey_example0001",
+    "clientNonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "serverNonce": "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+    "selectedProtocolVersion": "conduit.node/1",
+    "signedTranscriptDigest": "114bb445d60b0763c5561f96f2627e682cddaec29569016ece9680376aafaa16",
+    "signature": "RNFCMhLHZ6oCCX1NF-bOVx7eAKuamnMrNhCiEW7Xg1v5QbvAwphQKIRYKrP6HhmpHYXg8f_Cvdud_g15oAF1Bw"
+  }
+}

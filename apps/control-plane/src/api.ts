@@ -185,12 +185,12 @@ export async function handleApi(request: Request, env: ControlPlaneEnv, path: st
   const runTransition = path.match(/^\/v1\/runs\/([^/]+)\/transitions$/);
   if (request.method === "POST" && runTransition?.[1] !== undefined) return transition(request, env, "run", runTransition[1]);
   if (request.method === "POST" && path === "/v1/operations") {
-    const actor = await authenticateBearer(request, env);
+    const auth = await actorFor(request, env, true);
     const body = record(await readJsonBounded(request)) as unknown as StartOperationInput;
     const key = idempotencyKey(request);
     if (body.idempotencyKey !== undefined && body.idempotencyKey !== key) throw new PublicError("idempotency_conflict", 409, "Body and Idempotency-Key header differ");
     body.idempotencyKey = key;
-    return Response.json(await createOperation(env, actor, body), { status: 202 });
+    return Response.json(await createOperation(env, auth.actor, body, { kind: auth.connector ? "connector" : "owner" }), { status: 202 });
   }
   const stream = path.match(/^\/v1\/sessions\/([^/]+)\/stream$/);
   if (request.method === "GET" && stream?.[1] !== undefined && request.headers.get("upgrade")?.toLowerCase() === "websocket") {

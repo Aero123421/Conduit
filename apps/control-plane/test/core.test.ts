@@ -150,6 +150,36 @@ describe.sequential("control-plane contracts", () => {
     socket.close(1000, "test_complete");
   });
 
+  it("admits owner CLI effects through the first-party policy boundary", async () => {
+    const token = "conduit_owner_board_contract_token_00000001";
+    const headers = {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+      "idempotency-key": "owner-operation-contract-0001",
+    };
+    const body = {
+      deviceId: "dev_handshake01",
+      capability: "command.start",
+      runtime: { kind: "native", providerId: "native.linux", configurationRevision: 1 },
+      accessScope: "full_user",
+      approvalMode: "never",
+      sourceRevisions: [],
+      arguments: { argv: ["true"] },
+    };
+    const response = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/operations", { method: "POST", headers, body: JSON.stringify(body) }));
+    expect(response.status).toBe(202);
+    const accepted = await response.json<Record<string, unknown>>();
+    expect(accepted).toMatchObject({ state: "offered", payloadDigest: expect.stringMatching(/^[a-f0-9]{64}$/) });
+    const row = await env.DB.prepare("SELECT client_id,connector_policy_id,connector_policy_revision,connector_grant_id,request_json FROM operation_journal WHERE id=?1 LIMIT 1").bind(accepted.operationId).first<{ client_id: string; connector_policy_id: string; connector_policy_revision: number; connector_grant_id: string | null; request_json: string }>();
+    expect(row).toMatchObject({ client_id: "conduit.cli", connector_policy_id: "cpol_owner_first_party_v1", connector_policy_revision: 1, connector_grant_id: null });
+    expect(JSON.parse(row!.request_json)).toMatchObject({ actorPrincipalId: "prin_board_contract", accessScope: "full_user", approvalMode: "never" });
+    const replay = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/operations", { method: "POST", headers, body: JSON.stringify(body) }));
+    await expect(replay.json()).resolves.toMatchObject({ operationId: accepted.operationId, replay: true });
+    const malformed = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/operations", { method: "POST", headers: { ...headers, "idempotency-key": "owner-operation-contract-0002" }, body: JSON.stringify({ deviceId: "dev_handshake01", capability: "command.start" }) }));
+    expect(malformed.status).toBe(400);
+    await expect(malformed.json()).resolves.toMatchObject({ error: { code: "invalid_request" } });
+  });
+
   it("enforces limiter idempotency and digest conflicts", async () => {
     const limiter = env.CONNECTOR_LIMITERS.getByName("grant-test");
     const base = { operationId: "op_test_00000001", idempotencyKey: "same-operation", payloadDigest: "a".repeat(64), family: "commandStart", weight: 2, requestLimit: 2, windowSeconds: 60, capacity: 10, refillPerSecond: 1, responseBytes: 10, normalizedLogBytes: 0, rawLogBytes: 0, artifactUploadBytes: 0, byteLimits: { response: 1000, normalizedDaily: 1000, rawDaily: 0, artifactDaily: 0 }, nowMs: 1_788_192_000_000 };

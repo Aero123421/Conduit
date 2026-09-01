@@ -1931,17 +1931,30 @@ impl NodeService {
                     }
                 }
             }
-            if let Some(exit) = agent
-                .child
-                .try_wait()
-                .map_err(|error| ServiceError::Unavailable(error.to_string()))?
-            {
-                let adapter_state = agent.driver.state();
+            let adapter_state = agent.driver.state();
+            let exit = if adapter_state == AdapterState::Failed {
+                Some(
+                    agent
+                        .child
+                        .terminate()
+                        .map_err(|error| ServiceError::Unavailable(error.to_string()))?,
+                )
+            } else {
+                agent
+                    .child
+                    .try_wait()
+                    .map_err(|error| ServiceError::Unavailable(error.to_string()))?
+            };
+            if let Some(exit) = exit {
                 let (state, reason) = match (adapter_state, exit.success()) {
                     (AdapterState::Completed, true) => (OperationState::Completed, None),
                     (AdapterState::Cancelled, _) => {
                         (OperationState::Cancelled, Some("adapter_cancelled".into()))
                     }
+                    (AdapterState::Failed, _) => (
+                        OperationState::Failed,
+                        Some("adapter_protocol_error".into()),
+                    ),
                     _ => (
                         OperationState::Failed,
                         Some(
@@ -3147,6 +3160,237 @@ mod tests {
         assert_eq!(
             (expires_parsed - issued_parsed).whole_milliseconds(),
             i128::from(valid_for_ms)
+        );
+    }
+
+    #[test]
+    fn failed_driver_terminates_waiting_child_before_durable_finalization() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = NodeStore::open(directory.path().join("store")).unwrap();
+        let identity = Arc::new(
+            DeviceIdentity::load_or_create(directory.path().join("identity/device.ed25519"))
+                .unwrap(),
+        );
+        let node = Arc::new(Node::new(store.clone()));
+        let local = Arc::new(
+            LocalServices::open(directory.path().join("local-services"), [7; 32]).unwrap(),
+        );
+        let supervisor = ProcessSupervisor::open(directory.path().join("supervisor")).unwrap();
+        let mut service = NodeService::new(
+            node.clone(),
+            identity,
+            "wss://control.example.invalid/connect".into(),
+            "dev_policy_01".into(),
+            "cd".repeat(32),
+            "node-boot-adapter-failure-0001".into(),
+            NodePolicyConfig {
+                local_policy: LocalPolicy {
+                    revision: 1,
+                    capabilities: vec![],
+                    providers: vec![],
+                    access_scopes: vec![],
+                    approval_modes: vec![],
+                    required_approval_risk_classes: vec![],
+                    launch_profiles: vec![],
+                    max_cpu: None,
+                    max_memory_bytes: None,
+                    max_storage_bytes: None,
+                    allow_full_access_without_approval: false,
+                },
+                profiles: HashMap::new(),
+            },
+            local,
+            supervisor.clone(),
+        )
+        .unwrap();
+
+        let request = LaunchRequest {
+            cwd: directory.path().to_path_buf(),
+            prompt: Some("exercise provider request reuse".into()),
+            native_session_id: None,
+            model: None,
+            effort: None,
+            session_data_dir: Some(directory.path().join("sessions")),
+        };
+        let mut driver = ProtocolDriver::new(AdapterKind::Pi, &request).unwrap();
+        let (response, _) = driver
+            .on_record(
+                b"{\"type\":\"extension_ui_request\",\"id\":\"settled-pi\",\"method\":\"confirm\",\"title\":\"Continue?\"}\n",
+            )
+            .unwrap();
+        assert_eq!(response.len(), 1);
+        let (second_response, events) = driver
+            .on_record(
+                b"{\"type\":\"extension_ui_request\",\"id\":\"settled-pi\",\"method\":\"input\",\"title\":\"Changed\"}\n",
+            )
+            .unwrap();
+        assert!(second_response.is_empty());
+        assert_eq!(events[0].kind, AdapterEventKind::AdapterError);
+        assert_eq!(driver.state(), AdapterState::Failed);
+
+        let child_spec = conduit_adapters::LaunchSpec {
+            executable: PathBuf::from("/bin/sh"),
+            args: vec!["-c".into(), "while :; do sleep 60; done".into()],
+            cwd: directory.path().to_path_buf(),
+            protocol: conduit_adapters::AdapterProtocol::PiRpcJsonl,
+            initial_frames: vec![],
+        };
+        let child = AdapterChild::spawn_uninitialized(&child_spec).unwrap();
+        let runtime_id = "rt_adapter_failure01";
+        let runtime = RuntimeRequest {
+            runtime_id: runtime_id.into(),
+            run_id: "run_adapter_failure01".into(),
+            kind: RuntimeKind::Native,
+            provider_selector: "native".into(),
+            spec_digest: "22".repeat(32),
+            image: None,
+            resources: ResourceLimits {
+                cpu: None,
+                memory_bytes: None,
+                pid_limit: None,
+                storage_bytes: None,
+            },
+            network: NetworkMode::Open,
+            workspaces: vec![],
+        };
+        let launch = LaunchPlan {
+            executable: child_spec.executable.clone(),
+            argv: child_spec.args.clone(),
+            cwd: child_spec.cwd.clone(),
+            environment: BTreeMap::new(),
+            io_mode: IoMode::Pipes,
+            timeout_ms: None,
+        };
+        let prepared = supervisor
+            .reserve(&runtime, "native", child_spec.executable.clone(), false)
+            .unwrap();
+        let custody = supervisor
+            .adopt_external(&prepared, &launch, child.id())
+            .unwrap();
+
+        let operation_id = "op_adapter_failure01";
+        let key = "adapter-failure-idempotency-key";
+        let request_digest = "11".repeat(32);
+        let manifest = build_manifest(
+            &ManifestOperation {
+                operation_id,
+                idempotency_key: key,
+                request_digest: &request_digest,
+                run_id: &runtime.run_id,
+                assignment_id: None,
+                actor_id: "prin_adapter_failure01",
+                client_id: "conduit.adapter-failure-test",
+                device_id: "dev_policy_01",
+                boot_id: "node-boot-adapter-failure-0001",
+                capability_digest: &"cd".repeat(32),
+                local_policy_revision: 1,
+                runtime_kind: "native",
+                runtime_provider: "native",
+                runtime_config: b"{}",
+                access_scope: "read_only",
+                approval_mode: "always",
+                adapter_id: Some("pi"),
+                adapter_version: Some("fixture"),
+                executable_digest: None,
+                model: None,
+                effort: None,
+            },
+            &[],
+        )
+        .unwrap();
+        service.local.commit_manifest(&manifest).unwrap();
+        store
+            .admit_operation(
+                operation_id,
+                key,
+                &request_digest,
+                b"{}",
+                1,
+                "native",
+                "read_only",
+                "always",
+                b"{}",
+                b"{}",
+                b"{}",
+            )
+            .unwrap();
+        store
+            .transition_operation(
+                key,
+                OperationState::Admitted,
+                OperationState::Starting,
+                Some(runtime_id),
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .transition_operation(
+                key,
+                OperationState::Starting,
+                OperationState::Running,
+                Some(runtime_id),
+                custody.handle.process_identity.as_deref(),
+                None,
+            )
+            .unwrap();
+        service.agents.insert(
+            operation_id.into(),
+            AgentActive {
+                key: key.into(),
+                operation_id: operation_id.into(),
+                run_id: runtime.run_id.clone(),
+                request_digest: request_digest.clone(),
+                runtime_id: runtime_id.into(),
+                provider_id: "native".into(),
+                handle: custody.handle,
+                child,
+                driver,
+                adapter_kind: AdapterKind::Pi,
+                actor_principal_id: "prin_adapter_failure01".into(),
+                client_id: "conduit.adapter-failure-test".into(),
+                access_scope: "read_only".into(),
+                approval_mode: "always".into(),
+                effective_required_approval_risk_classes: vec![],
+                local_policy_revision: 1,
+                controller_epoch: 1,
+                event_sequence: 0,
+            },
+        );
+
+        let session =
+            crate::transport::TransportSession::new(store.clone(), "dev_policy_01".into(), 1)
+                .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_peer, _) = listener.accept().unwrap();
+        let mut client = WssClient::from_test_stream(stream, session, true);
+
+        service.poll_agents(&mut client).unwrap();
+
+        assert!(!service.agents.contains_key(operation_id));
+        assert_eq!(
+            store.operation(key).unwrap().unwrap().state,
+            OperationState::Failed
+        );
+        assert_eq!(
+            supervisor.inspect(runtime_id).unwrap().state,
+            RuntimeState::Stopped
+        );
+
+        let outbound = store
+            .unacknowledged_outbound(1, 16)
+            .unwrap()
+            .into_iter()
+            .map(|row| serde_json::from_slice::<Envelope>(&row.frame).unwrap())
+            .collect::<Vec<_>>();
+        let terminal_index = outbound
+            .iter()
+            .position(|frame| frame.kind == "operation.terminal")
+            .unwrap();
+        assert_eq!(
+            outbound[terminal_index].payload["reasonCode"],
+            "adapter_protocol_error"
         );
     }
 

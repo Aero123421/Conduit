@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "protocol": "conduit.node/1",
+  "type": "device.hello",
+  "messageId": "msg_hello0001",
+  "payload": {
+    "deviceId": "dev_example0001",
+    "keyId": "dkey_example0001",
+    "nodeInstanceId": "node_example0001",
+    "clientNonce": "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+    "supportedProtocolVersions": ["conduit.node/1"],
+    "capabilities": ["runtime.native", "agent.codex", "records.replay"],
+    "node": {"version": "0.1.0", "os": "linux", "arch": "x86_64"},
+    "resume": {
+      "journalGeneration": "jgen_example0001",
+      "lastCloudAckedRecordSeq": 40,
+      "lastRecordSeq": 43
+    }
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "protocol": "conduit.node/1",
+  "messageId": "nmsg_event_batch_01",
+  "deviceId": "dev_sahur_pc_01",
+  "connectionEpoch": "43",
+  "direction": "node_to_control",
+  "sequence": "921",
+  "type": "event.batch",
+  "correlationId": "run_conduit_codex_01",
+  "payloadDigest": "cb811ac5501aacbaa276185530de3cae63e6a3439755463dc2d8ad7068027c6c",
+  "payload": {
+    "runId": "run_conduit_codex_01",
+    "fromSequence": "27",
+    "throughSequence": "27",
+    "traceSchema": "conduit.trace/1",
+    "events": [
+      {
+        "schemaVersion": 1,
+        "kind": "normalized_event",
+        "eventId": "evt_skill_script_completed_01",
+        "runId": "run_conduit_codex_01",
+        "deviceId": "dev_sahur_pc_01",
+        "sequence": "27",
+        "eventType": "skill.script_completed",
+        "source": "adapter.codex",
+        "observedAt": "2026-09-01T10:04:12Z",
+        "monotonicNanos": "252310000000",
+        "nodeBootId": "boot-2026-09-01T09-58-00Z-01",
+        "correlationId": "tool_protocol_validation_01",
+        "traceId": "c128113b728b5b59fefc3db0744cd8c2",
+        "spanId": "28b3d2982c033dee",
+        "parentSpanId": "596c7a642abcf203",
+        "evidenceLevel": "observed",
+        "sensitivity": "metadata",
+        "retentionClass": "R1",
+        "payloadDigest": "83f622c738f57ab98612d5ad9d0c949e7b83f25b1a1d80d950041098dba01fb1",
+        "eventDigest": "71a2e2d4946c19c1a3b8541c70ad44a6c98150806217953810418b4205805e6f",
+        "previousChainHash": "c3ae1cfcbac76efb98cae41a550718230ece357e7580c5e691fc530fe858d3af",
+        "chainHash": "c8848af1d06ea3ed7542355516e163c53611cfda241137f0b7ef7d8bc83a51b8",
+        "payload": {
+          "skillId": "skill_conduit_protocol_01",
+          "skillDigest": "c79cbcf26985b49a422bb3e275195437370f9ff9b8e64de040c9ecb4ac553476",
+          "resourcePath": "scripts/validate-protocol.mjs",
+          "commandId": "cmd_skill_protocol_validation_01",
+          "exitCode": 0,
+          "durationMs": 842,
+          "usageEvidence": "script_process_observed"
+        }
+      }
+    ]
+  }
+}

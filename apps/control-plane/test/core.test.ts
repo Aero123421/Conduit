@@ -502,8 +502,59 @@ describe.sequential("control-plane contracts", () => {
     request.search = new URLSearchParams({ response_type: "code", client_id: "https://client.example/mcp-contract", redirect_uri: "https://client.example/callback", resource: "https://conduit.example.com/mcp", scope: "conduit.read", code_challenge: "a".repeat(43), code_challenge_method: "S256" }).toString();
     const stepUp = await exports.default.fetch(new Request(request, { headers: { cookie: `__Host-conduit_session=${staleSession}; __Host-conduit_csrf=${staleCsrf}` } }));
     expect(stepUp.status).toBe(200);
-    expect(await stepUp.text()).toContain("id=oauth-step-up");
+    const staleHtml = await stepUp.text();
+    expect(staleHtml).toContain("id=oauth-step-up");
     expect(stepUp.headers.get("content-security-policy")).toContain("connect-src 'self'");
+    const staleTransactionId = staleHtml.match(/name=transaction_id value="([^"]+)"/)?.[1];
+    expect(staleTransactionId).toMatch(/^consent_/);
+
+    // A successful WebAuthn step-up rotates the browser session and CSRF cookie,
+    // then the browser reloads the original authorization URL. Seed that
+    // post-verification state directly so this transaction-binding test remains
+    // deterministic and does not depend on a platform authenticator in CI.
+    const freshSession = "browser_oauth_fresh_session_000000001";
+    const freshCsrf = "browser_oauth_fresh_csrf_000000000001";
+    const freshNow = new Date().toISOString();
+    await env.DB.batch([
+      env.DB.prepare("UPDATE owner_sessions SET status='revoked',revoked_at=?1 WHERE id='bsess_oauth_stale01'").bind(freshNow),
+      env.DB.prepare("INSERT INTO owner_sessions(id,principal_id,verifier_hash,csrf_hash,kind,status,authenticated_at,fresh_authenticated_at,last_activity_at,expires_at,user_verified) VALUES ('bsess_oauth_fresh01','prin_board_contract',?1,?2,'owner','active',?3,?3,?3,?4,1)")
+        .bind(await keyedHash("test-only-token-pepper-with-at-least-32-bytes", freshSession), await keyedHash("test-only-token-pepper-with-at-least-32-bytes", freshCsrf), freshNow, new Date(Date.now() + 60_000).toISOString()),
+    ]);
+    const freshCookie = `__Host-conduit_session=${freshSession}; __Host-conduit_csrf=${freshCsrf}`;
+    const reloaded = await exports.default.fetch(new Request(request, { headers: { cookie: freshCookie } }));
+    expect(reloaded.status).toBe(200);
+    const freshHtml = await reloaded.text();
+    expect(freshHtml).toContain("name=decision value=approve");
+    const freshTransactionId = freshHtml.match(/name=transaction_id value="([^"]+)"/)?.[1];
+    expect(freshTransactionId).toMatch(/^consent_/);
+    expect(freshTransactionId).not.toBe(staleTransactionId);
+
+    const staleReplay = await exports.default.fetch(new Request("https://conduit.example.com/authorize", {
+      method: "POST",
+      headers: { cookie: freshCookie, origin: "https://conduit.example.com", "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ transaction_id: staleTransactionId!, csrf_token: freshCsrf, connector_policy_id: "cpol_mcp_contract01", decision: "approve" }),
+    }));
+    expect(staleReplay.status).toBe(400);
+    await expect(staleReplay.json()).resolves.toMatchObject({ error: "invalid_request" });
+    const staleTransaction = await env.DB.prepare("SELECT consumed_at FROM oauth_consent_transactions WHERE id=?1").bind(staleTransactionId).first<{ consumed_at: string | null }>();
+    expect(staleTransaction?.consumed_at).toBeNull();
+
+    const invalidCsrf = await exports.default.fetch(new Request("https://conduit.example.com/authorize", {
+      method: "POST",
+      headers: { cookie: freshCookie, origin: "https://conduit.example.com", "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ transaction_id: freshTransactionId!, csrf_token: staleCsrf, connector_policy_id: "cpol_mcp_contract01", decision: "approve" }),
+    }));
+    expect(invalidCsrf.status).toBe(403);
+    await expect(invalidCsrf.json()).resolves.toMatchObject({ error: { code: "csrf_failed" } });
+
+    const approved = await exports.default.fetch(new Request("https://conduit.example.com/authorize", {
+      method: "POST",
+      headers: { cookie: freshCookie, origin: "https://conduit.example.com", "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ transaction_id: freshTransactionId!, csrf_token: freshCsrf, connector_policy_id: "cpol_mcp_contract01", decision: "approve" }),
+      redirect: "manual",
+    }));
+    expect(approved.status).toBe(303);
+    expect(new URL(approved.headers.get("location")!).origin).toBe("https://client.example");
   });
 
   it("denies cross-Project MCP reads and conflicting create bindings using stored ownership", async () => {

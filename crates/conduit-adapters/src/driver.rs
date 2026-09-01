@@ -16,6 +16,10 @@ use crate::types::{
 const MAX_REPLAY_EVENTS: usize = 4_096;
 const MAX_PENDING_CODEX_REQUESTS: usize = 64;
 const MAX_PENDING_CODEX_APPROVALS: usize = 1;
+// Provider request IDs are process-scoped. Settled IDs are retained without eviction so a reused
+// ID can never receive a different terminal response. Once the bound is reached, new IDs fail
+// closed without a response for the remainder of the adapter process lifetime.
+const MAX_PROVIDER_REQUEST_TERMINALS: usize = 256;
 const CODEX_APPROVAL_TTL_MS: u64 = 5 * 60 * 1_000;
 const ACP_PERMISSION_TTL_MS: u64 = 5 * 60 * 1_000;
 
@@ -78,6 +82,13 @@ struct PendingPiDialog {
     params_digest: String,
 }
 
+#[derive(Debug, Clone)]
+struct ProviderRequestTerminal {
+    method: String,
+    params_digest: String,
+    response: ProtocolFrame,
+}
+
 #[derive(Debug)]
 pub struct ProtocolDriver {
     kind: AdapterKind,
@@ -99,6 +110,7 @@ pub struct ProtocolDriver {
     pending_acp_permission: Option<PendingAcpPermission>,
     pending_acp_prompt_id: Option<u64>,
     pending_pi_dialog: Option<PendingPiDialog>,
+    provider_request_terminals: BTreeMap<String, ProviderRequestTerminal>,
     replay: VecDeque<AdapterEvent>,
 }
 
@@ -155,6 +167,7 @@ impl ProtocolDriver {
             pending_acp_permission: None,
             pending_acp_prompt_id: None,
             pending_pi_dialog: None,
+            provider_request_terminals: BTreeMap::new(),
             replay: VecDeque::new(),
         })
     }
@@ -311,19 +324,33 @@ impl ProtocolDriver {
                 }
                 if pending.expires_at_unix_ms <= unix_ms() {
                     let pending = self.pending_acp_permission.take().expect("checked");
-                    self.state = AdapterState::Working;
-                    return acp_permission_cancelled(&pending.request_id);
+                    self.mark_provider_request_settled();
+                    let key = server_request_key(&pending.request_id).expect("admitted id");
+                    let frame = acp_permission_cancelled(&pending.request_id)?;
+                    return self.record_provider_request_terminal(
+                        key,
+                        pending.method,
+                        pending.params_digest,
+                        frame,
+                    );
                 }
                 let pending = self.pending_acp_permission.take().expect("checked");
-                self.state = AdapterState::Working;
-                if allow {
-                    match pending.allow_once_option_id {
-                        Some(option_id) => acp_permission_selected(request_id, &option_id),
+                self.mark_provider_request_settled();
+                let key = server_request_key(&pending.request_id).expect("admitted id");
+                let frame = if allow {
+                    match pending.allow_once_option_id.as_deref() {
+                        Some(option_id) => acp_permission_selected(request_id, option_id),
                         None => acp_permission_cancelled(request_id),
                     }
                 } else {
                     acp_permission_cancelled(request_id)
-                }
+                }?;
+                self.record_provider_request_terminal(
+                    key,
+                    pending.method,
+                    pending.params_digest,
+                    frame,
+                )
             }
             AdapterKind::Pi => {
                 let pending =
@@ -340,9 +367,16 @@ impl ProtocolDriver {
                         reason: "approval response did not match the pending Pi dialog request",
                     });
                 }
-                self.state = AdapterState::Working;
-                let _ = (allow, pending.method);
-                pi_dialog_cancelled(request_id)
+                self.mark_provider_request_settled();
+                let _ = allow;
+                let key = server_request_key(&pending.request_id).expect("admitted id");
+                let frame = pi_dialog_cancelled(request_id)?;
+                self.record_provider_request_terminal(
+                    key,
+                    &pending.method,
+                    pending.params_digest,
+                    frame,
+                )
             }
             _ => Err(AdapterError::UnsupportedOperation {
                 adapter: self.kind,
@@ -386,12 +420,19 @@ impl ProtocolDriver {
         }
         if pending.expires_at_unix_ms <= now_unix_ms {
             let pending = self.pending_codex_approvals.remove(&key).expect("checked");
-            self.state = AdapterState::Working;
-            return codex_approval_response(pending.method, &pending.request_id, false);
+            self.mark_provider_request_settled();
+            let frame = codex_approval_response(pending.method, &pending.request_id, false)?;
+            return self.record_provider_request_terminal(
+                key,
+                pending.method,
+                pending.params_digest,
+                frame,
+            );
         }
         let pending = self.pending_codex_approvals.remove(&key).expect("checked");
-        self.state = AdapterState::Working;
-        codex_approval_response(pending.method, &pending.request_id, allow)
+        self.mark_provider_request_settled();
+        let frame = codex_approval_response(pending.method, &pending.request_id, allow)?;
+        self.record_provider_request_terminal(key, pending.method, pending.params_digest, frame)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -433,19 +474,28 @@ impl ProtocolDriver {
         }
         if pending.expires_at_unix_ms <= now_unix_ms {
             let pending = self.pending_acp_permission.take().expect("checked");
-            self.state = AdapterState::Working;
-            return acp_permission_cancelled(&pending.request_id);
+            self.mark_provider_request_settled();
+            let key = server_request_key(&pending.request_id).expect("admitted id");
+            let frame = acp_permission_cancelled(&pending.request_id)?;
+            return self.record_provider_request_terminal(
+                key,
+                pending.method,
+                pending.params_digest,
+                frame,
+            );
         }
         let pending = self.pending_acp_permission.take().expect("checked");
-        self.state = AdapterState::Working;
-        if allow {
-            match pending.allow_once_option_id {
-                Some(option_id) => acp_permission_selected(&pending.request_id, &option_id),
+        self.mark_provider_request_settled();
+        let key = server_request_key(&pending.request_id).expect("admitted id");
+        let frame = if allow {
+            match pending.allow_once_option_id.as_deref() {
+                Some(option_id) => acp_permission_selected(&pending.request_id, option_id),
                 None => acp_permission_cancelled(&pending.request_id),
             }
         } else {
             acp_permission_cancelled(&pending.request_id)
-        }
+        }?;
+        self.record_provider_request_terminal(key, pending.method, pending.params_digest, frame)
     }
 
     pub fn expire_codex_approvals(
@@ -465,10 +515,12 @@ impl ProtocolDriver {
         let mut events = Vec::with_capacity(expired.len());
         for key in expired {
             let pending = self.pending_codex_approvals.remove(&key).expect("selected");
-            frames.push(codex_approval_response(
+            let frame = codex_approval_response(pending.method, &pending.request_id, false)?;
+            frames.push(self.record_provider_request_terminal(
+                key,
                 pending.method,
-                &pending.request_id,
-                false,
+                pending.params_digest.clone(),
+                frame,
             )?);
             events.push(AdapterEvent::bounded(
                 AdapterEventKind::AdapterError,
@@ -485,7 +537,7 @@ impl ProtocolDriver {
             ));
         }
         if self.pending_codex_approvals.is_empty() && !frames.is_empty() {
-            self.state = AdapterState::Working;
+            self.mark_provider_request_settled();
         }
         Ok((frames, events))
     }
@@ -497,9 +549,48 @@ impl ProtocolDriver {
         if let Some(method) = value.get("method").and_then(Value::as_str) {
             if let Some(request_id) = value.get("id") {
                 let correlation_id = request_id_text(request_id);
+                let params = value.get("params").cloned().unwrap_or_else(|| json!({}));
+                let params_digest = canonical_digest(&params)?;
+                let Some(key) = server_request_key(request_id) else {
+                    return Ok(self.provider_request_admission_error(
+                        method,
+                        &correlation_id,
+                        "provider request id had an unsupported type; no response was emitted",
+                    ));
+                };
+                if let Some(outcome) = self.terminal_provider_request_outcome(
+                    &key,
+                    method,
+                    &params_digest,
+                    &correlation_id,
+                ) {
+                    return Ok(outcome);
+                }
+                if let Some(existing) = self.pending_codex_approvals.get(&key) {
+                    return Ok((
+                        Vec::new(),
+                        vec![AdapterEvent::bounded(
+                            AdapterEventKind::AdapterError,
+                            method,
+                            self.native_session_id(),
+                            Some(&correlation_id),
+                            Some(
+                                "duplicate outstanding server request id was ignored; original request remains pending",
+                            ),
+                            Some(json!({
+                                "existingMethod": existing.method,
+                                "existingParametersDigest": existing.params_digest,
+                                "duplicateParametersDigest": params_digest,
+                                "sameCommitment": existing.method == method
+                                    && existing.params_digest == params_digest
+                            })),
+                        )],
+                    ));
+                }
+                if self.provider_request_slots_used() >= MAX_PROVIDER_REQUEST_TERMINALS {
+                    return Ok(self.provider_request_capacity_error(method, &correlation_id));
+                }
                 if is_codex_approval_method(method) {
-                    let params = value.get("params").cloned().unwrap_or_else(|| json!({}));
-                    let params_digest = canonical_digest(&params)?;
                     if !self.codex_approval_requires_bridge(method) {
                         let frame = codex_approval_response(method, request_id, true)?;
                         let event = AdapterEvent::bounded(
@@ -516,46 +607,23 @@ impl ProtocolDriver {
                                 "preAuthorized": true
                             })),
                         );
+                        let frame = self.record_provider_request_terminal(
+                            key,
+                            method,
+                            params_digest.clone(),
+                            frame,
+                        )?;
                         return Ok((vec![frame], vec![event]));
                     }
                     if self.approval_context.bridge == ApprovalBridgeOwnership::Typed {
-                        let Some(key) = server_request_key(request_id) else {
-                            let frame = codex_approval_response(method, request_id, false)?;
-                            return Ok((
-                                vec![frame],
-                                vec![AdapterEvent::bounded(
-                                    AdapterEventKind::AdapterError,
-                                    method,
-                                    self.native_session_id(),
-                                    Some(&correlation_id),
-                                    Some("unsupported JSON-RPC approval id type was denied"),
-                                    None,
-                                )],
-                            ));
-                        };
-                        if let Some(existing) = self.pending_codex_approvals.get(&key) {
-                            return Ok((
-                                Vec::new(),
-                                vec![AdapterEvent::bounded(
-                                    AdapterEventKind::AdapterError,
-                                    method,
-                                    self.native_session_id(),
-                                    Some(&correlation_id),
-                                    Some(
-                                        "duplicate outstanding server request id was ignored; original request remains pending",
-                                    ),
-                                    Some(json!({
-                                        "existingMethod": existing.method,
-                                        "existingParametersDigest": existing.params_digest,
-                                        "duplicateParametersDigest": params_digest,
-                                        "sameCommitment": existing.method == method
-                                            && existing.params_digest == params_digest
-                                    })),
-                                )],
-                            ));
-                        }
                         if self.pending_codex_approvals.len() >= MAX_PENDING_CODEX_APPROVALS {
                             let frame = codex_approval_response(method, request_id, false)?;
+                            let frame = self.record_provider_request_terminal(
+                                key,
+                                method,
+                                params_digest,
+                                frame,
+                            )?;
                             return Ok((
                                 vec![frame],
                                 vec![AdapterEvent::bounded(
@@ -611,6 +679,8 @@ impl ProtocolDriver {
                             "preAuthorized": false
                         })),
                     );
+                    let frame =
+                        self.record_provider_request_terminal(key, method, params_digest, frame)?;
                     return Ok((vec![frame], vec![event]));
                 }
 
@@ -626,8 +696,10 @@ impl ProtocolDriver {
                     } else {
                         "unknown Codex server request was denied"
                     }),
-                    value.get("params").cloned(),
+                    Some(params),
                 );
+                let frame =
+                    self.record_provider_request_terminal(key, method, params_digest, frame)?;
                 return Ok((vec![frame], vec![event]));
             }
             return Ok((Vec::new(), self.normalize_codex_notification(method, value)));
@@ -1114,30 +1186,50 @@ impl ProtocolDriver {
         if let Some(method) = value.get("method").and_then(Value::as_str) {
             if let Some(request_id) = value.get("id") {
                 let correlation_id = request_id_text(request_id);
+                let params = value.get("params").cloned().unwrap_or_else(|| json!({}));
+                let params_digest = canonical_digest(&params)?;
+                let Some(key) = server_request_key(request_id) else {
+                    return Ok(self.provider_request_admission_error(
+                        method,
+                        &correlation_id,
+                        "provider request id had an unsupported type; no response was emitted",
+                    ));
+                };
+                if let Some(outcome) = self.terminal_provider_request_outcome(
+                    &key,
+                    method,
+                    &params_digest,
+                    &correlation_id,
+                ) {
+                    return Ok(outcome);
+                }
+                if let Some(pending) = self.pending_acp_permission.as_ref()
+                    && server_request_key(&pending.request_id).as_deref() == Some(key.as_str())
+                {
+                    return Ok((
+                        Vec::new(),
+                        vec![AdapterEvent::bounded(
+                            AdapterEventKind::AdapterError,
+                            method,
+                            self.native_session_id(),
+                            Some(&correlation_id),
+                            Some(
+                                "duplicate outstanding ACP permission id was ignored; original request remains pending",
+                            ),
+                            Some(json!({
+                                "existingMethod": pending.method,
+                                "existingParametersDigest": pending.params_digest,
+                                "duplicateParametersDigest": params_digest,
+                                "sameCommitment": pending.method == method
+                                    && pending.params_digest == params_digest
+                            })),
+                        )],
+                    ));
+                }
+                if self.provider_request_slots_used() >= MAX_PROVIDER_REQUEST_TERMINALS {
+                    return Ok(self.provider_request_capacity_error(method, &correlation_id));
+                }
                 if method == "session/request_permission" {
-                    let params = value.get("params").cloned().unwrap_or_else(|| json!({}));
-                    let params_digest = canonical_digest(&params)?;
-                    if let Some(pending) = self.pending_acp_permission.as_ref()
-                        && pending.request_id == *request_id
-                    {
-                        return Ok((
-                            Vec::new(),
-                            vec![AdapterEvent::bounded(
-                                AdapterEventKind::AdapterError,
-                                method,
-                                self.native_session_id(),
-                                Some(&correlation_id),
-                                Some(
-                                    "duplicate outstanding ACP permission id was ignored; original request remains pending",
-                                ),
-                                Some(json!({
-                                    "existingParametersDigest": pending.params_digest,
-                                    "duplicateParametersDigest": params_digest,
-                                    "sameCommitment": pending.params_digest == params_digest
-                                })),
-                            )],
-                        ));
-                    }
                     let allow_once_option_id = acp_allow_once_option(value);
                     let requested_session_id = params
                         .get("sessionId")
@@ -1151,8 +1243,15 @@ impl ProtocolDriver {
                         || requested_session_id.as_deref() != self.native_session_id()
                         || tool_call_id.is_none()
                     {
+                        let frame = acp_permission_cancelled(request_id)?;
+                        let frame = self.record_provider_request_terminal(
+                            key,
+                            method,
+                            params_digest.clone(),
+                            frame,
+                        )?;
                         return Ok((
-                            vec![acp_permission_cancelled(request_id)?],
+                            vec![frame],
                             vec![AdapterEvent::bounded(
                                 AdapterEventKind::AdapterError,
                                 method,
@@ -1189,6 +1288,12 @@ impl ProtocolDriver {
                             Some(option_id) => acp_permission_selected(request_id, &option_id)?,
                             None => acp_permission_cancelled(request_id)?,
                         };
+                        let frame = self.record_provider_request_terminal(
+                            key,
+                            method,
+                            params_digest,
+                            frame,
+                        )?;
                         return Ok((vec![frame], vec![event]));
                     }
                     if self.approval_context.bridge == ApprovalBridgeOwnership::Typed
@@ -1206,17 +1311,23 @@ impl ProtocolDriver {
                         });
                         return Ok((Vec::new(), vec![event]));
                     }
-                    return Ok((vec![acp_permission_cancelled(request_id)?], vec![event]));
+                    let frame = acp_permission_cancelled(request_id)?;
+                    let frame =
+                        self.record_provider_request_terminal(key, method, params_digest, frame)?;
+                    return Ok((vec![frame], vec![event]));
                 }
+                let frame = acp_fail_closed_response(method, request_id)?;
+                let frame =
+                    self.record_provider_request_terminal(key, method, params_digest, frame)?;
                 return Ok((
-                    vec![acp_fail_closed_response(method, request_id)?],
+                    vec![frame],
                     vec![AdapterEvent::bounded(
                         AdapterEventKind::AdapterError,
                         method,
                         self.native_session_id(),
                         Some(&correlation_id),
                         Some("ACP client request was not advertised and was denied"),
-                        value.get("params").cloned(),
+                        Some(params),
                     )],
                 ));
             }
@@ -1399,29 +1510,40 @@ impl ProtocolDriver {
             } else {
                 AdapterEventKind::AdapterError
             };
-            let params_digest = canonical_digest(value)?;
-            if let (Some(request_id), Some(pending)) = (request_id, self.pending_pi_dialog.as_ref())
-                && pending.request_id == *request_id
-            {
-                return Ok((
-                    Vec::new(),
-                    vec![AdapterEvent::bounded(
-                        AdapterEventKind::AdapterError,
-                        &format!("extension_ui_request.{method}"),
-                        self.native_session_id(),
-                        correlation_id.as_deref(),
-                        Some(
-                            "duplicate outstanding Pi UI request id was ignored; original dialog remains pending",
-                        ),
-                        Some(json!({
-                            "existingMethod": pending.method,
-                            "existingParametersDigest": pending.params_digest,
-                            "duplicateParametersDigest": params_digest,
-                            "sameCommitment": pending.method == method
-                                && pending.params_digest == params_digest
-                        })),
-                    )],
-                ));
+            let params_digest = pi_ui_params_digest(value)?;
+            let key = request_id.and_then(server_request_key);
+            if let (Some(key), Some(correlation_id)) = (key.as_deref(), correlation_id.as_deref()) {
+                if let Some(outcome) = self.terminal_provider_request_outcome(
+                    key,
+                    method,
+                    &params_digest,
+                    correlation_id,
+                ) {
+                    return Ok(outcome);
+                }
+                if let Some(pending) = self.pending_pi_dialog.as_ref()
+                    && server_request_key(&pending.request_id).as_deref() == Some(key)
+                {
+                    return Ok((
+                        Vec::new(),
+                        vec![AdapterEvent::bounded(
+                            AdapterEventKind::AdapterError,
+                            &format!("extension_ui_request.{method}"),
+                            self.native_session_id(),
+                            Some(correlation_id),
+                            Some(
+                                "duplicate outstanding Pi UI request id was ignored; original dialog remains pending",
+                            ),
+                            Some(json!({
+                                "existingMethod": pending.method,
+                                "existingParametersDigest": pending.params_digest,
+                                "duplicateParametersDigest": params_digest,
+                                "sameCommitment": pending.method == method
+                                    && pending.params_digest == params_digest
+                            })),
+                        )],
+                    ));
+                }
             }
             let event = AdapterEvent::bounded(
                 kind,
@@ -1437,6 +1559,19 @@ impl ProtocolDriver {
             let Some(request_id) = request_id else {
                 return Ok((Vec::new(), vec![event]));
             };
+            let Some(key) = key else {
+                return Ok(self.provider_request_admission_error(
+                    &format!("extension_ui_request.{method}"),
+                    &request_id_text(request_id),
+                    "provider request id had an unsupported type; no response was emitted",
+                ));
+            };
+            if self.provider_request_slots_used() >= MAX_PROVIDER_REQUEST_TERMINALS {
+                return Ok(self.provider_request_capacity_error(
+                    &format!("extension_ui_request.{method}"),
+                    &request_id_text(request_id),
+                ));
+            }
             if dialog
                 && self.approval_context.bridge == ApprovalBridgeOwnership::Typed
                 && self.pending_pi_dialog.is_none()
@@ -1450,6 +1585,7 @@ impl ProtocolDriver {
                 return Ok((Vec::new(), vec![event]));
             }
             let frame = pi_dialog_cancelled(request_id)?;
+            let frame = self.record_provider_request_terminal(key, method, params_digest, frame)?;
             return Ok((vec![frame], vec![event]));
         }
         Ok((Vec::new(), self.normalize_pi_event(value)))
@@ -2148,6 +2284,118 @@ impl ProtocolDriver {
         self.json_rpc_request(method, params)
     }
 
+    fn terminal_provider_request_outcome(
+        &self,
+        key: &str,
+        method: &str,
+        params_digest: &str,
+        correlation_id: &str,
+    ) -> Option<(Vec<ProtocolFrame>, Vec<AdapterEvent>)> {
+        let terminal = self.provider_request_terminals.get(key)?;
+        let same_commitment = terminal.method == method && terminal.params_digest == params_digest;
+        let event = AdapterEvent::bounded(
+            if same_commitment {
+                AdapterEventKind::State
+            } else {
+                AdapterEventKind::AdapterError
+            },
+            method,
+            self.native_session_id(),
+            Some(correlation_id),
+            Some(if same_commitment {
+                "exact duplicate provider request replayed its recorded terminal response"
+            } else {
+                "settled provider request id was reused with a changed commitment; no response was emitted"
+            }),
+            Some(json!({
+                "existingMethod": terminal.method,
+                "existingParametersDigest": terminal.params_digest,
+                "duplicateParametersDigest": params_digest,
+                "sameCommitment": same_commitment
+            })),
+        );
+        Some((
+            if same_commitment {
+                vec![terminal.response.clone()]
+            } else {
+                Vec::new()
+            },
+            vec![event],
+        ))
+    }
+
+    fn provider_request_slots_used(&self) -> usize {
+        self.provider_request_terminals.len()
+            + self.pending_codex_approvals.len()
+            + usize::from(self.pending_acp_permission.is_some())
+            + usize::from(self.pending_pi_dialog.is_some())
+    }
+
+    fn provider_request_admission_error(
+        &self,
+        method: &str,
+        correlation_id: &str,
+        reason: &'static str,
+    ) -> (Vec<ProtocolFrame>, Vec<AdapterEvent>) {
+        (
+            Vec::new(),
+            vec![AdapterEvent::bounded(
+                AdapterEventKind::AdapterError,
+                method,
+                self.native_session_id(),
+                Some(correlation_id),
+                Some(reason),
+                Some(json!({"providerRequestTerminalLimit": MAX_PROVIDER_REQUEST_TERMINALS})),
+            )],
+        )
+    }
+
+    fn provider_request_capacity_error(
+        &mut self,
+        method: &str,
+        correlation_id: &str,
+    ) -> (Vec<ProtocolFrame>, Vec<AdapterEvent>) {
+        self.phase = Phase::Terminal;
+        self.state = AdapterState::Failed;
+        self.provider_request_admission_error(
+            method,
+            correlation_id,
+            "provider request terminal capacity is exhausted; adapter failed without responding to the new id",
+        )
+    }
+
+    fn mark_provider_request_settled(&mut self) {
+        if self.state != AdapterState::Failed {
+            self.state = AdapterState::Working;
+        }
+    }
+
+    fn record_provider_request_terminal(
+        &mut self,
+        key: String,
+        method: &str,
+        params_digest: String,
+        response: ProtocolFrame,
+    ) -> Result<ProtocolFrame, AdapterError> {
+        if self.provider_request_terminals.len() >= MAX_PROVIDER_REQUEST_TERMINALS {
+            self.phase = Phase::Terminal;
+            self.state = AdapterState::Failed;
+            return Err(AdapterError::UnexpectedResponse {
+                phase: "provider_request_terminal_capacity",
+                reason: "provider request terminal map is full",
+            });
+        }
+        self.provider_request_terminals.insert(
+            key,
+            ProviderRequestTerminal {
+                method: method.to_owned(),
+                params_digest,
+                response: response.clone(),
+            },
+        );
+        Ok(response)
+    }
+
     fn take_request_id(&mut self) -> u64 {
         let id = self.next_request_id;
         self.next_request_id = self.next_request_id.saturating_add(1);
@@ -2367,6 +2615,16 @@ fn server_request_key(id: &Value) -> Option<String> {
 
 fn canonical_digest(value: &Value) -> Result<String, AdapterError> {
     Ok(hex::encode(Sha256::digest(serde_jcs::to_vec(value)?)))
+}
+
+fn pi_ui_params_digest(value: &Value) -> Result<String, AdapterError> {
+    let mut params = value.clone();
+    if let Some(params) = params.as_object_mut() {
+        params.remove("type");
+        params.remove("id");
+        params.remove("method");
+    }
+    canonical_digest(&params)
 }
 
 fn codex_approval_summary(method: &str, params: &Value, params_digest: &str) -> Value {
@@ -3048,6 +3306,49 @@ mod tests {
     }
 
     #[test]
+    fn codex_settled_ids_replay_exact_bytes_and_reject_changed_or_unknown_reuse() {
+        let mut driver = ProtocolDriver::new_with_approval_context(
+            AdapterKind::Codex,
+            &request(),
+            context(
+                EffectiveApprovalPolicy::Always,
+                ApprovalBridgeOwnership::Typed,
+            ),
+        )
+        .unwrap();
+        let original = b"{\"id\":\"settled-codex\",\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"command\":\"pwd\"}}\n";
+        let (_, approval) = driver.on_record(original).unwrap();
+        let data = approval[0].data.as_ref().unwrap();
+        let digest = data["parametersDigest"].as_str().unwrap().to_owned();
+        let expires = data["expiresAtUnixMs"].as_u64().unwrap();
+        let terminal = driver
+            .resolve_codex_approval(
+                &json!("settled-codex"),
+                "item/commandExecution/requestApproval",
+                &digest,
+                true,
+                expires - 1,
+            )
+            .unwrap();
+
+        let (exact_frames, exact_events) = driver.on_record(original).unwrap();
+        assert_eq!(exact_frames, vec![terminal.clone()]);
+        assert_eq!(exact_events[0].kind, AdapterEventKind::State);
+
+        let (changed_frames, changed_events) = driver
+            .on_record(b"{\"id\":\"settled-codex\",\"method\":\"item/commandExecution/requestApproval\",\"params\":{\"command\":\"whoami\"}}\n")
+            .unwrap();
+        assert!(changed_frames.is_empty());
+        assert_eq!(changed_events[0].kind, AdapterEventKind::AdapterError);
+
+        let (unknown_frames, unknown_events) = driver
+            .on_record(b"{\"id\":\"settled-codex\",\"method\":\"future/unsafe\",\"params\":{\"command\":\"pwd\"}}\n")
+            .unwrap();
+        assert!(unknown_frames.is_empty());
+        assert_eq!(unknown_events[0].kind, AdapterEventKind::AdapterError);
+    }
+
+    #[test]
     fn codex_typed_approval_expires_with_one_correlated_decline() {
         let context = ApprovalContext {
             effective_policy: EffectiveApprovalPolicy::Always,
@@ -3332,6 +3633,24 @@ mod tests {
     }
 
     #[test]
+    fn pi_settled_cancel_ids_replay_exact_bytes_and_reject_changed_reuse() {
+        let mut driver = ProtocolDriver::new(AdapterKind::Pi, &request()).unwrap();
+        let original = b"{\"type\":\"extension_ui_request\",\"id\":\"settled-pi\",\"method\":\"confirm\",\"title\":\"Continue?\"}\n";
+        let (terminal_frames, _) = driver.on_record(original).unwrap();
+        let terminal = terminal_frames[0].clone();
+
+        let (exact_frames, exact_events) = driver.on_record(original).unwrap();
+        assert_eq!(exact_frames, vec![terminal]);
+        assert_eq!(exact_events[0].kind, AdapterEventKind::State);
+
+        let (changed_frames, changed_events) = driver
+            .on_record(b"{\"type\":\"extension_ui_request\",\"id\":\"settled-pi\",\"method\":\"input\",\"title\":\"Changed\"}\n")
+            .unwrap();
+        assert!(changed_frames.is_empty());
+        assert_eq!(changed_events[0].kind, AdapterEventKind::AdapterError);
+    }
+
+    #[test]
     fn pi_legacy_stream_without_settlement_fails_protocol_incomplete() {
         let mut driver = ProtocolDriver::new(AdapterKind::Pi, &request()).unwrap();
         driver.start().unwrap();
@@ -3465,6 +3784,38 @@ mod tests {
     }
 
     #[test]
+    fn acp_settled_selected_ids_replay_exact_bytes_and_reject_changed_or_unknown_reuse() {
+        let mut driver = ready_acp_driver(context(
+            EffectiveApprovalPolicy::Never,
+            ApprovalBridgeOwnership::Unavailable,
+        ));
+        let original = b"{\"jsonrpc\":\"2.0\",\"id\":\"settled-acp\",\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"session-1\",\"toolCall\":{\"toolCallId\":\"tool-1\"},\"options\":[{\"optionId\":\"once\",\"kind\":\"allow_once\"}]}}\n";
+        let (terminal_frames, _) = driver.on_record(original).unwrap();
+        let terminal = terminal_frames[0].clone();
+        let terminal_value: Value = serde_json::from_slice(&terminal.0).unwrap();
+        assert_eq!(
+            terminal_value.pointer("/result/outcome/outcome"),
+            Some(&json!("selected"))
+        );
+
+        let (exact_frames, exact_events) = driver.on_record(original).unwrap();
+        assert_eq!(exact_frames, vec![terminal]);
+        assert_eq!(exact_events[0].kind, AdapterEventKind::State);
+
+        let (changed_frames, changed_events) = driver
+            .on_record(b"{\"jsonrpc\":\"2.0\",\"id\":\"settled-acp\",\"method\":\"session/request_permission\",\"params\":{\"sessionId\":\"session-1\",\"toolCall\":{\"toolCallId\":\"tool-2\"},\"options\":[]}}\n")
+            .unwrap();
+        assert!(changed_frames.is_empty());
+        assert_eq!(changed_events[0].kind, AdapterEventKind::AdapterError);
+
+        let (unknown_frames, unknown_events) = driver
+            .on_record(b"{\"jsonrpc\":\"2.0\",\"id\":\"settled-acp\",\"method\":\"future/client_request\",\"params\":{}}\n")
+            .unwrap();
+        assert!(unknown_frames.is_empty());
+        assert_eq!(unknown_events[0].kind, AdapterEventKind::AdapterError);
+    }
+
+    #[test]
     fn acp_correlates_multiple_generated_follow_up_prompt_ids() {
         let mut driver = ready_acp_driver(context(
             EffectiveApprovalPolicy::Always,
@@ -3492,6 +3843,51 @@ mod tests {
             assert_eq!(events[0].kind, AdapterEventKind::Completed);
             assert_eq!(driver.state(), AdapterState::Completed);
         }
+    }
+
+    #[test]
+    fn provider_terminal_capacity_fails_adapter_without_eviction_or_response() {
+        let mut driver = ready_acp_driver(context(
+            EffectiveApprovalPolicy::Always,
+            ApprovalBridgeOwnership::Unavailable,
+        ));
+        let mut first_terminal = None;
+        for index in 0..MAX_PROVIDER_REQUEST_TERMINALS {
+            let mut record = serde_json::to_vec(&json!({
+                "jsonrpc": "2.0",
+                "id": format!("terminal-{index}"),
+                "method": "future/client_request",
+                "params": {}
+            }))
+            .unwrap();
+            record.push(b'\n');
+            let (frames, _) = driver.on_record(&record).unwrap();
+            assert_eq!(frames.len(), 1);
+            if index == 0 {
+                first_terminal = Some(frames[0].clone());
+            }
+        }
+        assert_eq!(
+            driver.provider_request_terminals.len(),
+            MAX_PROVIDER_REQUEST_TERMINALS
+        );
+
+        let (frames, events) = driver
+            .on_record(b"{\"jsonrpc\":\"2.0\",\"id\":\"overflow\",\"method\":\"future/client_request\",\"params\":{}}\n")
+            .unwrap();
+        assert!(frames.is_empty());
+        assert_eq!(events[0].kind, AdapterEventKind::AdapterError);
+        assert_eq!(driver.state(), AdapterState::Failed);
+        assert_eq!(driver.phase, Phase::Terminal);
+
+        let (frames, _) = driver
+            .on_record(b"{\"jsonrpc\":\"2.0\",\"id\":\"terminal-0\",\"method\":\"future/client_request\",\"params\":{}}\n")
+            .unwrap();
+        assert_eq!(frames, vec![first_terminal.unwrap()]);
+        assert_eq!(
+            driver.provider_request_terminals.len(),
+            MAX_PROVIDER_REQUEST_TERMINALS
+        );
     }
 
     #[test]

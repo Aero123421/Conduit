@@ -15,7 +15,7 @@ use crate::{
     AUTH_SCHEMA_V1, CHANGESET_SCHEMA_V1, NODE_SCHEMA_V1, RUNTIME_SCHEMA_V1, TRACE_SCHEMA_V1,
 };
 
-const MAX_REPORTED_ISSUES: usize = 16;
+const MAX_REPORTED_ISSUES: usize = 64;
 const TRACE_SCHEMA_SOURCE: &str = include_str!("../../../spec/schemas/trace-v1.schema.json");
 
 mod private {
@@ -721,6 +721,7 @@ mod tests {
                 let expected_keyword = match fixture.expected_invalid_reason.as_str() {
                     "invalid_digest" | "malformed_id" => "pattern",
                     "unknown_schema_version" => "const",
+                    "duplicate_item" => "uniqueItems",
                     reason => panic!(
                         "unknown schema expectedInvalidReason {reason:?} in {}",
                         path.display()
@@ -797,6 +798,6 @@ mod tests {
             }
             count += 1;
         }
-        assert_eq!(count, 5, "invalid fixture set changed");
+        assert_eq!(count, 6, "invalid fixture set changed");
     }
 }

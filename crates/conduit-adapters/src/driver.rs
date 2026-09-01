@@ -394,6 +394,7 @@ impl ProtocolDriver {
         codex_approval_response(pending.method, &pending.request_id, allow)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn resolve_acp_permission(
         &mut self,
         request_id: &Value,

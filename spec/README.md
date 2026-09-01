@@ -24,3 +24,18 @@ Rules:
 - bounded security events
 
 The prose contract is `docs/AUTHORIZATION.md`.
+
+## Node protocol v1
+
+`schemas/node-protocol-v1.schema.json` contains:
+
+- device hello, challenge, proof, and accepted connection records
+- persistent connection epochs and directional sequence numbers
+- operation offer, admission, state, input, approval, cancellation, and terminal receipts
+- normalized run event batches and explicit retention gaps
+- reconciliation summary, plan, and completion records
+- bounded device health and protocol errors
+
+Examples are under `examples/node-protocol/`.
+
+The prose contract is `docs/NODE_PROTOCOL.md`.

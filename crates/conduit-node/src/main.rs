@@ -1,3 +1,4 @@
+use conduit_domain::DeviceId;
 use conduit_node::{
     Node,
     ipc::IpcServer,
@@ -117,6 +118,9 @@ fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         data_root.join("local-services"),
         cursor_key,
     )?);
+    if let Some(device_id) = opts.device_id.as_ref() {
+        local.bind_device(DeviceId::parse(device_id.clone())?)?;
+    }
     let _credentials = CredentialStore::open(
         store.clone(),
         data_root.join("credentials/master.dek"),

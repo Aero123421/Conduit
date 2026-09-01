@@ -1,0 +1,169 @@
+{
+  "schemaVersion": 1,
+  "kind": "change_set",
+  "changeSetId": "chg_runtime_contract_01",
+  "projectId": "prj_conduit_01",
+  "sessionId": "csess_architecture_01",
+  "producingRunId": "run_conduit_codex_01",
+  "producingAssignmentId": "asg_conduit_codex_01",
+  "parentBaselineId": "bln_conduit_initial_01",
+  "parentBaselineRevision": 1,
+  "parentBaselineDigest": "7090997d91e8ca7889b55424083135fd8cb28af08d91ff4d2bc778ec692ccac4",
+  "parentChangeSetIds": [],
+  "state": "proposed",
+  "sourceChanges": [
+    {
+      "sourceType": "git",
+      "sourceId": "src_conduit_repo_01",
+      "repositoryIdentityDigest": "b714a0d5ef4c9b8e180a560360f44ee3cbed837285d766398965476e450e1d6a",
+      "originDeviceId": "dev_sahur_pc_01",
+      "originLocationId": "loc_sahur_conduit_01",
+      "baseCommit": "905920194c03bc39bccda1ed69e153f25593379b",
+      "baseTree": "8db28b67c9c2b1743b22cb781641f6c90a4cd85a",
+      "headCommit": "d62f1ba3254c4f37477908a143885c919e3b17ac",
+      "headTree": "a5df48357cc80629391c0b0e28de657e0bdcb4ef",
+      "mergeBase": "905920194c03bc39bccda1ed69e153f25593379b",
+      "commits": [
+        "d62f1ba3254c4f37477908a143885c919e3b17ac"
+      ],
+      "commitGraphDigest": "25d762ce340b728b5b59fefc3db0744cd8c2c4c931598247197878912b942d81",
+      "diffDigest": "ca2dc37567209c7a527d9ae3f47881575a702b358fe670553854b8d7bcc68e93",
+      "patchArtifactId": "art_runtime_patch_01",
+      "changedPaths": {
+        "added": 4,
+        "modified": 4,
+        "deleted": 0,
+        "renamed": 0,
+        "typeChanged": 0,
+        "conflicted": 0,
+        "untracked": 0,
+        "truncated": false
+      },
+      "gitFeatures": {
+        "submodules": "none",
+        "lfs": "not_used",
+        "sparseCheckout": false,
+        "partialClone": false,
+        "shallow": false,
+        "stateDigest": "32fe93c8088af1d06ea3ed7542355516e163c53611cfda241137f0b7ef7d8bc"
+      },
+      "verificationIds": [
+        "verify_schema_runtime_01"
+      ],
+      "custody": [
+        {
+          "custodyClass": "device_ref",
+          "deviceId": "dev_sahur_pc_01",
+          "provider": "git",
+          "reference": "refs/conduit/changesets/chg_runtime_contract_01/src_conduit_repo_01/head",
+          "contentDigest": "f0fb1ce7c2e2e9b50e591702148e2a1d83c3487012e21058116809cd3f22c7fe",
+          "state": "healthy",
+          "observedAt": "2026-09-01T12:30:00Z",
+          "receiptDigest": "e2973d719335b2881c66ff270a929b0a8f4bc3e14d8e1254c23c929e220a83f6"
+        },
+        {
+          "custodyClass": "device_archive",
+          "deviceId": "dev_sahur_pc_01",
+          "provider": "git_bundle",
+          "reference": "archive:chg_runtime_contract_01.bundle",
+          "contentDigest": "74bc53fb306bf4c9dd7b209e8b5834a472ae576e34935581a9fd69d3ed8cb660",
+          "state": "healthy",
+          "bytes": 9437184,
+          "observedAt": "2026-09-01T12:30:03Z",
+          "receiptDigest": "26b0487a72f9bdd4749c9ff8ad434d2d12d95b5ba7d18022347fe817e7d89679"
+        }
+      ],
+      "sourceChangeDigest": "8040615d8b65e6e006b4b96cb5ff2474ccf596c03e742f18ce5ccdf2c1c66d3a"
+    },
+    {
+      "sourceType": "managed_folder",
+      "sourceId": "src_conduit_notes_01",
+      "originDeviceId": "dev_sahur_pc_01",
+      "originLocationId": "loc_sahur_notes_01",
+      "baseSnapshotId": "snap_conduit_notes_01",
+      "baseManifestDigest": "8f49f79121eeb2669c70b24c98468d994671092689386397f4101657cc84b209",
+      "resultSnapshotId": "snap_conduit_notes_02",
+      "resultManifestDigest": "092d3ac099a88436739404372eef0829cb2c2f23c9a55f6bdd334c4f862e7dd7",
+      "operations": [
+        {
+          "operation": "create",
+          "pathReference": "notes/runtime-review.md",
+          "afterType": "file",
+          "afterDigest": "84dc72f4b1d5ad9d0c949e7b83f25b1a1d80d950041098dba01fb183f622c738",
+          "afterMode": "100644",
+          "contentAvailable": true
+        },
+        {
+          "operation": "modify",
+          "pathReference": "notes/index.md",
+          "beforeType": "file",
+          "afterType": "file",
+          "beforeDigest": "6c13cc49b5849240ac8848af1d06ea3ed7542355516e163c53611cfda241137f",
+          "afterDigest": "50c1a3b8541c70ad44a6c98150806217953810418b4205805e6f71a2e2d4946c",
+          "beforeMode": "100644",
+          "afterMode": "100644",
+          "contentAvailable": true
+        }
+      ],
+      "changedPaths": {
+        "added": 1,
+        "modified": 1,
+        "deleted": 0,
+        "renamed": 0,
+        "typeChanged": 0,
+        "conflicted": 0,
+        "untracked": 0,
+        "truncated": false
+      },
+      "verificationIds": [
+        "verify_notes_manifest_01"
+      ],
+      "custody": [
+        {
+          "custodyClass": "device_archive",
+          "deviceId": "dev_sahur_pc_01",
+          "provider": "managed_snapshot",
+          "reference": "archive:snap_conduit_notes_02",
+          "contentDigest": "092d3ac099a88436739404372eef0829cb2c2f23c9a55f6bdd334c4f862e7dd7",
+          "state": "healthy",
+          "bytes": 1114112,
+          "observedAt": "2026-09-01T12:30:02Z",
+          "receiptDigest": "dd607f6dd9ff584fe12009d013924c447d708551d44c1e004d817d0c37ffeb53"
+        }
+      ],
+      "sourceChangeDigest": "bdc36f08adf7e80aa45db72592c2c11ce293c9aa861cc8c8f3e18d69ff481740"
+    }
+  ],
+  "unchangedSources": [],
+  "applicationOrder": [
+    {
+      "order": 1,
+      "sourceId": "src_conduit_repo_01",
+      "sourceChangeDigest": "8040615d8b65e6e006b4b96cb5ff2474ccf596c03e742f18ce5ccdf2c1c66d3a",
+      "dependsOn": [],
+      "notes": "Apply the Runtime contract and schema before publishing design notes."
+    },
+    {
+      "order": 2,
+      "sourceId": "src_conduit_notes_01",
+      "sourceChangeDigest": "bdc36f08adf7e80aa45db72592c2c11ce293c9aa861cc8c8f3e18d69ff481740",
+      "dependsOn": [
+        "src_conduit_repo_01"
+      ],
+      "notes": "Notes describe the accepted Runtime contract."
+    }
+  ],
+  "requiredVerificationPolicyDigest": "0a929b0a8f4bc3e14d8e1254c23c929e220a83f622c738f57ab98612d5ad9d0c",
+  "verificationIds": [
+    "verify_schema_runtime_01",
+    "verify_notes_manifest_01"
+  ],
+  "artifactIds": [
+    "art_runtime_patch_01",
+    "art_runtime_tests_01",
+    "art_notes_manifest_01"
+  ],
+  "changeSetDigest": "becc9dc33cb79f6c6c192f293bf383540c8248c0c2df2c984a4c4a638dfe1f7b",
+  "createdAt": "2026-09-01T12:30:04Z",
+  "proposedAt": "2026-09-01T12:30:05Z"
+}

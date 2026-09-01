@@ -80,6 +80,32 @@ VM and selected Container implementations can use a Guest Agent for process supe
 
 The active Guest transport is reported. A provider-specific exec path can be used before a Conduit Guest Agent exists.
 
+### Structured Agent I/O
+
+Agent protocol framing is separate from process creation. The Node asks the
+selected Runtime Provider for an interactive pipes boundary only after durable
+admission and Runtime reservation. Restricted Native returns a process inside
+its effective namespace/cgroup wrapper, Docker and Podman return an attached
+container-main-process client, and Incus returns an attached `incus exec`
+client after a per-VM agent probe. The Adapter layer may read and write the
+child pipes but cannot construct provider commands or receive a management
+socket.
+
+Container and VM adapter executables are fixed by the Device-owned runtime
+image contract (`/usr/local/bin/<adapter>`); a remote operation cannot select a
+guest executable. Host executable digests are not reused as guest executable
+claims. Incus records the host CLI session plus LaunchPlan digest separately
+from guest process identity. Because current Incus exec receipts do not expose
+a stable guest PID, guest process identity is reported degraded and restart
+reconciliation fails closed rather than claiming attachment.
+
+Read-only workspace flags remain part of the typed attachment through this
+boundary. Container providers use read-only bind mounts, Incus uses named
+per-Run disk devices with `readonly=true`, and Restricted Native requires an
+effective read-only filesystem boundary. A Reviewer role is rejected by the
+Node unless its Access Scope and every Source revision are read-only and the
+provider is an enforcing Restricted Native, Container, or VM provider.
+
 ### Runtime identity and idempotency
 
 Every Runtime has a Conduit Runtime ID and immutable Spec digest. Provider objects carry or bind both values.
@@ -161,6 +187,8 @@ Rejected because uncommitted Workspace changes, raw traces, login state, or Arti
 - Device setup can add Container, VM, and privileged-helper capability later.
 - Dashboard states must show Runtime kind, effective isolation, access scope, and approval mode together.
 - Agent Adapter code cannot call Docker, Podman, Incus, or host elevation directly.
+- Interactive Agent protocol pipes are created by Runtime Providers; protocol
+  normalization does not acquire provider authority.
 - Storage and collection checks can block Runtime destruction.
 - Windows and macOS Providers can implement the same contract without claiming feature parity.
 

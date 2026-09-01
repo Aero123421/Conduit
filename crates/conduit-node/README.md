@@ -48,10 +48,17 @@ writer.
 
 `agent.run.start` selects only a structured `conduit-adapters` profile. The
 adapter ID must also appear in the Device-local policy `launchProfiles`
-allowlist. The first Linux slice supports agent adapters in the native Provider;
-other requested Providers fail closed instead of weakening isolation. Visible
-normalized adapter events are committed to the Device-local trace store and
+allowlist. The Linux provider bridge runs the same bounded protocol driver in
+Native, Restricted Native, Docker/Podman, and Incus/KVM. Container and VM
+images must provide the selected adapter at the fixed Device-owned guest path;
+missing guest execution capability fails closed. Reviewer operations require a
+read-only Access Scope, read-only Source revisions, and an enforcing non-Native
+provider. Visible normalized adapter events are committed to the Device-local trace store and
 event journal. Hidden reasoning, raw stderr, and credentials are not captured.
 Input, follow-up, steer, cancel, and launch-time native-session resume use typed
 adapter operations and fail closed when the selected protocol does not support
 the requested control.
+
+Agy uses its documented headless stream contract: prompts are NDJSON `user`
+events on stdin, output is `init`/`step_update`/`result` NDJSON, and resume uses
+the emitted conversation ID. Prompts are never placed in process arguments.

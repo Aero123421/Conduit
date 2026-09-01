@@ -10,8 +10,8 @@ pub mod transport;
 
 use conduit_node_store::{AdmissionResult, NodeStore, OperationState, StoreError};
 use conduit_runtime::{
-    LaunchPlan, PreparedRuntime, RuntimeError, RuntimeHandle, RuntimeProvider, RuntimeRequest,
-    RuntimeState, RuntimeStateReceipt,
+    InteractiveRuntime, LaunchPlan, PreparedRuntime, RuntimeError, RuntimeHandle, RuntimeProvider,
+    RuntimeRequest, RuntimeState, RuntimeStateReceipt,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
@@ -221,6 +221,76 @@ impl Node {
                     None,
                 )?;
                 Ok(receipt)
+            }
+            Err(error) => {
+                let evidence = error.to_string();
+                let _ = self.store.transition_operation(
+                    key,
+                    OperationState::Starting,
+                    OperationState::Uncertain,
+                    Some(&prepared.runtime_id),
+                    None,
+                    Some(evidence.as_bytes()),
+                );
+                Err(NodeError::Runtime(evidence))
+            }
+        }
+    }
+
+    /// Starts a structured adapter through the selected Runtime Provider while
+    /// retaining stdin/stdout custody for the protocol layer. Admission,
+    /// Runtime reservation and journal transitions are identical to `start`;
+    /// the provider, not the adapter, constructs the isolation command.
+    pub fn start_interactive(&self, key: &str) -> Result<InteractiveRuntime, NodeError> {
+        let admission = self
+            .store
+            .admission(key)?
+            .ok_or_else(|| NodeError::Rejected("operation_not_admitted".into()))?;
+        let provider = self
+            .providers
+            .get(&admission.provider_id)
+            .ok_or_else(|| NodeError::Rejected("runtime_provider_unavailable".into()))?;
+        if admission.operation.state != OperationState::Admitted {
+            return Err(NodeError::Rejected("operation_not_startable".into()));
+        }
+        let runtime: RuntimeRequest = serde_json::from_slice(&admission.runtime_request)
+            .map_err(|_| NodeError::Rejected("durable_runtime_request_corrupt".into()))?;
+        let launch: LaunchPlan = serde_json::from_slice(&admission.launch_plan)
+            .map_err(|_| NodeError::Rejected("durable_launch_plan_corrupt".into()))?;
+        self.store.transition_operation(
+            key,
+            OperationState::Admitted,
+            OperationState::Starting,
+            Some(&runtime.runtime_id),
+            None,
+            None,
+        )?;
+        let prepared = match provider.prepare(&runtime) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                let evidence = error.to_string();
+                self.store.transition_operation(
+                    key,
+                    OperationState::Starting,
+                    OperationState::Failed,
+                    Some(&runtime.runtime_id),
+                    None,
+                    Some(evidence.as_bytes()),
+                )?;
+                return Err(NodeError::Runtime(evidence));
+            }
+        };
+        match provider.start_interactive(&prepared, &launch) {
+            Ok(interactive) => {
+                self.store.transition_operation(
+                    key,
+                    OperationState::Starting,
+                    OperationState::Running,
+                    Some(&prepared.runtime_id),
+                    interactive.receipt.handle.process_identity.as_deref(),
+                    None,
+                )?;
+                Ok(interactive)
             }
             Err(error) => {
                 let evidence = error.to_string();

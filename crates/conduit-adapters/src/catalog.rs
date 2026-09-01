@@ -41,24 +41,6 @@ impl AdapterProfile {
             support: SupportLevel::Degraded,
             evidence: evidence.to_owned(),
         };
-        if self.kind == AdapterKind::Agy {
-            return Operation::ALL
-                .into_iter()
-                .map(|operation| AdapterCapability {
-                    operation,
-                    support: if matches!(
-                        operation,
-                        Operation::Discover | Operation::Probe | Operation::Capability
-                    ) {
-                        SupportLevel::Degraded
-                    } else {
-                        SupportLevel::Unavailable
-                    },
-                    evidence: "no installed or independently verified Agy structured CLI protocol"
-                        .to_owned(),
-                })
-                .collect();
-        }
         let mut values = vec![
             supported(Operation::Discover, "PATH executable identity"),
             supported(Operation::Probe, "bounded --version invocation"),
@@ -114,7 +96,21 @@ impl AdapterProfile {
                 supported(Operation::FollowUp, "stream-json input or --resume"),
                 supported(Operation::Resume, "--resume native session ID"),
             ]),
-            AdapterKind::Agy => unreachable!("Agy capabilities return above"),
+            AdapterKind::Agy => values.extend([
+                supported(Operation::ModelDiscovery, "agy models"),
+                degraded(
+                    Operation::Steer,
+                    "official stream-json input accepts complete user turns, not mid-turn rewrites",
+                ),
+                supported(
+                    Operation::FollowUp,
+                    "stream-json user event in a new supervised turn",
+                ),
+                supported(
+                    Operation::Resume,
+                    "--conversation with the emitted conversation_id",
+                ),
+            ]),
         }
         values.sort_by_key(|capability| capability.operation as u8);
         values
@@ -202,16 +198,30 @@ impl AdapterCatalog {
         request: &LaunchRequest,
     ) -> Result<(LaunchSpec, ProtocolDriver), AdapterError> {
         validate_launch_request(request)?;
-        if kind == AdapterKind::Agy {
-            return Err(AdapterError::UnsupportedOperation {
-                adapter: kind,
-                operation: AdapterOperation::Open,
-                reason: "Agy structured CLI behavior is not independently verified",
-            });
-        }
         let profile = Self::profile(kind);
         let executable = find_executable(profile.executable)
             .ok_or(AdapterError::ExecutableUnavailable(profile.executable))?;
+        Self::launch_resolved(kind, request, executable)
+    }
+
+    /// Builds the fixed Device-owned guest image contract without claiming
+    /// that a host executable proves guest availability. Provider start/exec
+    /// remains the effective per-Runtime probe.
+    pub fn launch_in_guest(
+        kind: AdapterKind,
+        request: &LaunchRequest,
+    ) -> Result<(LaunchSpec, ProtocolDriver), AdapterError> {
+        validate_launch_request(request)?;
+        let executable = PathBuf::from("/usr/local/bin").join(Self::profile(kind).executable);
+        Self::launch_resolved(kind, request, executable)
+    }
+
+    fn launch_resolved(
+        kind: AdapterKind,
+        request: &LaunchRequest,
+        executable: PathBuf,
+    ) -> Result<(LaunchSpec, ProtocolDriver), AdapterError> {
+        let profile = Self::profile(kind);
         let mut driver = ProtocolDriver::new(kind, request)?;
         let args = launch_args(kind, request)?;
         let initial_frames = driver.start()?;
@@ -229,7 +239,6 @@ impl AdapterCatalog {
 }
 
 fn launch_args(kind: AdapterKind, request: &LaunchRequest) -> Result<Vec<String>, AdapterError> {
-    let prompt = request.prompt.as_deref();
     let args = match kind {
         AdapterKind::Codex => vec![
             "app-server".to_owned(),
@@ -282,19 +291,22 @@ fn launch_args(kind: AdapterKind, request: &LaunchRequest) -> Result<Vec<String>
             args
         }
         AdapterKind::Agy => {
-            if request.native_session_id.is_some() {
-                return Err(AdapterError::UnsupportedOperation {
-                    adapter: kind,
-                    operation: AdapterOperation::Resume,
-                    reason: "Agy native resume was not verified",
-                });
-            }
-            vec![
-                "--print".to_owned(),
-                prompt.unwrap_or_default().to_owned(),
+            let mut args = vec![
+                "--input-format".to_owned(),
+                "stream-json".to_owned(),
                 "--output-format".to_owned(),
                 "stream-json".to_owned(),
-            ]
+            ];
+            if let Some(session_id) = request.native_session_id.as_deref() {
+                args.extend(["--conversation".to_owned(), session_id.to_owned()]);
+            }
+            if let Some(model) = request.model.as_deref() {
+                args.extend(["--model".to_owned(), model.to_owned()]);
+            }
+            if let Some(effort) = request.effort.as_deref() {
+                args.extend(["--effort".to_owned(), effort.to_owned()]);
+            }
+            args
         }
     };
     Ok(args)
@@ -398,25 +410,18 @@ mod tests {
                 .into_iter()
                 .find(|capability| capability.operation == AdapterOperation::Open)
                 .unwrap();
-            assert_eq!(
-                open.support,
-                if kind == AdapterKind::Agy {
-                    SupportLevel::Unavailable
-                } else {
-                    SupportLevel::Supported
-                }
-            );
+            assert_eq!(open.support, SupportLevel::Supported);
         }
     }
 
     #[test]
-    fn agy_does_not_claim_unverified_resume() {
+    fn agy_uses_the_official_stream_json_contract() {
         let capability = AdapterCatalog::profile(AdapterKind::Agy)
             .capabilities()
             .into_iter()
             .find(|value| value.operation == AdapterOperation::Resume)
             .unwrap();
-        assert_eq!(capability.support, SupportLevel::Unavailable);
+        assert_eq!(capability.support, SupportLevel::Supported);
     }
 
     #[test]
@@ -438,7 +443,7 @@ mod tests {
     }
 
     #[test]
-    fn agy_launch_fails_closed_without_a_verified_protocol() {
+    fn agy_prompt_is_sent_over_the_official_stream_json_input() {
         let request = LaunchRequest {
             cwd: PathBuf::from("/tmp"),
             prompt: Some("hello".to_owned()),
@@ -447,9 +452,38 @@ mod tests {
             effort: None,
             session_data_dir: None,
         };
-        assert!(matches!(
-            AdapterCatalog::launch(AdapterKind::Agy, &request),
-            Err(AdapterError::UnsupportedOperation { .. })
-        ));
+        let args = launch_args(AdapterKind::Agy, &request).unwrap();
+        assert!(!args.iter().any(|argument| argument == "hello"));
+        assert_eq!(
+            args,
+            [
+                "--input-format",
+                "stream-json",
+                "--output-format",
+                "stream-json"
+            ]
+        );
+        let mut driver = ProtocolDriver::new(AdapterKind::Agy, &request).unwrap();
+        let frames = driver.start().unwrap();
+        assert_eq!(frames.len(), 1);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&frames[0].0).unwrap(),
+            serde_json::json!({"event":"user","message":{"content":"hello"}})
+        );
+    }
+
+    #[test]
+    fn guest_launch_uses_the_fixed_image_contract_without_host_discovery() {
+        let request = LaunchRequest {
+            cwd: PathBuf::from("/workspace"),
+            prompt: Some("review".to_owned()),
+            native_session_id: None,
+            model: None,
+            effort: None,
+            session_data_dir: None,
+        };
+        let (spec, _) = AdapterCatalog::launch_in_guest(AdapterKind::Agy, &request).unwrap();
+        assert_eq!(spec.executable, PathBuf::from("/usr/local/bin/agy"));
+        assert_eq!(spec.cwd, PathBuf::from("/workspace"));
     }
 }

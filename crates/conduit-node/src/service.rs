@@ -12,7 +12,7 @@ use conduit_domain::{DeviceId, Sha256Digest};
 use conduit_node_store::{DeviceIdentity, Direction, OperationState, ReceiveResult, StoreError};
 use conduit_runtime::{
     IoMode, LaunchPlan, NetworkMode, ProcessSupervisor, ResourceLimits, RuntimeHandle, RuntimeKind,
-    RuntimeRequest, RuntimeState,
+    RuntimeRequest, RuntimeSignal, RuntimeState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -268,6 +268,8 @@ struct AgentActive {
     run_id: String,
     request_digest: String,
     runtime_id: String,
+    provider_id: String,
+    handle: RuntimeHandle,
     child: AdapterChild,
     driver: ProtocolDriver,
     event_sequence: u64,
@@ -820,6 +822,7 @@ impl NodeService {
         {
             return Err(TransportError::Malformed.into());
         }
+        enforce_reviewer_runtime(&op)?;
         let issued = OffsetDateTime::parse(&op.issued_at, &Rfc3339)
             .map_err(|_| TransportError::Malformed)?;
         let expires = OffsetDateTime::parse(&op.expires_at, &Rfc3339)
@@ -866,11 +869,6 @@ impl NodeService {
             .prepare_sources(&run_id, &op.source_revisions)
             .map_err(|error| ServiceError::Unavailable(source_reason(&error.to_string())))?;
         let runtime_kind = parse_kind(&op.runtime.kind)?;
-        if is_agent && (!matches!(runtime_kind, RuntimeKind::Native) || selected != "native") {
-            return Err(ServiceError::Unavailable(
-                "adapter_runtime_provider_unsupported".into(),
-            ));
-        }
         let workspaces = prepared_sources
             .iter()
             .enumerate()
@@ -886,17 +884,21 @@ impl NodeService {
                 source.attachment(guest)
             })
             .collect::<Vec<_>>();
-        if is_agent && workspaces.iter().any(|workspace| workspace.read_only) {
-            return Err(ServiceError::Unavailable(
-                "adapter_native_read_only_workspace_unavailable".into(),
-            ));
-        }
         let (launch, agent_launch) = if is_agent {
             let kind = parse_adapter(profile_id)?;
-            let cwd = prepared_sources
+            let cwd = workspaces
                 .first()
-                .map(|source| source.host_path.clone())
-                .unwrap_or_else(|| self.local.agent_scratch(&run_id));
+                .map(|workspace| workspace.guest_path.clone())
+                .unwrap_or_else(|| {
+                    if matches!(
+                        runtime_kind,
+                        RuntimeKind::Native | RuntimeKind::RestrictedNative
+                    ) {
+                        self.local.agent_scratch(&run_id)
+                    } else {
+                        PathBuf::from("/workspace")
+                    }
+                });
             let request = LaunchRequest {
                 cwd,
                 prompt: op
@@ -919,9 +921,18 @@ impl NodeService {
                     .get("effort")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
-                session_data_dir: Some(self.local.agent_session_dir(&run_id)),
+                session_data_dir: matches!(
+                    runtime_kind,
+                    RuntimeKind::Native | RuntimeKind::RestrictedNative
+                )
+                .then(|| self.local.agent_session_dir(&run_id)),
             };
-            let (spec, driver) = AdapterCatalog::launch(kind, &request)
+            let (spec, driver) =
+                if matches!(runtime_kind, RuntimeKind::Container | RuntimeKind::Vm) {
+                    AdapterCatalog::launch_in_guest(kind, &request)
+                } else {
+                    AdapterCatalog::launch(kind, &request)
+                }
                 .map_err(|error| ServiceError::Unavailable(adapter_reason(&error)))?;
             let launch = LaunchPlan {
                 executable: spec.executable.clone(),
@@ -997,7 +1008,12 @@ impl NodeService {
         let probe = agent_launch
             .as_ref()
             .map(|(_, _, kind)| AdapterCatalog::discover(*kind));
-        let executable_digest = hash_file(&launch.executable)?;
+        let executable_digest = matches!(
+            runtime_kind,
+            RuntimeKind::Native | RuntimeKind::RestrictedNative
+        )
+        .then(|| hash_file(&launch.executable))
+        .transpose()?;
         let manifest_record = build_manifest(
             &ManifestOperation {
                 operation_id: &op.operation_id,
@@ -1019,7 +1035,7 @@ impl NodeService {
                 approval_mode: &op.approval_mode,
                 adapter_id: is_agent.then_some(profile_id),
                 adapter_version: probe.as_ref().and_then(|probe| probe.version.as_deref()),
-                executable_digest: Some(executable_digest),
+                executable_digest,
                 model: op.arguments.get("model").and_then(Value::as_str),
                 effort: op.arguments.get("effort").and_then(Value::as_str),
             },
@@ -1057,6 +1073,77 @@ impl NodeService {
         )?;
         if decision == "admitted" {
             if let Some((spec, driver, _)) = agent_launch {
+                if !matches!(runtime_kind, RuntimeKind::Native) || selected != "native" {
+                    let interactive = match self.node.start_interactive(&op.idempotency_key) {
+                        Ok(interactive) => interactive,
+                        Err(error) => {
+                            self.queue_start_failure(client, &op, &error.to_string())?;
+                            return Ok(());
+                        }
+                    };
+                    let handle = interactive.receipt.handle.clone();
+                    let mut child = match AdapterChild::from_child(interactive.child) {
+                        Ok(child) => child,
+                        Err(error) => {
+                            let _ = self.node.signal_runtime(
+                                selected,
+                                &handle,
+                                RuntimeSignal::ForceStop,
+                            );
+                            self.node.store().transition_operation(
+                                &op.idempotency_key,
+                                OperationState::Running,
+                                OperationState::Failed,
+                                Some(&runtime_id),
+                                handle.process_identity.as_deref(),
+                                Some(error.to_string().as_bytes()),
+                            )?;
+                            self.queue_start_failure(client, &op, &error.to_string())?;
+                            return Ok(());
+                        }
+                    };
+                    if let Err(error) = child.initialize(&spec) {
+                        let _ = child.terminate();
+                        let _ =
+                            self.node
+                                .signal_runtime(selected, &handle, RuntimeSignal::ForceStop);
+                        self.node.store().transition_operation(
+                            &op.idempotency_key,
+                            OperationState::Running,
+                            OperationState::Failed,
+                            Some(&runtime_id),
+                            handle.process_identity.as_deref(),
+                            Some(error.to_string().as_bytes()),
+                        )?;
+                        self.queue_start_failure(client, &op, &error.to_string())?;
+                        return Ok(());
+                    }
+                    let status = json!({"operationId":op.operation_id,"runId":run_id,"state":"running","phase":"adapter_started","observedAt":now()});
+                    let msg = self.message_id();
+                    client.session.queue_outbound(
+                        &msg,
+                        "operation.status",
+                        Some(op.operation_id.clone()),
+                        status,
+                        0,
+                    )?;
+                    self.agents.insert(
+                        op.operation_id.clone(),
+                        AgentActive {
+                            key: op.idempotency_key,
+                            operation_id: op.operation_id,
+                            run_id,
+                            request_digest: op.payload_digest,
+                            runtime_id,
+                            provider_id: selected.to_owned(),
+                            handle,
+                            child,
+                            driver,
+                            event_sequence: 0,
+                        },
+                    );
+                    return Ok(());
+                }
                 self.node.store().transition_operation(
                     &op.idempotency_key,
                     OperationState::Admitted,
@@ -1136,9 +1223,10 @@ impl NodeService {
                     self.queue_start_failure(client, &op, &error.to_string())?;
                     return Ok(());
                 }
-                let process_identity = custody.handle.process_identity.ok_or_else(|| {
-                    ServiceError::Unavailable("adapter_process_identity_unavailable".into())
-                })?;
+                let process_identity =
+                    custody.handle.process_identity.clone().ok_or_else(|| {
+                        ServiceError::Unavailable("adapter_process_identity_unavailable".into())
+                    })?;
                 self.node.store().transition_operation(
                     &op.idempotency_key,
                     OperationState::Starting,
@@ -1164,6 +1252,8 @@ impl NodeService {
                         run_id,
                         request_digest: op.payload_digest,
                         runtime_id,
+                        provider_id: "native".into(),
+                        handle: custody.handle,
                         child,
                         driver,
                         event_sequence: 0,
@@ -1514,9 +1604,25 @@ impl NodeService {
         }
         for pending in terminals {
             if let Some(agent) = self.agents.get(&pending.id) {
-                self.supervisor
-                    .mark_external_stopped(&agent.runtime_id, pending.exit_code)
-                    .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                if matches!(agent.provider_id.as_str(), "native" | "restricted_native") {
+                    self.supervisor
+                        .mark_external_stopped(&agent.runtime_id, pending.exit_code)
+                        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                } else if self
+                    .node
+                    .inspect_runtime(&agent.provider_id, &agent.handle)
+                    .is_ok_and(|receipt| {
+                        matches!(receipt.state, RuntimeState::Running | RuntimeState::Paused)
+                    })
+                {
+                    self.node
+                        .signal_runtime(
+                            &agent.provider_id,
+                            &agent.handle,
+                            RuntimeSignal::GracefulStop,
+                        )
+                        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                }
             }
             self.finish_agent(
                 client,
@@ -2014,11 +2120,7 @@ fn parse_adapter(value: &str) -> Result<AdapterKind, ServiceError> {
         "claude_code" | "claude-code" | "claude" => Ok(AdapterKind::ClaudeCode),
         "opencode" => Ok(AdapterKind::OpenCode),
         "pi" => Ok(AdapterKind::Pi),
-        // Agy intentionally remains unavailable until its structured protocol
-        // is independently verified by conduit-adapters.
-        "agy" => Err(ServiceError::Unavailable(
-            "adapter_protocol_unverified".into(),
-        )),
+        "agy" => Ok(AdapterKind::Agy),
         _ => Err(ServiceError::Unavailable("adapter_unknown".into())),
     }
 }
@@ -2071,6 +2173,42 @@ fn hash_file(path: &Path) -> Result<Sha256Digest, ServiceError> {
 
 fn bounded(value: impl AsRef<str>, maximum: usize) -> String {
     value.as_ref().chars().take(maximum).collect()
+}
+
+fn enforce_reviewer_runtime(operation: &WireOperation) -> Result<(), ServiceError> {
+    let role = operation
+        .arguments
+        .get("role")
+        .or_else(|| operation.arguments.get("agentRole"))
+        .and_then(Value::as_str);
+    if operation.capability != "agent.run.start" || role != Some("reviewer") {
+        return Ok(());
+    }
+    if operation.access_scope != "read_only" {
+        return Err(ServiceError::Unavailable(
+            "reviewer_access_scope_must_be_read_only".into(),
+        ));
+    }
+    if operation
+        .source_revisions
+        .iter()
+        .any(|source| !matches!(source.mode, crate::local::WorkspaceMode::ReadOnly))
+    {
+        return Err(ServiceError::Unavailable(
+            "reviewer_workspace_must_be_read_only".into(),
+        ));
+    }
+    if operation.runtime.kind == "native"
+        || matches!(
+            operation.runtime.provider_id.as_str(),
+            "native" | "native.linux"
+        )
+    {
+        return Err(ServiceError::Unavailable(
+            "reviewer_requires_enforced_runtime_boundary".into(),
+        ));
+    }
+    Ok(())
 }
 
 pub(crate) fn now() -> String {
@@ -2139,5 +2277,43 @@ mod tests {
                 .evaluate(&operation("full_device", "never", 1.0), "safe")
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn reviewer_role_fails_closed_without_read_only_scope_workspace_and_runtime() {
+        let base = json!({
+            "schemaVersion": 1,
+            "operationId": "op_reviewer_01",
+            "idempotencyKey": "reviewer-idempotency-key",
+            "deviceId": "dev_policy_01",
+            "capability": "agent.run.start",
+            "sourceRevisions": [],
+            "runtime": {"kind":"restricted_native","providerId":"restricted_native","configurationRevision":1},
+            "accessScope": "read_only",
+            "approvalMode": "always",
+            "connectorPolicyRevision": 99,
+            "arguments": {"adapterId":"agy","role":"reviewer"},
+            "payloadDigest": "11".repeat(32),
+            "issuedAt": "2026-09-01T00:00:00Z",
+            "expiresAt": "2026-09-01T00:01:00Z",
+            "validForMs": 60000
+        });
+        let allowed: WireOperation = serde_json::from_value(base.clone()).unwrap();
+        enforce_reviewer_runtime(&allowed).unwrap();
+
+        let mut broad = base.clone();
+        broad["accessScope"] = json!("project_full");
+        assert!(matches!(
+            enforce_reviewer_runtime(&serde_json::from_value(broad).unwrap()),
+            Err(ServiceError::Unavailable(reason)) if reason == "reviewer_access_scope_must_be_read_only"
+        ));
+
+        let mut native = base;
+        native["runtime"]["kind"] = json!("native");
+        native["runtime"]["providerId"] = json!("native");
+        assert!(matches!(
+            enforce_reviewer_runtime(&serde_json::from_value(native).unwrap()),
+            Err(ServiceError::Unavailable(reason)) if reason == "reviewer_requires_enforced_runtime_boundary"
+        ));
     }
 }

@@ -3,9 +3,12 @@ use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::{Read, Seek, SeekFrom, Write},
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::{
+        fs::{OpenOptionsExt, PermissionsExt},
+        process::CommandExt,
+    },
     path::{Path, PathBuf},
-    process::Command,
+    process::{Command, Stdio},
     sync::atomic::{AtomicU64, Ordering},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -723,6 +726,116 @@ impl RuntimeProvider for ContainerProvider {
         Ok(receipt)
     }
 
+    fn start_interactive(
+        &self,
+        prepared: &PreparedRuntime,
+        launch: &LaunchPlan,
+    ) -> Result<InteractiveRuntime, RuntimeError> {
+        if prepared.provider_id != self.provider_id()
+            || prepared.object_id != Self::name(&prepared.runtime_id)
+        {
+            return Err(RuntimeError::IdentityMismatch);
+        }
+        validate_launch_plan(launch)?;
+        if launch.io_mode != IoMode::Pipes {
+            return Err(RuntimeError::CapabilityUnavailable(
+                "structured adapter I/O requires non-PTY pipes".into(),
+            ));
+        }
+        let launch_digest = launch_digest(launch)?;
+        let mut record = self.load_record(&prepared.runtime_id)?;
+        if record.request.spec_digest != prepared.spec_digest
+            || record.request.provider_selector != prepared.provider_id
+            || record.state != RuntimeState::Prepared
+        {
+            return Err(RuntimeError::IdentityMismatch);
+        }
+        if self.inspect_container(&prepared.object_id).is_ok() {
+            return Err(RuntimeError::Uncertain(
+                "interactive start requires a newly reserved container".into(),
+            ));
+        }
+        let image = record
+            .request
+            .image
+            .as_deref()
+            .ok_or_else(|| RuntimeError::Invalid("container image required".into()))?;
+        let mut create = self.create_args(&record, image, Some(launch), &launch_digest)?;
+        create.insert(1, "--interactive".into());
+        record.launch_digest = Some(launch_digest.clone());
+        record.state = RuntimeState::Starting;
+        self.save_record(&record)?;
+        let output = self.run(&create, Duration::from_secs(120))?;
+        if !output.status.success() {
+            return Err(RuntimeError::Provider {
+                code: "container_create_failed".into(),
+            });
+        }
+        let created = self.inspect_container(&prepared.object_id)?;
+        self.verify_inspection(
+            &prepared.runtime_id,
+            &prepared.spec_digest,
+            Some(&launch_digest),
+            &created,
+        )?;
+        record.container_id = Some(created.container_id.clone());
+        record.deadline_unix_ms = launch
+            .timeout_ms
+            .map(|timeout| unix_time_ms().saturating_add(u128::from(timeout)));
+        self.save_record(&record)?;
+
+        let mut command = Command::new(&self.program);
+        command
+            .args(["start", "--attach", "--interactive"])
+            .arg(&prepared.object_id)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        let mut child = command.spawn()?;
+        // If the provider rejected the attached start, fail before protocol
+        // initialization. A live wrapper is the custody boundary; Runtime
+        // liveness is subsequently proven through metadata inspection.
+        std::thread::sleep(Duration::from_millis(20));
+        if let Some(status) = child.try_wait()? {
+            return Err(RuntimeError::Provider {
+                code: if status.success() {
+                    "container_adapter_exited_before_initialization"
+                } else {
+                    "container_interactive_start_failed"
+                }
+                .into(),
+            });
+        }
+        record.state = RuntimeState::Running;
+        self.save_record(&record)?;
+        let receipt = RuntimeStateReceipt {
+            handle: RuntimeHandle {
+                runtime_id: prepared.runtime_id.clone(),
+                provider_id: self.provider_id().into(),
+                spec_digest: prepared.spec_digest.clone(),
+                object_id: prepared.object_id.clone(),
+                process_identity: Some(format!(
+                    "container:{}:launch:{}",
+                    created.container_id, launch_digest
+                )),
+            },
+            state: RuntimeState::Running,
+            exit_code: None,
+            evidence: vec![CapabilityEvidence {
+                capability: "interactive_adapter_io".into(),
+                state: CapabilityState::Effective,
+                source: "provider_attached_stdio".into(),
+                reason_code: "container_main_process_attached".into(),
+                detail: "bounded protocol pipes attach to the container main process; the management socket is not projected".into(),
+            }],
+        };
+        if let Some(timeout) = launch.timeout_ms {
+            self.arm_timeout(receipt.handle.clone(), timeout);
+        }
+        Ok(InteractiveRuntime { child, receipt })
+    }
+
     fn inspect(&self, handle: &RuntimeHandle) -> Result<RuntimeStateReceipt, RuntimeError> {
         validate_handle(self.provider_id(), handle)?;
         let mut inspection = self.inspect_container(&handle.object_id)?;
@@ -1139,7 +1252,7 @@ fn unix_time_ms() -> u128 {
         .as_millis()
 }
 
-fn validate_runtime_id(runtime_id: &str) -> Result<(), RuntimeError> {
+pub(crate) fn validate_runtime_id(runtime_id: &str) -> Result<(), RuntimeError> {
     if !runtime_id.starts_with("rt_")
         || runtime_id.len() < 11
         || runtime_id.len() > 131
@@ -1230,7 +1343,7 @@ fn validate_container_request(
     Ok(())
 }
 
-fn validate_launch_plan(launch: &LaunchPlan) -> Result<(), RuntimeError> {
+pub(crate) fn validate_launch_plan(launch: &LaunchPlan) -> Result<(), RuntimeError> {
     let executable = launch
         .executable
         .to_str()
@@ -1298,7 +1411,7 @@ fn validate_launch_plan(launch: &LaunchPlan) -> Result<(), RuntimeError> {
     Ok(())
 }
 
-fn launch_digest(launch: &LaunchPlan) -> Result<String, RuntimeError> {
+pub(crate) fn launch_digest(launch: &LaunchPlan) -> Result<String, RuntimeError> {
     let bytes =
         serde_json::to_vec(launch).map_err(|error| RuntimeError::Record(error.to_string()))?;
     Ok(digest_bytes(&bytes))
@@ -1520,7 +1633,11 @@ case "${1:-}" in
   create)
     printf '%s' created > "$root/state"; printf '%s' false > "$root/paused"; printf '%s' 0 > "$root/exit"
     while [ "$#" -gt 0 ]; do if [ "$1" = '--label' ]; then shift; case "$1" in dev.conduit.runtime-id=*) printf '%s' "${1#*=}" > "$root/runtime" ;; dev.conduit.spec-digest=*) printf '%s' "${1#*=}" > "$root/spec" ;; dev.conduit.launch-digest=*) printf '%s' "${1#*=}" > "$root/launch" ;; esac; fi; shift; done ;;
-  start) printf '%s' running > "$root/state" ;;
+  start)
+    printf '%s' running > "$root/state"
+    case "$*" in
+      *--attach*) IFS= read -r line; printf '%s\n' "$line" ;;
+    esac ;;
   stop|kill) printf '%s' exited > "$root/state" ;;
   pause) printf '%s' true > "$root/paused"; printf '%s' paused > "$root/state" ;;
   unpause) printf '%s' false > "$root/paused"; printf '%s' running > "$root/state" ;;
@@ -1605,6 +1722,36 @@ esac
                 .join("records/rt_container_01.collection")
                 .exists()
         );
+    }
+
+    #[test]
+    fn structured_agent_io_runs_as_the_attached_container_main_process() {
+        use std::io::{BufRead, BufReader};
+
+        let directory = tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        fs::create_dir(&workspace).unwrap();
+        let provider = fake_provider(directory.path());
+        let prepared = provider.prepare(&request(&workspace)).unwrap();
+        let mut interactive = provider.start_interactive(&prepared, &launch()).unwrap();
+        assert_eq!(interactive.receipt.state, RuntimeState::Running);
+        assert!(interactive.receipt.evidence.iter().any(|evidence| {
+            evidence.capability == "interactive_adapter_io"
+                && evidence.state == CapabilityState::Effective
+        }));
+        let mut stdin = interactive.child.stdin.take().unwrap();
+        stdin.write_all(b"{\"event\":\"probe\"}\n").unwrap();
+        drop(stdin);
+        let mut output = String::new();
+        BufReader::new(interactive.child.stdout.take().unwrap())
+            .read_line(&mut output)
+            .unwrap();
+        assert_eq!(output, "{\"event\":\"probe\"}\n");
+        assert!(interactive.child.wait().unwrap().success());
+        let argv = fs::read_to_string(directory.path().join("argv")).unwrap();
+        assert!(argv.contains("create\n--interactive\n"));
+        assert!(argv.contains("start\n--attach\n--interactive\n"));
+        assert!(argv.contains(",dst=/workspace,readonly"));
     }
 
     #[test]

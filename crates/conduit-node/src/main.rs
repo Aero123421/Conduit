@@ -141,7 +141,10 @@ fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         ContainerBackend::Podman,
         data_root.join("runtime/podman"),
     )?);
-    let incus: Arc<dyn RuntimeProvider> = Arc::new(IncusProvider::new("conduit")?);
+    let incus: Arc<dyn RuntimeProvider> = Arc::new(IncusProvider::with_state_root(
+        "conduit",
+        data_root.join("runtime/incus"),
+    )?);
     let providers = vec![native, restricted, docker, podman, incus];
     let mut node = Node::new(store.clone());
     for p in &providers {

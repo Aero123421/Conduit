@@ -104,6 +104,10 @@ impl ProtocolDriver {
                             "session_id": self.requested_session_id
                         }))?])
                     }
+                    (AdapterKind::Agy, Some(prompt)) => Ok(vec![ProtocolFrame::json(&json!({
+                        "event": "user",
+                        "message": {"content": prompt}
+                    }))?]),
                     _ => Ok(Vec::new()),
                 }
             }
@@ -807,66 +811,159 @@ impl ProtocolDriver {
 
     fn normalize_agy(&mut self, value: &Value) -> Vec<AdapterEvent> {
         let event_type = value
-            .get("type")
+            .get("event")
             .and_then(Value::as_str)
             .unwrap_or("unknown");
-        if let Some(session_id) = value.get("session_id").and_then(Value::as_str) {
+        let payload = value.get(event_type).unwrap_or(value);
+        if let Some(session_id) = value
+            .get("conversation_id")
+            .or_else(|| payload.get("conversation_id"))
+            .and_then(Value::as_str)
+        {
             self.native_session_id = Some(session_id.to_owned());
         }
-        let (kind, text, correlation) = match event_type {
+        match event_type {
             "init" => {
                 self.state = AdapterState::Working;
-                (AdapterEventKind::Session, None, None)
+                vec![AdapterEvent::bounded(
+                    AdapterEventKind::Session,
+                    "init",
+                    self.native_session_id(),
+                    None,
+                    None,
+                    Some(payload.clone()),
+                )]
             }
-            "message" if value.get("role").and_then(Value::as_str) == Some("assistant") => (
-                if value.get("delta").and_then(Value::as_bool) == Some(true) {
-                    AdapterEventKind::AssistantMessageDelta
-                } else {
-                    AdapterEventKind::AssistantMessage
-                },
-                value.get("content").and_then(Value::as_str),
-                None,
-            ),
-            "message" => return Vec::new(),
-            "tool_use" => (
-                AdapterEventKind::ToolCall,
-                value.get("tool_name").and_then(Value::as_str),
-                value.get("tool_id").and_then(Value::as_str),
-            ),
-            "tool_result" => (
-                AdapterEventKind::ToolResult,
-                value
-                    .get("output")
-                    .or_else(|| value.get("error"))
-                    .and_then(Value::as_str),
-                value.get("tool_id").and_then(Value::as_str),
-            ),
+            "step_update" => {
+                let step_type = payload
+                    .get("step_type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("unknown");
+                let correlation = payload.get("step_index").map(|value| value.to_string());
+                let mut events = Vec::new();
+                match step_type {
+                    "agent_response" => events.push(AdapterEvent::bounded(
+                        AdapterEventKind::AssistantMessageDelta,
+                        "step_update.agent_response",
+                        self.native_session_id(),
+                        correlation.as_deref(),
+                        payload.get("text_delta").and_then(Value::as_str),
+                        None,
+                    )),
+                    "tool" => {
+                        let tool = payload.get("tool_info").unwrap_or(payload);
+                        events.push(AdapterEvent::bounded(
+                            AdapterEventKind::ToolCall,
+                            "step_update.tool",
+                            self.native_session_id(),
+                            correlation.as_deref(),
+                            payload
+                                .get("tool_name")
+                                .or_else(|| tool.get("name"))
+                                .and_then(Value::as_str),
+                            tool.get("parameters").cloned(),
+                        ));
+                        if tool.get("output").is_some() || tool.get("error").is_some() {
+                            events.push(AdapterEvent::bounded(
+                                AdapterEventKind::ToolResult,
+                                "step_update.tool_result",
+                                self.native_session_id(),
+                                correlation.as_deref(),
+                                tool.get("output").and_then(Value::as_str),
+                                tool.get("error").cloned(),
+                            ));
+                        }
+                    }
+                    "user_input" | "checkpoint" => events.push(AdapterEvent::bounded(
+                        AdapterEventKind::State,
+                        &format!("step_update.{step_type}"),
+                        self.native_session_id(),
+                        correlation.as_deref(),
+                        payload.get("state").and_then(Value::as_str),
+                        None,
+                    )),
+                    _ if payload.get("subagent_info").is_some() => {
+                        events.push(AdapterEvent::bounded(
+                            AdapterEventKind::Subagent,
+                            "step_update.subagent",
+                            self.native_session_id(),
+                            correlation.as_deref(),
+                            None,
+                            payload.get("subagent_info").cloned(),
+                        ))
+                    }
+                    _ => events.push(AdapterEvent::bounded(
+                        AdapterEventKind::AdapterError,
+                        "step_update.unknown",
+                        self.native_session_id(),
+                        correlation.as_deref(),
+                        Some(
+                            "unrecognized Agy step_update was retained as a bounded adapter error",
+                        ),
+                        Some(payload.clone()),
+                    )),
+                }
+                if let Some(usage) = payload.get("usage") {
+                    events.push(AdapterEvent::bounded(
+                        AdapterEventKind::Usage,
+                        "step_update.usage",
+                        self.native_session_id(),
+                        correlation.as_deref(),
+                        None,
+                        Some(usage.clone()),
+                    ));
+                }
+                events
+            }
             "result" => {
-                self.state = AdapterState::Completed;
-                (
-                    AdapterEventKind::Completed,
-                    value.get("status").and_then(Value::as_str),
+                let status = payload
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .unwrap_or("INVALID");
+                let successful = status == "SUCCESS";
+                self.state = if successful {
+                    AdapterState::Completed
+                } else {
+                    AdapterState::Failed
+                };
+                let mut events = Vec::new();
+                if let Some(usage) = payload.get("usage") {
+                    events.push(AdapterEvent::bounded(
+                        AdapterEventKind::Usage,
+                        "result.usage",
+                        self.native_session_id(),
+                        None,
+                        None,
+                        Some(usage.clone()),
+                    ));
+                }
+                events.push(AdapterEvent::bounded(
+                    if successful {
+                        AdapterEventKind::Completed
+                    } else {
+                        AdapterEventKind::Error
+                    },
+                    "result",
+                    self.native_session_id(),
                     None,
-                )
-            }
-            "error" => {
-                self.state = AdapterState::Failed;
-                (
-                    AdapterEventKind::Error,
-                    value.get("message").and_then(Value::as_str),
+                    if successful {
+                        payload.get("response").and_then(Value::as_str)
+                    } else {
+                        payload.get("error").and_then(Value::as_str)
+                    },
                     None,
-                )
+                ));
+                events
             }
-            _ => (AdapterEventKind::AdapterError, None, None),
-        };
-        vec![AdapterEvent::bounded(
-            kind,
-            event_type,
-            self.native_session_id(),
-            correlation,
-            text,
-            None,
-        )]
+            _ => vec![AdapterEvent::bounded(
+                AdapterEventKind::AdapterError,
+                event_type,
+                self.native_session_id(),
+                None,
+                Some("unrecognized Agy stream-json event"),
+                Some(value.clone()),
+            )],
+        }
     }
 
     fn codex_command(

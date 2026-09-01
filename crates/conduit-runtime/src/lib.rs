@@ -18,7 +18,7 @@ use std::{
     io::Read,
     os::unix::{fs::FileTypeExt, process::CommandExt},
     path::{Path, PathBuf},
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
 use thiserror::Error;
@@ -163,6 +163,14 @@ pub struct RuntimeStateReceipt {
     pub exit_code: Option<i32>,
     pub evidence: Vec<CapabilityEvidence>,
 }
+/// A provider-owned interactive process boundary. The child is always a
+/// Device-spawned typed provider command (or a directly restricted process),
+/// never a shell reconstruction. Callers own protocol framing while the
+/// Runtime Provider remains authoritative for the returned Runtime identity.
+pub struct InteractiveRuntime {
+    pub child: Child,
+    pub receipt: RuntimeStateReceipt,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotReceipt {
     pub runtime_id: String,
@@ -210,6 +218,15 @@ pub trait RuntimeProvider: Send + Sync {
         prepared: &PreparedRuntime,
         launch: &LaunchPlan,
     ) -> Result<RuntimeStateReceipt, RuntimeError>;
+    fn start_interactive(
+        &self,
+        _prepared: &PreparedRuntime,
+        _launch: &LaunchPlan,
+    ) -> Result<InteractiveRuntime, RuntimeError> {
+        Err(RuntimeError::CapabilityUnavailable(
+            "interactive Runtime I/O boundary".into(),
+        ))
+    }
     fn inspect(&self, handle: &RuntimeHandle) -> Result<RuntimeStateReceipt, RuntimeError>;
     fn signal(
         &self,

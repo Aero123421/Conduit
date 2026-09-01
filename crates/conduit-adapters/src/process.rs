@@ -54,7 +54,14 @@ impl AdapterChild {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
         command.process_group(0);
-        let mut child = command.spawn()?;
+        let child = command.spawn()?;
+        Self::from_child(child)
+    }
+
+    /// Adopts a child spawned through a Runtime Provider's interactive I/O
+    /// boundary. The provider has already reserved and verified Runtime
+    /// identity; this layer only owns bounded protocol framing.
+    pub fn from_child(mut child: Child) -> Result<Self, AdapterError> {
         let stdin = child.stdin.take().ok_or(AdapterError::InvalidExecutable)?;
         let stdout = child.stdout.take().ok_or(AdapterError::InvalidExecutable)?;
         let mut stderr = child.stderr.take().ok_or(AdapterError::InvalidExecutable)?;
@@ -107,7 +114,10 @@ impl AdapterChild {
         for frame in &spec.initial_frames {
             self.write(frame)?;
         }
-        if matches!(spec.protocol, crate::AdapterProtocol::ClaudeStreamJson) {
+        if matches!(
+            spec.protocol,
+            crate::AdapterProtocol::ClaudeStreamJson | crate::AdapterProtocol::AgyStreamJson
+        ) {
             self.close_stdin();
         }
         Ok(())

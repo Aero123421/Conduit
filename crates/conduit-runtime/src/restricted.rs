@@ -1,5 +1,11 @@
+use crate::container::validate_launch_plan;
 use crate::*;
-use std::{path::PathBuf, process::Command, time::Duration};
+use std::{
+    os::unix::process::CommandExt,
+    path::PathBuf,
+    process::{Command, Stdio},
+    time::Duration,
+};
 
 pub struct RestrictedNativeProvider {
     supervisor: ProcessSupervisor,
@@ -35,6 +41,70 @@ impl RestrictedNativeProvider {
         let mut c = Command::new("systemd-run");
         c.args(["--user", "--scope", "--quiet", "/bin/true"]);
         command_output(c, Duration::from_secs(5)).is_ok_and(|o| o.status.success())
+    }
+
+    fn effective_launch(
+        &self,
+        p: &PreparedRuntime,
+        l: &LaunchPlan,
+    ) -> Result<LaunchPlan, RuntimeError> {
+        validate_launch_plan(l)?;
+        let b = Self::bwrap_effective();
+        let s = self.require_cgroup && Self::systemd_effective();
+        if self.require_filesystem && !b {
+            return Err(RuntimeError::CapabilityUnavailable(
+                "bubblewrap is no longer effective".into(),
+            ));
+        }
+        if self.require_cgroup && !s {
+            return Err(RuntimeError::CapabilityUnavailable(
+                "systemd user scope is no longer effective".into(),
+            ));
+        }
+        let mut wrapped = l.clone();
+        if b {
+            let mut args = vec![
+                "--die-with-parent".into(),
+                "--unshare-user".into(),
+                "--unshare-pid".into(),
+                "--proc".into(),
+                "/proc".into(),
+                "--dev".into(),
+                "/dev".into(),
+                "--ro-bind".into(),
+                "/".into(),
+                "/".into(),
+                "--chdir".into(),
+                l.cwd.to_string_lossy().into_owned(),
+                "--".into(),
+                l.executable.to_string_lossy().into_owned(),
+            ];
+            args.extend(l.argv.clone());
+            wrapped.executable = "/usr/bin/bwrap".into();
+            if !wrapped.executable.exists() {
+                wrapped.executable = "/bin/bwrap".into()
+            }
+            wrapped.argv = args;
+        }
+        if s {
+            let mut args = vec![
+                "--user".into(),
+                "--scope".into(),
+                "--quiet".into(),
+                "--collect".into(),
+                "--unit".into(),
+                format!("conduit-{}.scope", p.runtime_id),
+                "--".into(),
+                wrapped.executable.to_string_lossy().into_owned(),
+            ];
+            args.extend(wrapped.argv.clone());
+            wrapped.executable = "/usr/bin/systemd-run".into();
+            if !wrapped.executable.exists() {
+                wrapped.executable = "/bin/systemd-run".into()
+            }
+            wrapped.argv = args;
+        }
+        Ok(wrapped)
     }
 }
 impl RuntimeProvider for RestrictedNativeProvider {
@@ -124,6 +194,11 @@ impl RuntimeProvider for RestrictedNativeProvider {
                 "required filesystem restriction".into(),
             ));
         }
+        if r.workspaces.iter().any(|workspace| workspace.read_only) && !b {
+            return Err(RuntimeError::CapabilityUnavailable(
+                "read-only workspace requires effective bubblewrap filesystem restriction".into(),
+            ));
+        }
         if self.require_cgroup && !s {
             return Err(RuntimeError::CapabilityUnavailable(
                 "required systemd scope".into(),
@@ -143,65 +218,45 @@ impl RuntimeProvider for RestrictedNativeProvider {
         if p.provider_id != self.provider_id() {
             return Err(RuntimeError::IdentityMismatch);
         }
-        let b = Self::bwrap_effective();
-        let s = Self::systemd_effective();
-        if self.require_filesystem && !b {
-            return Err(RuntimeError::CapabilityUnavailable(
-                "bubblewrap is no longer effective".into(),
-            ));
-        }
-        if self.require_cgroup && !s {
-            return Err(RuntimeError::CapabilityUnavailable(
-                "systemd user scope is no longer effective".into(),
-            ));
-        }
-        let mut wrapped = l.clone();
-        if b {
-            let mut args = vec![
-                "--die-with-parent".into(),
-                "--unshare-user".into(),
-                "--unshare-pid".into(),
-                "--proc".into(),
-                "/proc".into(),
-                "--dev".into(),
-                "/dev".into(),
-                "--ro-bind".into(),
-                "/".into(),
-                "/".into(),
-                "--chdir".into(),
-                l.cwd.to_string_lossy().into_owned(),
-                "--".into(),
-                l.executable.to_string_lossy().into_owned(),
-            ];
-            args.extend(l.argv.clone());
-            wrapped.executable = "/usr/bin/bwrap".into();
-            if !wrapped.executable.exists() {
-                wrapped.executable = "/bin/bwrap".into()
-            }
-            wrapped.argv = args;
-        }
-        if s {
-            let mut args = vec![
-                "--user".into(),
-                "--scope".into(),
-                "--quiet".into(),
-                "--collect".into(),
-                "--unit".into(),
-                format!("conduit-{}.scope", p.runtime_id),
-                "--".into(),
-                wrapped.executable.to_string_lossy().into_owned(),
-            ];
-            args.extend(wrapped.argv.clone());
-            wrapped.executable = "/usr/bin/systemd-run".into();
-            if !wrapped.executable.exists() {
-                wrapped.executable = "/bin/systemd-run".into()
-            }
-            wrapped.argv = args;
-        }
+        let wrapped = self.effective_launch(p, l)?;
         let mut r = self.supervisor.spawn(p, &wrapped, |_| Ok(()))?;
         r.handle.provider_id = self.provider_id().into();
         r.evidence.extend(p.evidence.clone());
         Ok(r)
+    }
+    fn start_interactive(
+        &self,
+        p: &PreparedRuntime,
+        l: &LaunchPlan,
+    ) -> Result<InteractiveRuntime, RuntimeError> {
+        if p.provider_id != self.provider_id() {
+            return Err(RuntimeError::IdentityMismatch);
+        }
+        let wrapped = self.effective_launch(p, l)?;
+        let mut command = Command::new(&wrapped.executable);
+        command
+            .args(&wrapped.argv)
+            .current_dir(&wrapped.cwd)
+            .env_clear()
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0);
+        for (key, value) in &wrapped.environment {
+            command.env(key, value);
+        }
+        let mut child = command.spawn()?;
+        let mut receipt = match self.supervisor.adopt_external(p, &wrapped, child.id()) {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error);
+            }
+        };
+        receipt.handle.provider_id = self.provider_id().into();
+        receipt.evidence.extend(p.evidence.clone());
+        Ok(InteractiveRuntime { child, receipt })
     }
     fn inspect(&self, h: &RuntimeHandle) -> Result<RuntimeStateReceipt, RuntimeError> {
         if h.provider_id != self.provider_id() || h.object_id != "native-supervisor" {
@@ -276,5 +331,78 @@ impl RuntimeProvider for RestrictedNativeProvider {
                 Err(error) => Err(error),
             })
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        collections::BTreeMap,
+        io::{BufRead, BufReader, Write},
+    };
+    use tempfile::tempdir;
+
+    #[test]
+    fn structured_agent_io_is_spawned_inside_the_restricted_boundary() {
+        let directory = tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let supervisor = ProcessSupervisor::open(directory.path().join("supervisor")).unwrap();
+        let provider = RestrictedNativeProvider::new(supervisor, false, false);
+        let request = RuntimeRequest {
+            runtime_id: "rt_restricted_agent_01".into(),
+            run_id: "run_restricted_agent_01".into(),
+            kind: RuntimeKind::RestrictedNative,
+            provider_selector: "restricted_native".into(),
+            spec_digest: "66".repeat(32),
+            image: None,
+            resources: ResourceLimits {
+                cpu: None,
+                memory_bytes: None,
+                pid_limit: None,
+                storage_bytes: None,
+            },
+            network: NetworkMode::Offline,
+            workspaces: vec![WorkspaceAttachment {
+                host_path: workspace.clone(),
+                guest_path: workspace.clone(),
+                read_only: true,
+            }],
+        };
+        let prepared = provider.prepare(&request).unwrap();
+        let launch = LaunchPlan {
+            executable: "/bin/sh".into(),
+            argv: vec![
+                "-c".into(),
+                "if touch \"$PWD/reviewer-write\" 2>/dev/null; then exit 91; fi; IFS= read -r line; printf '%s\\n' \"$line\"".into(),
+            ],
+            cwd: workspace,
+            environment: BTreeMap::new(),
+            io_mode: IoMode::Pipes,
+            timeout_ms: None,
+        };
+        let mut interactive = provider.start_interactive(&prepared, &launch).unwrap();
+        let mut stdin = interactive.child.stdin.take().unwrap();
+        stdin.write_all(b"{\"event\":\"probe\"}\n").unwrap();
+        drop(stdin);
+        let mut output = String::new();
+        BufReader::new(interactive.child.stdout.take().unwrap())
+            .read_line(&mut output)
+            .unwrap();
+        assert_eq!(output, "{\"event\":\"probe\"}\n");
+        assert!(interactive.child.wait().unwrap().success());
+        assert!(
+            !request.workspaces[0]
+                .host_path
+                .join("reviewer-write")
+                .exists()
+        );
+        provider
+            .supervisor
+            .mark_external_stopped(&request.runtime_id, Some(0))
+            .unwrap();
+        let inspected = provider.inspect(&interactive.receipt.handle).unwrap();
+        assert_eq!(inspected.state, RuntimeState::Stopped);
     }
 }

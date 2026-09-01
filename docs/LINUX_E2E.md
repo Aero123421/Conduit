@@ -69,13 +69,15 @@ account.
     management-socket or whole-home mounts. The opt-in live test uses an already
     local image, offline networking, exact argv, bounded collection and
     custody-gated destroy; it never pulls an image.
-14. **Quick VM lifecycle:** Incus conformance covers metadata-bound prepare
-    validation, inspect, stop, archive/import restore, reconciliation and
-    custody-gated destroy command/receipt semantics. Guest start, snapshot
-    digest custody and output collection remain accurately unavailable until a
-    versioned guest-process identity/custody contract exists. Run provider-live
-    checks only after `conduit doctor` reports Incus, KVM, storage and offline
-    network prerequisites effective.
+14. **Quick VM lifecycle:** Incus conformance covers metadata-bound prepare,
+    read-only workspace device attachment, per-VM guest-agent readiness,
+    exact-argv guest execution, attached structured Agent I/O, inspect/stop,
+    snapshot export digest custody, full output collection export,
+    archive/import restore, reconciliation and custody-gated destroy. The
+    current Incus CLI receipt does not expose a stable guest PID, so that
+    identity remains degraded and restart recovery fails closed. Run
+    provider-live checks only after `conduit doctor` reports Incus, KVM,
+    storage and offline network prerequisites effective.
 15. **`full_user + never` and `full_device + never`:** local-policy tests require
     those exact combinations to be explicitly enabled and retain admission and
     audit receipts. The Device-local deny remains final.
@@ -95,10 +97,13 @@ account.
     process and spec identity. It resumes custody of matching work and marks
     missing or ambiguous effects `lost`, `recovery_required` or `uncertain`
     without respawning them.
-20. **All Agent adapters:** Codex, Claude Code, OpenCode and Pi use versioned
-    protocol fixtures and bounded process conformance. Agy is intentionally
-    `unavailable` until an independently verified structured CLI exists. Live
-    checks are opt-in and never count a missing executable or login as support.
+20. **All Agent adapters:** Codex, Claude Code, OpenCode, Pi and Agy use
+    versioned protocol fixtures and bounded process conformance. Agy follows
+    the documented headless `stream-json` input/output contract and keeps the
+    prompt off argv. Restricted Native, Docker/Podman and Incus conformance
+    drives a structured Agent record through the Provider-created pipes. Live
+    checks are opt-in and never count a missing executable, guest image tool,
+    provider daemon, KVM device or login as effective support.
 
 ## Live evidence record
 

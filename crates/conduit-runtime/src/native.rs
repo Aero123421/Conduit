@@ -444,7 +444,8 @@ impl ProcessSupervisor {
         if let Some(pid) = r.pid {
             match process_birth(pid) {
                 Some(b) if Some(b) == r.birth => {}
-                None if !matches!(r.state, RuntimeState::Stopped | RuntimeState::Failed) => {
+                None if matches!(r.state, RuntimeState::Stopped | RuntimeState::Failed) => {}
+                None => {
                     r.state = RuntimeState::Lost;
                     self.save(&r)?
                 }

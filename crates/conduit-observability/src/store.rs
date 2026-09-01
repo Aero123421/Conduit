@@ -128,8 +128,14 @@ pub struct ContentPutRequest<'a> {
 
 impl TraceStore {
     pub fn open(root: impl AsRef<Path>, cursor_key: [u8; 32]) -> Result<Self, TraceError> {
-        fs::create_dir_all(root.as_ref())?;
-        let root = fs::canonicalize(root)?;
+        let requested_root = root.as_ref();
+        if let Ok(metadata) = fs::symlink_metadata(requested_root)
+            && metadata.file_type().is_symlink()
+        {
+            return Err(TraceError::UnsafeStoreCustody);
+        }
+        fs::create_dir_all(requested_root)?;
+        let root = fs::canonicalize(requested_root)?;
         secure_directory(&root)?;
         for directory in ["runs", "objects", "segments", "artifacts"] {
             let path = root.join(directory);
@@ -948,9 +954,9 @@ fn read_bounded_file(path: &Path, max: usize) -> Result<Vec<u8>, TraceError> {
 }
 
 fn secure_directory(path: &Path) -> Result<(), TraceError> {
-    let metadata = fs::metadata(path)?;
+    let metadata = fs::symlink_metadata(path)?;
     let current_uid = fs::metadata("/proc/self")?.uid();
-    if !metadata.is_dir() || metadata.uid() != current_uid {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || metadata.uid() != current_uid {
         return Err(TraceError::UnsafeStoreCustody);
     }
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
@@ -1182,6 +1188,19 @@ mod tests {
             evaluation_tags: BTreeMap::new(),
         })
         .unwrap()
+    }
+
+    #[test]
+    fn trace_root_cannot_be_redirected_through_a_symlink() {
+        let target = temp();
+        let link = target.with_extension("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(matches!(
+            TraceStore::open(&link, [7; 32]),
+            Err(TraceError::UnsafeStoreCustody)
+        ));
+        fs::remove_file(link).unwrap();
+        fs::remove_dir_all(target).unwrap();
     }
     fn draft(id: &str, payload: Value) -> EventDraft {
         EventDraft {

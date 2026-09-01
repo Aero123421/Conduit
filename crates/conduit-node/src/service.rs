@@ -1608,20 +1608,8 @@ impl NodeService {
                     self.supervisor
                         .mark_external_stopped(&agent.runtime_id, pending.exit_code)
                         .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
-                } else if self
-                    .node
-                    .inspect_runtime(&agent.provider_id, &agent.handle)
-                    .is_ok_and(|receipt| {
-                        matches!(receipt.state, RuntimeState::Running | RuntimeState::Paused)
-                    })
-                {
-                    self.node
-                        .signal_runtime(
-                            &agent.provider_id,
-                            &agent.handle,
-                            RuntimeSignal::GracefulStop,
-                        )
-                        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                } else {
+                    self.stop_reconciled_runtime(&agent.provider_id, &agent.handle, false)?;
                 }
             }
             self.finish_agent(
@@ -1776,7 +1764,7 @@ impl NodeService {
                 active.journal_state,
             )
         } else if self.agents.contains_key(operation_id) {
-            let (runtime_id, status) = {
+            let (runtime_id, provider_id, handle, status) = {
                 let agent = self
                     .agents
                     .get_mut(operation_id)
@@ -1785,11 +1773,20 @@ impl NodeService {
                     .child
                     .terminate()
                     .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
-                (agent.runtime_id.clone(), status)
+                (
+                    agent.runtime_id.clone(),
+                    agent.provider_id.clone(),
+                    agent.handle.clone(),
+                    status,
+                )
             };
-            self.supervisor
-                .mark_external_stopped(&runtime_id, status.code())
-                .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+            if matches!(provider_id.as_str(), "native" | "restricted_native") {
+                self.supervisor
+                    .mark_external_stopped(&runtime_id, status.code())
+                    .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+            } else {
+                self.stop_reconciled_runtime(&provider_id, &handle, quarantine)?;
+            }
             let agent = self
                 .agents
                 .remove(operation_id)

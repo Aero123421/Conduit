@@ -106,6 +106,16 @@ effective read-only filesystem boundary. A Reviewer role is rejected by the
 Node unless its Access Scope and every Source revision are read-only and the
 provider is an enforcing Restricted Native, Container, or VM provider.
 
+Exit of an attached Adapter client is not proof that a Container or VM Runtime
+stopped. Before committing an ordinary Agent terminal receipt or completing a
+cancel, the Node signals the owning Provider and confirms a stopped, failed, or
+lost state; inspection failures leave cleanup unconfirmed and fail closed. On
+Node restart, an Agent that lacks a durable attachable protocol session is not
+replayed. The Node fences the exact recorded process identity, records whether
+that fence was confirmed in the `recovery_required` receipt, and keeps an
+unconfirmed or ambiguous fence explicit rather than claiming successful
+cleanup.
+
 ### Runtime identity and idempotency
 
 Every Runtime has a Conduit Runtime ID and immutable Spec digest. Provider objects carry or bind both values.

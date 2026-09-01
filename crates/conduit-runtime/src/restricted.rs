@@ -263,7 +263,12 @@ impl RuntimeProvider for RestrictedNativeProvider {
             return Err(RuntimeError::IdentityMismatch);
         }
         let mut r = self.supervisor.inspect(&h.runtime_id)?;
-        if r.handle.spec_digest != h.spec_digest || r.handle.provider_id != self.provider_id() {
+        if r.handle.spec_digest != h.spec_digest
+            || r.handle.provider_id != self.provider_id()
+            || h.process_identity
+                .as_ref()
+                .is_some_and(|expected| r.handle.process_identity.as_ref() != Some(expected))
+        {
             return Err(RuntimeError::IdentityMismatch);
         }
         r.handle.provider_id = self.provider_id().into();
@@ -383,6 +388,12 @@ mod tests {
             timeout_ms: None,
         };
         let mut interactive = provider.start_interactive(&prepared, &launch).unwrap();
+        let mut wrong_identity = interactive.receipt.handle.clone();
+        wrong_identity.process_identity = Some("pid:1:start:1".into());
+        assert!(matches!(
+            provider.inspect(&wrong_identity),
+            Err(RuntimeError::IdentityMismatch)
+        ));
         let mut stdin = interactive.child.stdin.take().unwrap();
         stdin.write_all(b"{\"event\":\"probe\"}\n").unwrap();
         drop(stdin);

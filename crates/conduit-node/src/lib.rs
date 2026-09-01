@@ -14,7 +14,11 @@ use conduit_runtime::{
     RuntimeRequest, RuntimeState, RuntimeStateReceipt,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -467,24 +471,8 @@ impl Node {
                     .providers
                     .get(&admission.provider_id)
                     .ok_or_else(|| NodeError::Rejected("runtime_provider_unavailable".into()))?;
-                let observed = provider.inspect(&handle);
-                let mut reason = "adapter_process_restart_not_live";
-                if let Ok(receipt) = &observed
-                    && matches!(
-                        receipt.state,
-                        RuntimeState::Running | RuntimeState::Paused | RuntimeState::Stopping
-                    )
-                {
-                    provider
-                        .signal(&receipt.handle, conduit_runtime::RuntimeSignal::ForceStop)
-                        .map_err(|error| NodeError::Runtime(error.to_string()))?;
-                    reason = "adapter_process_fenced_after_node_restart";
-                } else if matches!(
-                    observed,
-                    Err(RuntimeError::IdentityMismatch | RuntimeError::Uncertain(_))
-                ) {
-                    reason = "adapter_process_identity_ambiguous";
-                }
+                let (fence_confirmed, reason) =
+                    fence_agent_after_restart(provider.as_ref(), &handle);
                 let terminal = if operation.state == OperationState::Running {
                     OperationState::RecoveryRequired
                 } else {
@@ -503,7 +491,8 @@ impl Node {
                     "reasonCode": reason,
                     "resultSummary": {
                         "adapterSession": "unrecoverable",
-                        "automaticReplay": false
+                        "automaticReplay": false,
+                        "fenceConfirmed": fence_confirmed
                     },
                     "observedAt": time::OffsetDateTime::now_utc()
                         .format(&time::format_description::well_known::Rfc3339)
@@ -606,6 +595,56 @@ impl Node {
             )?;
         }
         Ok(recovered)
+    }
+}
+
+fn fence_agent_after_restart(
+    provider: &dyn RuntimeProvider,
+    handle: &RuntimeHandle,
+) -> (bool, &'static str) {
+    let observed = match provider.inspect(handle) {
+        Ok(receipt) => receipt,
+        Err(RuntimeError::NotFound) => return (true, "adapter_process_restart_not_live"),
+        Err(RuntimeError::IdentityMismatch | RuntimeError::Uncertain(_)) => {
+            return (false, "adapter_process_identity_ambiguous");
+        }
+        Err(_) => return (false, "adapter_process_inspection_failed"),
+    };
+    if matches!(
+        observed.state,
+        RuntimeState::Stopped | RuntimeState::Failed | RuntimeState::Lost
+    ) {
+        return (true, "adapter_process_restart_not_live");
+    }
+    if provider
+        .signal(&observed.handle, conduit_runtime::RuntimeSignal::ForceStop)
+        .is_err()
+    {
+        return (false, "adapter_process_fence_signal_failed");
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        match provider.inspect(&observed.handle) {
+            Ok(receipt)
+                if matches!(
+                    receipt.state,
+                    RuntimeState::Stopped | RuntimeState::Failed | RuntimeState::Lost
+                ) =>
+            {
+                return (true, "adapter_process_fenced_after_node_restart");
+            }
+            Err(RuntimeError::NotFound) => {
+                return (true, "adapter_process_fenced_after_node_restart");
+            }
+            Err(RuntimeError::IdentityMismatch | RuntimeError::Uncertain(_)) => {
+                return (false, "adapter_process_identity_ambiguous");
+            }
+            Err(_) => return (false, "adapter_process_fence_inspection_failed"),
+            Ok(_) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Ok(_) => return (false, "adapter_process_fence_unconfirmed"),
+        }
     }
 }
 
@@ -798,6 +837,7 @@ mod tests {
         assert_eq!(receipt["state"], "recovery_required");
         assert_eq!(receipt["lastRunEventSequence"], "0");
         assert_eq!(receipt["resultSummary"]["automaticReplay"], false);
+        assert_eq!(receipt["resultSummary"]["fenceConfirmed"], true);
         let digest = receipt["receiptDigest"].as_str().unwrap().to_owned();
         let mut committed = receipt;
         committed.as_object_mut().unwrap().remove("receiptDigest");

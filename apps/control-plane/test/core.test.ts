@@ -8,6 +8,20 @@ import { CLI_CONTROL_PLANE_ROUTE_MANIFEST } from "../src/api.ts";
 import { durableObjectOperationDispatcher, reconcileOperationDispatches, type OperationDispatcher } from "../src/dispatch.ts";
 import { createOperation } from "../src/operations.ts";
 
+function derEcdsaSignature(signature: Uint8Array): Uint8Array {
+  if (signature[0] === 0x30) return signature;
+  if (signature.length !== 64) throw new Error("unexpected WebCrypto ECDSA signature length");
+  const integer = (bytes: Uint8Array): Uint8Array => {
+    let offset = 0;
+    while (offset < bytes.length - 1 && bytes[offset] === 0) offset += 1;
+    const value = bytes.slice(offset);
+    return value[0]! >= 0x80 ? Uint8Array.from([0, ...value]) : value;
+  };
+  const r = integer(signature.slice(0, 32));
+  const s = integer(signature.slice(32));
+  return Uint8Array.from([0x30, 4 + r.length + s.length, 0x02, r.length, ...r, 0x02, s.length, ...s]);
+}
+
 describe.sequential("control-plane contracts", () => {
   beforeAll(async () => {
     const version = await env.DB.prepare("SELECT version FROM schema_versions WHERE component='control_plane'").first<{ version: number }>();
@@ -555,6 +569,71 @@ describe.sequential("control-plane contracts", () => {
     }));
     expect(approved.status).toBe(303);
     expect(new URL(approved.headers.get("location")!).origin).toBe("https://client.example");
+  });
+
+  it("completes a cryptographic passkey step-up and rotates the browser session", async () => {
+    const sessionToken = "browser_passkey_stepup_session_00000001";
+    const csrfToken = "browser_passkey_stepup_csrf_0000000001";
+    const pepper = "test-only-token-pepper-with-at-least-32-bytes";
+    const credentialId = base64url(Uint8Array.from({ length: 32 }, (_, index) => index + 1));
+    const keyPair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]) as CryptoKeyPair;
+    const exportedPublicKey = await crypto.subtle.exportKey("raw", keyPair.publicKey) as ArrayBuffer;
+    const rawPublicKey = new Uint8Array(exportedPublicKey);
+    const cosePublicKey = Uint8Array.from([
+      0xa5, 0x01, 0x02, 0x03, 0x26, 0x20, 0x01,
+      0x21, 0x58, 0x20, ...rawPublicKey.slice(1, 33),
+      0x22, 0x58, 0x20, ...rawPublicKey.slice(33, 65),
+    ]);
+    const old = new Date(Date.now() - 10 * 60_000).toISOString();
+    const expiresAt = new Date(Date.now() + 60_000).toISOString();
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO owner_sessions(id,principal_id,verifier_hash,csrf_hash,kind,status,authenticated_at,fresh_authenticated_at,last_activity_at,expires_at,user_verified) VALUES ('bsess_passkey_stepup01','prin_board_contract',?1,?2,'owner','active',?3,?3,?4,?5,1)")
+        .bind(await keyedHash(pepper, sessionToken), await keyedHash(pepper, csrfToken), old, new Date().toISOString(), expiresAt),
+      env.DB.prepare("INSERT INTO passkeys(id,principal_id,credential_id,public_key,relying_party_id,label,transports_json,sign_count,status,created_at) VALUES ('pkey_stepup_contract01','prin_board_contract',?1,?2,'conduit.example.com','Step-up contract','[\"internal\"]',0,'active',?3)")
+        .bind(credentialId, cosePublicKey, old),
+    ]);
+    const cookie = `__Host-conduit_session=${sessionToken}; __Host-conduit_csrf=${csrfToken}`;
+    const headers = { cookie, origin: "https://conduit.example.com", "x-csrf-token": csrfToken, "content-type": "application/json" };
+    const optionsResponse = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/auth/step-up/options", { method: "POST", headers, body: "{}" }));
+    expect(optionsResponse.status).toBe(200);
+    const ceremony = await optionsResponse.json<{ challengeId: string; options: { challenge: string } }>();
+    const clientDataJSON = new TextEncoder().encode(JSON.stringify({ type: "webauthn.get", challenge: ceremony.options.challenge, origin: "https://conduit.example.com", crossOrigin: false }));
+    const rpIdHash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode("conduit.example.com")));
+    const authenticatorData = Uint8Array.from([...rpIdHash, 0x05, 0, 0, 0, 1]);
+    const clientDataHash = new Uint8Array(await crypto.subtle.digest("SHA-256", clientDataJSON));
+    const signed = Uint8Array.from([...authenticatorData, ...clientDataHash]);
+    const rawSignature = new Uint8Array(await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, keyPair.privateKey, signed));
+    const verify = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/auth/step-up/verify", {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        challengeId: ceremony.challengeId,
+        challenge: ceremony.options.challenge,
+        response: {
+          id: credentialId,
+          rawId: credentialId,
+          type: "public-key",
+          authenticatorAttachment: "platform",
+          clientExtensionResults: {},
+          response: {
+            clientDataJSON: base64url(clientDataJSON),
+            authenticatorData: base64url(authenticatorData),
+            signature: base64url(derEcdsaSignature(rawSignature)),
+            userHandle: null,
+          },
+        },
+      }),
+    }));
+    expect(verify.status, await verify.clone().text()).toBe(200);
+    await expect(verify.json()).resolves.toMatchObject({ principalId: "prin_board_contract", fresh: true });
+    expect(verify.headers.get("set-cookie")).toContain("__Host-conduit_session=");
+    const oldSession = await env.DB.prepare("SELECT status,revoked_at FROM owner_sessions WHERE id='bsess_passkey_stepup01'").first<{ status: string; revoked_at: string | null }>();
+    expect(oldSession).toMatchObject({ status: "revoked", revoked_at: expect.any(String) });
+    const replacement = await env.DB.prepare("SELECT id,status,fresh_authenticated_at FROM owner_sessions WHERE principal_id='prin_board_contract' ORDER BY authenticated_at DESC,id DESC LIMIT 1").first<{ id: string; status: string; fresh_authenticated_at: string | null }>();
+    expect(replacement).toMatchObject({ status: "active", fresh_authenticated_at: expect.any(String) });
+    expect(replacement?.id).not.toBe("bsess_passkey_stepup01");
+    const passkey = await env.DB.prepare("SELECT sign_count,last_used_at FROM passkeys WHERE id='pkey_stepup_contract01'").first<{ sign_count: number; last_used_at: string | null }>();
+    expect(passkey).toMatchObject({ sign_count: 1, last_used_at: expect.any(String) });
   });
 
   it("denies cross-Project MCP reads and conflicting create bindings using stored ownership", async () => {

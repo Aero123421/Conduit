@@ -8,7 +8,11 @@ StartLimitBurst=5
 
 [Service]
 Type=exec
-ExecStart=@BINDIR@/conduit-node serve
+Environment=CONDUIT_DATA_DIR=%h/.local/share/conduit
+Environment=CONDUIT_SOCKET=%t/conduit/node.sock
+Environment=CONDUIT_LAUNCH_PROFILES=%h/.config/conduit/launch-profiles.json
+EnvironmentFile=-%h/.config/conduit/node.env
+ExecStart=@BINDIR@/conduit-node serve --data-dir ${CONDUIT_DATA_DIR} --socket ${CONDUIT_SOCKET} --launch-profiles ${CONDUIT_LAUNCH_PROFILES}
 Restart=on-failure
 RestartSec=2s
 TimeoutStopSec=30s

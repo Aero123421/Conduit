@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -eq 1 && "$1" == "--version" ]]; then
+  echo "conduit @VERSION@"
+  exit 0
+fi
+
+conduit_arguments=" $* "
+if [[ "$conduit_arguments" == *" backup create "* ]]; then
+  echo '{"backupId":"backup_packaging_smoke","schemaVersion":3}'
+  echo create >> "${CONDUIT_TEST_BACKUP_LOG:?}"
+  exit 0
+fi
+if [[ "$conduit_arguments" == *" backup verify "* ]]; then
+  echo verify >> "${CONDUIT_TEST_BACKUP_LOG:?}"
+  if [[ "${CONDUIT_TEST_INVALID_BACKUP:-0}" == 1 ]]; then
+    echo '{"backupId":"backup_packaging_smoke","schemaVersion":3,"verified":false}'
+    exit 0
+  fi
+  echo '{"backupId":"backup_packaging_smoke","schemaVersion":3,"verified":true}'
+  exit 0
+fi
+
+exec "@REAL_CONDUIT@" "$@"

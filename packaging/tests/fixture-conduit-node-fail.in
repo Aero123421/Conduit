@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  exec "@REAL_CONDUIT_NODE@" "$@"
+fi
+
+conduit_data=""
+conduit_previous=""
+for conduit_argument in "$@"; do
+  if [[ "$conduit_previous" == "--data-dir" ]]; then
+    conduit_data="$conduit_argument"
+    break
+  fi
+  conduit_previous="$conduit_argument"
+done
+
+if [[ "$conduit_data" == */probe-data ]]; then
+  exec "@REAL_CONDUIT_NODE@" "$@"
+fi
+if [[ -n "$conduit_data" ]]; then
+  install -d -m 0700 "$conduit_data"
+  printf 'candidate migration reached live state\n' > "$conduit_data/injected-migration"
+fi
+echo "injected candidate start failure" >&2
+exit 70

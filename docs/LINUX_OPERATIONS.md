@@ -93,11 +93,13 @@ configuration and data intact during uninstall. Use `--prefix /absolute/path`
 to select another prefix. The default service is a user service and never opens
 an inbound network port.
 
-Configuration is TOML schema version 1. Start from
-`packaging/conduit.toml.example`, substitute actual absolute XDG paths instead
-of copying the example placeholders literally, and keep the file owner-only.
-Remote control-plane URLs require HTTPS; loopback HTTP is accepted only for
-local development.
+The service invokes the implemented Node interface directly: `conduit-node
+serve --data-dir ... --socket ... --launch-profiles ...`. Installation writes
+an owner-only `~/.config/conduit/node.env` with the effective XDG paths. Start
+from `packaging/conduit-node.env.example` when editing it; this is systemd
+EnvironmentFile syntax, not TOML or shell syntax. `CONDUIT_CONTROL_URL` and
+`CONDUIT_DEVICE_ID` must either both be absent or both be set. The Node requires
+`wss://` for remote transport, including development endpoints.
 
 Useful service commands are:
 
@@ -212,6 +214,36 @@ its databases, completed migrations, reconciled active records, and returned a
 healthy local IPC receipt. On failure, stop the new binary, restore the database
 backup if a migration committed, restore the old binaries, and restart. Never
 downgrade a database by copying an older binary over a newer schema.
+
+Use the transactional updater for an installed Node:
+
+```sh
+cargo build --locked --release --bin conduit --bin conduit-node
+./installers/update.sh
+```
+
+If the service is live, the updater first requires successful `backup create`
+and `backup verify` CLI receipts. A missing or unavailable backup capability
+aborts before the service is stopped. It then stops the service and opens a
+disposable copy of the Node data with the candidate binary; failure to open,
+migrate, or serve IPC is a schema-compatibility failure and leaves live data
+untouched. Candidate binaries and the unit replace their predecessors with
+same-directory renames. The updater restarts the service and requires an
+installed-CLI IPC receipt before committing.
+
+If migration or startup fails after replacement, the updater stops the
+candidate, preserves its failed data, restores the pre-update data copy,
+binaries, unit, and generated configuration, and health-checks the old service.
+Verified backups are retained below `$XDG_DATA_HOME/conduit-backups`; transaction
+receipts, previous binaries, rollback data, and any failed data are owner-only
+below `$XDG_STATE_HOME/conduit/upgrades`. The updater rejects a candidate with a
+lower semantic version. There is no force-downgrade switch: restore a backup
+whose schema is explicitly compatible with the target release.
+
+`installers/uninstall.sh` stops and disables the user service and removes only
+the two binaries and managed unit. XDG configuration, data, state, cache,
+backups, and update evidence remain in place for recovery or explicit operator
+removal.
 
 Control-plane backup uses D1 export plus binding/deployment metadata. R2 object
 backup is a separate custody decision. Durable Object inbox/outbox state is not

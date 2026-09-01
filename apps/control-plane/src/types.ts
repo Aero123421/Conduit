@@ -18,6 +18,17 @@ export type AccessScope =
   | "custom";
 
 export type ApprovalMode = "always" | "outside_scope" | "risk_classes" | "never";
+export type ApprovalRiskClass =
+  | "external_publish"
+  | "secret_access"
+  | "destructive_delete"
+  | "elevation"
+  | "production_deploy"
+  | "device_admin"
+  | "raw_log_export"
+  | "lan_access"
+  | "credential_export"
+  | "runtime_management";
 export type RuntimeKind = "native" | "restricted_native" | "container" | "vm";
 
 export interface AuthActor {

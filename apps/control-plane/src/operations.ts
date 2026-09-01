@@ -3,7 +3,7 @@ import { z } from "zod";
 import { canonicalJson, newId, nowIso, operationDigest, sha256Hex } from "./crypto.ts";
 import { attemptOperationDispatch, durableObjectOperationDispatcher, type OperationDispatcher } from "./dispatch.ts";
 import { PublicError } from "./errors.ts";
-import { authorizeConnector, type PolicyRequest } from "./policy.ts";
+import { ALL_APPROVAL_RISK_CLASSES, authorizeConnector, type ConnectorPolicyAuthoritySnapshot, type PolicyRequest } from "./policy.ts";
 import type { ApprovalMode, AuthActor, ControlPlaneEnv, OperationRequest, RuntimeRequest, SourceRevision, AccessScope } from "./types.ts";
 
 export interface StartOperationInput {
@@ -96,10 +96,44 @@ export async function createOperation(
     ? { ...actor, policyId: OWNER_FIRST_PARTY_POLICY_ID, policyRevision: OWNER_FIRST_PARTY_POLICY_REVISION }
     : actor;
   if (effectiveActor.policyId === undefined || effectiveActor.policyRevision === undefined) throw new PublicError("grant_required", 403, "Operation requires an exact connector policy revision");
-  const stableDigest = await operationDigest({ actorPrincipalId: effectiveActor.principalId, clientId: effectiveActor.clientId, connectorPolicyId: effectiveActor.policyId, connectorPolicyRevision: effectiveActor.policyRevision, ...input });
   const operationId = newId("op");
   const now = new Date();
   const expiresInSeconds = Math.min(Math.max(input.expiresInSeconds ?? 600, 30), 3600);
+  const snapshottedRiskClasses = (snapshot: ConnectorPolicyAuthoritySnapshot | undefined) => {
+    const authoritative = snapshot?.requiredApprovalRiskClasses ?? [];
+    return input.approvalMode === "risk_classes" && authoritative.length === 0
+      ? [...ALL_APPROVAL_RISK_CLASSES]
+      : [...authoritative];
+  };
+  const permission = operationPermission(input.capability);
+  const policyRequest: PolicyRequest = {
+    operation: permission,
+    deviceId: input.deviceId,
+    runtimeKind: input.runtime.kind,
+    accessScope: input.accessScope,
+    approvalMode: input.approvalMode,
+    idempotencyKey: input.idempotencyKey,
+    operationId,
+    payloadDigest: async (snapshot) => operationDigest({
+      actorPrincipalId: effectiveActor.principalId,
+      clientId: effectiveActor.clientId,
+      connectorPolicyId: effectiveActor.policyId,
+      connectorPolicyRevision: effectiveActor.policyRevision,
+      ...input,
+      requiredApprovalRiskClasses: snapshottedRiskClasses(snapshot),
+    }),
+  };
+  if (input.projectId !== undefined) policyRequest.projectId = input.projectId;
+  const authorized = authorization.kind === "connector" ? await authorizeConnector(env, effectiveActor, policyRequest) : undefined;
+  const requiredApprovalRiskClasses = snapshottedRiskClasses(authorized?.authoritySnapshot);
+  const stableDigest = authorized?.payloadDigest ?? await operationDigest({
+    actorPrincipalId: effectiveActor.principalId,
+    clientId: effectiveActor.clientId,
+    connectorPolicyId: effectiveActor.policyId,
+    connectorPolicyRevision: effectiveActor.policyRevision,
+    ...input,
+    requiredApprovalRiskClasses,
+  });
   const requestWithoutDigest: Omit<OperationRequest, "payloadDigest"> = {
     schemaVersion: 1,
     operationId,
@@ -116,6 +150,7 @@ export async function createOperation(
     capability: input.capability,
     accessScope: input.accessScope,
     approvalMode: input.approvalMode,
+    requiredApprovalRiskClasses,
     runtime: input.runtime,
     sourceRevisions: input.sourceRevisions,
     arguments: input.arguments,
@@ -126,10 +161,6 @@ export async function createOperation(
   const digest = await operationDigest(requestWithoutDigest);
   const request: OperationRequest = { ...requestWithoutDigest, payloadDigest: digest };
   parseWireDocument(schemaIds.nodeV1, { protocol: "conduit.node/1", messageId: "cmsg_contract0001", deviceId: input.deviceId, connectionEpoch: "0", direction: "control_to_node", sequence: "1", type: "operation.offer", correlationId: operationId, payloadDigest: await sha256Hex(canonicalJson({ operation: request })), payload: { operation: request } });
-  const permission = operationPermission(input.capability);
-  const policyRequest: PolicyRequest = { operation: permission, deviceId: input.deviceId, runtimeKind: input.runtime.kind, accessScope: input.accessScope, approvalMode: input.approvalMode, idempotencyKey: input.idempotencyKey, operationId, payloadDigest: stableDigest };
-  if (input.projectId !== undefined) policyRequest.projectId = input.projectId;
-  const authorized = authorization.kind === "connector" ? await authorizeConnector(env, effectiveActor, policyRequest) : undefined;
   const idempotencyScope = effectiveActor.grantId ?? `owner:${effectiveActor.principalId}:${effectiveActor.clientId}`;
   const existing = await env.DB.prepare("SELECT operation_id,payload_digest,response_json,state FROM idempotency_records WHERE scope=?1 AND idempotency_key=?2 LIMIT 1").bind(idempotencyScope, input.idempotencyKey).first<{ operation_id: string; payload_digest: string; response_json: string | null; state: string }>();
   if (existing !== null) {

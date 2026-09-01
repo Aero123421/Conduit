@@ -320,6 +320,7 @@ The connector policy limits:
 - runtime providers
 - maximum access scope
 - most permissive approval policy
+- required approval risk classes
 - raw log and raw content access
 - artifact upload and export
 - rate-limit profile
@@ -345,6 +346,10 @@ never
 ```
 
 A run may choose a narrower access scope or a more restrictive approval mode than its connector ceiling. It cannot choose a broader or more permissive value.
+
+For every admitted Connector operation, the Control Plane reads `required_risk_classes_json` from the exact Connector Policy ID and revision bound to the OAuth grant. It validates the value against the ten `RiskClass` values, rejects malformed or duplicate policy state, and copies it to the immutable operation envelope as `requiredApprovalRiskClasses`. The field is not part of the OAuth authorization request, MCP tool input, or operation-intent API input. It is bound into the operation digest, D1 custody record, and durable Device outbox payload.
+
+A non-empty Connector list remains authoritative when the requested approval mode is `never`; the client cannot use that mode to erase required classes. When `risk_classes` is selected and the authoritative list is empty, the operation snapshots all defined risk classes. Owner first-party operations snapshot an empty list for other modes. Later policy revisions do not mutate an operation already in custody.
 
 `custom` access policies are admitted only after the server proves that each requested capability is a subset of the connector, project, and device policies. They are not ranked by name.
 

@@ -452,6 +452,11 @@ components:
         allowedRuntimes: { type: array, maxItems: 4, uniqueItems: true, items: { type: string, enum: [native, restricted_native, container, vm] } }
         maxAccessScope: { type: string, enum: [read_only, selected_sources, project_full, full_user, full_device, custom] }
         mostPermissiveApprovalMode: { type: string, enum: [always, outside_scope, risk_classes, never] }
+        requiredApprovalRiskClasses:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items: { type: string, enum: [external_publish, secret_access, destructive_delete, elevation, production_deploy, device_admin, raw_log_export, lan_access, credential_export, runtime_management] }
         allowRawContent: { type: boolean }
         allowArtifactUpload: { type: boolean }
     JsonRpcRequest:

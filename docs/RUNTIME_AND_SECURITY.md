@@ -68,6 +68,8 @@ Approval policy is evaluated independently from Access Scope.
 - `risk_classes`: ask for configured risk classes
 - `never`: do not ask for operations already inside effective authority
 
+The immutable operation envelope carries the authoritative `requiredApprovalRiskClasses` snapshot. For a Connector this list comes only from the grant-bound Connector Policy revision, never from operation arguments. A non-empty list is a minimum approval requirement even when the requested mode is `never`. If `risk_classes` is selected with an empty authoritative list, all defined risk classes are required so the mode cannot degrade into implicit no-approval behavior.
+
 `full_user + never` and `full_device + never` are valid.
 
 Unsupported platform capabilities, local policy denials, missing elevation, stale revisions, and resource failures remain errors. They are not hidden approval prompts.
@@ -87,7 +89,7 @@ The effective authority is the intersection of:
 
 A narrower layer can deny. A broader layer cannot force another layer to exceed its policy or capability.
 
-The exact actor, client, Device, Run, Source Location, Runtime Spec, arguments, revisions, expiry, and idempotency key are bound into the operation commitment.
+The exact actor, client, Device, Run, Source Location, Runtime Spec, arguments, revisions, required approval risk classes, expiry, and idempotency key are bound into the operation commitment.
 
 ## Owner-controlled Full Access
 

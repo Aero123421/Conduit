@@ -8,6 +8,7 @@ import { CLI_CONTROL_PLANE_ROUTE_MANIFEST } from "../src/api.ts";
 import { durableObjectOperationDispatcher, reconcileOperationDispatches, type OperationDispatcher } from "../src/dispatch.ts";
 import { createOperation } from "../src/operations.ts";
 import { attemptApprovalDispatch, buildApprovalReceipt } from "../src/approval-dispatch.ts";
+import { ALL_APPROVAL_RISK_CLASSES } from "../src/policy.ts";
 
 function derEcdsaSignature(signature: Uint8Array): Uint8Array {
   if (signature[0] === 0x30) return signature;
@@ -235,6 +236,7 @@ describe.sequential("control-plane contracts", () => {
         runtime: { kind: "native", providerId: "native.linux", configurationRevision: 1 },
         accessScope: "full_user",
         approvalMode: "never",
+        requiredApprovalRiskClasses: [],
         connectorPolicyId: "cpol_control_replay01",
         connectorPolicyRevision: 1,
         arguments: { argv: ["true"] },
@@ -356,12 +358,20 @@ describe.sequential("control-plane contracts", () => {
     expect(accepted).toMatchObject({ state: "offered", payloadDigest: expect.stringMatching(/^[a-f0-9]{64}$/) });
     const row = await env.DB.prepare("SELECT client_id,connector_policy_id,connector_policy_revision,connector_grant_id,request_json FROM operation_journal WHERE id=?1 LIMIT 1").bind(accepted.operationId).first<{ client_id: string; connector_policy_id: string; connector_policy_revision: number; connector_grant_id: string | null; request_json: string }>();
     expect(row).toMatchObject({ client_id: "conduit.cli", connector_policy_id: "cpol_owner_first_party_v1", connector_policy_revision: 1, connector_grant_id: null });
-    expect(JSON.parse(row!.request_json)).toMatchObject({ actorPrincipalId: "prin_board_contract", accessScope: "full_user", approvalMode: "never" });
+    expect(JSON.parse(row!.request_json)).toMatchObject({ actorPrincipalId: "prin_board_contract", accessScope: "full_user", approvalMode: "never", requiredApprovalRiskClasses: [] });
     const replay = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/operations", { method: "POST", headers, body: JSON.stringify(body) }));
     await expect(replay.json()).resolves.toMatchObject({ operationId: accepted.operationId, replay: true });
     const malformed = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/operations", { method: "POST", headers: { ...headers, "idempotency-key": "owner-operation-contract-0002" }, body: JSON.stringify({ deviceId: "dev_handshake01", capability: "command.start" }) }));
     expect(malformed.status).toBe(400);
     await expect(malformed.json()).resolves.toMatchObject({ error: { code: "invalid_request" } });
+    const riskClasses = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/operations", { method: "POST", headers: { ...headers, "idempotency-key": "owner-operation-contract-0003" }, body: JSON.stringify({ ...body, approvalMode: "risk_classes" }) }));
+    expect(riskClasses.status).toBe(202);
+    const riskReceipt = await riskClasses.json<Record<string, unknown>>();
+    const riskRow = await env.DB.prepare("SELECT request_json FROM operation_journal WHERE id=?1").bind(riskReceipt.operationId).first<{ request_json: string }>();
+    expect(JSON.parse(riskRow!.request_json)).toMatchObject({ approvalMode: "risk_classes", requiredApprovalRiskClasses: ALL_APPROVAL_RISK_CLASSES });
+    const injected = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/operations", { method: "POST", headers: { ...headers, "idempotency-key": "owner-operation-contract-0004" }, body: JSON.stringify({ ...body, requiredApprovalRiskClasses: [] }) }));
+    expect(injected.status).toBe(400);
+    await expect(injected.json()).resolves.toMatchObject({ error: { code: "invalid_request" } });
   });
 
   it("recovers a DeviceRoom RPC throw from the durable dispatch row", async () => {
@@ -629,8 +639,60 @@ describe.sequential("control-plane contracts", () => {
     expect(discovered).toMatchObject({ jsonrpc: "2.0", id: 1, result: { supportedVersions: ["2026-07-28"] } });
     const tools = await call(2, "tools/list", {});
     expect(tools).toMatchObject({ result: { tools: expect.arrayContaining([expect.objectContaining({ name: "project_get" }), expect.objectContaining({ name: "quick_command_start" }), expect.objectContaining({ name: "runtime_vm_lifecycle" })]) } });
+    expect(JSON.stringify(tools)).not.toContain("requiredApprovalRiskClasses");
     const project = await call(3, "tools/call", { name: "project_get", arguments: { projectId: "prj_board_contract", requestKey: "mcp-project-read-000001" } });
     expect(project).toMatchObject({ result: { structuredContent: { id: "prj_board_contract", name: "Board" } } });
+    const injected = await call(4, "tools/call", { name: "quick_command_start", arguments: { idempotencyKey: "mcp-risk-injection-000001", deviceId: "dev_handshake01", runtime: { kind: "native", providerId: "native.linux", configurationRevision: 1 }, accessScope: "read_only", approvalMode: "always", sourceRevisions: [], arguments: {}, requiredApprovalRiskClasses: [] } });
+    expect(JSON.stringify(injected)).toContain("Unrecognized key");
+  });
+
+  it("snapshots grant-bound required approval risks into immutable operation custody", async () => {
+    const now = new Date().toISOString();
+    const clientId = "https://client.example/risk-snapshot";
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO oauth_clients(client_id,registration_mechanism,client_name,redirect_uris_json,token_endpoint_auth_method,metadata_digest,status,created_at,updated_at) VALUES (?1,'pre_registered','Risk snapshot','[\"https://client.example/risk-callback\"]','none',?2,'active',?3,?3)").bind(clientId, "e".repeat(64), now),
+      env.DB.prepare("INSERT INTO connector_policies(id,principal_id,client_id,revision,status,device_selector_json,project_selector_json,allowed_operations_json,allowed_runtimes_json,max_access_scope,most_permissive_approval_mode,required_risk_classes_json,allow_raw_content,allow_artifact_upload,rate_limit_profile_id,max_command_seconds,max_run_seconds,created_at,updated_at) VALUES ('cpol_risk_snapshot01','prin_board_contract',?1,1,'active','{\"mode\":\"all\"}','{\"mode\":\"all\"}','[\"command.start\"]','[\"native\"]','full_user','never','[\"secret_access\",\"runtime_management\"]',0,0,'rate_mcp_contract01',60,600,?2,?2)").bind(clientId, now),
+      env.DB.prepare("INSERT INTO connector_policies(id,principal_id,client_id,revision,status,device_selector_json,project_selector_json,allowed_operations_json,allowed_runtimes_json,max_access_scope,most_permissive_approval_mode,required_risk_classes_json,allow_raw_content,allow_artifact_upload,rate_limit_profile_id,max_command_seconds,max_run_seconds,created_at,updated_at) VALUES ('cpol_risk_empty0001','prin_board_contract',?1,1,'active','{\"mode\":\"all\"}','{\"mode\":\"all\"}','[\"command.start\"]','[\"native\"]','full_user','never','[]',0,0,'rate_mcp_contract01',60,600,?2,?2)").bind(clientId, now),
+    ]);
+    const base = {
+      deviceId: "dev_handshake01",
+      capability: "command.start",
+      runtime: { kind: "native" as const, providerId: "native.linux", configurationRevision: 1 },
+      accessScope: "full_user" as const,
+      sourceRevisions: [],
+      arguments: { argv: ["true"] },
+    };
+    const actor = { principalId: "prin_board_contract", clientId, grantId: "grant_risk_snapshot01", policyId: "cpol_risk_snapshot01", policyRevision: 1, scopes: ["conduit.run.start"] };
+    const never = await createOperation(env, actor, { ...base, idempotencyKey: "risk-snapshot-never-0001", approvalMode: "never" });
+    const riskClasses = await createOperation(env, actor, { ...base, idempotencyKey: "risk-snapshot-classes-001", approvalMode: "risk_classes" });
+    const rows = await env.DB.prepare("SELECT id,request_json,payload_digest FROM operation_journal WHERE id IN (?1,?2) ORDER BY id").bind(never.operationId, riskClasses.operationId).all<{ id: string; request_json: string; payload_digest: string }>();
+    expect(rows.results).toHaveLength(2);
+    for (const row of rows.results) {
+      const request = JSON.parse(row.request_json) as Record<string, unknown>;
+      expect(request).toMatchObject({ connectorPolicyId: "cpol_risk_snapshot01", connectorPolicyRevision: 1, requiredApprovalRiskClasses: ["secret_access", "runtime_management"] });
+      expect(row.payload_digest).toBe(request.payloadDigest);
+      const outbox = await env.DB.prepare("SELECT payload_json FROM operation_dispatch_outbox WHERE operation_id=?1").bind(row.id).first<{ payload_json: string }>();
+      expect(JSON.parse(outbox!.payload_json)).toMatchObject({ operation: { requiredApprovalRiskClasses: ["secret_access", "runtime_management"], payloadDigest: row.payload_digest } });
+      const { payloadDigest: _payloadDigest, ...withoutDigest } = request;
+      expect(await operationDigest({ ...withoutDigest, requiredApprovalRiskClasses: ["destructive_delete"] })).not.toBe(row.payload_digest);
+    }
+
+    const emptyActor = { ...actor, grantId: "grant_risk_empty0001", policyId: "cpol_risk_empty0001" };
+    const conservative = await createOperation(env, emptyActor, { ...base, idempotencyKey: "risk-snapshot-empty-00001", approvalMode: "risk_classes" });
+    const conservativeRow = await env.DB.prepare("SELECT request_json FROM operation_journal WHERE id=?1").bind(conservative.operationId).first<{ request_json: string }>();
+    expect(JSON.parse(conservativeRow!.request_json)).toMatchObject({ requiredApprovalRiskClasses: ALL_APPROVAL_RISK_CLASSES });
+
+    const firstRequest = JSON.parse(rows.results[0]!.request_json) as Record<string, unknown>;
+    await env.DB.prepare("UPDATE connector_policies SET revision=2,required_risk_classes_json='[\"destructive_delete\"]' WHERE id='cpol_risk_snapshot01'").run();
+    const revisedActor = { ...actor, grantId: "grant_risk_snapshot02", policyRevision: 2 };
+    const revised = await createOperation(env, revisedActor, { ...base, idempotencyKey: "risk-snapshot-revision-0001", approvalMode: "never" });
+    const revisedRow = await env.DB.prepare("SELECT request_json FROM operation_journal WHERE id=?1").bind(revised.operationId).first<{ request_json: string }>();
+    expect(JSON.parse(revisedRow!.request_json)).toMatchObject({ connectorPolicyRevision: 2, requiredApprovalRiskClasses: ["destructive_delete"] });
+    const retained = await env.DB.prepare("SELECT request_json FROM operation_journal WHERE id=?1").bind(rows.results[0]!.id).first<{ request_json: string }>();
+    expect(JSON.parse(retained!.request_json)).toEqual(firstRequest);
+
+    await env.DB.prepare("UPDATE connector_policies SET required_risk_classes_json='[\"secret_access\",\"secret_access\"]' WHERE id='cpol_risk_snapshot01'").run();
+    await expect(createOperation(env, revisedActor, { ...base, idempotencyKey: "risk-snapshot-tamper-00001", approvalMode: "never" })).rejects.toMatchObject({ code: "grant_reauthorization_required", status: 403 });
   });
 
   it("completes standard OAuth consent in a browser without connector_policy_id or custom headers", async () => {
@@ -909,18 +971,18 @@ describe.sequential("control-plane contracts", () => {
         "if-match": '"1"',
         "content-type": "application/json",
       },
-      body: JSON.stringify({ maxAccessScope: "read_only" }),
+      body: JSON.stringify({ maxAccessScope: "read_only", requiredApprovalRiskClasses: ["secret_access"] }),
     }));
     const first = await request();
     expect(first.status).toBe(200);
     expect(first.headers.get("etag")).toBe('"2"');
-    await expect(first.json()).resolves.toMatchObject({ id: "cpol_mcp_contract01", revision: 2, maxAccessScope: "read_only" });
+    await expect(first.json()).resolves.toMatchObject({ id: "cpol_mcp_contract01", revision: 2, maxAccessScope: "read_only", requiredApprovalRiskClasses: ["secret_access"] });
     const replay = await request();
     expect(replay.status).toBe(200);
     expect(replay.headers.get("etag")).toBe('"2"');
     await expect(replay.json()).resolves.toMatchObject({ id: "cpol_mcp_contract01", revision: 2, replay: true });
-    const stored = await env.DB.prepare("SELECT revision FROM connector_policies WHERE id='cpol_mcp_contract01'").first<{ revision: number }>();
-    expect(stored?.revision).toBe(2);
+    const stored = await env.DB.prepare("SELECT revision,required_risk_classes_json FROM connector_policies WHERE id='cpol_mcp_contract01'").first<{ revision: number; required_risk_classes_json: string }>();
+    expect(stored).toEqual({ revision: 2, required_risk_classes_json: '["secret_access"]' });
   });
 
   it("replays connector-policy creation with the original generated effect", async () => {
@@ -933,6 +995,7 @@ describe.sequential("control-plane contracts", () => {
       allowedRuntimes: ["native"],
       maxAccessScope: "read_only",
       mostPermissiveApprovalMode: "always",
+      requiredApprovalRiskClasses: ["raw_log_export"],
       rateLimitProfileId: "rate_mcp_contract01",
     };
     const request = () => exports.default.fetch(new Request("https://conduit.example.com/api/v1/connector-policies", {
@@ -948,12 +1011,25 @@ describe.sequential("control-plane contracts", () => {
     }));
     const first = await request();
     expect(first.status).toBe(201);
-    await expect(first.json()).resolves.toMatchObject({ id: "cpol_create_contract01", revision: 1 });
+    await expect(first.json()).resolves.toMatchObject({ id: "cpol_create_contract01", revision: 1, requiredApprovalRiskClasses: ["raw_log_export"] });
     const replay = await request();
     expect(replay.status).toBe(200);
     await expect(replay.json()).resolves.toMatchObject({ id: "cpol_create_contract01", revision: 1, replay: true });
     const rows = await env.DB.prepare("SELECT COUNT(*) AS count FROM connector_policies WHERE id='cpol_create_contract01'").first<{ count: number }>();
     expect(rows?.count).toBe(1);
+    const duplicate = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/connector-policies", {
+      method: "POST",
+      headers: {
+        cookie: "__Host-conduit_session=browser_grant_session_token_0000000001",
+        origin: "https://conduit.example.com",
+        "x-csrf-token": "browser_grant_csrf_token_000000000001",
+        "idempotency-key": "policy-create-duplicate-0001",
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({ ...body, id: "cpol_duplicate_risks01", requiredApprovalRiskClasses: ["secret_access", "secret_access"] }),
+    }));
+    expect(duplicate.status).toBe(400);
+    await expect(duplicate.json()).resolves.toMatchObject({ error: { code: "invalid_request" } });
   });
 
   it("operates Task links, owner grant reads, and owner CLI token lifecycle", async () => {

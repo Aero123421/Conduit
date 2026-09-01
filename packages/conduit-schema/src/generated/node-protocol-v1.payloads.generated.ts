@@ -35,6 +35,17 @@ export type AssignmentId = string;
 export type RuntimeKind = "native" | "restricted_native" | "container" | "vm";
 export type AccessScope = "read_only" | "selected_sources" | "project_full" | "full_user" | "full_device" | "custom";
 export type ApprovalMode = "always" | "outside_scope" | "risk_classes" | "never";
+export type RiskClass =
+  | "external_publish"
+  | "secret_access"
+  | "destructive_delete"
+  | "elevation"
+  | "production_deploy"
+  | "device_admin"
+  | "raw_log_export"
+  | "lan_access"
+  | "credential_export"
+  | "runtime_management";
 export type Timestamp = string;
 export type TerminalState =
   | "completed"
@@ -191,6 +202,10 @@ export interface OperationEnvelope {
   runtime: RuntimeRequest;
   accessScope: AccessScope;
   approvalMode: ApprovalMode;
+  /**
+   * @maxItems 32
+   */
+  requiredApprovalRiskClasses: RiskClass[];
   connectorPolicyId: string;
   connectorPolicyRevision: number;
   arguments: {

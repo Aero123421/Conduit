@@ -64,6 +64,15 @@ describe("schema-derived wire documents", () => {
     }
   });
 
+  it("keeps the Node approval risk vocabulary identical to Auth v1", async () => {
+    const [auth, node] = await Promise.all([
+      readJson(`${repositoryRoot}/spec/schemas/auth-v1.schema.json`),
+      readJson(`${repositoryRoot}/spec/schemas/node-protocol-v1.schema.json`),
+    ]) as Array<{ $defs: Record<string, { enum?: unknown[] }> }>;
+    expect(node!.$defs.RiskClass?.enum).toEqual(auth!.$defs.RiskClass?.enum);
+    expect(node!.$defs.RiskClass?.enum).toHaveLength(10);
+  });
+
   it("preserves node frame type and payload discrimination", () => {
     type OfferFrame = Extract<
       NodeV1WireDocument,
@@ -177,6 +186,7 @@ interface InvalidFixture {
 }
 
 const validationReason = {
+  duplicate_item: "uniqueItems",
   invalid_digest: "pattern",
   malformed_id: "pattern",
   unknown_schema_version: "const",
@@ -191,7 +201,7 @@ describe("invalid wire fixtures", () => {
       .filter((fileName) => fileName.endsWith(".json"))
       .sort();
 
-    expect(fileNames).toHaveLength(5);
+    expect(fileNames).toHaveLength(6);
     for (const fileName of fileNames) {
       const fixture = (await readJson(
         `${directory}/${fileName}`,

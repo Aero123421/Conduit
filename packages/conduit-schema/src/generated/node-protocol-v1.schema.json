@@ -88,6 +88,21 @@
       "type": "string",
       "enum": ["always", "outside_scope", "risk_classes", "never"]
     },
+    "RiskClass": {
+      "type": "string",
+      "enum": [
+        "external_publish",
+        "secret_access",
+        "destructive_delete",
+        "elevation",
+        "production_deploy",
+        "device_admin",
+        "raw_log_export",
+        "lan_access",
+        "credential_export",
+        "runtime_management"
+      ]
+    },
     "OperationState": {
       "type": "string",
       "enum": [
@@ -264,6 +279,7 @@
         "runtime",
         "accessScope",
         "approvalMode",
+        "requiredApprovalRiskClasses",
         "connectorPolicyId",
         "connectorPolicyRevision",
         "arguments",
@@ -292,6 +308,12 @@
         "runtime": { "$ref": "#/$defs/RuntimeRequest" },
         "accessScope": { "$ref": "#/$defs/AccessScope" },
         "approvalMode": { "$ref": "#/$defs/ApprovalMode" },
+        "requiredApprovalRiskClasses": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/RiskClass" }
+        },
         "connectorPolicyId": { "type": "string", "pattern": "^cpol_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
         "connectorPolicyRevision": { "type": "integer", "minimum": 1 },
         "arguments": { "type": "object", "maxProperties": 128 },

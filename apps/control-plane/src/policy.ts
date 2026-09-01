@@ -2,7 +2,7 @@ import { boundedString, boundedStringArray, readJsonBounded, record } from "./bo
 import { canonicalJson, newId, nowIso, operationDigest } from "./crypto.ts";
 import { PublicError } from "./errors.ts";
 import { completeEffect, reserveEffect } from "./idempotency.ts";
-import type { AccessScope, ApprovalMode, AuthActor, ControlPlaneEnv, RuntimeKind } from "./types.ts";
+import type { AccessScope, ApprovalMode, ApprovalRiskClass, AuthActor, ControlPlaneEnv, RuntimeKind } from "./types.ts";
 import type { LimitAdmission } from "./do/connector-limiter.ts";
 import { requireBrowserSession } from "./auth/browser.ts";
 
@@ -31,6 +31,19 @@ interface Selector { mode: "all" | "ids"; ids?: string[]; }
 
 const scopeRank: Record<Exclude<AccessScope, "custom">, number> = { read_only: 0, selected_sources: 1, project_full: 2, full_user: 3, full_device: 4 };
 const approvalRank: Record<ApprovalMode, number> = { always: 0, outside_scope: 1, risk_classes: 2, never: 3 };
+export const ALL_APPROVAL_RISK_CLASSES: readonly ApprovalRiskClass[] = Object.freeze([
+  "external_publish",
+  "secret_access",
+  "destructive_delete",
+  "elevation",
+  "production_deploy",
+  "device_admin",
+  "raw_log_export",
+  "lan_access",
+  "credential_export",
+  "runtime_management",
+]);
+const approvalRiskClasses = new Set<ApprovalRiskClass>(ALL_APPROVAL_RISK_CLASSES);
 const scopeForOperation: Record<string, string> = {
   "project.read": "conduit.read", "session.read": "conduit.read", "board.read": "conduit.read", "run.read": "conduit.read",
   "board.write": "conduit.board.write", "assignment.create": "conduit.board.write", "run.start": "conduit.run.start", "command.start": "conduit.run.start",
@@ -56,15 +69,43 @@ export interface PolicyRequest {
   runSeconds?: number;
   idempotencyKey: string;
   operationId: string;
-  payloadDigest: string;
+  payloadDigest: string | ((snapshot: ConnectorPolicyAuthoritySnapshot) => Promise<string>);
   responseBytes?: number;
   normalizedLogBytes?: number;
   rawLogBytes?: number;
 }
 
-export interface AuthorizedPolicy { policy: PolicyRow; rate: RateProfileRow; }
+export interface ConnectorPolicyAuthoritySnapshot {
+  connectorPolicyId: string;
+  connectorPolicyRevision: number;
+  requiredApprovalRiskClasses: readonly ApprovalRiskClass[];
+}
+
+export interface AuthorizedPolicy {
+  policy: PolicyRow;
+  rate: RateProfileRow;
+  authoritySnapshot: Readonly<ConnectorPolicyAuthoritySnapshot>;
+  payloadDigest: string;
+}
 
 function deny(code: ConstructorParameters<typeof PublicError>[0], message: string): never { throw new PublicError(code, code === "rate_limited" ? 429 : 403, message); }
+
+function parseApprovalRiskClasses(value: unknown, code: "invalid_request" | "grant_reauthorization_required"): ApprovalRiskClass[] {
+  if (!Array.isArray(value) || value.length > 32 || value.some((item) => typeof item !== "string" || !approvalRiskClasses.has(item as ApprovalRiskClass))) {
+    throw new PublicError(code, code === "invalid_request" ? 400 : 403, "requiredApprovalRiskClasses is invalid");
+  }
+  if (new Set(value).size !== value.length) throw new PublicError(code, code === "invalid_request" ? 400 : 403, "requiredApprovalRiskClasses must be unique");
+  return value as ApprovalRiskClass[];
+}
+
+function parseStoredApprovalRiskClasses(json: string): ApprovalRiskClass[] {
+  try {
+    return parseApprovalRiskClasses(JSON.parse(json), "grant_reauthorization_required");
+  } catch (error) {
+    if (error instanceof PublicError) throw error;
+    throw new PublicError("grant_reauthorization_required", 403, "Connector policy risk-class snapshot is invalid");
+  }
+}
 
 export async function authorizeConnector(env: ControlPlaneEnv, actor: AuthActor, request: PolicyRequest): Promise<AuthorizedPolicy> {
   const requiredScope = scopeForOperation[request.operation];
@@ -85,6 +126,13 @@ export async function authorizeConnector(env: ControlPlaneEnv, actor: AuthActor,
   if (request.rawContent && policy.allow_raw_content !== 1) deny("connector_ceiling_exceeded", "Raw content is not permitted by connector policy");
   if ((request.artifactUploadBytes ?? 0) > 0 && policy.allow_artifact_upload !== 1) deny("connector_ceiling_exceeded", "Artifact upload is not permitted by connector policy");
   if ((request.commandSeconds ?? 0) > policy.max_command_seconds || (request.runSeconds ?? 0) > policy.max_run_seconds) deny("connector_ceiling_exceeded", "Requested duration exceeds connector ceiling");
+  const authoritySnapshot: Readonly<ConnectorPolicyAuthoritySnapshot> = Object.freeze({
+    connectorPolicyId: policy.id,
+    connectorPolicyRevision: policy.revision,
+    requiredApprovalRiskClasses: Object.freeze(parseStoredApprovalRiskClasses(policy.required_risk_classes_json)),
+  });
+  const payloadDigest = typeof request.payloadDigest === "string" ? request.payloadDigest : await request.payloadDigest(authoritySnapshot);
+  if (!/^[a-f0-9]{64}$/.test(payloadDigest)) throw new TypeError("Connector admission payload digest must be SHA-256 hex");
   const rate = await env.DB.prepare("SELECT id,revision,status,profile_json FROM rate_limit_profiles WHERE id=?1 AND status='active' LIMIT 1").bind(policy.rate_limit_profile_id).first<RateProfileRow>();
   if (rate === null) deny("rate_limited", "Connector rate profile is unavailable");
   const profile = JSON.parse(rate.profile_json) as Record<string, unknown>;
@@ -97,7 +145,7 @@ export async function authorizeConnector(env: ControlPlaneEnv, actor: AuthActor,
   const admission: LimitAdmission = {
     operationId: request.operationId,
     idempotencyKey: request.idempotencyKey,
-    payloadDigest: request.payloadDigest,
+    payloadDigest,
     family,
     weight: Number(weights[request.operation] ?? 1),
     requestLimit: Number(window.limit ?? 0),
@@ -113,7 +161,7 @@ export async function authorizeConnector(env: ControlPlaneEnv, actor: AuthActor,
   };
   const decision = await env.CONNECTOR_LIMITERS.getByName(actor.grantId).admit(admission);
   if (!decision.allowed) throw new PublicError(decision.code === "idempotency_conflict" ? "idempotency_conflict" : decision.code, decision.code === "idempotency_conflict" ? 409 : 429, `Connector limit denied: ${decision.limitClass}`, decision.retryAfterSeconds);
-  return { policy, rate };
+  return { policy, rate, authoritySnapshot, payloadDigest };
 }
 
 function operationFamily(operation: string): string {
@@ -158,11 +206,12 @@ async function createPolicy(request: Request, env: ControlPlaneEnv): Promise<Res
   const projectSelector = record(body.projectSelector, "projectSelector");
   const operations = boundedStringArray(body.allowedOperations, "allowedOperations", 128, 128);
   const runtimes = boundedStringArray(body.allowedRuntimes, "allowedRuntimes", 4, 32);
+  const requiredApprovalRiskClasses = parseApprovalRiskClasses(body.requiredApprovalRiskClasses ?? [], "invalid_request");
   const rateId = boundedString(body.rateLimitProfileId, "rateLimitProfileId", 128);
-  const snapshot = { ...body, id, principalId: session.principal_id, revision: 1 };
+  const snapshot = { ...body, requiredApprovalRiskClasses, id, principalId: session.principal_id, revision: 1 };
   const now = nowIso();
   await env.DB.batch([
-    env.DB.prepare("INSERT INTO connector_policies(id,principal_id,client_id,revision,status,device_selector_json,project_selector_json,allowed_operations_json,allowed_runtimes_json,max_access_scope,most_permissive_approval_mode,required_risk_classes_json,allow_raw_content,allow_artifact_upload,rate_limit_profile_id,max_command_seconds,max_run_seconds,expires_at,created_at,updated_at) VALUES (?1,?2,?3,1,'active',?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?17)").bind(id, session.principal_id, clientId, JSON.stringify(deviceSelector), JSON.stringify(projectSelector), JSON.stringify(operations), JSON.stringify(runtimes), maxScope, approval, JSON.stringify(body.requiredApprovalRiskClasses ?? []), body.allowRawContent === true ? 1 : 0, body.allowArtifactUpload === true ? 1 : 0, rateId, Number(body.maxCommandSeconds ?? 1800), Number(body.maxRunSeconds ?? 86400), body.expiresAt ?? null, now),
+    env.DB.prepare("INSERT INTO connector_policies(id,principal_id,client_id,revision,status,device_selector_json,project_selector_json,allowed_operations_json,allowed_runtimes_json,max_access_scope,most_permissive_approval_mode,required_risk_classes_json,allow_raw_content,allow_artifact_upload,rate_limit_profile_id,max_command_seconds,max_run_seconds,expires_at,created_at,updated_at) VALUES (?1,?2,?3,1,'active',?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?17)").bind(id, session.principal_id, clientId, JSON.stringify(deviceSelector), JSON.stringify(projectSelector), JSON.stringify(operations), JSON.stringify(runtimes), maxScope, approval, JSON.stringify(requiredApprovalRiskClasses), body.allowRawContent === true ? 1 : 0, body.allowArtifactUpload === true ? 1 : 0, rateId, Number(body.maxCommandSeconds ?? 1800), Number(body.maxRunSeconds ?? 86400), body.expiresAt ?? null, now),
     env.DB.prepare("INSERT INTO connector_policy_history(policy_id,revision,snapshot_json,changed_by_principal_id,change_reason,created_at) VALUES (?1,1,?2,?3,'created',?4)").bind(id, canonicalJson(snapshot), session.principal_id, now),
   ]);
   await repo.audit("connector_policy.created", { id, clientId, maxScope, approval }, session.principal_id, clientId);
@@ -207,15 +256,17 @@ async function updatePolicy(request: Request, env: ControlPlaneEnv, id: string):
   const projectSelector = body.projectSelector === undefined ? JSON.parse(current.project_selector_json) : record(body.projectSelector, "projectSelector");
   const operations = body.allowedOperations === undefined ? JSON.parse(current.allowed_operations_json) as string[] : boundedStringArray(body.allowedOperations, "allowedOperations", 128, 128);
   const runtimes = body.allowedRuntimes === undefined ? JSON.parse(current.allowed_runtimes_json) as string[] : boundedStringArray(body.allowedRuntimes, "allowedRuntimes", 4, 32);
+  const currentRequiredApprovalRiskClasses = parseStoredApprovalRiskClasses(current.required_risk_classes_json);
+  const requiredApprovalRiskClasses = body.requiredApprovalRiskClasses === undefined ? currentRequiredApprovalRiskClasses : parseApprovalRiskClasses(body.requiredApprovalRiskClasses, "invalid_request");
   const allowRaw = body.allowRawContent === undefined ? current.allow_raw_content === 1 : body.allowRawContent === true;
   const allowArtifact = body.allowArtifactUpload === undefined ? current.allow_artifact_upload === 1 : body.allowArtifactUpload === true;
-  const broadening = (maxScope !== "custom" && current.max_access_scope !== "custom" && scopeRank[maxScope] > scopeRank[current.max_access_scope]) || approvalRank[approval] > approvalRank[current.most_permissive_approval_mode] || (!current.allow_raw_content && allowRaw) || (!current.allow_artifact_upload && allowArtifact) || operations.some((item) => !(JSON.parse(current.allowed_operations_json) as string[]).includes(item)) || runtimes.some((item) => !(JSON.parse(current.allowed_runtimes_json) as string[]).includes(item));
+  const broadening = (maxScope !== "custom" && current.max_access_scope !== "custom" && scopeRank[maxScope] > scopeRank[current.max_access_scope]) || approvalRank[approval] > approvalRank[current.most_permissive_approval_mode] || currentRequiredApprovalRiskClasses.some((item) => !requiredApprovalRiskClasses.includes(item)) || (!current.allow_raw_content && allowRaw) || (!current.allow_artifact_upload && allowArtifact) || operations.some((item) => !(JSON.parse(current.allowed_operations_json) as string[]).includes(item)) || runtimes.some((item) => !(JSON.parse(current.allowed_runtimes_json) as string[]).includes(item));
   if (broadening) repo.requireFresh(session);
   const revision = expected + 1;
-  const snapshot = { id, revision, maxAccessScope: maxScope, mostPermissiveApprovalMode: approval, deviceSelector, projectSelector, allowedOperations: operations, allowedRuntimes: runtimes, allowRawContent: allowRaw, allowArtifactUpload: allowArtifact };
+  const snapshot = { id, revision, maxAccessScope: maxScope, mostPermissiveApprovalMode: approval, requiredApprovalRiskClasses, deviceSelector, projectSelector, allowedOperations: operations, allowedRuntimes: runtimes, allowRawContent: allowRaw, allowArtifactUpload: allowArtifact };
   const now = nowIso();
   const results = await env.DB.batch([
-    env.DB.prepare("UPDATE connector_policies SET revision=?1,device_selector_json=?2,project_selector_json=?3,allowed_operations_json=?4,allowed_runtimes_json=?5,max_access_scope=?6,most_permissive_approval_mode=?7,allow_raw_content=?8,allow_artifact_upload=?9,updated_at=?10 WHERE id=?11 AND principal_id=?12 AND revision=?13").bind(revision, JSON.stringify(deviceSelector), JSON.stringify(projectSelector), JSON.stringify(operations), JSON.stringify(runtimes), maxScope, approval, allowRaw ? 1 : 0, allowArtifact ? 1 : 0, now, id, session.principal_id, expected),
+    env.DB.prepare("UPDATE connector_policies SET revision=?1,device_selector_json=?2,project_selector_json=?3,allowed_operations_json=?4,allowed_runtimes_json=?5,max_access_scope=?6,most_permissive_approval_mode=?7,required_risk_classes_json=?8,allow_raw_content=?9,allow_artifact_upload=?10,updated_at=?11 WHERE id=?12 AND principal_id=?13 AND revision=?14").bind(revision, JSON.stringify(deviceSelector), JSON.stringify(projectSelector), JSON.stringify(operations), JSON.stringify(runtimes), maxScope, approval, JSON.stringify(requiredApprovalRiskClasses), allowRaw ? 1 : 0, allowArtifact ? 1 : 0, now, id, session.principal_id, expected),
     env.DB.prepare("INSERT INTO connector_policy_history(policy_id,revision,snapshot_json,changed_by_principal_id,change_reason,created_at) SELECT ?1,?2,?3,?4,?5,?6 WHERE EXISTS (SELECT 1 FROM connector_policies WHERE id=?1 AND revision=?2)").bind(id, revision, canonicalJson(snapshot), session.principal_id, broadening ? "broadened" : "updated", now),
     env.DB.prepare("UPDATE oauth_grants SET status='reauthorization_required' WHERE connector_policy_id=?1 AND connector_policy_revision=?2 AND status IN ('active','paused')").bind(id, expected),
     env.DB.prepare("UPDATE oauth_tokens SET revoked_at=?1 WHERE grant_id IN (SELECT id FROM oauth_grants WHERE connector_policy_id=?2 AND status='reauthorization_required') AND revoked_at IS NULL").bind(now, id),

@@ -180,6 +180,71 @@ describe.sequential("control-plane contracts", () => {
     await expect(malformed.json()).resolves.toMatchObject({ error: { code: "invalid_request" } });
   });
 
+  it("serves typed MCP tools through an OAuth policy and exact limiter", async () => {
+    const token = "mcp_contract_access_token_00000000000001";
+    const now = new Date().toISOString();
+    const expires = new Date(Date.now() + 60_000).toISOString();
+    const profile = {
+      requestWindows: {
+        read: { limit: 100, windowSeconds: 60 },
+        boardWrite: { limit: 100, windowSeconds: 60 },
+        commandStart: { limit: 100, windowSeconds: 60 },
+        agentRunStart: { limit: 100, windowSeconds: 60 },
+        runtimeStart: { limit: 100, windowSeconds: 60 },
+        approvalResolve: { limit: 100, windowSeconds: 60 },
+        rawLogRead: { limit: 100, windowSeconds: 60 },
+      },
+      weightedBudget: { capacity: 100, refillPerSecond: 10, weights: {} },
+      bytes: { responseBytes: 1_048_576, normalizedLogBytesPerDay: 1_048_576, rawLogBytesPerDay: 0, artifactUploadBytesPerDay: 0 },
+      concurrency: { commands: 2, agentRuns: 2, runtimeStarts: 1 },
+    };
+    const clientId = "https://client.example/mcp-contract";
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO oauth_clients(client_id,registration_mechanism,client_name,redirect_uris_json,token_endpoint_auth_method,metadata_digest,status,created_at,updated_at) VALUES (?1,'pre_registered','MCP contract','[\"https://client.example/callback\"]','none',?2,'active',?3,?3)").bind(clientId, "a".repeat(64), now),
+      env.DB.prepare("INSERT INTO rate_limit_profiles(id,revision,status,name,profile_json,created_at,updated_at) VALUES ('rate_mcp_contract01',1,'active','MCP contract',?1,?2,?2)").bind(JSON.stringify(profile), now),
+      env.DB.prepare("INSERT INTO connector_policies(id,principal_id,client_id,revision,status,device_selector_json,project_selector_json,allowed_operations_json,allowed_runtimes_json,max_access_scope,most_permissive_approval_mode,required_risk_classes_json,allow_raw_content,allow_artifact_upload,rate_limit_profile_id,max_command_seconds,max_run_seconds,created_at,updated_at) VALUES ('cpol_mcp_contract01','prin_board_contract',?1,1,'active','{\"mode\":\"all\"}','{\"mode\":\"all\"}',?2,'[\"native\",\"restricted_native\",\"container\",\"vm\"]','project_full','always','[]',0,0,'rate_mcp_contract01',60,600,?3,?3)").bind(clientId, JSON.stringify(["project.read", "session.read", "board.read", "run.read"]), now),
+      env.DB.prepare("INSERT INTO oauth_grants(id,principal_id,client_id,resource,scopes_json,connector_policy_id,connector_policy_revision,token_family_id,status,created_at,expires_at) VALUES ('grant_mcp_contract01','prin_board_contract',?1,'https://conduit.example.com/mcp','[\"conduit.read\"]','cpol_mcp_contract01',1,'family_mcp_contract01','active',?2,?3)").bind(clientId, now, expires),
+      env.DB.prepare("INSERT INTO oauth_tokens(id,grant_id,token_family_id,kind,verifier_hash,resource,scopes_json,issued_at,expires_at) VALUES ('tok_mcp_contract01','grant_mcp_contract01','family_mcp_contract01','access',?1,'https://conduit.example.com/mcp','[\"conduit.read\"]',?2,?3)").bind(await keyedHash("test-only-token-pepper-with-at-least-32-bytes", token), now, expires),
+    ]);
+    const call = async (id: number, method: string, params: Record<string, unknown>) => {
+      const protocolVersion = "2026-07-28";
+      const headers: Record<string, string> = {
+        authorization: `Bearer ${token}`,
+        accept: "application/json, text/event-stream",
+        "content-type": "application/json",
+        "MCP-Protocol-Version": protocolVersion,
+        "Mcp-Method": method,
+      };
+      if (method === "tools/call" && typeof params.name === "string") headers["Mcp-Name"] = params.name;
+      const response = await exports.default.fetch(new Request("https://conduit.example.com/mcp", {
+        method: "POST",
+        headers,
+        body: JSON.stringify({
+          jsonrpc: "2.0",
+          id,
+          method,
+          params: {
+            ...params,
+            _meta: {
+              "io.modelcontextprotocol/protocolVersion": protocolVersion,
+              "io.modelcontextprotocol/clientInfo": { name: "conduit-test", version: "1" },
+              "io.modelcontextprotocol/clientCapabilities": {},
+            },
+          },
+        }),
+      }));
+      const text = await response.text();
+      expect(response.status, text).toBe(200);
+      return JSON.parse(text) as Record<string, unknown>;
+    };
+    const discovered = await call(1, "server/discover", {});
+    expect(discovered).toMatchObject({ jsonrpc: "2.0", id: 1, result: { supportedVersions: ["2026-07-28"] } });
+    const tools = await call(2, "tools/list", {});
+    expect(tools).toMatchObject({ result: { tools: expect.arrayContaining([expect.objectContaining({ name: "project_get" }), expect.objectContaining({ name: "quick_command_start" }), expect.objectContaining({ name: "runtime_vm_lifecycle" })]) } });
+    const project = await call(3, "tools/call", { name: "project_get", arguments: { projectId: "prj_board_contract", requestKey: "mcp-project-read-000001" } });
+    expect(project).toMatchObject({ result: { structuredContent: { id: "prj_board_contract", name: "Board" } } });
+  });
+
   it("enforces limiter idempotency and digest conflicts", async () => {
     const limiter = env.CONNECTOR_LIMITERS.getByName("grant-test");
     const base = { operationId: "op_test_00000001", idempotencyKey: "same-operation", payloadDigest: "a".repeat(64), family: "commandStart", weight: 2, requestLimit: 2, windowSeconds: 60, capacity: 10, refillPerSecond: 1, responseBytes: 10, normalizedLogBytes: 0, rawLogBytes: 0, artifactUploadBytes: 0, byteLimits: { response: 1000, normalizedDaily: 1000, rawDaily: 0, artifactDaily: 0 }, nowMs: 1_788_192_000_000 };

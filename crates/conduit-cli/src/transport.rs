@@ -23,7 +23,7 @@ use crate::{
 
 const MAX_TOKEN_BYTES: usize = 8 * 1024;
 const MAX_HTTP_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
-const MAX_IPC_FRAME_BYTES: usize = 4 * 1024 * 1024;
+const MAX_IPC_FRAME_BYTES: usize = 1024 * 1024;
 
 pub(crate) struct ControlPlaneClient {
     base: Url,
@@ -121,45 +121,29 @@ impl NodeIpcClient {
         let request_id = uuid::Uuid::now_v7().to_string();
         let value = json!({
             "version": 1,
-            "requestId": request_id,
+            "request_id": request_id,
             "method": invocation.route,
             "params": invocation.body.clone().unwrap_or_else(|| json!({})),
             "revision": invocation.revision,
-            "idempotencyKey": invocation.idempotency_key,
+            "idempotency_key": invocation.idempotency_key,
         });
-        let mut frame = serde_json::to_vec(&value)?;
-        frame.push(b'\n');
-        if frame.len() > MAX_IPC_FRAME_BYTES {
-            return Err(CliError::Usage(format!(
-                "local IPC request exceeds {MAX_IPC_FRAME_BYTES} bytes"
-            )));
-        }
-        stream.write_all(&frame)?;
-        stream.flush()?;
-
-        let mut response = Vec::new();
-        stream
-            .take((MAX_IPC_FRAME_BYTES + 1) as u64)
-            .read_to_end(&mut response)?;
-        if response.len() > MAX_IPC_FRAME_BYTES {
-            return Err(CliError::Unavailable(
-                "node IPC response exceeded the bounded frame limit".to_owned(),
-            ));
-        }
-        let value: Value = serde_json::from_slice(&response)?;
-        if value.get("requestId").and_then(Value::as_str) != Some(&request_id) {
+        write_ipc_frame(&mut stream, &value)?;
+        let value = read_ipc_frame(&mut stream)?;
+        if value.get("request_id").and_then(Value::as_str) != Some(&request_id) {
             return Err(CliError::Unavailable(
                 "node IPC response correlation mismatch".to_owned(),
             ));
         }
         if value.get("ok").and_then(Value::as_bool) != Some(true) {
-            let code = value
-                .pointer("/error/code")
+            let error = value.get("error");
+            let code = error
+                .and_then(|error| error.get("code"))
                 .and_then(Value::as_str)
                 .unwrap_or("node_error");
-            let message = value
-                .pointer("/error/message")
+            let message = error
+                .and_then(|error| error.get("message"))
                 .and_then(Value::as_str)
+                .or_else(|| error.and_then(Value::as_str))
                 .unwrap_or("node rejected the operation");
             return Err(CliError::Denied(format!("{code}: {}", bound(message, 512))));
         }
@@ -239,7 +223,46 @@ fn validate_socket_custody(path: &PathBuf) -> Result<(), CliError> {
             "node IPC socket failed owner/type/mode custody checks".to_owned(),
         ));
     }
+    let parent = path.parent().ok_or_else(|| {
+        CliError::Denied("node IPC socket has no parent custody directory".to_owned())
+    })?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if !parent_metadata.is_dir()
+        || parent_metadata.uid() != rustix::process::geteuid().as_raw()
+        || parent_metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(CliError::Denied(
+            "node IPC parent directory must be owner-only and non-symlinked".to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn write_ipc_frame(stream: &mut impl Write, value: &Value) -> Result<(), CliError> {
+    let body = serde_json::to_vec(value)?;
+    if body.len() > MAX_IPC_FRAME_BYTES {
+        return Err(CliError::Usage(format!(
+            "local IPC request exceeds {MAX_IPC_FRAME_BYTES} bytes"
+        )));
+    }
+    stream.write_all(&(body.len() as u32).to_be_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn read_ipc_frame(stream: &mut impl Read) -> Result<Value, CliError> {
+    let mut length = [0_u8; 4];
+    stream.read_exact(&mut length)?;
+    let length = u32::from_be_bytes(length) as usize;
+    if length > MAX_IPC_FRAME_BYTES {
+        return Err(CliError::Unavailable(
+            "node IPC response exceeded the bounded frame limit".to_owned(),
+        ));
+    }
+    let mut body = vec![0_u8; length];
+    stream.read_exact(&mut body)?;
+    serde_json::from_slice(&body).map_err(CliError::from)
 }
 
 fn decode_http_response(response: Response) -> Result<Value, CliError> {
@@ -311,5 +334,26 @@ mod tests {
     fn token_validation_never_accepts_header_injection() {
         assert!(validate_token("secret\r\nInjected: yes".to_owned()).is_err());
         assert!(validate_token("bounded-token".to_owned()).is_ok());
+    }
+
+    #[test]
+    fn ipc_uses_one_bounded_big_endian_length_frame() {
+        let value = json!({"request_id":"req_12345678","ok":true});
+        let mut bytes = Vec::new();
+        write_ipc_frame(&mut bytes, &value).unwrap();
+        assert_eq!(
+            u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize,
+            bytes.len() - 4
+        );
+        assert_eq!(read_ipc_frame(&mut bytes.as_slice()).unwrap(), value);
+    }
+
+    #[test]
+    fn ipc_rejects_oversized_response_before_allocating_body() {
+        let bytes = ((MAX_IPC_FRAME_BYTES + 1) as u32).to_be_bytes();
+        assert!(matches!(
+            read_ipc_frame(&mut bytes.as_slice()),
+            Err(CliError::Unavailable(_))
+        ));
     }
 }

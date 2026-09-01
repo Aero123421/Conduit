@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "protocol": "conduit.node/1",
+  "type": "record.batch",
+  "messageId": "msg_batchterm01",
+  "connectionId": "conn_example0001",
+  "connectionEpoch": 7,
+  "sequence": 20,
+  "sentAt": "2026-09-01T09:10:01Z",
+  "payload": {
+    "firstRecordSeq": 100,
+    "lastRecordSeq": 100,
+    "records": [
+      {
+        "recordContract": "conduit.node-record/1",
+        "recordId": "nrec_example0100",
+        "recordSeq": 100,
+        "recordType": "operation.terminal",
+        "createdAt": "2026-09-01T09:10:00Z",
+        "bodySha256": "0969c2769e865d5b769b6b3a508cbff0163f785419b798212a4e22f9846f51f8",
+        "body": {
+          "core": {
+            "operationId": "op_example0001",
+            "executionId": "exec_example0001",
+            "payloadDigest": "798daac77f5206a93dcf75c6466bf0361138a67800550505de29b3adefc1641a",
+            "terminalState": "completed",
+            "finishedAt": "2026-09-01T09:10:00Z",
+            "resultSummary": {
+              "changeSetId": "changeset-example-1",
+              "testsPassed": 18,
+              "testsFailed": 0
+            }
+          },
+          "receiptDigest": "6ecb57ee7c890074045ee8cf03524a1b074ca6455d7df75f5788ca5023422467",
+          "deviceSignature": {
+            "keyId": "dkey_example0001",
+            "algorithm": "Ed25519",
+            "signedDigest": "6ecb57ee7c890074045ee8cf03524a1b074ca6455d7df75f5788ca5023422467",
+            "signature": "_iIxyt0DXUR6PFwKwT66Tud3zc9_1Zhx6aaX62AMtvl1azPKgRb0bv0dU_goYhoNriN-UIYMqxMU0KivSD-5CA"
+          }
+        }
+      }
+    ]
+  }
+}

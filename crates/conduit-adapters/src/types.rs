@@ -59,6 +59,40 @@ pub enum EffectiveApprovalPolicy {
     Never,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveAccessScope {
+    ReadOnly,
+    SelectedSources,
+    ProjectFull,
+    FullUser,
+    FullDevice,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveSandboxPolicy {
+    ReadOnly,
+    External,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl TryFrom<&str> for EffectiveAccessScope {
+    type Error = AdapterError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "read_only" => Ok(Self::ReadOnly),
+            "selected_sources" => Ok(Self::SelectedSources),
+            "project_full" | "full_project" => Ok(Self::ProjectFull),
+            "full_user" => Ok(Self::FullUser),
+            "full_device" => Ok(Self::FullDevice),
+            _ => Err(AdapterError::InvalidAccessScope),
+        }
+    }
+}
+
 impl TryFrom<&str> for EffectiveApprovalPolicy {
     type Error = AdapterError;
 
@@ -281,6 +315,8 @@ pub enum AdapterError {
     VersionProbeTimeout,
     #[error("working directory must be absolute")]
     RelativeWorkingDirectory,
+    #[error("effective access scope is invalid")]
+    InvalidAccessScope,
     #[error("session data directory must be absolute")]
     RelativeSessionDirectory,
     #[error("prompt exceeds the {maximum} byte adapter limit")]

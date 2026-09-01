@@ -15,8 +15,9 @@ use crate::{
     driver::ProtocolDriver,
     types::{
         AdapterCapability, AdapterError, AdapterKind, AdapterOperation, AdapterProbe,
-        AdapterProtocol, ApprovalContext, AuthenticationState, LaunchRequest, LaunchSpec,
-        MAX_VERSION_OUTPUT_BYTES, SupportLevel, bound_utf8, validate_launch_request,
+        AdapterProtocol, ApprovalContext, AuthenticationState, EffectiveAccessScope,
+        EffectiveSandboxPolicy, LaunchRequest, LaunchSpec, MAX_VERSION_OUTPUT_BYTES, SupportLevel,
+        bound_utf8, validate_launch_request,
     },
 };
 
@@ -212,6 +213,47 @@ impl AdapterCatalog {
         Self::launch_resolved(kind, request, executable, approval_context)
     }
 
+    pub fn launch_with_authority_context(
+        kind: AdapterKind,
+        request: &LaunchRequest,
+        access_scope: EffectiveAccessScope,
+        approval_context: ApprovalContext,
+    ) -> Result<(LaunchSpec, ProtocolDriver), AdapterError> {
+        validate_launch_request(request)?;
+        let profile = Self::profile(kind);
+        let executable = find_executable(profile.executable)
+            .ok_or(AdapterError::ExecutableUnavailable(profile.executable))?;
+        Self::launch_resolved_with_authority(
+            kind,
+            request,
+            executable,
+            access_scope,
+            EffectiveSandboxPolicy::ReadOnly,
+            approval_context,
+        )
+    }
+
+    pub fn launch_with_effective_authority(
+        kind: AdapterKind,
+        request: &LaunchRequest,
+        access_scope: EffectiveAccessScope,
+        sandbox_policy: EffectiveSandboxPolicy,
+        approval_context: ApprovalContext,
+    ) -> Result<(LaunchSpec, ProtocolDriver), AdapterError> {
+        validate_launch_request(request)?;
+        let profile = Self::profile(kind);
+        let executable = find_executable(profile.executable)
+            .ok_or(AdapterError::ExecutableUnavailable(profile.executable))?;
+        Self::launch_resolved_with_authority(
+            kind,
+            request,
+            executable,
+            access_scope,
+            sandbox_policy,
+            approval_context,
+        )
+    }
+
     /// Builds the fixed Device-owned guest image contract without claiming
     /// that a host executable proves guest availability. Provider start/exec
     /// remains the effective per-Runtime probe.
@@ -232,15 +274,75 @@ impl AdapterCatalog {
         Self::launch_resolved(kind, request, executable, approval_context)
     }
 
+    pub fn launch_in_guest_with_authority_context(
+        kind: AdapterKind,
+        request: &LaunchRequest,
+        access_scope: EffectiveAccessScope,
+        approval_context: ApprovalContext,
+    ) -> Result<(LaunchSpec, ProtocolDriver), AdapterError> {
+        validate_launch_request(request)?;
+        let executable = PathBuf::from("/usr/local/bin").join(Self::profile(kind).executable);
+        Self::launch_resolved_with_authority(
+            kind,
+            request,
+            executable,
+            access_scope,
+            EffectiveSandboxPolicy::ReadOnly,
+            approval_context,
+        )
+    }
+
+    pub fn launch_in_guest_with_effective_authority(
+        kind: AdapterKind,
+        request: &LaunchRequest,
+        access_scope: EffectiveAccessScope,
+        sandbox_policy: EffectiveSandboxPolicy,
+        approval_context: ApprovalContext,
+    ) -> Result<(LaunchSpec, ProtocolDriver), AdapterError> {
+        validate_launch_request(request)?;
+        let executable = PathBuf::from("/usr/local/bin").join(Self::profile(kind).executable);
+        Self::launch_resolved_with_authority(
+            kind,
+            request,
+            executable,
+            access_scope,
+            sandbox_policy,
+            approval_context,
+        )
+    }
+
     fn launch_resolved(
         kind: AdapterKind,
         request: &LaunchRequest,
         executable: PathBuf,
         approval_context: ApprovalContext,
     ) -> Result<(LaunchSpec, ProtocolDriver), AdapterError> {
+        Self::launch_resolved_with_authority(
+            kind,
+            request,
+            executable,
+            EffectiveAccessScope::ReadOnly,
+            EffectiveSandboxPolicy::ReadOnly,
+            approval_context,
+        )
+    }
+
+    fn launch_resolved_with_authority(
+        kind: AdapterKind,
+        request: &LaunchRequest,
+        executable: PathBuf,
+        access_scope: EffectiveAccessScope,
+        sandbox_policy: EffectiveSandboxPolicy,
+        approval_context: ApprovalContext,
+    ) -> Result<(LaunchSpec, ProtocolDriver), AdapterError> {
         let profile = Self::profile(kind);
-        let mut driver =
-            ProtocolDriver::new_with_approval_context(kind, request, approval_context)?;
+        let mut driver = ProtocolDriver::new_with_authority_context(
+            kind,
+            request,
+            access_scope,
+            sandbox_policy,
+            approval_context,
+        )?;
         let args = launch_args(kind, request)?;
         let initial_frames = driver.start()?;
         Ok((

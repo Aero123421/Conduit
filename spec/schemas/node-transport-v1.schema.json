@@ -1,0 +1,11 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conduit.dev/spec/schemas/node-transport-v1.schema.json",
+  "title": "Conduit node transport frame v1",
+  "oneOf": [
+    { "$ref": "node-handshake-v1.schema.json" },
+    { "$ref": "node-operation-v1.schema.json" },
+    { "$ref": "node-reconciliation-v1.schema.json" },
+    { "$ref": "node-control-v1.schema.json" }
+  ]
+}

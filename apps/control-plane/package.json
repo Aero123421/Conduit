@@ -5,11 +5,16 @@
   "type": "module",
   "scripts": {
     "check": "npm run types:check && npm run typecheck && npm test && npm run deploy:check",
+    "predeploy:check": "corepack pnpm --filter @conduit/schema build",
     "deploy:check": "wrangler deploy --dry-run --outdir .wrangler/dry-run",
+    "predev": "corepack pnpm --filter @conduit/schema build",
     "dev": "wrangler dev --local",
     "migrate:local": "wrangler d1 migrations apply conduit-control-plane --local",
+    "pretest": "corepack pnpm --filter @conduit/schema build",
     "test": "vitest run",
+    "pretest:e2e": "corepack pnpm --filter @conduit/schema build",
     "test:e2e": "vitest run test/core.test.ts",
+    "pretypecheck": "corepack pnpm --filter @conduit/schema build",
     "typecheck": "tsc --noEmit",
     "types": "wrangler types worker-configuration.d.ts",
     "types:check": "wrangler types worker-configuration.d.ts --check"

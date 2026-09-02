@@ -1,0 +1,100 @@
+{
+  "schemaVersion": 1,
+  "kind": "runtime_request",
+  "runtimeId": "rt_vm_claude_review_01",
+  "runId": "run_claude_review_01",
+  "runtimeKind": "vm",
+  "providerSelector": "incus.kvm",
+  "configurationRevision": 3,
+  "requiredCapabilities": [
+    {
+      "capabilityId": "isolation.vm_boundary",
+      "requirement": "required"
+    },
+    {
+      "capabilityId": "execution.guest_exec",
+      "requirement": "required"
+    },
+    {
+      "capabilityId": "workspace.read_only_mount",
+      "requirement": "required"
+    },
+    {
+      "capabilityId": "privilege.guest_root",
+      "requirement": "required"
+    },
+    {
+      "capabilityId": "lifecycle.snapshot",
+      "requirement": "preferred"
+    }
+  ],
+  "workspaceAttachments": [
+    {
+      "sourceId": "src_conduit_repo_01",
+      "locationId": "loc_sahur_conduit_01",
+      "locationRevision": 3,
+      "workspaceMode": "read_only",
+      "hostPath": {
+        "reference": "pathref_conduit_review_01",
+        "displayPath": "Conduit review workspace"
+      },
+      "guestPath": "/workspace/primary",
+      "access": "read_only",
+      "ownershipMode": "mapped",
+      "contentDigest": "905920194c03bc39bccda1ed69e153f25593379b000000000000000000000000",
+      "cleanupPolicy": "archive"
+    }
+  ],
+  "credentialProjections": [
+    {
+      "profileId": "cred_claude_project_01",
+      "revision": 1,
+      "adapterId": "claude-code",
+      "projectionType": "guest_volume",
+      "targetReference": "claude-code-credential-volume",
+      "access": "read_write",
+      "lifetime": "project",
+      "persistChanges": true
+    }
+  ],
+  "resources": {
+    "cpu": 4,
+    "memoryBytes": 17179869184,
+    "pidLimit": 2048,
+    "storageBytes": 85899345920,
+    "gpuCount": 0,
+    "gpuSelectors": []
+  },
+  "network": {
+    "mode": "restricted",
+    "allowedDomains": [
+      "api.anthropic.com",
+      "github.com",
+      "objects.githubusercontent.com"
+    ],
+    "allowedCidrs": [],
+    "allowedLanTargets": [],
+    "publishedPorts": []
+  },
+  "environmentDigest": "a762bcc507a6e340e3df1d9500712503238136f021a0d7eaccea6e44a53997b4",
+  "imageReference": "images:ubuntu/24.04/cloud",
+  "lifecycle": {
+    "onTerminal": "snapshot_and_stop",
+    "archiveAfterSeconds": 604800,
+    "destroyAfterSeconds": 2592000,
+    "pinned": false
+  },
+  "accessScope": "selected_sources",
+  "approvalMode": "never",
+  "providerOptions": {
+    "incusProject": "conduit-prj-conduit-01",
+    "guestPrivilege": "root",
+    "workspaceMechanismPreference": [
+      "virtiofs",
+      "managed_volume",
+      "copy"
+    ],
+    "guestAgentRequired": true
+  },
+  "requestDigest": "1c6b91c02dc57710c888b9bd34b2af007ddbbf564c04711012289ae1678cc552"
+}

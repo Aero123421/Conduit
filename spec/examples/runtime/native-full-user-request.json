@@ -1,0 +1,81 @@
+{
+  "schemaVersion": 1,
+  "kind": "runtime_request",
+  "runtimeId": "rt_native_codex_01",
+  "runId": "run_conduit_codex_01",
+  "runtimeKind": "native",
+  "providerSelector": "native.linux",
+  "configurationRevision": 1,
+  "requiredCapabilities": [
+    {
+      "capabilityId": "execution.exact_argv",
+      "requirement": "required"
+    },
+    {
+      "capabilityId": "execution.process_tree_tracking",
+      "requirement": "required"
+    },
+    {
+      "capabilityId": "resource.memory_limit",
+      "requirement": "preferred"
+    }
+  ],
+  "workspaceAttachments": [
+    {
+      "sourceId": "src_conduit_repo_01",
+      "locationId": "loc_sahur_conduit_01",
+      "locationRevision": 3,
+      "workspaceMode": "worktree",
+      "hostPath": {
+        "reference": "pathref_conduit_run_01",
+        "displayPath": "~/Conduit worktree"
+      },
+      "guestPath": "/workspace/primary",
+      "access": "read_write",
+      "ownershipMode": "host",
+      "contentDigest": "905920194c03bc39bccda1ed69e153f25593379b000000000000000000000000",
+      "cleanupPolicy": "retain"
+    }
+  ],
+  "credentialProjections": [
+    {
+      "profileId": "cred_codex_personal_01",
+      "revision": 2,
+      "adapterId": "codex",
+      "projectionType": "native_host",
+      "targetReference": "codex-host-login",
+      "access": "read_write",
+      "lifetime": "run",
+      "persistChanges": true
+    }
+  ],
+  "resources": {
+    "cpu": 4,
+    "memoryBytes": 8589934592,
+    "pidLimit": 512,
+    "storageBytes": 21474836480,
+    "gpuCount": 0,
+    "gpuSelectors": []
+  },
+  "network": {
+    "mode": "open",
+    "allowedDomains": [],
+    "allowedCidrs": [],
+    "allowedLanTargets": [],
+    "publishedPorts": []
+  },
+  "environmentDigest": "5154c58bc6abec2c3393d34f630950ea3b9cb7d20f999ac6f5b4f8ab1ecdfdb5",
+  "lifecycle": {
+    "onTerminal": "stop",
+    "archiveAfterSeconds": 604800,
+    "destroyAfterSeconds": 2592000,
+    "pinned": false
+  },
+  "accessScope": "full_user",
+  "approvalMode": "never",
+  "providerOptions": {
+    "systemdScope": true,
+    "workingUser": "signed_in_user"
+  },
+  "requestDigest": "e429a8529208d78604dc8eaa4c6937135ee8aa9ad20cf4eb0fed49371981d987"
+}

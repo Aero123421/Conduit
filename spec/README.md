@@ -22,13 +22,13 @@ python scripts/validate_spec.py
 
 `schemas/auth-v1.schema.json` contains:
 
-- owner and passkey metadata
+- owner and Passkey metadata
 - browser-session metadata
 - OAuth client registrations and grants
-- connector ceilings
+- Connector ceilings
 - exact application rate-limit profiles
-- device enrollment and public-key records
-- bounded security events
+- Device enrollment and public-key records
+- bounded security Events
 
 The prose contract is `docs/AUTHORIZATION.md`.
 
@@ -36,12 +36,12 @@ The prose contract is `docs/AUTHORIZATION.md`.
 
 `schemas/node-protocol-v1.schema.json` contains:
 
-- device hello, challenge, proof, and accepted connection records
+- Device hello, challenge, proof, and accepted connection records
 - persistent connection epochs and directional sequence numbers
 - operation offer, admission, state, input, approval, cancellation, and terminal receipts
-- trace-v1 event batches and explicit retention gaps
+- Trace-v1 Event batches and explicit retention gaps
 - reconciliation summary, plan, and completion records
-- bounded device health and protocol errors
+- bounded Device health and protocol errors
 
 Examples are under `examples/node-protocol/`.
 
@@ -53,7 +53,7 @@ The prose contract is `docs/NODE_PROTOCOL.md`.
 
 - immutable Run Manifests
 - per-input Context Snapshots
-- normalized device Events with evidence, sensitivity, retention, and chain commitments
+- normalized Device Events with evidence, sensitivity, retention, and chain commitments
 - Content Objects and raw Segment descriptors
 - opaque trace cursors
 - instruction and Skill catalogs needed for later evaluation
@@ -61,3 +61,18 @@ The prose contract is `docs/NODE_PROTOCOL.md`.
 Examples are under `examples/trace/`.
 
 The prose contract is `docs/TRACE_FORMAT.md`.
+
+## Runtime v1
+
+`schemas/runtime-v1.schema.json` contains:
+
+- Native, Restricted Native, Container, and VM Runtime requests
+- effective Capability Receipts
+- Run Workspace and Credential Projection records
+- prepared and live Runtime receipts
+- CPU, memory, PID, storage, GPU, and network observations
+- Snapshot, collection, destroy, and reconciliation receipts
+
+Examples are under `examples/runtime/`.
+
+The prose contract is `docs/RUNTIME_PROVIDER.md`.

@@ -19,6 +19,7 @@ EXAMPLE_SCHEMAS = {
     "auth": "https://conduit.dev/spec/schemas/auth-v1.schema.json",
     "node-protocol": "https://conduit.dev/spec/schemas/node-protocol-v1.schema.json",
     "trace": "https://conduit.dev/spec/schemas/trace-v1.schema.json",
+    "runtime": "https://conduit.dev/spec/schemas/runtime-v1.schema.json",
 }
 
 

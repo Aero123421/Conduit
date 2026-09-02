@@ -344,6 +344,39 @@ impl<M: SystemdManager> HelperEngine<M> {
         Ok(receipts)
     }
 
+    /// Complete custody for an admitted/prepared Runtime which never acquired
+    /// a systemd unit. This is used only by the explicit local-root
+    /// stop-active recovery path; it cannot terminate or relabel a process.
+    pub fn cancel_unstarted_for_admin(&self, runtime_id: &str) -> Result<HelperReceipt> {
+        let runtime = self
+            .journal
+            .runtime(runtime_id)?
+            .ok_or_else(|| HelperError::Denied("privileged_runtime_not_prepared".into()))?;
+        if !matches!(runtime.state.as_str(), "admitted" | "prepared")
+            || runtime.invocation_id.is_some()
+            || runtime.main_pid.is_some()
+        {
+            return Err(HelperError::RecoveryRequired(
+                "active_runtime_identity_missing".into(),
+            ));
+        }
+        if self.systemd.inspect_optional(&runtime.unit_name)?.is_some() {
+            return Err(HelperError::RecoveryRequired(
+                "active_runtime_identity_mismatch".into(),
+            ));
+        }
+        let receipt = self.receipt(
+            &runtime.authority_ticket,
+            "admin_stop_unstarted",
+            "cancelled",
+            None,
+            runtime.state_revision + 1,
+        )?;
+        self.journal
+            .record_observation(&receipt, "stopped", None, None)?;
+        Ok(receipt)
+    }
+
     /// Reconcile durable root custody with systemd before the server exposes
     /// an admission socket. Callers must treat any error as a startup failure.
     pub fn reconcile_before_admission(&self) -> Result<Vec<HelperReceipt>> {
@@ -3036,6 +3069,35 @@ mod tests {
                 .state,
             "recovery_required"
         );
+    }
+
+    #[test]
+    fn local_root_stop_can_close_prepared_custody_without_a_unit() {
+        let (engine, backend, plan, issuer, receipt_key) = setup();
+        engine
+            .prepare(
+                ticket(
+                    &engine,
+                    &issuer,
+                    &plan,
+                    PrivilegedOperation::Prepare,
+                    "ptkt_admin_cancel_prepared",
+                ),
+                plan.clone(),
+                vec![],
+            )
+            .unwrap();
+        assert_eq!(engine.journal.active_runtime_count().unwrap(), 1);
+        assert!(
+            backend
+                .inspect_optional(&plan.systemd_unit)
+                .unwrap()
+                .is_none()
+        );
+        let receipt = engine.cancel_unstarted_for_admin(&plan.runtime_id).unwrap();
+        assert_eq!(receipt.claims.transition, "cancelled");
+        receipt.verify(receipt_key.as_bytes()).unwrap();
+        assert_eq!(engine.journal.active_runtime_count().unwrap(), 0);
     }
 
     #[test]

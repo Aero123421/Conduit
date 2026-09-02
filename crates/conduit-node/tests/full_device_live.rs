@@ -317,12 +317,12 @@ fn never_denied() {
 
 fn never_allowed() {
     let evidence = evidence_dir();
-    let (runtime, bundle, issuer) = connect("full-device-live-node-never-allowed");
+    let (runtime, bundle, _issuer) = connect("full-device-live-node-never-allowed");
     let provider = runtime.provider();
     let (plan, request) = case_plan(
         "never_allowed",
         existing(&["/usr/bin/sleep", "/bin/sleep"]),
-        vec!["sleep".into(), "30".into()],
+        vec!["sleep".into(), "1".into()],
         StdioMode::Pipes,
         30_000_000,
         &evidence,
@@ -357,32 +357,31 @@ fn never_allowed() {
     let prepared = provider
         .prepare_privileged(&request, prepare_ticket, plan.clone())
         .unwrap();
-    let started = provider
-        .start_privileged(
-            &prepared.runtime,
-            ticket_with_approval(
-                &issuer,
-                &bundle,
-                &plan,
-                &request,
-                PrivilegedOperation::Start,
-                "ptkt_live_never_allowed_start",
-                "never",
-            ),
-            &plan,
-        )
-        .unwrap();
-    assert_eq!(started.final_helper_receipt().claims.effective_uid, Some(0));
-    let stopped = stop(
-        &provider,
-        &issuer,
+    let (start_result, _) = control_plane_ticket_result(
         &bundle,
+        &identity,
         &plan,
         &request,
-        &started.runtime.handle,
-        RuntimeSignal::GracefulStop,
-        "ptkt_live_never_allowed_stop",
+        &manifest_digest,
+        &operation_digest,
+        PrivilegedOperation::Start,
+        true,
     );
+    let start_ticket: PrivilegeTicket =
+        serde_json::from_value(start_result["ticket"].clone()).unwrap();
+    let started = provider
+        .start_privileged(&prepared.runtime, start_ticket, &plan)
+        .unwrap();
+    assert_eq!(started.final_helper_receipt().claims.effective_uid, Some(0));
+    let stopped = loop {
+        let receipt = provider
+            .inspect_privileged(&started.runtime.handle)
+            .unwrap();
+        if receipt.runtime.state == RuntimeState::Stopped {
+            break receipt;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
     let local_denial = read_json(&evidence.join("never-local-denial.json"));
     write_json(
         &evidence.join("never-summary.json"),

@@ -1264,8 +1264,31 @@ fn stop_active_runtimes(
         .iter()
         .map(|runtime| (runtime.runtime_id.clone(), runtime.state_revision + 1))
         .collect::<BTreeMap<_, _>>();
+    let signing = load_receipt_key_root_owned(&state.join("receipt.key"))?;
+    let config = HelperConfig::load_policy_root_owned(
+        policy_path,
+        node_path,
+        key_id("hkey", signing.verifying_key().as_bytes()),
+        state.to_path_buf(),
+        env::current_exe()?,
+    )?;
+    let engine = HelperEngine::new(
+        config,
+        PinnedTicketKeys::load_root_owned(keys_path)?,
+        signing,
+        helper,
+        SystemdBackend::connect_system()?,
+    )?;
     let mut units_to_stop = Vec::new();
+    let mut receipts = Vec::new();
     for runtime in &runtimes {
+        if matches!(runtime.state.as_str(), "admitted" | "prepared")
+            && runtime.invocation_id.is_none()
+            && runtime.main_pid.is_none()
+        {
+            receipts.push(engine.cancel_unstarted_for_admin(&runtime.runtime_id)?);
+            continue;
+        }
         let observation = backend.inspect(&runtime.unit_name).map_err(|_| {
             conduit_privileged_helper::HelperError::RecoveryRequired(
                 "active_runtime_identity_missing".into(),
@@ -1302,22 +1325,7 @@ fn stop_active_runtimes(
             }
         }
     }
-    let signing = load_receipt_key_root_owned(&state.join("receipt.key"))?;
-    let config = HelperConfig::load_policy_root_owned(
-        policy_path,
-        node_path,
-        key_id("hkey", signing.verifying_key().as_bytes()),
-        state.to_path_buf(),
-        env::current_exe()?,
-    )?;
-    let engine = HelperEngine::new(
-        config,
-        PinnedTicketKeys::load_root_owned(keys_path)?,
-        signing,
-        helper,
-        SystemdBackend::connect_system()?,
-    )?;
-    let receipts = engine.recover_nonterminal()?;
+    receipts.extend(engine.recover_nonterminal()?);
     let terminal_receipts = receipts
         .iter()
         .filter(|receipt| {

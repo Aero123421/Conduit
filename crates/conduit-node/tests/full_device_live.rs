@@ -1277,6 +1277,9 @@ fn control_plane_ticket(
     serde_json::from_value(projection["ticket"].clone()).unwrap()
 }
 
+// Keep every Control Plane authority input explicit. Bundling these values in
+// a permissive fixture object risks silently reusing the wrong Run or digest.
+#[allow(clippy::too_many_arguments)]
 fn control_plane_ticket_result(
     bundle: &Value,
     identity: &DeviceIdentity,

@@ -314,7 +314,13 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       this.ctx.storage.sql.exec("UPDATE transport_positions SET durable_sequence=? WHERE direction=\'node_to_control\'", sequence);
     });
     try {
-      const result = await projectPrivilegeFrame(this.env, frame);
+      let result: Record<string, unknown>;
+      try {
+        result = await projectPrivilegeFrame(this.env, frame);
+      } catch (error) {
+        if (!(error instanceof PublicError) && !(error instanceof TypeError)) throw error;
+        result = privilegeDenialResult(String(frame.payload.requestId ?? frame.messageId), error);
+      }
       if (frame.type === "privilege.ticket_request") {
         await this.enqueueControlFrame(privilegeResultType(), result, String(frame.payload.requestId), new Date(Date.now() + 300_000).toISOString(), undefined, `cmsg_${String(frame.payload.requestId)}`, frame.deviceId);
       }

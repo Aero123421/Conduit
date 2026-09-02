@@ -109,11 +109,11 @@ steady-state window has 144 actual socket sends (6 in the first hour), 144
 DeviceRoom application receives, 72 D1 health
 row mutations, 72 Durable Object base-row mutations, one retained cumulative
 ACK row, six bounded inbound rows, and zero alarm scheduling or invocations.
-The corresponding aggregate counters are 144 D1 statements/binding calls,
-maximum 5 bound parameters, 1,152 Durable Object SQL statements, and 8,784
-Durable Object rows read. The setup's fresh health frame is intentionally
-outside that reset measurement; the separate allocation test observes one
-fresh send plus 144 exact replays and only one Node outbox sequence.
+The corresponding aggregate counters are 72 D1 statements/binding calls,
+maximum 4 bound parameters, 144 D1 rows read, 1,152 Durable Object SQL
+statements, and 8,784 Durable Object rows read. The setup's fresh health frame
+is intentionally outside that reset measurement; the separate allocation test
+observes one fresh send plus 144 exact replays and only one Node outbox sequence.
 
 For the conservative fleet gate, an idle Device is charged one fresh
 two-row D1 projection, 72 one-row exact checkpoints, one connection row, 89
@@ -212,7 +212,7 @@ Additional after-only release gates exercise the production bindings and fault p
 | Gate | Measured after result |
 |---|---:|
 | Empty DeviceRoom fleet, 1 / 5 / 10 rooms | 0 application messages, 0 SQL base-row mutations, 0 alarms; respectively 3 / 15 / 30 read-only SQL statements |
-| Real NodeService + WssClient + Worker route + DeviceRoom, accelerated 24h idle | 144 socket sends and incoming messages; D1 144 statements / 72 rows written / max 5 parameters; DO SQL 1,152 statements / 72 rows written; 1 ACK row, 6 inbound rows, 0 alarms |
+| Real NodeService + WssClient + Worker route + DeviceRoom, accelerated 24h idle | 144 socket sends and incoming messages; D1 72 statements / 72 binding calls / 144 rows read / 72 rows written / max 4 parameters; DO SQL 1,152 statements / 8,784 rows read / 72 rows written; 1 ACK row, 6 inbound rows, 0 alarms |
 | Maximum configured Queue consumer batch (6 poison-plus-valid messages), one outer invocation | 24 D1 statements / 24 binding calls / max 6 parameters / 66 rows written |
 | DeviceRoom alarm with 32 due `event.batch` frames | 8 D1 statements / 8 binding calls / max 2 parameters / 12 rows written; 4 projected and 28 durably pending for the next invocation |
 | RetryScheduler alarm with 32 due work rows | 16 D1 statements / 16 binding calls / max 3 parameters / 1 row written; 1 work item processed and 31 rearmed |

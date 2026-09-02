@@ -8,7 +8,7 @@ prompt, or generated Device identifier.
 ## Review 5086220413 verification
 
 - Date: 2026-09-02
-- Implementation commit: `1303f4d`
+- Implementation commit: `836317b`
 - Local result: PASS
 - Merge state: not merged
 
@@ -23,8 +23,8 @@ Node-only regression executes all 864,000 polls for 24 hours.
 | Actual Node application sends after 1 hour | 6 |
 | Actual Node application sends after 24 hours | 144 |
 | DeviceRoom application receives | 144 |
-| D1 statements / binding calls / maximum parameters | 144 / 144 / 5 |
-| D1 rows read / written | 72 / 72 |
+| D1 statements / binding calls / maximum parameters | 72 / 72 / 4 |
+| D1 rows read / written | 144 / 72 |
 | Durable Object SQL statements / rows read / rows written | 1,152 / 8,784 / 72 |
 | Retained inbound / cumulative ACK rows | 6 / 1 |
 | Alarm schedules / invocations / remaining alarm | 0 / 0 / none |

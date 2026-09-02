@@ -17,6 +17,22 @@ export interface InstrumentedD1 {
   reset(): void;
 }
 
+export interface D1RowCeilings {
+  rowsRead: number;
+  rowsWritten: number;
+}
+
+/**
+ * The privilege projector runs once for each DeviceRoom application frame.
+ * These row ceilings are deliberately lower than the platform's daily
+ * allowance so a query-plan regression cannot turn one signed registration,
+ * ticket request, or receipt into an unbounded scan/write invocation.
+ */
+export const PRIVILEGE_OUTER_INVOCATION_D1_ROW_CEILINGS = {
+  rowsRead: 64,
+  rowsWritten: 16,
+} as const satisfies D1RowCeilings;
+
 interface MutableD1Usage {
   statements: number;
   bindingCalls: number;
@@ -116,10 +132,15 @@ export function instrumentD1(database: D1Database): InstrumentedD1 {
   };
 }
 
-export function assertFreeD1Ceilings(snapshot: D1UsageSnapshot): void {
+export function assertFreeD1Ceilings(snapshot: D1UsageSnapshot, rowCeilings?: D1RowCeilings): void {
   if (snapshot.statements > 40) throw new Error(`D1 statement budget exceeded: ${snapshot.statements} > 40`);
   if (snapshot.bindingCalls > 40) throw new Error(`D1 binding-call budget exceeded: ${snapshot.bindingCalls} > 40`);
   if (snapshot.maxBoundParameters > 90) throw new Error(`D1 parameter budget exceeded: ${snapshot.maxBoundParameters} > 90`);
+  if (rowCeilings !== undefined) {
+    if (!Number.isFinite(rowCeilings.rowsRead) || rowCeilings.rowsRead < 0 || !Number.isFinite(rowCeilings.rowsWritten) || rowCeilings.rowsWritten < 0) throw new TypeError("D1 row ceilings must be finite non-negative numbers");
+    if (snapshot.rowsRead > rowCeilings.rowsRead) throw new Error(`D1 row-read budget exceeded: ${snapshot.rowsRead} > ${rowCeilings.rowsRead}`);
+    if (snapshot.rowsWritten > rowCeilings.rowsWritten) throw new Error(`D1 row-write budget exceeded: ${snapshot.rowsWritten} > ${rowCeilings.rowsWritten}`);
+  }
 }
 
 const QUEUE_CHUNK_BYTES = 64 * 1024;

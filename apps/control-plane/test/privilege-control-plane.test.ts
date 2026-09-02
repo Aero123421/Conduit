@@ -4,7 +4,7 @@ import { parseWireDocument, parseWireDocumentText, schemaIds } from "@conduit/sc
 import { beforeAll, describe, expect, it } from "vitest";
 import { base64url, canonicalJson, fromBase64url, keyedHash, sha256Hex } from "../src/crypto.ts";
 import { handlePrivilegeAdmin, isDevicePolicyNarrower, parsePrivilegeTransportFrame, projectPrivilegeFrame, requireVerifiedPrivilegeReceipt, rootPolicySummary, type PrivilegeTransportFrame } from "../src/privilege.ts";
-import { assertFreeD1Ceilings, instrumentD1 } from "../src/usage-instrumentation.ts";
+import { assertFreeD1Ceilings, instrumentD1, PRIVILEGE_OUTER_INVOCATION_D1_ROW_CEILINGS, type D1UsageSnapshot } from "../src/usage-instrumentation.ts";
 import type { ControlPlaneEnv } from "../src/types.ts";
 import { projectNodeState } from "../src/node-projection.ts";
 import type { DeviceRoom } from "../src/do/device-room.ts";
@@ -396,12 +396,14 @@ describe.sequential("privileged helper Control Plane", () => {
       originalEnv = holder.env;
       Object.defineProperty(instance, "env", { value: new Proxy(holder.env, { get: (target, property, receiver) => property === "DB" ? measured.db : Reflect.get(target, property, receiver) }), configurable: true });
     });
-    const assertInvocation = () => {
+    const invocations: Array<{ flow: "registration" | "policy" | "ticket" | "receipt"; usage: D1UsageSnapshot }> = [];
+    const assertInvocation = (flow: (typeof invocations)[number]["flow"]) => {
       const snapshot = measured.snapshot();
-      assertFreeD1Ceilings(snapshot);
+      assertFreeD1Ceilings(snapshot, PRIVILEGE_OUTER_INVOCATION_D1_ROW_CEILINGS);
       expect(snapshot.statements).toBeGreaterThan(0);
-      expect(snapshot.bindingCalls).toBeLessThanOrEqual(40);
-      expect(snapshot.maxBoundParameters).toBeLessThanOrEqual(90);
+      expect(snapshot.rowsRead).toBeGreaterThan(0);
+      expect(snapshot.rowsWritten).toBeGreaterThan(0);
+      invocations.push({ flow, usage: snapshot });
       measured.reset();
     };
     const receiveAck = async (through: string) => {
@@ -428,14 +430,14 @@ describe.sequential("privileged helper Control Plane", () => {
       const registrationSequence = String(sequence);
       await sendFrame("privilege.installation_attestation", { requestId: "phreq_privbudgetnew1", registrationBundle: initial.bundle, devicePolicy, deviceKeyId }, "phreq_privbudgetnew1");
       await receiveAck(registrationSequence);
-      assertInvocation();
+      assertInvocation("registration");
       expect(await env.DB.prepare("SELECT status,expected_uid FROM device_privilege_installations WHERE installation_id='phinst_privbudgetnew1'").first()).toEqual({ status: "pending_owner", expected_uid: 1001 });
 
       const reattestation = await bundleFor("phinst_privilegeflow01", 4, ["prepare"]);
       const policySequence = String(sequence);
       await sendFrame("privilege.installation_attestation", { requestId: "phreq_privbudgetpol1", registrationBundle: reattestation.bundle, devicePolicy, deviceKeyId }, "phreq_privbudgetpol1");
       await receiveAck(policySequence);
-      assertInvocation();
+      assertInvocation("policy");
       expect(await env.DB.prepare("SELECT active_policy_revision,active_policy_digest FROM device_privilege_installations WHERE installation_id='phinst_privilegeflow01'").first()).toEqual({ active_policy_revision: 4, active_policy_digest: reattestation.digest });
 
       const ticketRequestId = "ptreq_privbudget0001";
@@ -445,15 +447,26 @@ describe.sequential("privileged helper Control Plane", () => {
       const result = ticketFrames.find((frame) => frame.type === "privilege.ticket_result");
       expect(ticketFrames.find((frame) => frame.type === "transport.ack")).toMatchObject({ payload: { throughSequence: ticketSequence } });
       if (result?.type !== "privilege.ticket_result" || result.payload.status !== "issued") throw new Error("expected issued privilege ticket");
-      assertInvocation();
+      assertInvocation("ticket");
       const ticket = result.payload.ticket as { claims: Record<string, unknown> };
       const previousReceiptDigest = await sha256Hex(canonicalJson(durableReceipt));
       const receiptClaims = { ...durableReceipt.claims, receiptId: "prcpt_privbudget0001", ticketId: ticket.claims.ticketId, ticketDigest: await sha256Hex(canonicalJson(result.payload.ticket)), policyRevision: 4, policyDigest: reattestation.digest, controllerEpoch: Number(accepted.connectionEpoch), stateRevision: 2, transition: "prepared", observedAt: new Date().toISOString(), previousReceiptDigest };
       const receiptSequence = String(sequence);
       await sendFrame("privilege.receipt", { receipt: { keyId: "hkey_privilegeflow01", claims: receiptClaims, signature: await sign(helperPrivate, receiptClaims) }, deviceKeyId }, "op_privilegeflow01");
       await receiveAck(receiptSequence);
-      assertInvocation();
+      assertInvocation("receipt");
       expect(await env.DB.prepare("SELECT transition FROM privilege_receipt_projections WHERE receipt_id='prcpt_privbudget0001'").first()).toEqual({ transition: "prepared" });
+      expect(invocations.map(({ flow }) => flow)).toEqual(["registration", "policy", "ticket", "receipt"]);
+      for (const { usage } of invocations) {
+        expect(usage).toMatchObject({
+          statements: expect.any(Number),
+          bindingCalls: expect.any(Number),
+          maxBoundParameters: expect.any(Number),
+          rowsRead: expect.any(Number),
+          rowsWritten: expect.any(Number),
+        });
+      }
+      console.log(`CONDUIT_PRIVILEGE_OUTER_D1_BUDGET=${JSON.stringify(invocations)}`);
     } finally {
       if (originalEnv !== undefined) await runInDurableObject(room, (instance: DeviceRoom) => { Object.defineProperty(instance, "env", { value: originalEnv, configurable: true }); });
       socket.close(1000, "privilege_budget_complete");

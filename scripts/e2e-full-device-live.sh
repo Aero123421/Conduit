@@ -154,7 +154,9 @@ conduit_cleanup() {
   else
     echo "automatic cleanup could not prove terminal custody; root staging was retained for explicit recovery" >&2
   fi
-  if [[ -d "$conduit_user_evidence" ]]; then
+  if ((conduit_status != 0)) && [[ "${CONDUIT_FULL_DEVICE_E2E_PRESERVE_FAILURE_EVIDENCE:-0}" == 1 ]]; then
+    echo "private failure diagnostics retained at $conduit_user_evidence" >&2
+  elif [[ -d "$conduit_user_evidence" ]]; then
     find "$conduit_user_evidence" -xdev -depth -delete
   fi
   exit "$conduit_status"

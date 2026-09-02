@@ -1,6 +1,6 @@
 import { env, exports } from "cloudflare:workers";
 import { beforeAll, describe, expect, it } from "vitest";
-import { keyedHash } from "../src/crypto.ts";
+import { canonicalJson, keyedHash, sha256Hex } from "../src/crypto.ts";
 import { projectDeviceTerminalSubmission } from "../src/review-workflow.ts";
 
 describe.sequential("Board assignment to accepted Session Baseline", () => {
@@ -44,7 +44,7 @@ describe.sequential("Board assignment to accepted Session Baseline", () => {
             runtime: { kind: "native", providerId: "native.linux", configurationRevision: 4, networkMode: "restricted" },
             model: "gpt-5.6-codex", effort: "high", accessScope: "project_full", approvalMode: "always",
             sourceRevisions: [{ sourceId: "src_board_baseline", sourceRevision: 1, locationId: "loc_board_baseline", locationRevision: 1, mode: "worktree", baseCommit: "1".repeat(40) }],
-            verificationPolicy: { requiredChecks: ["tests"] },
+            verificationPolicy: { requiredChecks: ["workspace_clean"] },
           },
         },
       }],
@@ -71,7 +71,7 @@ describe.sequential("Board assignment to accepted Session Baseline", () => {
     expect(String(persisted?.snapshot_digest)).toHaveLength(64);
     expect(["queued", "offered"]).toContain(persisted?.operation_state);
     expect(["pending", "offered"]).toContain(persisted?.outbox_state);
-    expect(JSON.parse(String(persisted?.request_json))).toMatchObject({ arguments: { parentBaselineId: null, sourceBaselineRevisions: {}, expectedNodeRevision: 0, verificationPolicy: { requiredChecks: ["tests"] }, settlementPolicy: "close_on_settle" } });
+    expect(JSON.parse(String(persisted?.request_json))).toMatchObject({ arguments: { parentBaselineId: null, sourceBaselineRevisions: {}, expectedNodeRevision: 0, verificationPolicy: { requiredChecks: ["workspace_clean"] }, settlementPolicy: "close_on_settle" } });
 
     const replay = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/board/messages", { method: "POST", headers, body: JSON.stringify(body) }));
     expect(replay.status).toBe(200);
@@ -92,29 +92,40 @@ describe.sequential("Board assignment to accepted Session Baseline", () => {
         sourceChanges: [{ sourceId: "src_board_baseline", sourceDigest, baseRevision: { kind: "git", commit: "1".repeat(40) }, resultRevision: { kind: "git", commit: "3".repeat(40), treeDigest: "4".repeat(64) }, state: "clean", custody: "healthy" }],
         unchangedSources: [], applicationOrder: ["src_board_baseline"], artifactCommitments: [{ artifactId: "art_test_report01", digest: "5".repeat(64) }],
         provenance: { adapterId: "codex" }, custody: { deviceRef: true, localArchive: true },
-        verification: [{ checkId: "tests", status: "passed", evidenceRefs: ["evid_test_report01"], observedDigest: "6".repeat(64) }],
+        verification: [{ checkId: "workspace_clean", status: "passed", evidenceRefs: ["evid_test_report01"], observedDigest: "6".repeat(64) }],
       },
     }) as { changeSetId: string; changeSetDigest: string; state: string; runState: string; assignmentState: string };
     changeSetId = projected.changeSetId;
     changeSetDigest = projected.changeSetDigest;
     expect(projected).toMatchObject({ state: "proposed", runState: "ready_for_review", assignmentState: "ready_for_review" });
-    const verification = await env.DB.prepare("SELECT status,evidence_refs_json FROM verification_records WHERE change_set_id=?1 AND check_id='tests'").bind(changeSetId).first<{ status: string; evidence_refs_json: string }>();
+    const verification = await env.DB.prepare("SELECT status,evidence_refs_json FROM verification_records WHERE change_set_id=?1 AND check_id='workspace_clean'").bind(changeSetId).first<{ status: string; evidence_refs_json: string }>();
     expect(verification).toMatchObject({ status: "passed" });
     await expect(env.DB.prepare("UPDATE change_sets SET custody_json='{}' WHERE id=?1").bind(changeSetId).run()).rejects.toThrow(/immutable/);
     await expect(env.DB.prepare("UPDATE context_snapshots SET compiler_version='changed' WHERE id=?1").bind(contextSnapshotId).run()).rejects.toThrow(/immutable/);
   });
 
   it("binds Review to the exact digest and advances the Baseline with compare-and-swap", async () => {
+    const verificationStateDigest = await sha256Hex(`conduit.verification-state.v1\n${canonicalJson([{ checkId: "workspace_clean", status: "passed", evidenceRefs: ["evid_test_report01"], observedDigest: "6".repeat(64) }])}`);
+    const wrongSourceEvidence = await exports.default.fetch(new Request(`https://conduit.example.com/api/v1/change_sets/${changeSetId}/reviews`, {
+      method: "POST", headers: { ...authHeaders, "idempotency-key": "board-baseline-review-wrong-source", "if-match": '"1"' },
+      body: JSON.stringify({ changeSetDigest, sourceChangeDigests: ["f".repeat(64)], verificationStateDigest, findings: [], evidenceRefs: [], verdict: "approved" }),
+    }));
+    expect(wrongSourceEvidence.status).toBe(409);
+    const wrongVerificationEvidence = await exports.default.fetch(new Request(`https://conduit.example.com/api/v1/change_sets/${changeSetId}/reviews`, {
+      method: "POST", headers: { ...authHeaders, "idempotency-key": "board-baseline-review-wrong-verification", "if-match": '"1"' },
+      body: JSON.stringify({ changeSetDigest, sourceChangeDigests: [sourceDigest], verificationStateDigest: "7".repeat(64), findings: [], evidenceRefs: [], verdict: "approved" }),
+    }));
+    expect(wrongVerificationEvidence.status).toBe(409);
     const review = await exports.default.fetch(new Request(`https://conduit.example.com/api/v1/change_sets/${changeSetId}/reviews`, {
       method: "POST", headers: { ...authHeaders, "idempotency-key": "board-baseline-review-0001", "if-match": '"1"' },
-      body: JSON.stringify({ changeSetDigest, sourceChangeDigests: [sourceDigest], verificationStateDigest: "7".repeat(64), findings: [], evidenceRefs: ["evid_test_report01"], verdict: "approved" }),
+      body: JSON.stringify({ changeSetDigest, sourceChangeDigests: [sourceDigest], verificationStateDigest, findings: [], evidenceRefs: ["evid_test_report01"], verdict: "approved" }),
     }));
     expect(review.status).toBe(201);
     await expect(review.json()).resolves.toMatchObject({ changeSetId, changeSetDigest, verdict: "approved", state: "approved", revision: 2 });
 
     const staleDigestReview = await exports.default.fetch(new Request(`https://conduit.example.com/api/v1/change_sets/${changeSetId}/reviews`, {
       method: "POST", headers: { ...authHeaders, "idempotency-key": "board-baseline-review-0002", "if-match": '"2"' },
-      body: JSON.stringify({ changeSetDigest: "8".repeat(64), sourceChangeDigests: [sourceDigest], verificationStateDigest: "7".repeat(64), findings: [], evidenceRefs: [], verdict: "approved" }),
+      body: JSON.stringify({ changeSetDigest: "8".repeat(64), sourceChangeDigests: [sourceDigest], verificationStateDigest, findings: [], evidenceRefs: [], verdict: "approved" }),
     }));
     expect(staleDigestReview.status).toBe(409);
 
@@ -146,7 +157,7 @@ describe.sequential("Board assignment to accepted Session Baseline", () => {
           deviceId: "dev_board_baseline", runtime: { kind: "native", providerId: "native.linux", configurationRevision: 4 },
           model: "gpt-5.6-codex", effort: "high", accessScope: "project_full", approvalMode: "always",
           sourceRevisions: [{ sourceId: "src_board_baseline", sourceRevision: 1, locationId: "loc_board_baseline", locationRevision: 1, mode: "worktree", baseCommit: "3".repeat(40) }],
-          verificationPolicy: { requiredChecks: ["tests"] },
+          verificationPolicy: { requiredChecks: ["workspace_clean"] },
         },
       }}],
     };
@@ -171,7 +182,7 @@ describe.sequential("Board assignment to accepted Session Baseline", () => {
         sourceChanges: [{ sourceId: "src_board_baseline", sourceDigest: "c".repeat(64), baseRevision: { kind: "git", commit: "3".repeat(40), treeDigest: "4".repeat(64) }, resultRevision: { kind: "git", commit: "d".repeat(40) }, state: "clean", custody: "healthy" }],
         unchangedSources: [], applicationOrder: ["src_board_baseline"], artifactCommitments: [],
         provenance: { adapterId: "codex" }, custody: { deviceRef: true, localArchive: true },
-        verification: [{ checkId: "tests", status: "passed", evidenceRefs: ["evid_followup_test"], observedDigest: "e".repeat(64) }],
+        verification: [{ checkId: "workspace_clean", status: "passed", evidenceRefs: ["evid_followup_test"], observedDigest: "e".repeat(64) }],
       },
     });
     expect(projected).toMatchObject({ runId: nextRunId, state: "proposed", runState: "ready_for_review" });

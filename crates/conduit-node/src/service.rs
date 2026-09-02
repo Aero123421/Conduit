@@ -3143,7 +3143,7 @@ impl NodeService {
             _ => "failed",
         };
         let mut payload = json!({"operationId":operation_id,"runId":run_id,"state":state,"requestDigest":request_digest,"lastRunEventSequence":last_sequence.to_string(),"observedAt":now()});
-        if terminal == OperationState::Completed && !agent.prepared_sources.is_empty() {
+        if terminal == OperationState::Completed {
             let capture = self
                 .local
                 .capture_workspace(&agent.prepared_sources, &agent.source_baseline_revisions)
@@ -4461,17 +4461,21 @@ mod tests {
             let workspace = directory.path().join("captured-workspace");
             std::fs::create_dir_all(&workspace).unwrap();
             std::fs::write(workspace.join("result.txt"), format!("captured-{index}\n")).unwrap();
-            let captured_sources = vec![PreparedSource {
-                source_id: SourceId::parse("src_settle_capture01").unwrap(),
-                location_id: LocationId::parse("loc_settle_capture01").unwrap(),
-                location_revision: 1,
-                mode: crate::local::WorkspaceMode::ManagedCopy,
-                host_path: workspace,
-                base_revision: "snap_initial_settle_capture01".into(),
-                initial_state_digest: Sha256Digest::from_bytes([index as u8 + 1; 32]),
-                repository_identity_digest: None,
-                display_path: "captured-workspace".into(),
-            }];
+            let captured_sources = if index == 2 {
+                Vec::new()
+            } else {
+                vec![PreparedSource {
+                    source_id: SourceId::parse("src_settle_capture01").unwrap(),
+                    location_id: LocationId::parse("loc_settle_capture01").unwrap(),
+                    location_revision: 1,
+                    mode: crate::local::WorkspaceMode::ManagedCopy,
+                    host_path: workspace,
+                    base_revision: "snap_initial_settle_capture01".into(),
+                    initial_state_digest: Sha256Digest::from_bytes([index as u8 + 1; 32]),
+                    repository_identity_digest: None,
+                    display_path: "captured-workspace".into(),
+                }]
+            };
             let driver = completed_long_lived_driver(kind, directory.path());
             let child_spec = conduit_adapters::LaunchSpec {
                 executable: PathBuf::from("/bin/sh"),
@@ -4652,10 +4656,21 @@ mod tests {
                 terminal.payload["resultSummary"]["submission"]["verification"][0]["status"],
                 "passed"
             );
-            assert_eq!(
-                terminal.payload["resultSummary"]["submission"]["sourceChanges"][0]["state"],
-                "clean"
-            );
+            if index == 2 {
+                assert_eq!(
+                    terminal.payload["resultSummary"]["submission"]["sourceChanges"],
+                    json!([])
+                );
+                assert_eq!(
+                    terminal.payload["resultSummary"]["submission"]["unchangedSources"],
+                    json!([])
+                );
+            } else {
+                assert_eq!(
+                    terminal.payload["resultSummary"]["submission"]["sourceChanges"][0]["state"],
+                    "clean"
+                );
+            }
         }
     }
 

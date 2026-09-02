@@ -13,7 +13,8 @@ Implemented product boundaries:
 - projects with multiple folders and device-specific locations
 - session board and `@` assignment
 - native, container, and VM runtime providers
-- explicit access scope and approval policy, including full access
+- explicit access scope and approval policy, including `full_user`; `full_device`
+  is rejected as unavailable until a privileged helper is implemented
 - run traces for agent, instruction, and skill analysis
 - MCP as an optional OAuth client of the same control-plane services
 

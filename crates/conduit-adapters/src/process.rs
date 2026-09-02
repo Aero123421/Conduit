@@ -288,6 +288,15 @@ mod tests {
             b"{\"type\":\"get_state\"}\n"
         );
         child.close_stdin();
-        assert!(child.terminate().unwrap().success());
+        let status = (0..100)
+            .find_map(|_| {
+                let status = child.try_wait().unwrap();
+                if status.is_none() {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                status
+            })
+            .expect("single-record fixture exits after writing its response");
+        assert!(status.success());
     }
 }

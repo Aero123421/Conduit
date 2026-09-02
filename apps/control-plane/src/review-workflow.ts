@@ -80,6 +80,32 @@ function requiredChecks(policyJson: string): string[] {
   return checks.filter((value): value is string => typeof value === "string");
 }
 
+interface VerificationCommitmentRow {
+  check_id: string;
+  status: string;
+  evidence_refs_json: string;
+  observed_digest: string;
+}
+
+async function reviewEvidenceCommitment(db: D1Database, changeSet: ChangeSetRow): Promise<{ sourceChangeDigests: string[]; verificationStateDigest: string }> {
+  const sourceChanges = JSON.parse(changeSet.source_changes_json) as Array<{ sourceDigest?: unknown }>;
+  const sourceChangeDigests = sourceChanges.map((change) => {
+    if (typeof change.sourceDigest !== "string" || !/^[a-f0-9]{64}$/.test(change.sourceDigest)) throw new TypeError("Stored Source Change digest is invalid");
+    return change.sourceDigest;
+  });
+  const rows = await db.prepare("SELECT check_id,status,evidence_refs_json,observed_digest FROM verification_records WHERE change_set_id=?1 ORDER BY check_id").bind(changeSet.id).all<VerificationCommitmentRow>();
+  const verificationState = rows.results.map((row) => ({
+    checkId: row.check_id,
+    status: row.status,
+    evidenceRefs: JSON.parse(row.evidence_refs_json) as unknown,
+    observedDigest: row.observed_digest,
+  }));
+  return {
+    sourceChangeDigests,
+    verificationStateDigest: await domainDigest("conduit.verification-state.v1", verificationState),
+  };
+}
+
 export async function projectTerminalSubmission(
   env: ControlPlaneEnv,
   actor: AuthActor,
@@ -220,6 +246,9 @@ export async function createReview(
   const changeSet = await loadChangeSet(env.DB, changeSetId);
   if (changeSet.change_set_digest !== review.changeSetDigest) throw new PublicError("revision_conflict", 409, "Review digest does not match the immutable Change Set");
   if (changeSet.state_revision !== expectedStateRevision || !["proposed", "under_review"].includes(changeSet.state)) throw new PublicError("revision_conflict", 409, "Change Set review state is stale");
+  const evidence = await reviewEvidenceCommitment(env.DB, changeSet);
+  if (canonicalJson(review.sourceChangeDigests) !== canonicalJson(evidence.sourceChangeDigests)) throw new PublicError("revision_conflict", 409, "Review Source Change digests do not match the immutable Change Set");
+  if (review.verificationStateDigest !== evidence.verificationStateDigest) throw new PublicError("revision_conflict", 409, "Review verification digest does not match immutable verification records");
   if (review.reviewerProjectAgentId !== undefined) {
     const reviewer = await env.DB.prepare("SELECT project_id,role,status FROM project_agents WHERE id=?1 LIMIT 1").bind(review.reviewerProjectAgentId).first<{ project_id: string; role: string; status: string }>();
     const session = await env.DB.prepare("SELECT project_id FROM collaboration_sessions WHERE id=?1").bind(changeSet.session_id).first<{ project_id: string }>();
@@ -229,7 +258,7 @@ export async function createReview(
   const nextState = review.verdict === "approved" ? "approved" : review.verdict === "changes_requested" ? "changes_requested" : "rejected";
   const now = nowIso();
   const [inserted, updated] = await env.DB.batch([
-    env.DB.prepare("INSERT INTO reviews(id,change_set_id,change_set_digest,reviewer_principal_id,reviewer_project_agent_id,source_change_digests_json,verification_state_digest,findings_json,evidence_refs_json,verdict,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)").bind(reviewId, changeSetId, review.changeSetDigest, actor.principalId, review.reviewerProjectAgentId ?? null, canonicalJson(review.sourceChangeDigests), review.verificationStateDigest, canonicalJson(review.findings), canonicalJson(review.evidenceRefs), review.verdict, now),
+    env.DB.prepare("INSERT INTO reviews(id,change_set_id,change_set_digest,reviewer_principal_id,reviewer_project_agent_id,source_change_digests_json,verification_state_digest,findings_json,evidence_refs_json,verdict,created_at) SELECT ?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11 WHERE EXISTS (SELECT 1 FROM change_set_state WHERE change_set_id=?2 AND revision=?12 AND state IN ('proposed','under_review'))").bind(reviewId, changeSetId, review.changeSetDigest, actor.principalId, review.reviewerProjectAgentId ?? null, canonicalJson(review.sourceChangeDigests), review.verificationStateDigest, canonicalJson(review.findings), canonicalJson(review.evidenceRefs), review.verdict, now, expectedStateRevision),
     env.DB.prepare("UPDATE change_set_state SET state=?1,revision=revision+1,updated_at=?2 WHERE change_set_id=?3 AND revision=?4 AND state IN ('proposed','under_review')").bind(nextState, now, changeSetId, expectedStateRevision),
   ]);
   if (inserted?.meta.changes !== 1 || updated?.meta.changes !== 1) throw new PublicError("revision_conflict", 409, "Change Set changed before Review commit");
@@ -264,7 +293,8 @@ export async function acceptChangeSet(
   const session = await env.DB.prepare("SELECT revision,accepted_baseline_id FROM collaboration_sessions WHERE id=?1 AND status='active' LIMIT 1").bind(sessionId).first<{ revision: number; accepted_baseline_id: string | null }>();
   if (session === null) throw new PublicError("not_found", 404, "Active Collaboration Session not found");
   if (session.revision !== expectedSessionRevision || session.accepted_baseline_id !== acceptance.expectedBaselineId) throw new PublicError("revision_conflict", 409, "Session Baseline compare-and-swap failed");
-  const currentReview = await env.DB.prepare("SELECT id FROM reviews WHERE change_set_id=?1 AND change_set_digest=?2 AND verdict='approved' ORDER BY created_at DESC LIMIT 1").bind(changeSet.id, changeSet.change_set_digest).first<{ id: string }>();
+  const evidence = await reviewEvidenceCommitment(env.DB, changeSet);
+  const currentReview = await env.DB.prepare("SELECT id FROM reviews WHERE change_set_id=?1 AND change_set_digest=?2 AND source_change_digests_json=?3 AND verification_state_digest=?4 AND verdict='approved' ORDER BY created_at DESC LIMIT 1").bind(changeSet.id, changeSet.change_set_digest, canonicalJson(evidence.sourceChangeDigests), evidence.verificationStateDigest).first<{ id: string }>();
   if (currentReview === null) throw new PublicError("invalid_request", 409, "Current approved Review is missing");
   const failedVerification = await env.DB.prepare("SELECT id FROM verification_records WHERE change_set_id=?1 AND status<>'passed' LIMIT 1").bind(changeSet.id).first<{ id: string }>();
   if (failedVerification !== null) throw new PublicError("invalid_request", 409, "Change Set verification is not fully passing");

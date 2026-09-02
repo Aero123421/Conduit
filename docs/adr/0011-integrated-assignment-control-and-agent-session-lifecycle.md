@@ -28,15 +28,15 @@ A structured Board mention that requests an Assignment stores an immutable bindi
 - the Context Compiler input and resulting Context Snapshot digest
 - the parent Session Baseline revision
 
-The Board transaction commits the Message, mention, Assignment, and binding before publishing realtime state. A durable scheduler may then create one Run, Agent Session lease, operation journal entry, and dispatch-outbox entry. Scheduler replay uses the Assignment identity and binding digest; it cannot create another Run for the same binding.
+The Board transaction commits the Message, mention, Assignment, and binding before publishing realtime state. A durable scheduler may then create one Run, Agent Session lease, operation journal entry, and dispatch-outbox entry. Scheduler replay uses the Assignment identity and binding digest; it cannot create another Run for the same binding. Realtime publication is itself recorded in a durable D1 outbox after the authoritative transition; publish failure or Worker eviction leaves a retryable record instead of a committed state change with a permanently missing notification.
 
 The Context Snapshot is immutable. Its identity and digest are part of the Run Manifest before Runtime start.
 
 ### Proposal, verification, and acceptance
 
-After the task settles, the Device captures the exact Workspace state before ordinary Runtime destruction. It returns immutable Source Change custody and verification receipts bound to the Run Manifest and parent Baseline. The Control Plane verifies the submission digest before storing an immutable Change Set and transitions the Assignment to `ready_for_review` only when required checks are satisfied.
+After the task settles successfully, the Device captures the exact Workspace state before ordinary Runtime destruction. It returns immutable Source Change custody and verification receipts bound to the Run Manifest and parent Baseline, including an explicit empty Source vector when the Assignment has no Sources. The Control Plane verifies the submission digest before storing an immutable Change Set and transitions the Assignment to `ready_for_review` only when required checks are satisfied. A failed or cancelled terminal state cannot submit a Change Set. A completed terminal state without a valid submission fails the Assignment integration gate instead of becoming reviewable.
 
-A Review binds one Change Set digest. Acceptance requires an approved Review, an eligible Change Set, the expected Collaboration Session revision, and the expected parent Baseline revision and digest. One D1 transaction stores the next immutable Baseline revision and compare-and-swaps the Session pointer. Materializing the accepted state to user folders, branches, or remotes remains a separate Device operation.
+A Review binds one Change Set digest, its ordered Source Change digest vector, and a canonical digest of the stored verification records. Acceptance re-derives those commitments and requires an approved Review, an eligible Change Set, the expected Collaboration Session revision, and the expected parent Baseline revision and digest. One D1 transaction stores the next immutable Baseline revision and compare-and-swaps the Session pointer. Materializing the accepted state to user folders, branches, or remotes remains a separate Device operation.
 
 ### Start and control are separate commands
 
@@ -54,7 +54,7 @@ An existing-target control operation stores:
 
 Input, steer, follow-up, explicit close, and cancellation use `operation.input` or `operation.cancel`. Runtime pause, resume, stop, snapshot, restore, and destroy use `runtime.control`. They are delivered through the same durable dispatch outbox but never through the start adapter.
 
-The Device journals control custody before applying the effect. Exact duplicate commands replay a durable receipt. A reused idempotency key, target digest, controller epoch, or expected revision conflict is rejected. An effect left ambiguous by a crash is not automatically repeated.
+The Device journals control custody before applying the effect. Exact duplicate commands replay a durable receipt. Each Runtime control result echoes the command, control-request digest, target controller epoch, expected Runtime state and revision, and the Device's current connection epoch. The Control Plane accepts the result only when every field matches the committed control and current custody. A reused idempotency key, target digest, controller epoch, or expected revision conflict is rejected. An effect left ambiguous by a crash is not automatically repeated.
 
 ### Node-to-Control Plane projection
 
@@ -62,7 +62,11 @@ The Device journals control custody before applying the effect. Exact duplicate 
 
 The Control Plane accepts a projection only when Device ID, operation ID, request digest, Run custody, connection epoch, and monotonic node sequence match stored authority. Each message identity and digest has one idempotent projection receipt. Exact duplicates replay the projection result; reordered state, stale epochs, conflicting digests, and invalid transitions are retained as bounded security evidence and do not advance shared state.
 
-Admission and status update Operation, Run, Assignment, Agent Session, and Device read models in one bounded projection. Rejection and all terminal states release operation-bound connector concurrency idempotently. Board realtime events are emitted only after the D1 transition commits.
+Admission and status update Operation, Run, Assignment, Agent Session, and Device read models in one bounded projection. Every projection compares and swaps an operation projection marker before updating related read models, so concurrent or reordered messages cannot regress Run or Assignment state. Rejection, transport failure, and all terminal states release operation-bound connector concurrency idempotently. Board realtime events are emitted only after the D1 transition commits and are retried from the durable realtime outbox.
+
+### Bootstrap atomicity
+
+Owner approval of a Device enrollment changes the pending enrollment, creates the Device, and installs its first Device key in one D1 batch. A raced decision or any failed insert rolls the batch back; no approved enrollment can exist without its assigned Device and active key.
 
 ### Assignment Run and Agent Session lifecycle
 

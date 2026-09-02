@@ -1,4 +1,4 @@
-import { exports } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
 import { parseWireDocumentText, schemaIds } from "@conduit/schema";
 import { describe, expect, it } from "vitest";
 import { base64url, canonicalJson } from "../src/crypto.ts";
@@ -109,6 +109,12 @@ describe.sequential("clean browser bootstrap", () => {
     const approval = await approved.json<{ deviceId: string }>();
     const poll = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/device-enrollments/poll", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ deviceCode: enrollment.deviceCode }) }));
     await expect(poll.json()).resolves.toMatchObject({ state: "completed", deviceId: approval.deviceId, keyId });
+    const enrollmentBinding = await env.DB.prepare("SELECT e.state,e.assigned_device_id,d.id AS device_id,k.id AS key_id FROM device_enrollments e LEFT JOIN devices d ON d.enrollment_id=e.id LEFT JOIN device_keys k ON k.device_id=d.id AND k.status='active' WHERE e.id=?1").bind(enrollment.enrollmentId).first<Record<string, unknown>>();
+    expect(enrollmentBinding).toMatchObject({ state: "completed", assigned_device_id: approval.deviceId, device_id: approval.deviceId, key_id: keyId });
+    const duplicateDecision = await exports.default.fetch(new Request(`https://conduit.example.com/api/v1/device-enrollments/${enrollment.enrollmentId}/decision`, { method: "POST", headers: { cookie: session.cookie, origin: "https://conduit.example.com", "x-csrf-token": session.csrf, "content-type": "application/json" }, body: JSON.stringify({ decision: "approve" }) }));
+    expect(duplicateDecision.status).toBe(409);
+    const duplicateCounts = await env.DB.prepare("SELECT (SELECT COUNT(*) FROM devices WHERE enrollment_id=?1) AS devices,(SELECT COUNT(*) FROM device_keys WHERE device_id=?2) AS keys").bind(enrollment.enrollmentId, approval.deviceId).first<{ devices: number; keys: number }>();
+    expect(duplicateCounts).toEqual({ devices: 1, keys: 1 });
 
     const connected = await exports.default.fetch(new Request(`https://conduit.example.com/v1/devices/${approval.deviceId}/connect`, { headers: { upgrade: "websocket" } }));
     expect(connected.status).toBe(101);

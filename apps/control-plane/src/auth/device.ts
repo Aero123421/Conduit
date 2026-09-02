@@ -84,19 +84,20 @@ async function approveEnrollment(request: Request, env: ControlPlaneEnv, enrollm
   const decision = boundedString(body.decision, "decision", 16);
   const now = nowIso();
   if (decision === "deny") {
-    await env.DB.prepare("UPDATE device_enrollments SET state='denied',approved_by=?1,terminal_at=?2 WHERE id=?3 AND state='pending_owner'").bind(session.principal_id, now, enrollmentId).run();
+    const denied = await env.DB.prepare("UPDATE device_enrollments SET state='denied',approved_by=?1,terminal_at=?2 WHERE id=?3 AND state='pending_owner'").bind(session.principal_id, now, enrollmentId).run();
+    if (denied.meta.changes !== 1) throw new PublicError("invalid_request", 409, "Enrollment decision raced with another request");
     await repo.audit("device_enrollment.denied", { enrollmentId }, session.principal_id);
     return new Response(null, { status: 204 });
   }
   if (decision !== "approve") throw new PublicError("invalid_request", 400, "decision must be approve or deny");
   const claims = JSON.parse(row.claims_json) as Record<string, unknown>;
   const deviceId = newId("dev");
-  const updated = await env.DB.prepare("UPDATE device_enrollments SET state='approved',approved_by=?1,assigned_device_id=?2 WHERE id=?3 AND state='pending_owner'").bind(session.principal_id, deviceId, enrollmentId).run();
-  if (updated.meta.changes !== 1) throw new PublicError("invalid_request", 409, "Enrollment approval raced with another decision");
-  await env.DB.batch([
-    env.DB.prepare("INSERT INTO devices(id,enrollment_id,display_label,os,arch,node_version,protocol_version,status,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'active',?8,?8)").bind(deviceId, enrollmentId, String(claims.hostnameLabel), String(claims.os), String(claims.arch), String(claims.nodeVersion), String(claims.protocolVersion), now),
-    env.DB.prepare("INSERT INTO device_keys(id,device_id,public_jwk_json,fingerprint,status,created_at) VALUES (?1,?2,?3,?4,'active',?5)").bind(row.requested_key_id, deviceId, row.requested_public_jwk_json, row.requested_fingerprint, now),
+  const [updated, device, key] = await env.DB.batch([
+    env.DB.prepare("UPDATE device_enrollments SET state='approved',approved_by=?1,assigned_device_id=?2 WHERE id=?3 AND state='pending_owner'").bind(session.principal_id, deviceId, enrollmentId),
+    env.DB.prepare("INSERT INTO devices(id,enrollment_id,display_label,os,arch,node_version,protocol_version,status,created_at,updated_at) SELECT ?1,?2,?3,?4,?5,?6,?7,'active',?8,?8 WHERE EXISTS (SELECT 1 FROM device_enrollments WHERE id=?2 AND state='approved' AND assigned_device_id=?1)").bind(deviceId, enrollmentId, String(claims.hostnameLabel), String(claims.os), String(claims.arch), String(claims.nodeVersion), String(claims.protocolVersion), now),
+    env.DB.prepare("INSERT INTO device_keys(id,device_id,public_jwk_json,fingerprint,status,created_at) SELECT ?1,?2,?3,?4,'active',?5 WHERE EXISTS (SELECT 1 FROM device_enrollments WHERE id=?6 AND state='approved' AND assigned_device_id=?2) AND EXISTS (SELECT 1 FROM devices WHERE id=?2 AND enrollment_id=?6)").bind(row.requested_key_id, deviceId, row.requested_public_jwk_json, row.requested_fingerprint, now, enrollmentId),
   ]);
+  if (updated?.meta.changes !== 1 || device?.meta.changes !== 1 || key?.meta.changes !== 1) throw new PublicError("invalid_request", 409, "Enrollment approval raced with another decision");
   await repo.audit("device_enrollment.approved", { enrollmentId, keyFingerprint: row.requested_fingerprint }, session.principal_id, undefined, deviceId);
   return Response.json({ deviceId, state: "approved" });
 }

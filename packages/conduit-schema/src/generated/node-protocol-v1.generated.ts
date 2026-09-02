@@ -45,6 +45,7 @@ export type PostAuthFrame = {
     | "event.gap"
     | "device.health"
     | "privilege.installation_attestation"
+    | "privilege.registration_result"
     | "privilege.policy_attestation"
     | "privilege.ticket_request"
     | "privilege.ticket_result"

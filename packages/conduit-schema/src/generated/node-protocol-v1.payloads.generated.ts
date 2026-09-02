@@ -109,6 +109,21 @@ export type RuntimeControlPayload = {
 export type ApprovalId = string;
 export type Base64Url = string;
 export type DeviceKeyId = string;
+export type PrivilegeTicketResultPayload =
+  | {
+      requestId: string;
+      status: "issued";
+      ticket: SignedPrivilegeDocument;
+      replay?: boolean;
+    }
+  | {
+      requestId: string | null;
+      status: "denied";
+      error: {
+        code: string;
+        retryable: false;
+      };
+    };
 
 export interface NodeProtocolPayloadCatalogV1 {
   "transport.ack": TransportAckPayload;
@@ -131,6 +146,7 @@ export interface NodeProtocolPayloadCatalogV1 {
   "event.gap": EventGapPayload;
   "device.health": DeviceHealthPayload;
   "privilege.installation_attestation": PrivilegeInstallationAttestationPayload;
+  "privilege.registration_result": PrivilegeRegistrationResultPayload;
   "privilege.policy_attestation": PrivilegePolicyAttestationPayload;
   "privilege.ticket_request": PrivilegeTicketRequestPayload;
   "privilege.ticket_result": PrivilegeTicketResultPayload;
@@ -512,21 +528,77 @@ export interface DeviceHealthPayload {
 export interface PrivilegeInstallationAttestationPayload {
   requestId: string;
   installationId: string;
-  deviceId: DeviceId;
-  uid: number;
-  origin: string;
-  helperVersion: string;
-  protocol: "conduit.privileged/1";
-  receiptKeyId: string;
-  receiptPublicKey: Base64Url;
-  receiptKeyFingerprint: Sha256Hex;
-  policyRevision: U64Decimal;
-  policyDigest: Sha256Hex;
-  capabilityDigest: Sha256Hex;
-  attestationDigest: Sha256Hex;
+  expectedUid: number;
+  publicOrigin: string;
+  receiptPublicJwk: Ed25519PublicJwk;
+  signedCapability: SignedPrivilegeDocument;
+  policy: PrivilegePolicyAttestation;
+  devicePolicy: DevicePrivilegePolicyAttestation;
   deviceKeyId: DeviceKeyId;
   deviceSignature: Base64Url;
-  observedAt: Timestamp;
+}
+export interface Ed25519PublicJwk {
+  kty: "OKP";
+  crv: "Ed25519";
+  x: Base64Url;
+}
+export interface SignedPrivilegeDocument {
+  keyId: string;
+  claims: {
+    [k: string]: unknown;
+  };
+  signature: Base64Url;
+}
+export interface PrivilegePolicyAttestation {
+  revision: number;
+  policyDigest: Sha256Hex;
+  previousPolicyDigest: Sha256Hex | null;
+  publicSummary: {
+    [k: string]: unknown;
+  };
+  changeClass: "initial" | "same" | "narrowed" | "broadened";
+  signature: Base64Url;
+}
+export interface DevicePrivilegePolicyAttestation {
+  revision: number;
+  policyDigest: Sha256Hex;
+  previousPolicyDigest: Sha256Hex | null;
+  publicSummary: {
+    [k: string]: unknown;
+  };
+  signature: Base64Url;
+}
+export interface PrivilegeRegistrationResultPayload {
+  installationId: string;
+  status: "active";
+  helperKeyId: string;
+  helperPublicJwk: Ed25519PublicJwk;
+  helperKeyFingerprint: Sha256Hex;
+  helperPolicyRevision: number;
+  helperPolicyDigest: Sha256Hex;
+  /**
+   * @minItems 1
+   * @maxItems 4
+   */
+  issuerKeys:
+    | [PrivilegeIssuerKey]
+    | [PrivilegeIssuerKey, PrivilegeIssuerKey]
+    | [PrivilegeIssuerKey, PrivilegeIssuerKey, PrivilegeIssuerKey]
+    | [PrivilegeIssuerKey, PrivilegeIssuerKey, PrivilegeIssuerKey, PrivilegeIssuerKey];
+  attestationDigest: Sha256Hex;
+  ownerDecisionDigest: Sha256Hex;
+}
+export interface PrivilegeIssuerKey {
+  keyId: string;
+  revision: number;
+  publicJwk: Ed25519PublicJwk;
+  fingerprint: Sha256Hex;
+  status: "active" | "retiring";
+  validFrom: Timestamp;
+  validUntil: Timestamp | null;
+  predecessorKeyId: string | null;
+  rotationStatementDigest: Sha256Hex | null;
+  rotationSignature: Base64Url | null;
 }
 export interface PrivilegePolicyAttestationPayload {
   requestId: string;
@@ -549,59 +621,49 @@ export interface PrivilegePolicyAttestationPayload {
 export interface PrivilegeTicketRequestPayload {
   requestId: string;
   idempotencyKey: string;
-  requestDigest: Sha256Hex;
+  installationId: string;
+  deviceKeyId: DeviceKeyId;
   operationId: OperationId;
   runId: RunId;
   runtimeId: string;
   runtimeSpecDigest: Sha256Hex;
   launchPlanDigest: Sha256Hex;
   localExecutionPlanDigest: Sha256Hex;
-  controlRequestDigest?: Sha256Hex;
-  controllerEpoch: U64Decimal;
-  installationId: string;
-  helperKeyId: string;
-  helperPolicyRevision: U64Decimal;
+  controlRequestDigest: Sha256Hex | null;
+  runManifestDigest: Sha256Hex;
+  helperPolicyRevision: number;
   helperPolicyDigest: Sha256Hex;
-  devicePolicyRevision: U64Decimal;
-  adapterCapabilityDigest: Sha256Hex;
+  devicePolicyRevision: number;
   approvalReceiptDigest: Sha256Hex | null;
+  approvalEnforcement: "exact_command" | "adapter_mediated" | "unavailable";
+  allowedOperation:
+    | "prepare"
+    | "start"
+    | "inspect"
+    | "input"
+    | "resize_pty"
+    | "pause"
+    | "resume"
+    | "graceful_stop"
+    | "force_stop"
+    | "reconcile";
+  resourceCeilings: PrivilegeResourceCeilings;
   redactedSummary: {
     [k: string]: unknown;
   };
-  deviceKeyId: DeviceKeyId;
-  deviceSignature: Base64Url;
+  requestedAt: Timestamp;
   expiresAt: Timestamp;
+  deviceSignature: Base64Url;
 }
-export interface PrivilegeTicketResultPayload {
-  requestId: string;
-  requestDigest: Sha256Hex;
-  decision: "issued" | "denied" | "expired" | "conflict";
-  ticketId: string | null;
-  ticketDigest: Sha256Hex | null;
-  ticket: {
-    [k: string]: unknown;
-  } | null;
-  reasonCode: string | null;
-  observedAt: Timestamp;
+export interface PrivilegeResourceCeilings {
+  cpuQuotaPerSecUsec: number | null;
+  memoryMaxBytes: number | null;
+  tasksMax: number | null;
+  ioWeight: number | null;
+  runtimeMaxUsec: number | null;
 }
 export interface PrivilegeReceiptPayload {
-  receiptId: string;
-  receiptDigest: Sha256Hex;
-  installationId: string;
-  helperKeyId: string;
-  ticketId: string;
-  ticketDigest: Sha256Hex;
-  operationId: OperationId;
-  requestDigest: Sha256Hex;
-  runId: RunId;
-  runtimeId: string;
-  controllerEpoch: U64Decimal;
-  stateRevision: U64Decimal;
-  transition: string;
-  localExecutionPlanDigest: Sha256Hex;
-  controlRequestDigest?: Sha256Hex;
-  signedReceipt: {
-    [k: string]: unknown;
-  };
-  observedAt: Timestamp;
+  receipt: SignedPrivilegeDocument;
+  deviceKeyId: DeviceKeyId;
+  deviceSignature: Base64Url;
 }

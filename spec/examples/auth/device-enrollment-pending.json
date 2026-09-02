@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "kind": "device_enrollment",
+  "id": "enroll_sahur_pc_01",
+  "state": "pending_owner",
+  "claims": {
+    "hostnameLabel": "sahur-pc",
+    "os": "linux",
+    "arch": "x86_64",
+    "nodeVersion": "0.1.0-dev",
+    "protocolVersion": "conduit.node/1"
+  },
+  "requestedKey": {
+    "keyId": "dkey_sahur_pc_01",
+    "algorithm": "Ed25519",
+    "publicJwk": {
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "x": "11qYAYafhZMqUNQ18NhwLL09ip8cN0J6GvYVZ0t1cZQ"
+    },
+    "fingerprint": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "status": "active",
+    "createdAt": "2026-09-01T00:00:00Z"
+  },
+  "userCodeHint": "K7MP-2Q",
+  "createdAt": "2026-09-01T00:00:00Z",
+  "expiresAt": "2026-09-01T00:10:00Z"
+}

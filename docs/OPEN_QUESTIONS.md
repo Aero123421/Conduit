@@ -1,18 +1,24 @@
 # Open decisions
 
+## Resolved contracts
+
+### Authentication and authorization
+
+The first-release identity, owner bootstrap, passkey recovery, device enrollment, MCP OAuth, connector ceiling, Full Access, and rate-limit contracts are fixed in:
+
+- `docs/AUTHORIZATION.md`
+- `docs/adr/0006-separate-identities-and-server-side-connector-ceilings.md`
+- `spec/schemas/auth-v1.schema.json`
+
+Library selection, D1 migrations, endpoint implementation, and interoperability receipts remain implementation work. They must not change the identity separation or connector-ceiling contract without a new ADR.
+
 ## Blocks the first executable vertical slice
-
-### Authentication and owner bootstrap
-
-Decide the first-owner enrollment, passkey/OAuth flow, recovery method, and whether the dashboard and device enrollment share one issuer.
-
-Proposed default: single owner, passkey login, dynamic OAuth registration only for explicitly supported MCP clients, and local recovery material generated during bootstrap.
 
 ### Node transport and reconciliation protocol
 
-Define handshake, device identity, sequence numbers, operation admission, event replay, local journal format, and reconnect reconciliation.
+Define handshake message encoding, sequence numbers, operation admission, event replay, local journal format, and reconnect reconciliation.
 
-The protocol must cover control-plane disconnect, node restart, duplicate admission, late terminal result, and device clock skew.
+Device identity, enrollment, challenge authentication, connection epochs, key rotation, and revocation are already defined by the authorization contract. The transport work must cover control-plane disconnect, node restart, duplicate admission, late terminal result, and device clock skew.
 
 ### Collaboration-session baseline and change-set acceptance
 

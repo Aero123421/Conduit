@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "kind": "rate_limit_profile",
+  "id": "rate_trusted_mcp_01",
+  "revision": 1,
+  "status": "active",
+  "name": "Trusted personal MCP",
+  "requestWindows": {
+    "read": {
+      "limit": 120,
+      "windowSeconds": 60
+    },
+    "boardWrite": {
+      "limit": 30,
+      "windowSeconds": 60
+    },
+    "commandStart": {
+      "limit": 10,
+      "windowSeconds": 60
+    },
+    "agentRunStart": {
+      "limit": 6,
+      "windowSeconds": 600
+    },
+    "runtimeStart": {
+      "limit": 2,
+      "windowSeconds": 600
+    },
+    "approvalResolve": {
+      "limit": 20,
+      "windowSeconds": 60
+    },
+    "rawLogRead": {
+      "limit": 10,
+      "windowSeconds": 60
+    }
+  },
+  "weightedBudget": {
+    "capacity": 200,
+    "refillPerSecond": 2,
+    "weights": {
+      "project.read": 1,
+      "board.write": 2,
+      "command.start": 10,
+      "run.start": 20,
+      "runtime.create": 50,
+      "logs.raw.read": 10
+    }
+  },
+  "concurrency": {
+    "commands": 2,
+    "agentRuns": 3,
+    "runtimeStarts": 1
+  },
+  "durations": {
+    "commandSeconds": 1800,
+    "runSeconds": 86400
+  },
+  "bytes": {
+    "responseBytes": 524288,
+    "normalizedLogBytesPerDay": 1073741824,
+    "rawLogBytesPerDay": 209715200,
+    "artifactUploadBytesPerDay": 5368709120
+  },
+  "createdAt": "2026-09-01T00:00:00Z",
+  "updatedAt": "2026-09-01T00:00:00Z"
+}

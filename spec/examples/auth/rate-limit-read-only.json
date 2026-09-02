@@ -1,0 +1,68 @@
+{
+  "schemaVersion": 1,
+  "kind": "rate_limit_profile",
+  "id": "rate_read_only_01",
+  "revision": 1,
+  "status": "active",
+  "name": "Read-only MCP",
+  "requestWindows": {
+    "read": {
+      "limit": 120,
+      "windowSeconds": 60
+    },
+    "boardWrite": {
+      "limit": 0,
+      "windowSeconds": 60
+    },
+    "commandStart": {
+      "limit": 0,
+      "windowSeconds": 60
+    },
+    "agentRunStart": {
+      "limit": 0,
+      "windowSeconds": 600
+    },
+    "runtimeStart": {
+      "limit": 0,
+      "windowSeconds": 600
+    },
+    "approvalResolve": {
+      "limit": 0,
+      "windowSeconds": 60
+    },
+    "rawLogRead": {
+      "limit": 0,
+      "windowSeconds": 60
+    }
+  },
+  "weightedBudget": {
+    "capacity": 120,
+    "refillPerSecond": 2,
+    "weights": {
+      "project.read": 1,
+      "session.read": 1,
+      "board.read": 1,
+      "run.read": 1,
+      "logs.summary.read": 2,
+      "logs.normalized.read": 4,
+      "artifact.read": 4
+    }
+  },
+  "concurrency": {
+    "commands": 0,
+    "agentRuns": 0,
+    "runtimeStarts": 0
+  },
+  "durations": {
+    "commandSeconds": 1,
+    "runSeconds": 1
+  },
+  "bytes": {
+    "responseBytes": 262144,
+    "normalizedLogBytesPerDay": 104857600,
+    "rawLogBytesPerDay": 0,
+    "artifactUploadBytesPerDay": 0
+  },
+  "createdAt": "2026-09-01T00:00:00Z",
+  "updatedAt": "2026-09-01T00:00:00Z"
+}

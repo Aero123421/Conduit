@@ -5057,7 +5057,13 @@ mod tests {
         assert_eq!(probe["setAlarm"], 0);
         assert_eq!(probe["alarmInvocations"], 0);
         assert!(probe["alarmAt"].is_null());
+        assert_eq!(probe["d1"]["statements"], 72);
+        assert_eq!(probe["d1"]["bindingCalls"], 72);
+        assert_eq!(probe["d1"]["maxBoundParameters"], 4);
+        assert_eq!(probe["d1"]["rowsRead"], 144);
         assert_eq!(probe["d1"]["rowsWritten"], 72);
+        assert_eq!(probe["sqlStatements"], 1_152);
+        assert_eq!(probe["sqlRowsRead"], 8_784);
         assert_eq!(probe["sqlRowsWritten"], 72);
         assert_eq!(
             store.transport_positions().unwrap().node_sent_through,

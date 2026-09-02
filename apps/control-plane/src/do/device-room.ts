@@ -544,17 +544,30 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
    * over an old replay, so this helper is deliberately a no-op in that case.
    */
   private async projectExactHealthCheckpoint(frame: Extract<NodeV1PostAuthFrame, { type: "device.health" }>): Promise<void> {
+    const observedAt = nowIso();
+    // Keep the common exact-checkpoint path to one D1 binding call. Sequence
+    // values are canonical unsigned decimal strings, so length followed by
+    // lexical order is the same as numeric order without narrowing to SQLite's
+    // signed INTEGER range. The diagnostic SELECT only runs for the exceptional
+    // no-change path, preserving the stale-epoch fail-closed distinction.
+    const updated = await this.env.DB.prepare(`
+      UPDATE devices
+      SET health_sequence=?1,last_observed_at=?2,updated_at=?2
+      WHERE id=?3 AND status='active' AND connection_epoch=?4
+        AND (
+          length(health_sequence) < length(?1)
+          OR (length(health_sequence) = length(?1) AND health_sequence <= ?1)
+        )
+      RETURNING id
+    `).bind(frame.sequence, observedAt, frame.deviceId, frame.connectionEpoch).all<{ id: string }>();
+    if (updated.results.length === 1) return;
+
     const device = await this.env.DB.prepare("SELECT connection_epoch,health_sequence FROM devices WHERE id=?1 AND status='active' LIMIT 1")
       .bind(frame.deviceId)
       .first<{ connection_epoch: string; health_sequence: string }>();
-    if (device === null || device.connection_epoch !== frame.connectionEpoch) {
-      throw new TypeError("stale_connection_epoch");
-    }
+    if (device === null || device.connection_epoch !== frame.connectionEpoch) throw new TypeError("stale_connection_epoch");
     if (BigInt(device.health_sequence) > BigInt(frame.sequence)) return;
-    const observedAt = nowIso();
-    await this.env.DB.prepare("UPDATE devices SET health_sequence=?1,last_observed_at=?2,updated_at=?2 WHERE id=?3 AND status='active' AND connection_epoch=?4 AND health_sequence=?5")
-      .bind(frame.sequence, observedAt, frame.deviceId, frame.connectionEpoch, device.health_sequence)
-      .run();
+    throw new TypeError("health_checkpoint_projection_conflict");
   }
 
   private compactedThrough(direction: "control_to_node" | "node_to_control"): number {

@@ -118,25 +118,18 @@ pub struct PublicJwk {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct RegistrationBundle {
+    pub protocol: String,
     pub installation_id: String,
     pub device_id: String,
     pub device_key_id: String,
-    pub expected_uid: u32,
-    pub public_origin: String,
-    pub helper_key_id: String,
+    pub uid: u32,
+    pub origin: String,
+    pub policy_revision: u64,
+    pub policy_digest: String,
     pub receipt_public_jwk: PublicJwk,
+    pub signed_policy_attestation:
+        conduit_privileged_protocol::SignedClaims<conduit_privileged_protocol::RootPolicy>,
     pub signed_capability: conduit_privileged_protocol::SignedCapability,
-    pub policy: PublicPolicyAttestation,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PolicyAttestationClaims<'a> {
-    revision: u64,
-    policy_digest: &'a str,
-    previous_policy_digest: &'a Option<String>,
-    public_summary: &'a PublicPolicySummary,
-    change_class: &'a str,
 }
 
 impl HelperConfig {
@@ -1280,26 +1273,6 @@ pub fn build_registration_bundle(
     }
     let receipt_key_id =
         conduit_privileged_protocol::key_id("hkey", receipt_key.verifying_key().as_bytes());
-    let summary = PublicPolicySummary {
-        enabled: policy.enabled,
-        ticket_key_ids: policy.ticket_key_ids.clone(),
-        allowed_operations: policy.allowed_operations.clone(),
-        allowed_adapters: policy.allowed_adapters.clone(),
-        allowed_launch_profiles: policy.allowed_launch_profiles.clone(),
-        ceilings: policy.ceilings.clone(),
-        allow_never: policy.allow_never,
-        allow_unrestricted_launch: policy.allow_unrestricted_launch,
-        allow_persistent_sessions: policy.allow_persistent_sessions,
-        allow_offline_control: policy.allow_offline_control,
-    };
-    let policy_claims = PolicyAttestationClaims {
-        revision: policy.revision,
-        policy_digest: &policy_digest,
-        previous_policy_digest: &policy_change.previous_policy_digest,
-        public_summary: &summary,
-        change_class: &policy_change.change_class,
-    };
-    let signature = SignedClaims::sign(&receipt_key_id, policy_claims, receipt_key)?.signature;
     let capability = CapabilityClaims {
         protocol: PROTOCOL.into(),
         helper_version: helper_version.into(),
@@ -1328,27 +1301,26 @@ pub fn build_registration_bundle(
         },
     };
     Ok(RegistrationBundle {
+        protocol: PROTOCOL.into(),
         installation_id: policy.installation_id.clone(),
         device_id: policy.device_id.clone(),
         device_key_id: conduit_privileged_protocol::key_id("dkey", &device_public_key),
-        expected_uid: policy.uid,
-        public_origin: policy.origin.clone(),
-        helper_key_id: receipt_key_id.clone(),
+        uid: policy.uid,
+        origin: policy.origin.clone(),
+        policy_revision: policy.revision,
+        policy_digest: policy_digest.clone(),
         receipt_public_jwk: PublicJwk {
             kty: "OKP".into(),
             crv: "Ed25519".into(),
             x: URL_SAFE_NO_PAD.encode(receipt_key.verifying_key().as_bytes()),
             kid: receipt_key_id.clone(),
         },
+        signed_policy_attestation: SignedClaims::sign(
+            &receipt_key_id,
+            policy.clone(),
+            receipt_key,
+        )?,
         signed_capability: SignedClaims::sign(&receipt_key_id, capability, receipt_key)?,
-        policy: PublicPolicyAttestation {
-            revision: policy.revision,
-            policy_digest,
-            previous_policy_digest: policy_change.previous_policy_digest.clone(),
-            public_summary: summary,
-            change_class: policy_change.change_class.clone(),
-            signature,
-        },
     })
 }
 
@@ -1599,14 +1571,7 @@ mod tests {
                 runtime_id: plan.runtime_id.clone(),
                 runtime_spec_digest: "33".repeat(32),
                 launch_plan_digest: "44".repeat(32),
-                control_digest: if matches!(
-                    operation,
-                    PrivilegedOperation::Prepare | PrivilegedOperation::Start
-                ) {
-                    None
-                } else {
-                    Some("77".repeat(32))
-                },
+                control_digest: None,
                 local_execution_plan_digest: plan.digest().unwrap(),
                 controller_epoch: 1,
                 connector_policy_id: Some("cpol_test".into()),
@@ -1845,15 +1810,42 @@ mod tests {
             panic!("registration bundle replay")
         };
         assert_eq!(first, replay);
-        assert_eq!(first.helper_key_id, first.signed_capability.key_id);
+        assert_eq!(first.receipt_public_jwk.kid, first.signed_capability.key_id);
         assert_eq!(first.device_key_id, engine.config.device_key_id);
-        assert_eq!(first.policy.revision, engine.config.policy.revision);
-        assert_eq!(first.policy.policy_digest, engine.config.policy_digest);
+        assert_eq!(first.policy_revision, engine.config.policy.revision);
+        assert_eq!(first.policy_digest, engine.config.policy_digest);
         first
             .signed_capability
             .verify(receipt_key.as_bytes())
             .unwrap();
+        first
+            .signed_policy_attestation
+            .verify(receipt_key.as_bytes())
+            .unwrap();
         let value = serde_json::to_value(&first).unwrap();
+        let mut keys = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "deviceId",
+                "deviceKeyId",
+                "installationId",
+                "origin",
+                "policyDigest",
+                "policyRevision",
+                "protocol",
+                "receiptPublicJwk",
+                "signedCapability",
+                "signedPolicyAttestation",
+                "uid",
+            ]
+        );
         let jwk = value["receiptPublicJwk"].as_object().unwrap();
         assert_eq!(jwk.len(), 4);
         assert!(

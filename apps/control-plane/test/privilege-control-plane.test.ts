@@ -2,7 +2,7 @@ import { env, exports } from "cloudflare:workers";
 import { runInDurableObject } from "cloudflare:test";
 import { parseWireDocument, parseWireDocumentText, schemaIds } from "@conduit/schema";
 import { beforeAll, describe, expect, it } from "vitest";
-import { base64url, canonicalJson, sha256Hex } from "../src/crypto.ts";
+import { base64url, canonicalJson, fromBase64url, sha256Hex } from "../src/crypto.ts";
 import { parsePrivilegeTransportFrame, projectPrivilegeFrame, requireVerifiedPrivilegeReceipt, type PrivilegeTransportFrame } from "../src/privilege.ts";
 import { assertFreeD1Ceilings, instrumentD1 } from "../src/usage-instrumentation.ts";
 import type { ControlPlaneEnv } from "../src/types.ts";
@@ -107,7 +107,7 @@ describe.sequential("privileged helper Control Plane", () => {
       env.DB.prepare("UPDATE privilege_policy_attestations SET status='active',approved_by='prin_privilegeflow01',approved_at=?1 WHERE installation_id='phinst_privilegeflow01' AND revision=1").bind(now),
       env.DB.prepare("UPDATE device_user_policy_attestations SET status='active' WHERE device_id='dev_privilegeflow01' AND revision=1"),
       env.DB.prepare("UPDATE device_privilege_installations SET active_key_id='hkey_privilegeflow01',active_policy_revision=1,active_policy_digest=?1,status='active',owner_principal_id='prin_privilegeflow01',approved_at=?2 WHERE installation_id='phinst_privilegeflow01'").bind(rootPolicyDigest, now),
-      env.DB.prepare("INSERT INTO privilege_issuer_keys(key_id,revision,public_jwk_json,fingerprint,status,valid_from,created_at) VALUES ('pkey_testissuer0001',1,?1,?2,'active',?3,?3)").bind(canonicalJson({ kty: "OKP", crv: "Ed25519", x: "BqRlMWvAVKLe2h6jRtRBlfOlZ8I2m5nuwkFqhm_cD0M" }), await sha256Hex("BqRlMWvAVKLe2h6jRtRBlfOlZ8I2m5nuwkFqhm_cD0M"), now),
+      env.DB.prepare("INSERT INTO privilege_issuer_keys(key_id,revision,public_jwk_json,fingerprint,status,valid_from,created_at) VALUES ('pkey_testissuer0001',1,?1,?2,'active',?3,?3)").bind(canonicalJson({ kty: "OKP", crv: "Ed25519", x: "BqRlMWvAVKLe2h6jRtRBlfOlZ8I2m5nuwkFqhm_cD0M" }), await sha256Hex(fromBase64url("BqRlMWvAVKLe2h6jRtRBlfOlZ8I2m5nuwkFqhm_cD0M")), now),
     ]);
     const unsignedStatus = { protocol: "conduit.node/1", messageId: "nmsg_privstatusbad01", deviceId: "dev_privilegeflow01", connectionEpoch: "7", direction: "node_to_control", sequence: "4", type: "operation.status", correlationId: "op_privilegeflow01", payloadDigest: "8".repeat(64), payload: { operationId: "op_privilegeflow01", runId: "run_privilegeflow01", requestDigest: operationDigest, state: "running", revision: "1", controllerEpoch: "7", targetRuntimeId: "rt_privilegeflow01", targetDigest: "9".repeat(64), runtimeHandleDigest: "a".repeat(64), runtimeTargetDigest: "b".repeat(64), selectedRuntimeProvider: "privileged-native", observedAt: new Date().toISOString() } };
     await expect(projectNodeState(env, unsignedStatus as never)).rejects.toMatchObject({ code: "privilege_ticket_required" });

@@ -113,6 +113,11 @@ impl PrivilegedNodeRuntime {
         let object = bundle
             .as_object()
             .ok_or_else(|| PrivilegedNodeError::Config("registration bundle object".into()))?;
+        if object.get("protocol").and_then(Value::as_str)
+            != Some(conduit_privileged_protocol::PROTOCOL)
+        {
+            return Err(PrivilegedNodeError::RegistrationMissing);
+        }
         let bundle_device = string(object.get("deviceId"), "deviceId")?;
         let installation_id = string(object.get("installationId"), "installationId")?;
         let expected_uid = object
@@ -155,8 +160,33 @@ impl PrivilegedNodeRuntime {
         if jwk.get("kid").and_then(Value::as_str) != Some(capability.key_id.as_str()) {
             return Err(PrivilegedNodeError::RegistrationMissing);
         }
+        let policy: conduit_privileged_protocol::SignedClaims<
+            conduit_privileged_protocol::RootPolicy,
+        > = serde_json::from_value(
+            object
+                .get("signedPolicyAttestation")
+                .cloned()
+                .ok_or_else(|| PrivilegedNodeError::Config("signedPolicyAttestation".into()))?,
+        )
+        .map_err(|error| PrivilegedNodeError::Config(error.to_string()))?;
+        policy
+            .verify(receipt_key.as_bytes())
+            .map_err(|_| PrivilegedNodeError::RegistrationMissing)?;
+        let policy_digest = policy
+            .claims
+            .digest()
+            .map_err(|_| PrivilegedNodeError::PolicyMismatch)?;
         if capability.claims.installation_id != installation_id
             || capability.claims.receipt_key_id != capability.key_id
+            || policy.key_id != capability.key_id
+            || policy.claims.installation_id != installation_id
+            || policy.claims.device_id != device_id
+            || policy.claims.uid as u64 != expected_uid
+            || policy.claims.origin
+                != object
+                    .get("origin")
+                    .and_then(Value::as_str)
+                    .ok_or(PrivilegedNodeError::PolicyMismatch)?
             || capability.claims.policy_revision
                 != object
                     .get("policyRevision")
@@ -164,6 +194,8 @@ impl PrivilegedNodeRuntime {
                     .ok_or(PrivilegedNodeError::PolicyMismatch)?
             || capability.claims.policy_digest
                 != string(object.get("policyDigest"), "policyDigest")?
+            || policy.claims.revision != capability.claims.policy_revision
+            || policy_digest != capability.claims.policy_digest
         {
             return Err(PrivilegedNodeError::PolicyMismatch);
         }
@@ -286,9 +318,8 @@ impl PrivilegedNodeRuntime {
                 .map_err(|_| PrivilegedNodeError::RegistrationMissing)?
                 .try_into()
                 .map_err(|_| PrivilegedNodeError::RegistrationMissing)?;
-            if hex::encode(Sha256::digest(
-                string(jwk.get("x"), "issuer JWK x")?.as_bytes(),
-            )) != string(item.get("fingerprint"), "issuer fingerprint")?
+            if hex::encode(Sha256::digest(raw))
+                != string(item.get("fingerprint"), "issuer fingerprint")?
             {
                 return Err(PrivilegedNodeError::RegistrationMissing);
             }

@@ -1,6 +1,6 @@
 import { parseWireDocument, schemaIds, type PrivilegedV1WireDocument } from "@conduit/schema";
 import { boundedString, readJsonBounded, record } from "./bounds.ts";
-import { base64url, canonicalJson, newId, nowIso, randomToken, sha256Hex, verifyEd25519 } from "./crypto.ts";
+import { base64url, canonicalJson, fromBase64url, newId, nowIso, randomToken, sha256Hex, verifyEd25519 } from "./crypto.ts";
 import { PublicError, type DenialCode } from "./errors.ts";
 import type { ControlPlaneEnv } from "./types.ts";
 import { requireBrowserSession } from "./auth/browser.ts";
@@ -280,7 +280,7 @@ async function projectInstallation(env: ControlPlaneEnv, frame: PrivilegeTranspo
   const receiptJwk = publicJwk(bundle.receiptPublicJwk, capability.keyId);
   if (!await verifyEd25519(receiptJwk, capability.signature, canonicalJson(claims))) throw new PublicError("privilege_ticket_invalid", 403, "Helper capability signature is invalid");
   const helperKeyId = capability.keyId;
-  const fingerprint = await sha256Hex(String(receiptJwk.x));
+  const fingerprint = await sha256Hex(fromBase64url(String(receiptJwk.x)));
   const capabilityDigest = await sha256Hex(canonicalJson(bundle.signedCapability));
   const policy = signedDocument(bundle.signedPolicyAttestation, "policy");
   const policyClaims = policy.claims;
@@ -368,7 +368,7 @@ async function issuerMaterial(env: ControlPlaneEnv): Promise<{ config: IssuerKey
   const exported = await crypto.subtle.exportKey("jwk", key) as JsonWebKey;
   if (typeof exported.x !== "string") throw new PublicError("full_device_capability_unavailable", 503, "Privilege ticket signer public key is unavailable");
   const publicKey: JsonWebKey = { kty: "OKP", crv: "Ed25519", x: exported.x };
-  const fingerprint = await sha256Hex(String(exported.x));
+  const fingerprint = await sha256Hex(fromBase64url(String(exported.x)));
   return { config, key, publicJwk: publicKey, fingerprint };
 }
 

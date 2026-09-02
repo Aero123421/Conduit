@@ -144,11 +144,7 @@ impl SystemdBackend {
             "ExecMainStatus",
         )?)
         .ok();
-        let (exit_code, signal) = match (main_code, main_status) {
-            (Some(libc::CLD_EXITED), value) => (value, None),
-            (Some(_), value) => (None, value),
-            _ => (None, None),
-        };
+        let (exit_code, signal) = decode_exec_status(main_code, main_status);
         Ok(UnitObservation {
             unit_name: unit_name.into(),
             invocation_id: invocation,
@@ -454,6 +450,24 @@ fn validate_unit_name(name: &str) -> Result<()> {
 fn bus_error(error: impl std::fmt::Display) -> HelperError {
     HelperError::Systemd(error.to_string())
 }
+
+fn decode_exec_status(
+    main_code: Option<i32>,
+    main_status: Option<i32>,
+) -> (Option<i32>, Option<i32>) {
+    match (main_code, main_status) {
+        (Some(libc::CLD_EXITED), Some(status)) if status >= 0 => (Some(status), None),
+        (Some(code), Some(signal))
+            if matches!(code, libc::CLD_KILLED | libc::CLD_DUMPED)
+                && (1..=64).contains(&signal) =>
+        {
+            (None, Some(signal))
+        }
+        // ExecMainCode and ExecMainStatus are both zero while a service has
+        // not exited. Do not turn systemd's sentinel into a claimed signal.
+        _ => (None, None),
+    }
+}
 fn proc_identity(pid: u32) -> Option<(u32, u32, String)> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let uid = status
@@ -479,6 +493,25 @@ fn proc_identity(pid: u32) -> Option<(u32, u32, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn running_systemd_sentinels_do_not_claim_an_exit_signal() {
+        assert_eq!(decode_exec_status(Some(0), Some(0)), (None, None));
+        assert_eq!(decode_exec_status(None, Some(0)), (None, None));
+        assert_eq!(
+            decode_exec_status(Some(libc::CLD_EXITED), Some(0)),
+            (Some(0), None)
+        );
+        assert_eq!(
+            decode_exec_status(Some(libc::CLD_KILLED), Some(15)),
+            (None, Some(15))
+        );
+        assert_eq!(
+            decode_exec_status(Some(libc::CLD_KILLED), Some(0)),
+            (None, None)
+        );
+    }
+
     #[test]
     fn fake_uses_exact_unit_and_supports_control() {
         let backend = FakeSystemd::default();

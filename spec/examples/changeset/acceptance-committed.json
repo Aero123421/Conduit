@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "kind": "acceptance_receipt",
+  "operationId": "op_accept_runtime_01",
+  "projectId": "prj_conduit_01",
+  "sessionId": "csess_architecture_01",
+  "changeSetId": "chg_runtime_contract_01",
+  "changeSetDigest": "becc9dc33cb79f6c6c192f293bf383540c8248c0c2df2c984a4c4a638dfe1f7b",
+  "prepareReceiptDigest": "0de8d61b8bf66dcbf85b03630d188eca563ee56bc080062e2303710c1d01d1b9",
+  "previousBaselineId": "bln_conduit_initial_01",
+  "previousBaselineRevision": 1,
+  "newBaselineId": "bln_conduit_runtime_02",
+  "newBaselineRevision": 2,
+  "newBaselineDigest": "099947e76551a55ead8ff024537852303940279996405ca6135ec85e6cc7819f",
+  "state": "finalization_pending",
+  "acceptedByPrincipalId": "prin_owner_01",
+  "acceptedByClientId": "https://client.example/dashboard/conduit",
+  "receiptDigest": "8dbadbc2442346d7dd83ce29a1561765dcc4131b8dfbb9bbcf90df381a31fc8b",
+  "acceptedAt": "2026-09-01T13:00:04Z"
+}

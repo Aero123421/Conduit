@@ -1,0 +1,83 @@
+{
+  "schemaVersion": 1,
+  "kind": "baseline_revision",
+  "baselineId": "bln_conduit_initial_01",
+  "projectId": "prj_conduit_01",
+  "sessionId": "csess_architecture_01",
+  "revision": 1,
+  "state": "active",
+  "sources": [
+    {
+      "sourceType": "git",
+      "sourceId": "src_conduit_repo_01",
+      "repositoryIdentityDigest": "b714a0d5ef4c9b8e180a560360f44ee3cbed837285d766398965476e450e1d6a",
+      "objectFormat": "sha1",
+      "commit": "905920194c03bc39bccda1ed69e153f25593379b",
+      "treeDigest": "8db28b67c9c2b1743b22cb781641f6c90a4cd85a",
+      "stateDigest": "6b3bd8653d354f2818aa27e1fbb0bc515f8264fb332737106dde344b47c991e0",
+      "custody": [
+        {
+          "custodyClass": "device_ref",
+          "deviceId": "dev_sahur_pc_01",
+          "provider": "git",
+          "reference": "refs/conduit/sessions/csess_architecture_01/src_conduit_repo_01/accepted",
+          "contentDigest": "6b3bd8653d354f2818aa27e1fbb0bc515f8264fb332737106dde344b47c991e0",
+          "state": "healthy",
+          "observedAt": "2026-09-01T12:00:00Z",
+          "receiptDigest": "3b1d702ae8fd873a2a06abca0f1ed0e6337c11dbc7dff290bcdf06457b507461"
+        },
+        {
+          "custodyClass": "device_archive",
+          "deviceId": "dev_sahur_pc_01",
+          "provider": "git_bundle",
+          "reference": "archive:conduit-baseline-1.bundle",
+          "contentDigest": "45c49c0a91c7777a69fafc97f6f64cc289895169c2697377013a01dcb7e69b75",
+          "state": "healthy",
+          "bytes": 7340032,
+          "observedAt": "2026-09-01T12:00:02Z",
+          "receiptDigest": "1a78724afbc3f9dd018ee33c82afe594b6023e7034b47b2a932b2752e80fd89a"
+        }
+      ],
+      "materializations": [
+        {
+          "deviceId": "dev_sahur_pc_01",
+          "locationId": "loc_sahur_conduit_01",
+          "state": "materialized",
+          "observedDigest": "6b3bd8653d354f2818aa27e1fbb0bc515f8264fb332737106dde344b47c991e0",
+          "observedAt": "2026-09-01T12:00:00Z"
+        }
+      ]
+    },
+    {
+      "sourceType": "managed_folder",
+      "sourceId": "src_conduit_notes_01",
+      "snapshotId": "snap_conduit_notes_01",
+      "manifestDigest": "8f49f79121eeb2669c70b24c98468d994671092689386397f4101657cc84b209",
+      "stateDigest": "06beae58badf8a6b63d2868e553ee20b641957864bf0a475f5884f28d60a1db1",
+      "custody": [
+        {
+          "custodyClass": "device_archive",
+          "deviceId": "dev_sahur_pc_01",
+          "provider": "managed_snapshot",
+          "reference": "archive:snap_conduit_notes_01",
+          "contentDigest": "06beae58badf8a6b63d2868e553ee20b641957864bf0a475f5884f28d60a1db1",
+          "state": "healthy",
+          "bytes": 1048576,
+          "observedAt": "2026-09-01T12:00:01Z",
+          "receiptDigest": "076c68dc28129bc3c49d50bd67838ea3bdb7ef76431c456dc11fefccfc90dc21"
+        }
+      ],
+      "materializations": [
+        {
+          "deviceId": "dev_sahur_pc_01",
+          "locationId": "loc_sahur_notes_01",
+          "state": "materialized",
+          "observedDigest": "06beae58badf8a6b63d2868e553ee20b641957864bf0a475f5884f28d60a1db1",
+          "observedAt": "2026-09-01T12:00:01Z"
+        }
+      ]
+    }
+  ],
+  "baselineDigest": "7090997d91e8ca7889b55424083135fd8cb28af08d91ff4d2bc778ec692ccac4",
+  "createdAt": "2026-09-01T12:00:03Z"
+}

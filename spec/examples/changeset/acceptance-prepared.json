@@ -1,0 +1,55 @@
+{
+  "schemaVersion": 1,
+  "kind": "acceptance_prepare_receipt",
+  "operationId": "op_accept_runtime_01",
+  "deviceId": "dev_sahur_pc_01",
+  "sessionId": "csess_architecture_01",
+  "changeSetId": "chg_runtime_contract_01",
+  "changeSetDigest": "becc9dc33cb79f6c6c192f293bf383540c8248c0c2df2c984a4c4a638dfe1f7b",
+  "expectedBaselineId": "bln_conduit_initial_01",
+  "expectedBaselineRevision": 1,
+  "expectedBaselineDigest": "7090997d91e8ca7889b55424083135fd8cb28af08d91ff4d2bc778ec692ccac4",
+  "state": "prepared",
+  "preparedSources": [
+    {
+      "sourceId": "src_conduit_repo_01",
+      "sourceChangeDigest": "8040615d8b65e6e006b4b96cb5ff2474ccf596c03e742f18ce5ccdf2c1c66d3a",
+      "preparedReference": "refs/conduit/acceptance-prepares/op_accept_runtime_01/src_conduit_repo_01",
+      "targetStateDigest": "f0fb1ce7c2e2e9b50e591702148e2a1d83c3487012e21058116809cd3f22c7fe",
+      "custody": [
+        {
+          "custodyClass": "device_ref",
+          "deviceId": "dev_sahur_pc_01",
+          "provider": "git",
+          "reference": "refs/conduit/acceptance-prepares/op_accept_runtime_01/src_conduit_repo_01",
+          "contentDigest": "f0fb1ce7c2e2e9b50e591702148e2a1d83c3487012e21058116809cd3f22c7fe",
+          "state": "healthy",
+          "observedAt": "2026-09-01T13:00:00Z",
+          "receiptDigest": "436319605866996509853151466259523454578911100534865996590735666121"
+        }
+      ]
+    },
+    {
+      "sourceId": "src_conduit_notes_01",
+      "sourceChangeDigest": "bdc36f08adf7e80aa45db72592c2c11ce293c9aa861cc8c8f3e18d69ff481740",
+      "preparedReference": "snapshot:snap_conduit_notes_02",
+      "targetStateDigest": "092d3ac099a88436739404372eef0829cb2c2f23c9a55f6bdd334c4f862e7dd7",
+      "custody": [
+        {
+          "custodyClass": "device_archive",
+          "deviceId": "dev_sahur_pc_01",
+          "provider": "managed_snapshot",
+          "reference": "archive:snap_conduit_notes_02",
+          "contentDigest": "092d3ac099a88436739404372eef0829cb2c2f23c9a55f6bdd334c4f862e7dd7",
+          "state": "healthy",
+          "bytes": 1114112,
+          "observedAt": "2026-09-01T13:00:01Z",
+          "receiptDigest": "6135ec85e6cc7819f099947e76551a55ead8ff024537852303940279996405ca"
+        }
+      ]
+    }
+  ],
+  "receiptDigest": "0de8d61b8bf66dcbf85b03630d188eca563ee56bc080062e2303710c1d01d1b9",
+  "preparedAt": "2026-09-01T13:00:02Z",
+  "expiresAt": "2026-09-01T13:10:02Z"
+}

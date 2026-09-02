@@ -645,7 +645,7 @@ mod tests {
         assert_eq!(validate_example_directory::<AuthV1>("auth"), 5);
         assert_eq!(
             validate_example_directory::<NodeProtocolV1>("node-protocol"),
-            4
+            5
         );
         assert_eq!(validate_example_directory::<TraceV1>("trace"), 5);
         assert_eq!(validate_example_directory::<RuntimeV1>("runtime"), 4);

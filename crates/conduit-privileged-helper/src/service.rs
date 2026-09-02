@@ -1348,6 +1348,11 @@ impl<M: SystemdManager> HelperEngine<M> {
         if !self.config.policy.enabled {
             return Err(HelperError::Denied("privileged_helper_disabled".into()));
         }
+        if c.approval_mode == "never" && !self.config.policy.allow_never {
+            return Err(HelperError::Denied(
+                "full_device_never_local_opt_in_required".into(),
+            ));
+        }
         if c.protocol != PROTOCOL
             || c.audience != "conduit-privileged-helper"
             || c.helper_installation_id != self.config.policy.installation_id
@@ -1364,7 +1369,6 @@ impl<M: SystemdManager> HelperEngine<M> {
             || ((now < not_before || now > expires_at) && !already_admitted)
             || expires_at - not_before > time::Duration::minutes(10)
             || c.access_scope != "full_device"
-            || (c.approval_mode == "never" && !self.config.policy.allow_never)
             || (matches!(
                 c.approval_enforcement,
                 conduit_privileged_protocol::ApprovalEnforcement::ExactCommand
@@ -2076,6 +2080,32 @@ mod tests {
                 vec![]
             ),
             Err(HelperError::Denied(reason)) if reason == "launch_profile_not_allowed"
+        ));
+    }
+
+    #[test]
+    fn never_requires_the_separate_root_owned_opt_in() {
+        let (engine, _backend, plan, issuer, _) = setup();
+        let mut claims = ticket(
+            &engine,
+            &issuer,
+            &plan,
+            PrivilegedOperation::Prepare,
+            "ptkt_neverdeny01",
+        )
+        .claims;
+        claims.approval_mode = "never".into();
+        claims.approval_receipt_digest = None;
+        let denied = SignedClaims::sign(
+            engine.config.policy.ticket_key_ids[0].clone(),
+            claims,
+            &issuer,
+        )
+        .unwrap();
+        assert!(matches!(
+            engine.prepare(denied, plan, vec![]),
+            Err(HelperError::Denied(reason))
+                if reason == "full_device_never_local_opt_in_required"
         ));
     }
 

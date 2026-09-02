@@ -797,7 +797,7 @@ for line in sys.stdin:
             managed.io.write_input(&frame.0).unwrap();
             input_index += 1;
         }
-        let page = managed.io.read_stdout(stdout_cursor, 64 * 1024).unwrap();
+        let page = managed.io.read_stdout(stdout_cursor, 32 * 1024).unwrap();
         stdout_cursor = page.next_cursor;
         pending.extend(page.bytes);
         let mut next = Vec::new();

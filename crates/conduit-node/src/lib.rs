@@ -136,6 +136,89 @@ impl VerifiedPrivilegedAdmission {
         plan: LocalExecutionPlan,
         capability: SignedCapability,
     ) -> Result<Self, NodeError> {
+        Self::verify_for_authority(
+            offer,
+            approval_policy,
+            expected_device_id,
+            expected_origin,
+            ticket_verification_key,
+            receipt_verification_key,
+            expected_ticket_idempotency_key,
+            &offer.operation_id,
+            &offer.request_digest,
+            expected_operation,
+            ticket,
+            plan,
+            capability,
+        )
+    }
+
+    /// Verifies an action-specific ticket issued for a durable control
+    /// operation while retaining the original start operation as the Runtime
+    /// and local-plan authority. This prevents a control ticket from being
+    /// mistaken for, or replayed as, the start ticket.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_control_for_operation(
+        offer: &OperationOffer,
+        approval_policy: &str,
+        expected_device_id: &str,
+        expected_origin: &str,
+        ticket_verification_key: &[u8; 32],
+        receipt_verification_key: &[u8; 32],
+        expected_ticket_idempotency_key: &str,
+        control_operation_id: &str,
+        control_request_digest: &str,
+        expected_operation: PrivilegedOperation,
+        ticket: PrivilegeTicket,
+        plan: LocalExecutionPlan,
+        capability: SignedCapability,
+    ) -> Result<Self, NodeError> {
+        if !matches!(
+            expected_operation,
+            PrivilegedOperation::Input
+                | PrivilegedOperation::ResizePty
+                | PrivilegedOperation::Pause
+                | PrivilegedOperation::Resume
+                | PrivilegedOperation::GracefulStop
+                | PrivilegedOperation::ForceStop
+        ) || control_operation_id == offer.operation_id
+            || ticket.claims.control_digest.as_deref() != Some(control_request_digest)
+        {
+            return Err(NodeError::Rejected("privilege_ticket_invalid".into()));
+        }
+        Self::verify_for_authority(
+            offer,
+            approval_policy,
+            expected_device_id,
+            expected_origin,
+            ticket_verification_key,
+            receipt_verification_key,
+            expected_ticket_idempotency_key,
+            control_operation_id,
+            control_request_digest,
+            expected_operation,
+            ticket,
+            plan,
+            capability,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn verify_for_authority(
+        offer: &OperationOffer,
+        approval_policy: &str,
+        expected_device_id: &str,
+        expected_origin: &str,
+        ticket_verification_key: &[u8; 32],
+        receipt_verification_key: &[u8; 32],
+        expected_ticket_idempotency_key: &str,
+        expected_ticket_operation_id: &str,
+        expected_operation_request_digest: &str,
+        expected_operation: PrivilegedOperation,
+        ticket: PrivilegeTicket,
+        plan: LocalExecutionPlan,
+        capability: SignedCapability,
+    ) -> Result<Self, NodeError> {
         ticket
             .verify(ticket_verification_key)
             .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
@@ -180,9 +263,9 @@ impl VerifiedPrivilegedAdmission {
             && claims.helper_policy_digest == helper.policy_digest
             && claims.device_id == expected_device_id
             && claims.expected_uid == unsafe { libc::geteuid() }
-            && claims.operation_id == offer.operation_id
+            && claims.operation_id == expected_ticket_operation_id
             && claims.idempotency_key_digest == idempotency_key_digest
-            && claims.operation_request_digest == offer.request_digest
+            && claims.operation_request_digest == expected_operation_request_digest
             && claims.run_id == offer.runtime.run_id
             && claims.runtime_id == offer.runtime.runtime_id
             && claims.runtime_spec_digest == offer.runtime.spec_digest
@@ -403,6 +486,23 @@ impl Node {
                     | "recovery_required"
             ),
         };
+        let is_control_ticket = matches!(
+            ticket.claims.allowed_operation,
+            PrivilegedOperation::Input
+                | PrivilegedOperation::ResizePty
+                | PrivilegedOperation::Pause
+                | PrivilegedOperation::Resume
+                | PrivilegedOperation::GracefulStop
+                | PrivilegedOperation::ForceStop
+        );
+        let operation_binding_matches = claims.operation_id == ticket.claims.operation_id
+            && claims.request_digest == ticket.claims.operation_request_digest
+            && if is_control_ticket {
+                ticket.claims.control_digest.is_some()
+            } else {
+                ticket.claims.operation_id == offer.operation_id
+                    && ticket.claims.operation_request_digest == offer.request_digest
+            };
         let exact = receipt.key_id == binding.helper_key_id
             && claims.protocol == PROTOCOL
             && claims.installation_id == binding.installation_id
@@ -412,8 +512,7 @@ impl Node {
             && claims.ticket_id == ticket.claims.ticket_id
             && claims.ticket_digest == ticket_digest
             && ticket_record.ticket_digest.as_deref() == Some(ticket_digest.as_str())
-            && claims.operation_id == offer.operation_id
-            && claims.request_digest == offer.request_digest
+            && operation_binding_matches
             && claims.run_id == offer.runtime.run_id
             && claims.runtime_id == offer.runtime.runtime_id
             && claims.runtime_spec_digest == binding.runtime_spec_digest

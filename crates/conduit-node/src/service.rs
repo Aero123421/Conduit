@@ -683,6 +683,7 @@ enum PendingPrivilegedControl {
 
 struct PendingPrivilegedControlRequest {
     start_operation_id: String,
+    ticket_operation_id: String,
     ticket_idempotency_key: String,
     action: PrivilegedOperation,
     control_digest: String,
@@ -1361,6 +1362,7 @@ impl NodeService {
                 return self.queue_privileged_control_ticket_request(
                     client,
                     &start_operation_id,
+                    &start_operation_id,
                     PrivilegedOperation::Input,
                     control_digest,
                     PendingPrivilegedControl::Approval {
@@ -1410,6 +1412,7 @@ impl NodeService {
             ));
             return self.queue_privileged_control_ticket_request(
                 client,
+                &start_operation_id,
                 &start_operation_id,
                 PrivilegedOperation::Input,
                 control_digest,
@@ -1607,6 +1610,7 @@ impl NodeService {
         &mut self,
         client: &mut WssClient,
         start_operation_id: &str,
+        ticket_operation_id: &str,
         action: PrivilegedOperation,
         control_digest: String,
         control: PendingPrivilegedControl,
@@ -1677,7 +1681,7 @@ impl NodeService {
             "idempotencyKey": ticket_idempotency_key,
             "installationId": privileged.capability().claims.installation_id,
             "deviceKeyId": self.identity.key_id(),
-            "operationId": context.offer.operation_id,
+            "operationId": ticket_operation_id,
             "runId": context.offer.runtime.run_id,
             "runtimeId": context.offer.runtime.runtime_id,
             "runtimeSpecDigest": context.offer.runtime.spec_digest,
@@ -1732,6 +1736,7 @@ impl NodeService {
             request_id.clone(),
             PendingPrivilegedControlRequest {
                 start_operation_id: start_operation_id.to_owned(),
+                ticket_operation_id: ticket_operation_id.to_owned(),
                 ticket_idempotency_key,
                 action,
                 control_digest,
@@ -1821,19 +1826,37 @@ impl NodeService {
             .get(&request.start_operation_id)
             .cloned()
             .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_required".into()))?;
-        let authority = VerifiedPrivilegedAdmission::verify_for_operation(
-            &context.offer,
-            &context.op.approval_mode,
-            &self.device_id,
-            &ticket.claims.public_origin.clone(),
-            &issuer_key,
-            privileged.receipt_key(),
-            &request.ticket_idempotency_key,
-            request.action.clone(),
-            ticket,
-            context.plan.clone(),
-            privileged.capability().clone(),
-        )?;
+        let authority = if request.ticket_operation_id == request.start_operation_id {
+            VerifiedPrivilegedAdmission::verify_for_operation(
+                &context.offer,
+                &context.op.approval_mode,
+                &self.device_id,
+                &ticket.claims.public_origin.clone(),
+                &issuer_key,
+                privileged.receipt_key(),
+                &request.ticket_idempotency_key,
+                request.action.clone(),
+                ticket,
+                context.plan.clone(),
+                privileged.capability().clone(),
+            )?
+        } else {
+            VerifiedPrivilegedAdmission::verify_control_for_operation(
+                &context.offer,
+                &context.op.approval_mode,
+                &self.device_id,
+                &ticket.claims.public_origin.clone(),
+                &issuer_key,
+                privileged.receipt_key(),
+                &request.ticket_idempotency_key,
+                &request.ticket_operation_id,
+                &request.control_digest,
+                request.action.clone(),
+                ticket,
+                context.plan.clone(),
+                privileged.capability().clone(),
+            )?
+        };
         if authority.ticket().claims.control_digest.as_deref()
             != Some(request.control_digest.as_str())
         {
@@ -3964,6 +3987,7 @@ impl NodeService {
         self.queue_privileged_control_ticket_request(
             client,
             &start_operation_id,
+            &control.operation_id,
             action,
             request_digest,
             PendingPrivilegedControl::Agent {
@@ -4053,6 +4077,7 @@ impl NodeService {
         self.queue_privileged_control_ticket_request(
             client,
             &custody.start_operation_id,
+            &control.operation_id,
             action,
             request_digest,
             PendingPrivilegedControl::Runtime {
@@ -5161,6 +5186,7 @@ impl NodeService {
             self.queue_privileged_control_ticket_request(
                 client,
                 &pending.operation_id,
+                &pending.operation_id,
                 PrivilegedOperation::Input,
                 digest,
                 PendingPrivilegedControl::AdapterFrames {
@@ -5182,6 +5208,7 @@ impl NodeService {
             ));
             self.queue_privileged_control_ticket_request(
                 client,
+                &pending.operation_id,
                 &pending.operation_id,
                 pending.action,
                 digest,

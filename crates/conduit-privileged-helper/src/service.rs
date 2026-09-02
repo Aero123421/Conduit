@@ -1122,13 +1122,27 @@ impl<M: SystemdManager> HelperEngine<M> {
         ticket: &PrivilegeTicket,
         runtime: &crate::RuntimeRecord,
     ) -> Result<()> {
+        self.validate_runtime_commitments(ticket, runtime)?;
+        let current = &ticket.claims;
+        let admitted = &runtime.authority_ticket.claims;
+        if current.operation_id != runtime.operation_id
+            || current.operation_request_digest != admitted.operation_request_digest
+        {
+            return Err(HelperError::Denied("ticket_runtime_mismatch".into()));
+        }
+        Ok(())
+    }
+
+    fn validate_runtime_commitments(
+        &self,
+        ticket: &PrivilegeTicket,
+        runtime: &crate::RuntimeRecord,
+    ) -> Result<()> {
         let current = &ticket.claims;
         let admitted = &runtime.authority_ticket.claims;
         if current.runtime_id != runtime.runtime_id
             || current.run_id != runtime.run_id
-            || current.operation_id != runtime.operation_id
             || current.local_execution_plan_digest != runtime.plan_digest
-            || current.operation_request_digest != admitted.operation_request_digest
             || current.run_manifest_digest != admitted.run_manifest_digest
             || current.runtime_spec_digest != admitted.runtime_spec_digest
             || current.launch_plan_digest != admitted.launch_plan_digest
@@ -1153,7 +1167,16 @@ impl<M: SystemdManager> HelperEngine<M> {
         target: &ControlTarget,
         runtime: &crate::RuntimeRecord,
     ) -> Result<()> {
-        self.validate_runtime_ticket(ticket, runtime)?;
+        self.validate_runtime_commitments(ticket, runtime)?;
+        let mediated_agent_internal_control = ticket.claims.operation_id == runtime.operation_id
+            && runtime.plan.adapter_id.is_some()
+            && ticket.claims.approval_enforcement
+                == conduit_privileged_protocol::ApprovalEnforcement::AdapterMediated;
+        if (ticket.claims.operation_id == runtime.operation_id && !mediated_agent_internal_control)
+            || ticket.claims.control_digest.is_none()
+        {
+            return Err(HelperError::Denied("control_operation_mismatch".into()));
+        }
         if ticket.claims.controller_epoch != target.controller_epoch {
             return Err(HelperError::Denied("controller_epoch_mismatch".into()));
         }
@@ -2091,6 +2114,11 @@ mod tests {
             PrivilegedOperation::Pause,
             "ptkt_epochctrl01",
         );
+        let mut control_claims = control.claims;
+        control_claims.operation_id = "op_epochcontrol0001".into();
+        control_claims.control_digest = Some("66".repeat(32));
+        control_claims.operation_request_digest = "66".repeat(32);
+        let control = SignedClaims::sign(control.key_id, control_claims, &issuer).unwrap();
         let target = ControlTarget {
             runtime_id: runtime.runtime_id.clone(),
             unit_name: runtime.unit_name.clone(),

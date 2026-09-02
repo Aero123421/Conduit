@@ -376,6 +376,14 @@ impl<M: SystemdManager> HelperEngine<M> {
         if peer.uid != self.config.policy.uid {
             return Err(HelperError::Authentication("peer uid mismatch".into()));
         }
+        let expected_descriptors = match &request {
+            HelperRequest::Prepare { plan, .. } => plan.credentials.len(),
+            HelperRequest::Input { .. } => 1,
+            _ => 0,
+        };
+        if descriptors.len() != expected_descriptors {
+            return Err(HelperError::Denied("unexpected_fd_manifest".into()));
+        }
         match request {
             HelperRequest::Hello {
                 protocol_versions,
@@ -1890,13 +1898,21 @@ mod tests {
     #[test]
     fn control_ticket_requires_signed_control_digest_and_receipt_uses_it() {
         let (engine, _backend, plan, issuer, _) = setup();
-        let missing = ticket(
+        let generated = ticket(
             &engine,
             &issuer,
             &plan,
             PrivilegedOperation::Input,
             "ptkt_input_missing_digest",
         );
+        let mut missing_claims = generated.claims;
+        missing_claims.control_digest = None;
+        let missing = SignedClaims::sign(
+            engine.config.policy.ticket_key_ids[0].clone(),
+            missing_claims,
+            &issuer,
+        )
+        .unwrap();
         assert!(matches!(
             engine.validate_ticket(&missing, PrivilegedOperation::Input, None),
             Err(HelperError::Denied(_))
@@ -1938,6 +1954,140 @@ mod tests {
                 Some(&plan)
             ),
             Err(HelperError::Denied(_))
+        ));
+    }
+
+    #[test]
+    fn ticket_binding_matrix_fails_closed() {
+        let (engine, _backend, plan, issuer, _) = setup();
+        let valid = ticket(
+            &engine,
+            &issuer,
+            &plan,
+            PrivilegedOperation::Prepare,
+            "ptkt_binding0001",
+        );
+        engine
+            .validate_ticket(&valid, PrivilegedOperation::Prepare, Some(&plan))
+            .unwrap();
+
+        let resign = |claims: PrivilegeTicketClaims| {
+            SignedClaims::sign(
+                engine.config.policy.ticket_key_ids[0].clone(),
+                claims,
+                &issuer,
+            )
+            .unwrap()
+        };
+        let rejected = |candidate: PrivilegeTicket| {
+            assert!(matches!(
+                engine.validate_ticket(&candidate, PrivilegedOperation::Prepare, Some(&plan)),
+                Err(HelperError::Denied(_)) | Err(HelperError::Protocol(_))
+            ));
+        };
+
+        let mut claims = valid.claims.clone();
+        claims.audience = "another-helper".into();
+        rejected(resign(claims));
+        let mut claims = valid.claims.clone();
+        claims.public_origin = "https://wrong.example.test".into();
+        rejected(resign(claims));
+        let mut claims = valid.claims.clone();
+        claims.helper_installation_id = "phinst_wrong0001".into();
+        rejected(resign(claims));
+        let mut claims = valid.claims.clone();
+        claims.helper_key_id = "hkey_wrong000001".into();
+        rejected(resign(claims));
+        let mut claims = valid.claims.clone();
+        claims.expected_uid = engine.config.policy.uid.saturating_add(1);
+        rejected(resign(claims));
+        let mut claims = valid.claims.clone();
+        claims.device_id = "dev_wrong000001".into();
+        rejected(resign(claims));
+        let mut claims = valid.claims.clone();
+        claims.device_key_id = "dkey_wrong00001".into();
+        rejected(resign(claims));
+        let mut claims = valid.claims.clone();
+        claims.allowed_operation = PrivilegedOperation::Start;
+        rejected(resign(claims));
+        let mut claims = valid.claims.clone();
+        claims.local_execution_plan_digest = "ab".repeat(32);
+        rejected(resign(claims));
+        let mut claims = valid.claims.clone();
+        claims.schema_version = 2;
+        rejected(resign(claims));
+
+        let now = OffsetDateTime::now_utc();
+        let mut claims = valid.claims.clone();
+        claims.issued_at = (now - time::Duration::minutes(2)).format(&Rfc3339).unwrap();
+        claims.expires_at = (now - time::Duration::minutes(1)).format(&Rfc3339).unwrap();
+        rejected(resign(claims));
+        let mut claims = valid.claims.clone();
+        claims.issued_at = (now + time::Duration::minutes(1)).format(&Rfc3339).unwrap();
+        claims.expires_at = (now + time::Duration::minutes(2)).format(&Rfc3339).unwrap();
+        rejected(resign(claims));
+
+        let mut wrong_key = valid.clone();
+        wrong_key.key_id = "pkey_unpinned0001".into();
+        rejected(wrong_key);
+        let mut bad_signature = valid;
+        bad_signature.claims.operation_request_digest = "cd".repeat(32);
+        assert!(matches!(
+            engine.validate_ticket(&bad_signature, PrivilegedOperation::Prepare, Some(&plan)),
+            Err(HelperError::Protocol(_))
+        ));
+    }
+
+    #[test]
+    fn control_ticket_is_bound_to_controller_epoch() {
+        let (engine, _backend, plan, issuer, _) = setup();
+        engine
+            .prepare(
+                ticket(
+                    &engine,
+                    &issuer,
+                    &plan,
+                    PrivilegedOperation::Prepare,
+                    "ptkt_epochprep01",
+                ),
+                plan.clone(),
+                vec![],
+            )
+            .unwrap();
+        let runtime = engine.journal.runtime(&plan.runtime_id).unwrap().unwrap();
+        let control = ticket(
+            &engine,
+            &issuer,
+            &plan,
+            PrivilegedOperation::Pause,
+            "ptkt_epochctrl01",
+        );
+        let target = ControlTarget {
+            runtime_id: runtime.runtime_id.clone(),
+            unit_name: runtime.unit_name.clone(),
+            invocation_id: "0".repeat(32),
+            controller_epoch: control.claims.controller_epoch + 1,
+            expected_state_revision: runtime.state_revision,
+            runtime_handle_digest: "00".repeat(32),
+        };
+        assert!(matches!(
+            engine.validate_control_authority(&control, &target, &runtime),
+            Err(HelperError::Denied(reason)) if reason == "controller_epoch_mismatch"
+        ));
+    }
+
+    #[test]
+    fn request_fd_manifest_is_exact() {
+        let (engine, _backend, _plan, _issuer, _) = setup();
+        let peer = PeerCredentials {
+            pid: std::process::id(),
+            uid: engine.config.policy.uid,
+            gid: unsafe { libc::getegid() },
+        };
+        let descriptor: OwnedFd = File::open("/dev/null").unwrap().into();
+        assert!(matches!(
+            engine.handle(peer, true, HelperRequest::Probe, vec![descriptor]),
+            Err(HelperError::Denied(reason)) if reason == "unexpected_fd_manifest"
         ));
     }
 

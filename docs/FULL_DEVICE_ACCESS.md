@@ -88,6 +88,24 @@ policy revision/digest, systemd reachability, peer credential enforcement,
 transient units, cgroup/freeze, pidfd/openat2/execveat, PTY/stream replay, and
 the two local opt-ins.
 
+## Protocol and test vectors
+
+The helper wire contract is `spec/schemas/privileged-helper-v1.schema.json`;
+the public registration, ticket-request/result, and receipt frames are in
+`spec/schemas/node-protocol-v1.schema.json`. Canonical valid shapes are kept in
+`spec/examples/privileged-helper/` and
+`spec/examples/node-protocol/privilege-installation-attestation.json`. They use
+synthetic IDs, hosts, keys, digests, process values, and signatures and contain
+no contributor or deployment data.
+
+Rust contract tests cover canonical claim validation, wrong key/audience/origin,
+helper/UID/Device/operation/epoch binding, expiration and future issuance,
+digest mutation, unsupported versions, signature failure, packet and FD bounds,
+and journal idempotency conflicts. The schema validator and generated
+TypeScript validators separately reject malformed wire shapes and generated
+code drift. These deterministic checks are not substitutes for the protected
+real-root/systemd live test described in `docs/LINUX_E2E.md`.
+
 ## Audit limitation
 
 Host root is intentionally broad authority. A root Agent can alter Node/helper

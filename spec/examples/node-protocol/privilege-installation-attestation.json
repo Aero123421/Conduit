@@ -1,0 +1,98 @@
+{
+  "protocol": "conduit.node/1",
+  "messageId": "nmsg_privilege_registration_01",
+  "deviceId": "dev_fixture0001",
+  "connectionEpoch": "8",
+  "direction": "node_to_control",
+  "sequence": "12",
+  "type": "privilege.installation_attestation",
+  "correlationId": "phreq_fixture0001",
+  "payloadDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "payload": {
+    "requestId": "phreq_fixture0001",
+    "registrationBundle": {
+      "protocol": "conduit.privileged/1",
+      "installationId": "phinst_fixture0001",
+      "deviceId": "dev_fixture0001",
+      "deviceKeyId": "dkey_fixture0001",
+      "uid": 1000,
+      "origin": "https://conduit.example.test",
+      "policyRevision": 3,
+      "policyDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+      "receiptPublicJwk": {
+        "kty": "OKP",
+        "crv": "Ed25519",
+        "x": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        "kid": "hkey_fixture0001"
+      },
+      "signedPolicyAttestation": {
+        "keyId": "hkey_fixture0001",
+        "claims": {
+          "policyVersion": 1,
+          "installationId": "phinst_fixture0001",
+          "deviceId": "dev_fixture0001",
+          "uid": 1000,
+          "revision": 3,
+          "enabled": true,
+          "origin": "https://conduit.example.test",
+          "ticketKeyIds": ["pkey_fixture0001"],
+          "allowedOperations": ["prepare", "start", "inspect", "input", "resize_pty", "pause", "resume", "graceful_stop", "force_stop", "reconcile"],
+          "allowedAdapters": ["codex"],
+          "allowedLaunchProfiles": ["native.root.agent"],
+          "ceilings": {
+            "cpuQuotaPerSecUsec": 200000,
+            "memoryMaxBytes": 1073741824,
+            "tasksMax": 256,
+            "ioWeight": 100,
+            "runtimeMaxUsec": 300000000
+          },
+          "allowNever": false,
+          "allowUnrestrictedLaunch": false,
+          "allowPersistentSessions": false,
+          "allowOfflineControl": false,
+          "receiptRetentionSeconds": 604800
+        },
+        "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      },
+      "signedCapability": {
+        "keyId": "hkey_fixture0001",
+        "claims": {
+          "protocol": "conduit.privileged/1",
+          "helperVersion": "0.1.0",
+          "installationId": "phinst_fixture0001",
+          "receiptKeyId": "hkey_fixture0001",
+          "policyRevision": 3,
+          "policyDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+          "enabled": true,
+          "observedAt": "2026-09-03T00:00:00Z",
+          "systemdSystemManager": true,
+          "socketPeerCredentials": true,
+          "transientUnits": true,
+          "cgroupV2": true,
+          "freeze": true,
+          "pidfd": true,
+          "openat2": true,
+          "execveat": true,
+          "pty": true,
+          "streamReplay": true,
+          "neverOptIn": false,
+          "unrestrictedLaunchOptIn": false,
+          "unavailableReason": null
+        },
+        "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+      }
+    },
+    "devicePolicy": {
+      "revision": 4,
+      "policyDigest": "2222222222222222222222222222222222222222222222222222222222222222",
+      "previousPolicyDigest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "publicSummary": {
+        "fullDeviceEnabled": true,
+        "helperInstallationId": "phinst_fixture0001"
+      },
+      "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    },
+    "deviceKeyId": "dkey_fixture0001",
+    "deviceSignature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  }
+}

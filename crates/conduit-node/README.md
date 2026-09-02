@@ -32,8 +32,30 @@ provider, access scope, approval mode, and launch profile. Connector policy
 revision is retained in the immutable offer but never substitutes for this local
 decision. `full_user` combined with `never` requires a separate explicit
 local-policy opt-in. `full_device` fails closed with
-`full_device_capability_unavailable` until the privileged helper and its receipt
-boundary are implemented and packaged.
+`full_device_capability_unavailable` unless the packaged root helper, signed
+capability and registration bundle, active Control Plane registration, exact
+privilege ticket, root-owned policy, durable helper journal, systemd custody,
+and helper receipt-verification path all match. It never falls back to
+`full_user`.
+
+The optional Linux path is enabled only when both
+`--privileged-socket /run/conduit/privileged/<uid>.sock` and
+`--privileged-registration-bundle <root-helper-export.json>` are supplied. At
+startup the Node performs the Device-key challenge/proof handshake, verifies
+the helper-signed capability and receipt key, and submits the Device-signed
+registration attestation. It does not advertise effective `full_device` until
+the correlated `privilege.registration_result` is active. Prepare, start, Agent
+input, PTY resize, pause, resume, stop, and kill each obtain their own exact
+ticket. The complete helper receipt chain is persisted and projected; a generic
+unsigned Node state claim cannot substitute for it.
+
+On restart, privileged reconciliation checks root journal, systemd unit,
+Invocation ID, process identity, state revision and receipt chain before
+reattaching. If exact Agent/stream custody cannot be restored, the Node records
+`privileged_runtime_recovery_required` and does not respawn or replay the
+prompt. Setup, registration, policy enabling, key rotation, update, rollback,
+uninstall, and live-root verification commands are documented in
+`docs/LINUX_OPERATIONS.md` and `docs/LINUX_E2E.md`.
 
 Docker, Podman, Incus, KVM, bubblewrap, and systemd user scopes are diagnosed
 but never installed or globally configured by the network-facing service.

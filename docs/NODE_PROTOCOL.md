@@ -330,6 +330,32 @@ An admitted receipt binds:
 
 The control plane marks a run as preparing only after a valid admitted receipt. It marks a run as working only after an agent or command start receipt or an observed running event.
 
+### Privileged admission and evidence
+
+A Native host `full_device` offer remains in privileged admission custody while
+the Node resolves the Device-local executable, interpreter, cwd, Workspace,
+credential-descriptor and systemd-unit plan. The Node sends
+`privilege.installation_attestation` only for a locally authenticated signed
+helper bundle. It sends `privilege.ticket_request` with a Device signature over
+the exact local-plan and operation commitments. The Control Plane response is
+correlated by request ID and persisted before the ticket is delivered to the
+helper.
+
+`privilege.ticket_result` does not prove execution. The Node separately records
+and verifies helper receipts received from the authenticated socket and sends
+them in `privilege.receipt`. For a privileged Run, generic unsigned
+`operation.status` or `operation.terminal` claims cannot advance the cloud Run
+to elevated running or terminal states. `DeviceRoom` verifies active
+installation/key/policy bindings, signature, ticket digest, request/plan
+digests, controller epoch, transition legality, monotonic state revision, and
+previous-receipt linkage before projection.
+
+Each effectful Runtime control is a new Operation with its own idempotency key,
+exact target revision, and action-specific ticket. Start authority is not reused
+for input, PTY resize, pause, resume, graceful stop, or force stop. A lost Node
+or WebSocket response replays the same durable ticket/receipt records; it never
+mints or consumes a broader action implicitly.
+
 ## Effect start
 
 Each runtime provider must offer an idempotent start boundary to `conduit-node`.
@@ -505,6 +531,14 @@ The node cannot determine whether an external effect started or completed. Examp
 The observed state conflicts with a durable terminal or authority record. Examples include a runtime still running after a terminal journal state, a different runtime digest under the same run ID, or an unresolvable controller transition.
 
 An Agent subprocess cannot be resumed merely because its PID is still live. Resume requires an attachable provider I/O channel plus durable Adapter protocol phase, native session identity, active turn correlation, and event cursor. If any of those are unavailable after Node restart, the Node fences the exact recorded process identity and commits a schema-complete `recovery_required` terminal receipt. The receipt binds the original request digest and last durable event sequence and states that automatic replay did not occur.
+
+For a privileged Runtime, that decision also requires the authenticated helper
+reconciliation result and a valid signed receipt chain. The Node first checks
+the registered installation, current receipt key and root-policy digest. It then
+matches the helper journal record to the transient systemd unit, Invocation ID,
+cgroup and process identity. A missing helper, key mismatch, policy mismatch,
+unknown unit, or unavailable Adapter phase cannot be promoted to `running`; the
+result is `uncertain` or `privileged_runtime_recovery_required` without respawn.
 
 `lost`, `uncertain`, and `recovery_required` require an explicit recovery action. None automatically create a replacement run.
 

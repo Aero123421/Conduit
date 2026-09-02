@@ -714,4 +714,20 @@ mod tests {
         assert_eq!(client.receive().unwrap().bytes, b"response");
         child.join().unwrap();
     }
+
+    #[test]
+    fn rejects_oversize_packets_and_descriptor_manifests_before_send() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("helper.sock");
+        let server = SeqpacketServer::bind(&path, 0o600).unwrap();
+        let client = SeqpacketClient::connect(&path).unwrap();
+        let file = fs::File::open("/dev/null").unwrap();
+        assert!(client.send(&vec![b'x'; MAX_PACKET_BYTES + 1], &[]).is_err());
+        assert!(
+            client
+                .send(b"request", &vec![file.as_raw_fd(); MAX_DESCRIPTORS + 1])
+                .is_err()
+        );
+        drop(server);
+    }
 }

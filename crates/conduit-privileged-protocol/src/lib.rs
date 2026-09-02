@@ -152,7 +152,31 @@ impl PrivilegeTicketClaims {
             || self
                 .control_digest
                 .as_ref()
-                .is_some_and(|value| value.len() != 64)
+                .is_some_and(|value| !valid_sha256(value))
+            || !valid_id(&self.ticket_id, Some("ptkt"))
+            || !valid_id(&self.issuer_key_id, None)
+            || !valid_id(&self.helper_installation_id, Some("phinst"))
+            || !valid_id(&self.helper_key_id, None)
+            || !valid_id(&self.device_id, Some("dev"))
+            || !valid_id(&self.device_key_id, None)
+            || !valid_id(&self.operation_id, Some("op"))
+            || !valid_run_id(&self.run_id)
+            || !valid_id(&self.runtime_id, Some("rt"))
+            || ![
+                &self.helper_policy_digest,
+                &self.idempotency_key_digest,
+                &self.operation_request_digest,
+                &self.run_manifest_digest,
+                &self.runtime_spec_digest,
+                &self.launch_plan_digest,
+                &self.local_execution_plan_digest,
+            ]
+            .iter()
+            .all(|value| valid_sha256(value))
+            || self
+                .approval_receipt_digest
+                .as_ref()
+                .is_some_and(|value| !valid_sha256(value))
         {
             return Err(ProtocolError::Invalid(
                 "privilege ticket canonical binding".into(),
@@ -168,6 +192,35 @@ impl PrivilegeTicketClaims {
         }
         Ok(())
     }
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .as_bytes()
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+fn valid_id(value: &str, expected_prefix: Option<&str>) -> bool {
+    let Some((prefix, suffix)) = value.split_once('_') else {
+        return false;
+    };
+    expected_prefix.is_none_or(|expected| expected == prefix)
+        && !prefix.is_empty()
+        && prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && suffix.len() >= 8
+        && suffix.len() <= 128
+        && suffix.as_bytes()[0].is_ascii_alphanumeric()
+        && suffix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+fn valid_run_id(value: &str) -> bool {
+    valid_id(value, Some("run")) || valid_id(value, Some("lrun"))
 }
 
 pub type PrivilegeTicket = SignedClaims<PrivilegeTicketClaims>;
@@ -524,6 +577,63 @@ mod tests {
     use super::*;
     use rand::RngCore;
 
+    fn ticket_claims() -> PrivilegeTicketClaims {
+        PrivilegeTicketClaims {
+            schema_version: 1,
+            protocol: PROTOCOL.into(),
+            ticket_id: "ptkt_fixture0001".into(),
+            issuer_kind: "control_plane".into(),
+            issuer_key_id: "pkey_fixture0001".into(),
+            audience: "conduit-privileged-helper".into(),
+            public_origin: "https://conduit.example.test".into(),
+            helper_installation_id: "phinst_fixture0001".into(),
+            helper_key_id: "hkey_fixture0001".into(),
+            helper_policy_revision: 1,
+            helper_policy_digest: "11".repeat(32),
+            device_id: "dev_fixture0001".into(),
+            device_key_id: "dkey_fixture0001".into(),
+            device_policy_revision: 1,
+            device_revision: 1,
+            expected_uid: 1000,
+            operation_id: "op_fixture0001".into(),
+            idempotency_key_digest: "22".repeat(32),
+            operation_request_digest: "33".repeat(32),
+            run_manifest_digest: "44".repeat(32),
+            run_id: "run_fixture0001".into(),
+            runtime_id: "rt_fixture0001".into(),
+            runtime_spec_digest: "55".repeat(32),
+            launch_plan_digest: "66".repeat(32),
+            control_digest: None,
+            local_execution_plan_digest: "77".repeat(32),
+            controller_epoch: 1,
+            connector_policy_id: None,
+            connector_policy_revision: 1,
+            project_id: None,
+            project_revision: None,
+            assignment_id: None,
+            project_agent_id: None,
+            project_agent_revision: None,
+            runtime_configuration_revision: 1,
+            access_scope: "full_device".into(),
+            approval_mode: "always".into(),
+            approval_receipt_digest: Some("88".repeat(32)),
+            approval_enforcement: ApprovalEnforcement::ExactCommand,
+            required_approval_risk_classes: vec!["host_control".into()],
+            allowed_operation: PrivilegedOperation::Prepare,
+            resource_ceilings: ResourceCeilings {
+                cpu_quota_per_sec_usec: None,
+                memory_max_bytes: None,
+                tasks_max: None,
+                io_weight: None,
+                runtime_max_usec: Some(60_000_000),
+            },
+            issued_at: "2026-09-03T00:00:00Z".into(),
+            expires_at: "2026-09-03T00:05:00Z".into(),
+            nonce: "fixture_nonce_0001".into(),
+            max_use_count: 1,
+        }
+    }
+
     #[test]
     fn signed_claims_detect_mutation() {
         let mut seed = [0u8; 32];
@@ -553,5 +663,59 @@ mod tests {
         assert!(dangerous_environment_key("LD_PRELOAD"));
         assert!(dangerous_environment_key("NODE_OPTIONS"));
         assert!(!dangerous_environment_key("LANG"));
+    }
+
+    #[test]
+    fn privilege_ticket_canonical_validation_rejects_malformed_ids_and_versions() {
+        let claims = ticket_claims();
+        claims.validate("pkey_fixture0001").unwrap();
+
+        for mutation in [
+            |claims: &mut PrivilegeTicketClaims| claims.ticket_id = "ticket bad".into(),
+            |claims: &mut PrivilegeTicketClaims| claims.operation_id = "run_wrongkind01".into(),
+            |claims: &mut PrivilegeTicketClaims| claims.run_id = "op_wrongkind0001".into(),
+            |claims: &mut PrivilegeTicketClaims| claims.runtime_id = "runtime_wrongkind01".into(),
+        ] {
+            let mut invalid = claims.clone();
+            mutation(&mut invalid);
+            assert!(invalid.validate("pkey_fixture0001").is_err());
+        }
+
+        let mut unsupported = claims.clone();
+        unsupported.schema_version = 2;
+        assert!(unsupported.validate("pkey_fixture0001").is_err());
+
+        let mut duplicate_risk = claims.clone();
+        duplicate_risk.required_approval_risk_classes =
+            vec!["host_control".into(), "host_control".into()];
+        assert!(duplicate_risk.validate("pkey_fixture0001").is_err());
+
+        let mut changed_digest = claims;
+        changed_digest.run_manifest_digest = "A1".repeat(32);
+        assert!(changed_digest.validate("pkey_fixture0001").is_err());
+    }
+
+    #[test]
+    fn privilege_ticket_signature_and_key_id_are_cryptographically_bound() {
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let other = SigningKey::from_bytes(&[8; 32]);
+        let signed = SignedClaims::sign("pkey_fixture0001", ticket_claims(), &key).unwrap();
+        signed.verify(key.verifying_key().as_bytes()).unwrap();
+        assert!(signed.verify(other.verifying_key().as_bytes()).is_err());
+
+        let mut wrong_envelope = signed;
+        wrong_envelope.key_id = "pkey_fixture0002".into();
+        assert!(
+            wrong_envelope
+                .claims
+                .validate(&wrong_envelope.key_id)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn packet_decoder_rejects_empty_and_oversize_packets() {
+        assert!(decode_packet::<serde_json::Value>(&[]).is_err());
+        assert!(decode_packet::<serde_json::Value>(&vec![b'x'; MAX_PACKET_BYTES + 1]).is_err());
     }
 }

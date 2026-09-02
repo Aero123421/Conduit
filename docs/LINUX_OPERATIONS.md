@@ -207,8 +207,11 @@ projection before starting work.
 Native runs as the service user with an exact executable and argument vector,
 process-group custody, bounded environment projection, and timeout/cancellation
 reconciliation. Full User is an explicit policy choice, not an implicit
-fallback. Full Device admission currently fails closed because the typed root
-helper and receipt boundary are not implemented or packaged.
+fallback. Native host Full Device uses the separately packaged root helper and
+fixed exec worker described above. Admission remains fail closed until the
+signed probe, owner-approved registration, exact one-use ticket, root policy,
+durable journal, systemd unit and verified helper receipt chain are all
+effective; missing evidence never selects Full User instead.
 
 ### Restricted Native
 

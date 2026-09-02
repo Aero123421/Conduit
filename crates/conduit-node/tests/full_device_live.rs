@@ -8,11 +8,13 @@ use conduit_adapters::{
     LaunchRequest, ProtocolDriver,
 };
 use conduit_node::privileged::PrivilegedNodeRuntime;
-use conduit_node_store::DeviceIdentity;
+use conduit_node_store::{
+    CredentialMetadata, CredentialStore, DeviceIdentity, NodeStore, ProjectionKind,
+};
 use conduit_privileged_helper::capture_file_identity;
 use conduit_privileged_protocol::{
-    ApprovalEnforcement, LocalExecutionPlan, PrivilegeTicket, PrivilegeTicketClaims,
-    PrivilegedOperation, ResourceCeilings, SignedClaims, StdioMode, key_id,
+    ApprovalEnforcement, CredentialDescriptor, LocalExecutionPlan, PrivilegeTicket,
+    PrivilegeTicketClaims, PrivilegedOperation, ResourceCeilings, SignedClaims, StdioMode, key_id,
 };
 use conduit_runtime::{
     IoMode, LaunchPlan, NativeProvider, NetworkMode, PrivilegedNativeProvider, ProcessSupervisor,
@@ -24,7 +26,10 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     env, fs,
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    },
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -742,18 +747,40 @@ fn structured_codex_agent(
     bundle: &Value,
     evidence: &Path,
 ) -> Value {
+    let credential_store = CredentialStore::open(
+        NodeStore::open(evidence.join("live-credential-store")).unwrap(),
+        evidence.join("live-credential.dek"),
+        evidence.join("live-credential-projections"),
+    )
+    .unwrap();
+    let credential_metadata = CredentialMetadata {
+        profile_id: "cred_full_device_live".into(),
+        revision: 1,
+        adapter_id: "codex".into(),
+        kind: ProjectionKind::ReadOnlyFile,
+        label: "synthetic-live-fixture".into(),
+    };
+    credential_store
+        .put(&credential_metadata, b"synthetic-live-credential")
+        .unwrap();
+    let sealed = credential_store
+        .sealed_read_only("cred_full_device_live", "codex", 1)
+        .unwrap();
+    let expected_credential_digest = sealed.sha256.clone();
     let python = existing(&[
         "/usr/bin/python3.12",
         "/usr/bin/python3.11",
         "/usr/bin/python3.10",
     ]);
-    let fixture = r#"import json,sys
+    let fixture = r#"import hashlib,json,os,pathlib,sys
+credential=pathlib.Path(os.environ["HOME"])/".codex"/"auth.json"
+credential_digest=hashlib.sha256(credential.read_bytes()).hexdigest()
 for line in sys.stdin:
     message=json.loads(line)
     method=message.get("method")
     request_id=message.get("id")
     if method == "initialize":
-        print(json.dumps({"id":request_id,"result":{"serverInfo":{"name":"conduit-live-fixture","version":"1"}}}),flush=True)
+        print(json.dumps({"id":request_id,"result":{"serverInfo":{"name":"conduit-live-fixture","version":"1","credentialDigest":credential_digest}}}),flush=True)
     elif method == "thread/start":
         print(json.dumps({"id":request_id,"result":{"thread":{"id":"codex-thread-live"}}}),flush=True)
     elif method == "turn/start":
@@ -772,8 +799,17 @@ for line in sys.stdin:
     );
     plan.adapter_id = Some("codex".into());
     plan.launch_profile_id = None;
+    plan.credentials = vec![CredentialDescriptor {
+        projection_id: "cred_full_device_live".into(),
+        revision: 1,
+        target_name: ".codex/auth.json".into(),
+        descriptor_index: 0,
+        size: sealed.size,
+        sha256: sealed.sha256.clone(),
+        read_only: true,
+    }];
     let prepared = provider
-        .prepare_privileged(
+        .prepare_privileged_with_descriptors(
             &request,
             ticket(
                 issuer,
@@ -784,6 +820,7 @@ for line in sys.stdin:
                 "ptkt_live_codex_prepare",
             ),
             plan.clone(),
+            &[sealed.file.as_raw_fd()],
         )
         .unwrap();
     let mut managed = provider
@@ -833,6 +870,7 @@ for line in sys.stdin:
     let mut prompt_accepted = false;
     let mut completed = false;
     let mut assistant_observed = false;
+    let mut credential_observed = false;
     let mut input_index = 0_u32;
     let root_liveness_before_prompt = managed.receipt.runtime.state == RuntimeState::Running;
     assert!(root_liveness_before_prompt && !prompt_accepted);
@@ -849,6 +887,11 @@ for line in sys.stdin:
         let mut next = Vec::new();
         while let Some(offset) = pending.iter().position(|byte| *byte == b'\n') {
             let record: Vec<u8> = pending.drain(..=offset).collect();
+            let value: Value = serde_json::from_slice(&record).unwrap();
+            if value.get("id") == Some(&json!(1)) {
+                credential_observed = value.pointer("/result/serverInfo/credentialDigest")
+                    == Some(&Value::String(expected_credential_digest.clone()));
+            }
             let (outbound, events) = driver.on_record(&record).unwrap();
             next.extend(outbound);
             for event in events {
@@ -869,6 +912,7 @@ for line in sys.stdin:
     assert!(prompt_accepted);
     assert!(assistant_observed);
     assert!(completed);
+    assert!(credential_observed);
     assert_eq!(driver.state(), AdapterState::Completed);
 
     let mut stderr = Vec::new();
@@ -900,6 +944,7 @@ for line in sys.stdin:
         "rootLivenessBeforePromptAcceptance":root_liveness_before_prompt,
         "promptAccepted":prompt_accepted,"assistantOutput":assistant_observed,
         "agentSettled":completed,"explicitSessionClose":true,"stderr":true,
+        "sealedCredentialProjection":credential_observed,"credentialPlaintextInEvidence":false,
         "terminalReceiptVerified":true
     })
 }

@@ -125,9 +125,11 @@ impl PrivilegedNativeProvider {
                 "prepared"
                     | "running"
                     | "paused"
-                    | "stopped"
+                    | "completed"
+                    | "cancelled"
+                    | "timed_out"
+                    | "uncertain"
                     | "failed"
-                    | "missing"
                     | "recovery_required"
             )
         {
@@ -734,9 +736,9 @@ fn state(receipt: &HelperReceipt) -> RuntimeState {
             RuntimeState::Running
         }
         "paused" => RuntimeState::Paused,
-        "stopped" | "already_stopped" | "completed" => RuntimeState::Stopped,
-        "failed" => RuntimeState::Failed,
-        "recovery_required" | "missing" => RuntimeState::RecoveryRequired,
+        "cancelled" | "completed" => RuntimeState::Stopped,
+        "failed" | "timed_out" => RuntimeState::Failed,
+        "recovery_required" => RuntimeState::RecoveryRequired,
         _ => RuntimeState::Uncertain,
     }
 }

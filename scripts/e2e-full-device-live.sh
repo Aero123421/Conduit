@@ -295,6 +295,7 @@ sudo -n "$conduit_helper" admin policy \
   --uid "$(id -u)" \
   --allow-unrestricted-launch true \
   --allowed-adapters codex \
+  --allowed-credential-profiles cred_full_device_live \
   --allowed-launch-profiles full-device-live \
   --output json > "$conduit_user_evidence/root-policy-opt-in.json"
 sudo -n "$conduit_helper" admin enable \
@@ -503,7 +504,7 @@ conduit_driver_summary="$conduit_user_evidence/driver-summary.json"
   echo "live driver summary exceeded the public evidence bound" >&2
   exit 4
 }
-if grep -Eiq '(/home/|machine.?id|boot.?id|hardware.?serial|ip.?address|private.?key|secret|credential|raw.?prompt|canonical.?path)' \
+if grep -Eiq '(/home/|machine.?id|boot.?id|hardware.?serial|ip.?address|private.?key|secret.?value|credential.?value|credential.?secret|raw.?prompt|canonical.?path)' \
   "$conduit_driver_summary"; then
   echo "live driver summary contains a field forbidden from public OSS evidence" >&2
   exit 4

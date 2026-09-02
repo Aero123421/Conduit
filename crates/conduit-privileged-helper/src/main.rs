@@ -1318,7 +1318,7 @@ fn stop_active_runtimes(
         .filter(|receipt| {
             expected_terminal_revisions.get(&receipt.claims.runtime_id)
                 == Some(&receipt.claims.state_revision)
-                && matches!(receipt.claims.transition.as_str(), "stopped" | "failed")
+                && matches!(receipt.claims.transition.as_str(), "cancelled" | "failed")
         })
         .count();
     let active_after = active_runtime_count(journal_path)?;

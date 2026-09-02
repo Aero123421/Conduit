@@ -1165,7 +1165,7 @@ impl<M: SystemdManager> HelperEngine<M> {
         let transition = match operation {
             PrivilegedOperation::Pause => "paused",
             PrivilegedOperation::Resume => "resumed",
-            PrivilegedOperation::GracefulStop | PrivilegedOperation::ForceStop => "stopped",
+            PrivilegedOperation::GracefulStop | PrivilegedOperation::ForceStop => "cancelled",
             _ => "failed",
         };
         let receipt = self.receipt(
@@ -1740,9 +1740,9 @@ fn receipt_transition(value: &str) -> &'static str {
         "active" | "activating" | "running" => "running",
         "frozen" | "paused" => "paused",
         "prepared" => "prepared",
-        "inactive" | "dead" | "stopped" => "stopped",
+        "inactive" | "dead" | "stopped" => "completed",
         "failed" => "failed",
-        "missing" => "missing",
+        "missing" => "recovery_required",
         _ => "recovery_required",
     }
 }

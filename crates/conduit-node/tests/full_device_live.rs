@@ -457,6 +457,7 @@ fn node_registered() {
     let expected_digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&policy).unwrap()));
     let mut observed = None;
     let mut remote = Value::Null;
+    let mut registration_result_applied = false;
     for _ in 0..300 {
         observed = NodeStore::open_read_only(evidence.join("node-service-data"))
             .ok()
@@ -465,12 +466,28 @@ fn node_registered() {
             "/__full-device-live/inspect",
             &json!({"deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID")}),
         );
+        registration_result_applied = remote
+            .pointer("/deviceRoom/positions")
+            .and_then(Value::as_array)
+            .and_then(|positions| {
+                positions.iter().find(|position| {
+                    position.get("direction").and_then(Value::as_str) == Some("control_to_node")
+                })
+            })
+            .is_some_and(|position| {
+                let durable = position.get("durable_sequence").and_then(Value::as_u64);
+                let acknowledged = position
+                    .get("acknowledged_sequence")
+                    .and_then(Value::as_u64);
+                durable.is_some_and(|durable| durable > 0 && acknowledged == Some(durable))
+            });
         if observed.as_ref().is_some_and(|state| {
             state.device_policy_revision == 2 && state.device_policy_digest == expected_digest
-        }) && remote
-            .pointer("/deviceRoom/activeSocketCount")
-            .and_then(Value::as_u64)
-            == Some(1)
+        }) && registration_result_applied
+            && remote
+                .pointer("/deviceRoom/activeSocketCount")
+                .and_then(Value::as_u64)
+                == Some(1)
         {
             break;
         }
@@ -479,6 +496,10 @@ fn node_registered() {
     let observed = observed.expect("production Node did not persist accepted Device policy");
     assert_eq!(observed.device_policy_revision, 2);
     assert_eq!(observed.device_policy_digest, expected_digest);
+    assert!(
+        registration_result_applied,
+        "production Node did not acknowledge the registration result"
+    );
     assert_eq!(
         remote
             .pointer("/deviceRoom/activeSocketCount")
@@ -492,7 +513,8 @@ fn node_registered() {
             "actualWorkerRoute":true,"actualDeviceRoomWebSocket":true,
             "devicePolicyRevision":observed.device_policy_revision,
             "devicePolicyDigest":observed.device_policy_digest,
-            "acceptedStatePersisted":true
+            "acceptedStatePersisted":true,
+            "registrationResultTransportAcknowledged":true
         }),
     );
 }

@@ -86,7 +86,7 @@ describe.sequential("privileged helper Control Plane", () => {
     const rootPolicy = {
       policyVersion: 1, installationId: "phinst_privilegeflow01", deviceId: "dev_privilegeflow01", uid: 1000, revision: 1, enabled: true, origin: env.PUBLIC_ORIGIN,
       ticketKeyIds: ["pkey_testissuer0001"], allowedOperations: ["prepare", "start", "input", "resize_pty", "pause", "resume", "graceful_stop", "force_stop", "reconcile"],
-      allowedAdapters: [], allowedLaunchProfiles: ["safe"], ceilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null },
+      allowedAdapters: [], allowedLaunchProfiles: ["safe"], launchProfileExecutableDigests: {}, allowedCredentialProfiles: [], ceilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null },
       allowNever: true, allowUnrestrictedLaunch: true, allowPersistentSessions: false, allowOfflineControl: false, receiptRetentionSeconds: 86400,
     };
     rootPolicyDigest = await sha256Hex(canonicalJson(rootPolicy));
@@ -300,7 +300,7 @@ describe.sequential("privileged helper Control Plane", () => {
     const policyClaims = (revision: number, narrowed: boolean) => ({
       policyVersion: 1, installationId: "phinst_privilegeflow01", deviceId: "dev_privilegeflow01", uid: 1000, revision, enabled: true, origin: env.PUBLIC_ORIGIN,
       ticketKeyIds: ["pkey_testissuer0001"], allowedOperations: narrowed ? ["prepare", "start"] : allOperations,
-      allowedAdapters: [], allowedLaunchProfiles: ["safe"], ceilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null },
+      allowedAdapters: [], allowedLaunchProfiles: ["safe"], launchProfileExecutableDigests: {}, allowedCredentialProfiles: [], ceilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null },
       allowNever: true, allowUnrestrictedLaunch: true, allowPersistentSessions: false, allowOfflineControl: false, receiptRetentionSeconds: 86400,
     });
     const initialSummary = {
@@ -416,7 +416,7 @@ describe.sequential("privileged helper Control Plane", () => {
     const bundleFor = async (installationId: string, revision: number, operations: string[], uid = 1000) => {
       const root = {
         policyVersion: 1, installationId, deviceId, uid, revision, enabled: true, origin: env.PUBLIC_ORIGIN, ticketKeyIds: ["pkey_testissuer0001"], allowedOperations: operations,
-        allowedAdapters: [], allowedLaunchProfiles: ["safe"], ceilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, allowNever: true,
+        allowedAdapters: [], allowedLaunchProfiles: ["safe"], launchProfileExecutableDigests: {}, allowedCredentialProfiles: [], ceilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, allowNever: true,
         allowUnrestrictedLaunch: true, allowPersistentSessions: false, allowOfflineControl: false, receiptRetentionSeconds: 86400,
       };
       const digest = await sha256Hex(canonicalJson(root));
@@ -545,7 +545,7 @@ describe.sequential("privileged helper Control Plane", () => {
     const devicePolicy = { revision: 1, policyDigest: devicePolicyDigest, previousPolicyDigest: null, publicSummary: devicePolicySummary, signature: await sign(devicePrivate, { deviceId: "dev_privilegeflow01", revision: 1, policyDigest: devicePolicyDigest, previousPolicyDigest: null, publicSummary: devicePolicySummary }) };
     const policy = {
       policyVersion: 1, installationId: "phinst_privilegeflow01", deviceId: "dev_privilegeflow01", uid: 1000, revision: 5, enabled: true, origin: env.PUBLIC_ORIGIN,
-      ticketKeyIds: ["pkey_testissuer0001", "pkey_testissuer0002"], allowedOperations: ["prepare"], allowedAdapters: [], allowedLaunchProfiles: ["safe"],
+      ticketKeyIds: ["pkey_testissuer0001", "pkey_testissuer0002"], allowedOperations: ["prepare"], allowedAdapters: [], allowedLaunchProfiles: ["safe"], launchProfileExecutableDigests: {}, allowedCredentialProfiles: [],
       ceilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, allowNever: true, allowUnrestrictedLaunch: false,
       allowPersistentSessions: false, allowOfflineControl: false, receiptRetentionSeconds: 86400,
     };

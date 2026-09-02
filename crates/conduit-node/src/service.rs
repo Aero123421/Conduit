@@ -3650,11 +3650,7 @@ impl NodeService {
             let approval_context = ApprovalContext {
                 effective_policy: EffectiveApprovalPolicy::try_from(op.approval_mode.as_str())
                     .map_err(|error| ServiceError::Unavailable(adapter_reason(&error)))?,
-                bridge: if kind == AdapterKind::Codex {
-                    ApprovalBridgeOwnership::Typed
-                } else {
-                    ApprovalBridgeOwnership::Unavailable
-                },
+                bridge: adapter_approval_bridge(profile_id),
                 required_risk_classes,
             };
             let access_scope = EffectiveAccessScope::try_from(op.access_scope.as_str())
@@ -7057,10 +7053,18 @@ fn privileged_operation_name(operation: &PrivilegedOperation) -> &'static str {
 }
 
 fn full_device_adapter_approval_supported(adapter_id: &str) -> bool {
+    adapter_approval_bridge(adapter_id) == ApprovalBridgeOwnership::Typed
+}
+
+fn adapter_approval_bridge(adapter_id: &str) -> ApprovalBridgeOwnership {
     // These are the structured adapters whose correlated, pre-execution
     // approval responses are exercised by the adapter protocol suites. Other
     // adapters remain fail-closed for elevated interactive approval modes.
-    matches!(adapter_id, "codex" | "pi" | "opencode")
+    if matches!(adapter_id, "codex" | "pi" | "opencode") {
+        ApprovalBridgeOwnership::Typed
+    } else {
+        ApprovalBridgeOwnership::Unavailable
+    }
 }
 
 fn initial_frames_bytes(spec: &conduit_adapters::LaunchSpec) -> Result<Vec<u8>, ServiceError> {
@@ -8149,11 +8153,19 @@ mod tests {
 
     #[test]
     fn full_device_interactive_approval_only_names_proven_adapter_bridges() {
-        assert!(full_device_adapter_approval_supported("codex"));
-        assert!(full_device_adapter_approval_supported("pi"));
-        assert!(full_device_adapter_approval_supported("opencode"));
+        for supported in ["codex", "pi", "opencode"] {
+            assert!(full_device_adapter_approval_supported(supported));
+            assert_eq!(
+                adapter_approval_bridge(supported),
+                ApprovalBridgeOwnership::Typed
+            );
+        }
         for unsupported in ["claude", "agy", "shell", "unknown"] {
             assert!(!full_device_adapter_approval_supported(unsupported));
+            assert_eq!(
+                adapter_approval_bridge(unsupported),
+                ApprovalBridgeOwnership::Unavailable
+            );
         }
     }
 

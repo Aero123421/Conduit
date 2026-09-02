@@ -99,7 +99,7 @@ fn registration() {
     let public_jwk = json!({
         "kty":"OKP","crv":"Ed25519",
         "x":URL_SAFE_NO_PAD.encode(issuer.verifying_key().as_bytes()),
-        "kid":issuer_id
+        "kid":issuer_id,"revision":1
     });
     write_json(&evidence.join("issuer-public-jwk.json"), &public_jwk);
     write_json(

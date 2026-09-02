@@ -196,6 +196,7 @@ fn run_root_uid_probe(
         cwd: capture_file_identity(evidence, false).unwrap(),
         systemd_unit: format!("conduit-elevated-live-{}.service", std::process::id()),
         adapter_id: None,
+        launch_profile_id: Some("full-device-live".into()),
         environment: BTreeMap::new(),
         environment_value_digests: BTreeMap::new(),
         workspaces: vec![],

@@ -162,6 +162,22 @@ impl SeqpacketConnection {
     pub fn send(&self, bytes: &[u8], descriptors: &[RawFd]) -> Result<()> {
         send(self.fd.as_raw_fd(), bytes, descriptors)
     }
+    pub fn set_read_timeout(&self, timeout: std::time::Duration) -> Result<()> {
+        let value = libc::timeval {
+            tv_sec: timeout.as_secs().try_into().unwrap_or(libc::time_t::MAX),
+            tv_usec: timeout.subsec_micros().into(),
+        };
+        cvt(unsafe {
+            libc::setsockopt(
+                self.fd.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&value as *const libc::timeval).cast(),
+                mem::size_of_val(&value) as _,
+            )
+        })?;
+        Ok(())
+    }
 }
 
 impl SeqpacketClient {

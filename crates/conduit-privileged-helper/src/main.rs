@@ -16,6 +16,10 @@ use std::{
     io::Write,
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
 };
 
 fn main() {
@@ -91,13 +95,17 @@ fn serve(args: &[String]) -> conduit_privileged_helper::Result<()> {
     let pinned = PinnedTicketKeys::load_root_owned(&keys)?;
     let journal = HelperJournal::open_root_owned(&journal_path)?;
     let node = load_public(&node_key)?;
-    let engine = std::sync::Arc::new(HelperEngine::new(
+    let engine = Arc::new(HelperEngine::new(
         config,
         pinned,
         signing,
         journal,
         SystemdBackend::connect_system()?,
     )?);
+    // Reconcile root journal custody against systemd before accepting any new
+    // authority. Receipts remain in the journal for the authenticated Node to
+    // fetch; a missing/ambiguous unit is never replaced automatically.
+    engine.recover_nonterminal()?;
     let watcher = engine.clone();
     std::thread::spawn(move || {
         loop {
@@ -112,80 +120,108 @@ fn serve(args: &[String]) -> conduit_privileged_helper::Result<()> {
     } else {
         SeqpacketServer::bind(&socket, 0o660)?
     };
+    let active_connections = Arc::new(AtomicUsize::new(0));
     loop {
         let connection = server.accept()?;
-        let mut authenticated = false;
-        loop {
-            let packet = match connection.receive() {
+        if active_connections.fetch_add(1, Ordering::AcqRel) >= 32 {
+            active_connections.fetch_sub(1, Ordering::AcqRel);
+            continue;
+        }
+        connection.set_read_timeout(std::time::Duration::from_secs(5))?;
+        let engine = engine.clone();
+        let node = node.clone();
+        let policy = policy.clone();
+        let active_connections = active_connections.clone();
+        std::thread::spawn(move || {
+            let _ = serve_connection(connection, engine, node, &policy);
+            active_connections.fetch_sub(1, Ordering::AcqRel);
+        });
+    }
+}
+
+fn serve_connection(
+    connection: conduit_privileged_helper::SeqpacketConnection,
+    engine: Arc<HelperEngine<SystemdBackend>>,
+    node: VerifyingKey,
+    policy: &Path,
+) -> conduit_privileged_helper::Result<()> {
+    let mut authenticated = false;
+    loop {
+        let packet = match connection.receive() {
+            Ok(value) => value,
+            Err(_) => break,
+        };
+        let request =
+            match conduit_privileged_protocol::decode_packet::<HelperRequest>(&packet.bytes) {
                 Ok(v) => v,
-                Err(_) => break,
-            };
-            let request =
-                match conduit_privileged_protocol::decode_packet::<HelperRequest>(&packet.bytes) {
-                    Ok(v) => v,
-                    Err(protocol_error) => {
-                        match conduit_privileged_protocol::decode_packet::<
-                            conduit_privileged_helper::ManagedIoRequest,
-                        >(&packet.bytes)
-                        {
-                            Ok(request) => {
-                                let response = engine
-                                    .handle_managed(
+                Err(protocol_error) => {
+                    match conduit_privileged_protocol::decode_packet::<
+                        conduit_privileged_helper::ManagedIoRequest,
+                    >(&packet.bytes)
+                    {
+                        Ok(request) => {
+                            let response = engine
+                                .verify_current_policy(&policy)
+                                .and_then(|()| {
+                                    engine.handle_managed(
                                         authenticated,
                                         request,
                                         packet.descriptors.len(),
                                     )
-                                    .unwrap_or_else(|error| {
-                                        conduit_privileged_helper::ManagedIoResponse::Error {
-                                            code: error.to_string(),
-                                            retryable: false,
-                                        }
-                                    });
-                                connection.send(&serde_jcs::to_vec(&response)?, &[])?;
-                                continue;
-                            }
-                            _ => {
-                                send_response(
-                                    &connection,
-                                    &HelperResponse::Error {
-                                        code: protocol_error.to_string(),
+                                })
+                                .unwrap_or_else(|error| {
+                                    conduit_privileged_helper::ManagedIoResponse::Error {
+                                        code: error.to_string(),
                                         retryable: false,
-                                    },
-                                )?;
-                                continue;
-                            }
+                                    }
+                                });
+                            connection.send(&serde_jcs::to_vec(&response)?, &[])?;
+                            continue;
+                        }
+                        _ => {
+                            send_response(
+                                &connection,
+                                &HelperResponse::Error {
+                                    code: protocol_error.to_string(),
+                                    retryable: false,
+                                },
+                            )?;
+                            continue;
                         }
                     }
-                };
-            let response = match &request {
-                HelperRequest::Prove {
-                    challenge,
-                    signature,
-                } => engine
-                    .prove(connection.peer_credentials(), challenge, signature, &node)
-                    .map(|v| {
-                        authenticated = true;
-                        v
-                    }),
-                _ => engine.handle(
+                }
+            };
+        let response = match &request {
+            HelperRequest::Prove {
+                challenge,
+                signature,
+            } => engine
+                .prove(connection.peer_credentials(), challenge, signature, &node)
+                .map(|v| {
+                    authenticated = true;
+                    v
+                }),
+            _ => engine.verify_current_policy(&policy).and_then(|()| {
+                engine.handle(
                     connection.peer_credentials(),
                     authenticated,
                     request,
                     packet.descriptors,
-                ),
-            };
-            match response {
-                Ok(v) => send_response(&connection, &v)?,
-                Err(e) => send_response(
-                    &connection,
-                    &HelperResponse::Error {
-                        code: e.to_string(),
-                        retryable: false,
-                    },
-                )?,
-            }
+                )
+            }),
+        };
+        match response {
+            Ok(v) => send_response(&connection, &v)?,
+            Err(e) => send_response(
+                &connection,
+                &HelperResponse::Error {
+                    code: e.to_string(),
+                    retryable: false,
+                },
+            )?,
         }
     }
+    Ok(())
 }
 fn exec_worker(args: &[String]) -> conduit_privileged_helper::Result<()> {
     let record = required_path(args, "--record")?;

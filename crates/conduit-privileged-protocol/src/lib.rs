@@ -293,6 +293,7 @@ pub struct LocalExecutionPlan {
     pub cwd: FileIdentity,
     pub systemd_unit: String,
     pub adapter_id: Option<String>,
+    pub launch_profile_id: Option<String>,
     pub environment: BTreeMap<String, String>,
     pub environment_value_digests: BTreeMap<String, String>,
     pub workspaces: Vec<WorkspaceBinding>,
@@ -333,10 +334,41 @@ impl LocalExecutionPlan {
         {
             return Err(ProtocolError::Invalid("dangerous environment key".into()));
         }
+        if self.environment.len() != self.environment_value_digests.len()
+            || self.environment.iter().any(|(key, value)| {
+                !matches!(
+                    key.as_str(),
+                    "LANG"
+                        | "LC_ALL"
+                        | "LC_CTYPE"
+                        | "TERM"
+                        | "COLORTERM"
+                        | "TZ"
+                        | "NO_COLOR"
+                        | "FORCE_COLOR"
+                ) || value.len() > 512
+                    || self.environment_value_digests.get(key)
+                        != Some(&hex::encode(Sha256::digest(value.as_bytes())))
+            })
+        {
+            return Err(ProtocolError::Invalid(
+                "environment value commitment".into(),
+            ));
+        }
         if !self.systemd_unit.starts_with("conduit-elevated-")
             || !self.systemd_unit.ends_with(".service")
         {
             return Err(ProtocolError::Invalid("systemd unit name".into()));
+        }
+        if self.adapter_id.is_some() == self.launch_profile_id.is_some()
+            || self
+                .launch_profile_id
+                .as_ref()
+                .is_some_and(|value| value.is_empty() || value.len() > 128)
+        {
+            return Err(ProtocolError::Invalid(
+                "adapter or launch profile binding".into(),
+            ));
         }
         Ok(())
     }

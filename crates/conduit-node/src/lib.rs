@@ -1244,6 +1244,7 @@ mod tests {
             cwd: file("opaque-cwd"),
             systemd_unit: "conduit-elevated-test.service".into(),
             adapter_id: None,
+            launch_profile_id: Some("test-profile".into()),
             environment: BTreeMap::new(),
             environment_value_digests: BTreeMap::new(),
             workspaces: vec![],

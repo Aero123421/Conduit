@@ -636,6 +636,7 @@ mod tests {
             cwd: file("/tmp"),
             systemd_unit: "conduit-elevated-journal0001.service".into(),
             adapter_id: None,
+            launch_profile_id: Some("journal-test".into()),
             environment: BTreeMap::new(),
             environment_value_digests: BTreeMap::new(),
             workspaces: vec![],

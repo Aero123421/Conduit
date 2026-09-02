@@ -1450,6 +1450,7 @@ impl NodeService {
                 &request_id,
                 self.local_policy.revision,
                 summary,
+                client.session.epoch(),
                 &self.identity,
             )
             .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
@@ -1563,10 +1564,13 @@ impl NodeService {
             .as_object_mut()
             .expect("ticket request payload")
             .remove("deviceSignature");
-        payload["deviceSignature"] = Value::String(
-            self.identity
-                .sign(&serde_jcs::to_vec(&unsigned).map_err(|_| TransportError::Malformed)?),
-        );
+        payload["deviceSignature"] = Value::String(sign_privilege_payload(
+            &self.identity,
+            "privilege.ticket_request",
+            &self.device_id,
+            client.session.epoch(),
+            &unsigned,
+        )?);
         let encoded = serde_jcs::to_vec(&payload).map_err(|_| TransportError::Malformed)?;
         let digest = hex::encode(Sha256::digest(
             serde_jcs::to_vec(&unsigned).map_err(|_| TransportError::Malformed)?,
@@ -1704,10 +1708,13 @@ impl NodeService {
             .as_object_mut()
             .expect("ticket request payload")
             .remove("deviceSignature");
-        payload["deviceSignature"] = Value::String(
-            self.identity
-                .sign(&serde_jcs::to_vec(&unsigned).map_err(|_| TransportError::Malformed)?),
-        );
+        payload["deviceSignature"] = Value::String(sign_privilege_payload(
+            &self.identity,
+            "privilege.ticket_request",
+            &self.device_id,
+            client.session.epoch(),
+            &unsigned,
+        )?);
         let encoded = serde_jcs::to_vec(&payload).map_err(|_| TransportError::Malformed)?;
         let digest = hex::encode(Sha256::digest(
             serde_jcs::to_vec(&unsigned).map_err(|_| TransportError::Malformed)?,
@@ -1760,15 +1767,18 @@ impl NodeService {
             .as_object_mut()
             .expect("receipt payload")
             .remove("deviceSignature");
-        payload["deviceSignature"] = Value::String(
-            self.identity
-                .sign(&serde_jcs::to_vec(&unsigned).map_err(|_| TransportError::Malformed)?),
-        );
+        payload["deviceSignature"] = Value::String(sign_privilege_payload(
+            &self.identity,
+            "privilege.receipt",
+            &self.device_id,
+            client.session.epoch(),
+            &unsigned,
+        )?);
         let message_id = self.message_id();
         client.session.queue_outbound(
             &message_id,
             "privilege.receipt",
-            Some(receipt.claims.receipt_id.clone()),
+            Some(receipt.claims.operation_id.clone()),
             payload,
             0,
         )?;
@@ -3327,8 +3337,12 @@ impl NodeService {
                 .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
                 .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_invalid".into()))?
                 .to_owned();
-            let plan =
-                privileged_local_plan(&offer, &prepared_sources, is_agent.then_some(profile_id))?;
+            let plan = privileged_local_plan(
+                &offer,
+                &prepared_sources,
+                is_agent.then_some(profile_id),
+                (!is_agent).then_some(profile_id),
+            )?;
             let privileged = self.privileged.as_ref().ok_or_else(|| {
                 ServiceError::Unavailable("privileged_helper_not_installed".into())
             })?;
@@ -6187,6 +6201,22 @@ fn runtime_handle_digest(handle: &RuntimeHandle) -> Result<String, ServiceError>
     )))
 }
 
+fn sign_privilege_payload(
+    identity: &DeviceIdentity,
+    frame_type: &str,
+    device_id: &str,
+    connection_epoch: u64,
+    unsigned_payload: &Value,
+) -> Result<String, ServiceError> {
+    let transcript = json!({
+        "domain": format!("conduit.{frame_type}.v1"),
+        "deviceId": device_id,
+        "connectionEpoch": connection_epoch.to_string(),
+        "payload": unsigned_payload,
+    });
+    Ok(identity.sign(&serde_jcs::to_vec(&transcript).map_err(|_| TransportError::Malformed)?))
+}
+
 fn custody_target_digest(
     agent_session: bool,
     run_id: &str,
@@ -6268,6 +6298,7 @@ fn privileged_local_plan(
     offer: &OperationOffer,
     prepared_sources: &[PreparedSource],
     adapter_id: Option<&str>,
+    launch_profile_id: Option<&str>,
 ) -> Result<conduit_privileged_protocol::LocalExecutionPlan, ServiceError> {
     use conduit_privileged_protocol::{ResourceCeilings, StdioMode, WorkspaceBinding};
     let executable =
@@ -6326,6 +6357,7 @@ fn privileged_local_plan(
         cwd,
         systemd_unit: format!("conduit-elevated-{}.service", offer.runtime.runtime_id),
         adapter_id: adapter_id.map(str::to_owned),
+        launch_profile_id: launch_profile_id.map(str::to_owned),
         environment: offer.launch.environment.clone(),
         environment_value_digests,
         workspaces,
@@ -7375,6 +7407,42 @@ mod tests {
         for unsupported in ["claude", "agy", "shell", "unknown"] {
             assert!(!full_device_adapter_approval_supported(unsupported));
         }
+    }
+
+    #[test]
+    fn privilege_device_signature_binds_frame_domain_device_and_epoch() {
+        let directory = tempfile::tempdir().unwrap();
+        let identity =
+            DeviceIdentity::load_or_create(directory.path().join("device.ed25519")).unwrap();
+        let payload = json!({"requestId":"ptreq_signature_test","allowedOperation":"prepare"});
+        let signature = sign_privilege_payload(
+            &identity,
+            "privilege.ticket_request",
+            "dev_signature_test",
+            7,
+            &payload,
+        )
+        .unwrap();
+        let transcript = json!({
+            "domain":"conduit.privilege.ticket_request.v1",
+            "deviceId":"dev_signature_test",
+            "connectionEpoch":"7",
+            "payload":payload,
+        });
+        identity
+            .verify(&serde_jcs::to_vec(&transcript).unwrap(), &signature)
+            .unwrap();
+        let wrong = json!({
+            "domain":"conduit.privilege.receipt.v1",
+            "deviceId":"dev_signature_test",
+            "connectionEpoch":"7",
+            "payload":transcript["payload"],
+        });
+        assert!(
+            identity
+                .verify(&serde_jcs::to_vec(&wrong).unwrap(), &signature)
+                .is_err()
+        );
     }
 
     #[test]

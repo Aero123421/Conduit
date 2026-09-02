@@ -234,6 +234,20 @@ impl<M: SystemdManager> HelperEngine<M> {
             challenges: Mutex::new(BTreeMap::new()),
         })
     }
+
+    /// A root policy change immediately fences this process. Broadening only
+    /// becomes usable after a fresh service start and Control Plane approval;
+    /// narrowing therefore cannot be delayed by a long-lived socket session.
+    pub fn verify_current_policy(&self, path: &Path) -> Result<()> {
+        validate_regular(path, 0, 0o600)?;
+        let current: RootPolicy = serde_json::from_slice(&fs::read(path)?)?;
+        if current != self.config.policy || current.digest()? != self.config.policy_digest {
+            return Err(HelperError::Denied(
+                "privileged_helper_policy_mismatch".into(),
+            ));
+        }
+        Ok(())
+    }
     pub fn recover_nonterminal(&self) -> Result<Vec<HelperReceipt>> {
         let ids = self
             .journal
@@ -582,6 +596,9 @@ impl<M: SystemdManager> HelperEngine<M> {
             .join("runtimes")
             .join(&plan.runtime_id);
         fs::create_dir_all(&runtime_dir)?;
+        let managed_home = runtime_dir.join("home");
+        fs::create_dir_all(&managed_home)?;
+        fs::set_permissions(&managed_home, fs::Permissions::from_mode(0o700))?;
         if !plan.credentials.is_empty() {
             let credential_dir = runtime_dir.join("credentials");
             fs::create_dir_all(&credential_dir)?;
@@ -1213,14 +1230,25 @@ impl<M: SystemdManager> HelperEngine<M> {
             {
                 return Err(HelperError::Denied("ticket_plan_mismatch".into()));
             }
+            // Adapter/profile labels are not executable identities. Until a
+            // root-owned profile carries an exact executable commitment, they
+            // may narrow an explicitly unrestricted grant but must never turn
+            // into a generic root-exec grant by themselves.
+            if !self.config.policy.allow_unrestricted_launch {
+                return Err(HelperError::Denied(
+                    "unrestricted_launch_not_allowed".into(),
+                ));
+            }
             if let Some(adapter) = &plan.adapter_id {
                 if !self.config.policy.allowed_adapters.contains(adapter) {
                     return Err(HelperError::Denied("adapter_not_allowed".into()));
                 }
-            } else if !self.config.policy.allow_unrestricted_launch {
-                return Err(HelperError::Denied(
-                    "unrestricted_launch_not_allowed".into(),
-                ));
+            } else if let Some(profile) = &plan.launch_profile_id {
+                if !self.config.policy.allowed_launch_profiles.contains(profile) {
+                    return Err(HelperError::Denied("launch_profile_not_allowed".into()));
+                }
+            } else {
+                return Err(HelperError::Denied("launch_authority_missing".into()));
             }
             if plan.resources.runtime_max_usec.is_none()
                 && !self.config.policy.allow_persistent_sessions
@@ -1580,7 +1608,7 @@ mod tests {
                 PrivilegedOperation::ForceStop,
             ],
             allowed_adapters: vec![],
-            allowed_launch_profiles: vec![],
+            allowed_launch_profiles: vec!["service-test".into()],
             ceilings: resources(),
             allow_never: false,
             allow_unrestricted_launch: true,
@@ -1618,6 +1646,7 @@ mod tests {
             cwd: capture_file_identity(Path::new("/tmp"), false).unwrap(),
             systemd_unit: "conduit-elevated-service0001.service".into(),
             adapter_id: None,
+            launch_profile_id: Some("service-test".into()),
             environment: BTreeMap::new(),
             environment_value_digests: BTreeMap::new(),
             workspaces: vec![],

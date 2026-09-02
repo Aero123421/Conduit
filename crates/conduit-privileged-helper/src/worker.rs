@@ -88,7 +88,7 @@ pub fn run_exec_worker(record_path: &Path, public_key: &VerifyingKey) -> Result<
             cvt(unsafe { libc::dup2(stdin.as_raw_fd(), libc::STDIN_FILENO) })?;
             cvt(unsafe { libc::dup2(stdout.as_raw_fd(), libc::STDOUT_FILENO) })?;
             cvt(unsafe { libc::dup2(stderr.as_raw_fd(), libc::STDERR_FILENO) })?;
-            execute(&record.claims.plan)
+            execute(&record.claims.plan, directory)
         }
         StdioMode::Pty => run_pty_supervisor(record_path, &record.claims.plan),
     }
@@ -135,7 +135,12 @@ fn run_pty_supervisor(record_path: &Path, plan: &LocalExecutionPlan) -> Result<(
             libc::dup2(slave.as_raw_fd(), 1);
             libc::dup2(slave.as_raw_fd(), 2)
         };
-        return execute(plan);
+        return execute(
+            plan,
+            record_path
+                .parent()
+                .ok_or_else(|| HelperError::Denied("record parent".into()))?,
+        );
     }
     drop(slave);
     let directory = record_path.parent().unwrap();
@@ -195,7 +200,7 @@ fn run_pty_supervisor(record_path: &Path, plan: &LocalExecutionPlan) -> Result<(
     }
 }
 
-fn execute(plan: &LocalExecutionPlan) -> Result<()> {
+fn execute(plan: &LocalExecutionPlan, runtime_directory: &Path) -> Result<()> {
     plan.validate()?;
     let executable = open_verified(&plan.executable, true)?;
     let cwd = open_verified(&plan.cwd, false)?;
@@ -225,7 +230,7 @@ fn execute(plan: &LocalExecutionPlan) -> Result<()> {
         .iter()
         .map(|v| CString::new(v.as_bytes()).map_err(|_| HelperError::Denied("argv_nul".into())))
         .collect::<Result<Vec<_>>>()?;
-    let environment = clean_environment(&plan.environment)?;
+    let environment = clean_environment(&plan.environment, &runtime_directory.join("home"))?;
     cvt(unsafe { libc::fchdir(cwd.as_raw_fd()) })?;
     let argv_ptrs = argv
         .iter()
@@ -339,8 +344,12 @@ fn open_verified(identity: &FileIdentity, executable: bool) -> Result<OwnedFd> {
     Ok(fd)
 }
 
-fn clean_environment(values: &BTreeMap<String, String>) -> Result<Vec<CString>> {
-    values
+fn clean_environment(
+    values: &BTreeMap<String, String>,
+    managed_home: &Path,
+) -> Result<Vec<CString>> {
+    validate_regular_directory(managed_home, unsafe { libc::geteuid() })?;
+    let mut environment = values
         .iter()
         .map(|(k, v)| {
             if conduit_privileged_protocol::dangerous_environment_key(k) {
@@ -349,7 +358,30 @@ fn clean_environment(values: &BTreeMap<String, String>) -> Result<Vec<CString>> 
             CString::new(format!("{k}={v}"))
                 .map_err(|_| HelperError::Denied("environment_nul".into()))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    environment.push(
+        CString::new(format!(
+            "HOME={}",
+            managed_home.as_os_str().to_string_lossy()
+        ))
+        .map_err(|_| HelperError::Denied("environment_nul".into()))?,
+    );
+    environment.push(
+        CString::new("PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin").unwrap(),
+    );
+    Ok(environment)
+}
+
+fn validate_regular_directory(path: &Path, expected_uid: u32) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_dir()
+        || metadata.file_type().is_symlink()
+        || metadata.uid() != expected_uid
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(HelperError::Denied("managed_home_invalid".into()));
+    }
+    Ok(())
 }
 fn directory_digest(metadata: &fs::Metadata) -> String {
     hex::encode(Sha256::digest(
@@ -448,7 +480,8 @@ mod tests {
     fn rejects_loader_environment() {
         let mut env = BTreeMap::new();
         env.insert("LD_PRELOAD".into(), "/tmp/x".into());
-        assert!(clean_environment(&env).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        assert!(clean_environment(&env, directory.path()).is_err());
     }
     #[test]
     fn captures_directory_and_detects_interpreter_replacement() {

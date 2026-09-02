@@ -341,6 +341,7 @@ impl PrivilegedNodeRuntime {
         request_id: &str,
         device_policy_revision: u64,
         device_policy_summary: Value,
+        connection_epoch: u64,
         identity: &DeviceIdentity,
     ) -> Result<Value, PrivilegedNodeError> {
         let object = self
@@ -379,9 +380,15 @@ impl PrivilegedNodeRuntime {
             .as_object_mut()
             .expect("payload object")
             .remove("deviceSignature");
+        let transcript = json!({
+            "domain": "conduit.privilege.installation_attestation.v1",
+            "deviceId": object.get("deviceId").cloned().ok_or(PrivilegedNodeError::RegistrationMissing)?,
+            "connectionEpoch": connection_epoch.to_string(),
+            "payload": unsigned,
+        });
         payload["deviceSignature"] = Value::String(
             identity.sign(
-                &serde_jcs::to_vec(&unsigned)
+                &serde_jcs::to_vec(&transcript)
                     .map_err(|error| PrivilegedNodeError::Config(error.to_string()))?,
             ),
         );

@@ -25,6 +25,7 @@
   },
   "systemdUnit": "conduit-elevated-rt_example0001.service",
   "adapterId": null,
+  "launchProfileId": "full-device-example",
   "environment": {"LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"},
   "environmentValueDigests": {
     "LANG": "4444444444444444444444444444444444444444444444444444444444444444",

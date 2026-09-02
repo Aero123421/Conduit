@@ -1552,6 +1552,13 @@ impl NodeService {
         } else {
             "exact_command"
         };
+        let control_authority =
+            matches!(phase, PrivilegedStartPhase::InitialInputTicket).then(|| {
+                json!({
+                    "kind": "initial_agent_input",
+                    "agentStateRevision": "1"
+                })
+            });
         let mut payload = json!({
             "requestId": request_id,
             "idempotencyKey": ticket_idempotency_key,
@@ -1564,6 +1571,7 @@ impl NodeService {
             "launchPlanDigest": launch_digest,
             "localExecutionPlanDigest": plan_digest,
             "controlRequestDigest": control_digest,
+            "controlAuthority": control_authority,
             "runManifestDigest": context.run_manifest_digest,
             "helperPolicyRevision": privileged.capability().claims.policy_revision,
             "helperPolicyDigest": privileged.capability().claims.policy_digest,
@@ -1701,6 +1709,37 @@ impl NodeService {
         } else {
             "exact_command"
         };
+        let agent_revision = self
+            .agents
+            .get(start_operation_id)
+            .map(|agent| agent.revision.to_string());
+        let control_authority = match &control {
+            PendingPrivilegedControl::Agent { .. } | PendingPrivilegedControl::Runtime { .. } => {
+                json!({"kind": "external_control"})
+            }
+            PendingPrivilegedControl::Approval {
+                payload,
+                approval_id,
+            } => json!({
+                "kind": "adapter_approval",
+                "approvalId": approval_id,
+                "approvalReceiptDigest": payload.get("receiptDigest").cloned().unwrap_or(Value::Null),
+                "agentStateRevision": agent_revision
+            }),
+            PendingPrivilegedControl::AdapterFrames { approval_id, .. } => json!({
+                "kind": if approval_id.is_some() { "adapter_approval" } else { "adapter_protocol_response" },
+                "approvalId": approval_id,
+                "agentStateRevision": agent_revision
+            }),
+            PendingPrivilegedControl::StopAgent {
+                terminal, reason, ..
+            } => json!({
+                "kind": "agent_lifecycle_stop",
+                "terminal": terminal_state_name(*terminal),
+                "reasonCode": reason,
+                "agentStateRevision": agent_revision
+            }),
+        };
         let mut payload = json!({
             "requestId": request_id,
             "idempotencyKey": ticket_idempotency_key,
@@ -1713,6 +1752,7 @@ impl NodeService {
             "launchPlanDigest": launch_digest,
             "localExecutionPlanDigest": plan_digest,
             "controlRequestDigest": control_digest,
+            "controlAuthority": control_authority,
             "runManifestDigest": context.run_manifest_digest,
             "helperPolicyRevision": privileged.capability().claims.policy_revision,
             "helperPolicyDigest": privileged.capability().claims.policy_digest,

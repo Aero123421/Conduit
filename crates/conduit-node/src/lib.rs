@@ -793,6 +793,28 @@ impl Node {
             spec_digest: request.spec_digest,
             object_id: match admission.provider_id.as_str() {
                 "native" | "restricted_native" => "native-supervisor".into(),
+                "privileged-native" => {
+                    let receipt = self
+                        .store
+                        .privileged_receipts(&admission.operation.idempotency_key)?
+                        .into_iter()
+                        .last()
+                        .ok_or_else(|| {
+                            NodeError::Rejected("privileged_runtime_recovery_required".into())
+                        })?;
+                    let signed: HelperReceipt = serde_json::from_slice(&receipt.signed_receipt)
+                        .map_err(|_| {
+                            NodeError::Rejected("privileged_runtime_recovery_required".into())
+                        })?;
+                    if signed.claims.runtime_id != request.runtime_id
+                        || signed.claims.unit_name.is_empty()
+                    {
+                        return Err(NodeError::Rejected(
+                            "privileged_runtime_recovery_required".into(),
+                        ));
+                    }
+                    signed.claims.unit_name
+                }
                 "docker" | "podman" | "incus_kvm" => {
                     format!("conduit-{}", request.runtime_id.trim_start_matches("rt_"))
                 }
@@ -820,6 +842,41 @@ impl Node {
                 })
                 .as_deref()
                 == Some("agent.run.start");
+            if admission.provider_id == "privileged-native" {
+                let receipts = self.store.privileged_receipts(&operation.idempotency_key)?;
+                let last_receipt_digest = receipts
+                    .last()
+                    .map(|receipt| serde_json::Value::String(receipt.receipt_digest.clone()));
+                let mut evidence = serde_json::json!({
+                    "operationId": operation.operation_id,
+                    "runId": request.run_id,
+                    "runtimeId": request.runtime_id,
+                    "state": "recovery_required",
+                    "requestDigest": operation.request_digest,
+                    "lastRunEventSequence": operation.last_event_sequence.to_string(),
+                    "reasonCode": "privileged_runtime_recovery_required",
+                    "resultSummary": {
+                        "automaticReplay": false,
+                        "helperReconciliationRequired": true,
+                        "lastVerifiedHelperReceiptDigest": last_receipt_digest
+                    },
+                    "observedAt": time::OffsetDateTime::now_utc()
+                        .format(&time::format_description::well_known::Rfc3339)
+                        .map_err(|error| NodeError::Rejected(error.to_string()))?
+                });
+                evidence["receiptDigest"] = serde_json::Value::String(value_commitment(&evidence)?);
+                let encoded = serde_jcs::to_vec(&evidence)
+                    .map_err(|error| NodeError::Rejected(error.to_string()))?;
+                self.store.transition_operation(
+                    &operation.idempotency_key,
+                    operation.state,
+                    OperationState::RecoveryRequired,
+                    Some(&request.runtime_id),
+                    None,
+                    Some(&encoded),
+                )?;
+                continue;
+            }
             let handle = RuntimeHandle {
                 runtime_id: request.runtime_id.clone(),
                 provider_id: admission.provider_id.clone(),

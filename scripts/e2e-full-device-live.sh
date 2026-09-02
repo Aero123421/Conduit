@@ -543,6 +543,18 @@ grep -Eq '"activeRuntimeCountAfter"[[:space:]]*:[[:space:]]*0' \
 # upgrade route, DeviceRoom durable outbox, D1 projection, and privileged
 # helper. The operation is persisted and offered before Node connects, proving
 # that delivery is replayed from durable custody rather than process memory.
+curl --insecure --silent --show-error --fail-with-body --max-time 15 \
+  --request POST \
+  --header "Authorization: Bearer $conduit_control_token" \
+  --header 'Content-Type: application/json' \
+  --data-binary "{\"deviceId\":\"$conduit_device_id\"}" \
+  "$conduit_control_endpoint/__full-device-live/reset-transport" \
+  > "$conduit_user_evidence/node-transport-reset.json"
+grep -Eq '"authorityRecordsPreserved"[[:space:]]*:[[:space:]]*true' \
+  "$conduit_user_evidence/node-transport-reset.json" || {
+    echo "isolated transport reset did not preserve authority records" >&2
+    exit 4
+  }
 export CONDUIT_FULL_DEVICE_E2E_PHASE=node_prepare
 cargo test --locked -p conduit-node --test full_device_live \
   -- --ignored --exact full_device_live_systemd_root_e2e --nocapture

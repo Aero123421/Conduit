@@ -149,6 +149,13 @@ async function inspect(request: Request, env: LiveEnv): Promise<Response> {
   return Response.json({ worker: true, d1, deviceRoom: room, operation, runtime, operationTicketCount: operationTickets?.count ?? 0 });
 }
 
+async function resetTransport(request: Request, env: LiveEnv): Promise<Response> {
+  const input = await body(request);
+  const deviceId = String(input.deviceId ?? "");
+  if (!ID.test(deviceId)) throw new Error("invalid live E2E Device transport reset");
+  return Response.json(await env.DEVICE_ROOMS.getByName(deviceId).resetFullDeviceLiveTransportE2E(env.FULL_DEVICE_LIVE_E2E_TOKEN));
+}
+
 async function control(request: Request, env: LiveEnv): Promise<Response> {
   const input = await body(request);
   const runtimeId = String(input.runtimeId ?? "");
@@ -183,6 +190,7 @@ async function liveRoute(request: Request, env: LiveEnv, ctx: ExecutionContext):
   if (path === "/__full-device-live/approve") return approve(request, env);
   if (path === "/__full-device-live/intent") return intent(request, env);
   if (path === "/__full-device-live/inspect") return inspect(request, env);
+  if (path === "/__full-device-live/reset-transport") return resetTransport(request, env);
   if (path === "/__full-device-live/control") return control(request, env);
   if (path === "/__full-device-live/assert-never-denied") return assertNever(request, env, false);
   if (path === "/__full-device-live/assert-never-enabled") return assertNever(request, env, true);

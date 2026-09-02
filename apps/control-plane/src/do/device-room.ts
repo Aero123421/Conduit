@@ -343,6 +343,26 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     return { ...rows, positions, connection, activeSocketCount };
   }
 
+  /**
+   * Separate the fixture's direct privilege-projection setup from the real
+   * Node transport exercise. D1 authority records remain intact; only the
+   * isolated room's synthetic transport history is removed. Production
+   * deployments cannot enable this binding or supply its per-run token.
+   */
+  async resetFullDeviceLiveTransportE2E(token: string): Promise<Record<string, unknown>> {
+    const liveEnv = this.env as ControlPlaneEnv & { FULL_DEVICE_LIVE_E2E?: string; FULL_DEVICE_LIVE_E2E_TOKEN?: string };
+    if (liveEnv.FULL_DEVICE_LIVE_E2E !== "enabled" || liveEnv.FULL_DEVICE_LIVE_E2E_TOKEN === undefined || token !== liveEnv.FULL_DEVICE_LIVE_E2E_TOKEN) throw new TypeError("full_device_live_e2e_unavailable");
+    if (this.ctx.getWebSockets().length !== 0) throw new TypeError("full_device_live_e2e_socket_active");
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM connection_state; DELETE FROM outbound_frames; DELETE FROM inbound_frames; DELETE FROM auth_challenges; DELETE FROM reconciliation_sessions; DELETE FROM terminal_receipt_cache; DELETE FROM outbound_message_receipts; DELETE FROM control_replay_intents; DELETE FROM outbound_message_tombstones");
+      this.ctx.storage.sql.exec("UPDATE transport_positions SET durable_sequence=0,acknowledged_sequence=0,retained_sequence=0,projected_sequence=0");
+      this.ctx.storage.sql.exec("UPDATE transport_compaction SET compacted_through=0,compacted_digest='',updated_at=?", nowIso());
+      this.ctx.storage.sql.exec("UPDATE room_work_marker SET pending=0,min_due_at=NULL,retention_pending=0,retention_due_at=NULL,realtime_pending=0,realtime_min_due_at=NULL,realtime_device_id=NULL,ack_pending_through=0,ack_pending_at=NULL,ack_sent_through=0,ack_message_id=NULL,health_semantic_json=NULL,health_last_projected_at=NULL,updated_at=? WHERE singleton=1", nowIso());
+    });
+    await this.ctx.storage.deleteAlarm();
+    return { reset: true, authorityRecordsPreserved: true };
+  }
+
   async acknowledgeFullDeviceLiveRegistrationE2E(token: string, installationId: string): Promise<void> {
     const liveEnv = this.env as ControlPlaneEnv & { FULL_DEVICE_LIVE_E2E?: string; FULL_DEVICE_LIVE_E2E_TOKEN?: string };
     if (liveEnv.FULL_DEVICE_LIVE_E2E !== "enabled" || liveEnv.FULL_DEVICE_LIVE_E2E_TOKEN === undefined || token !== liveEnv.FULL_DEVICE_LIVE_E2E_TOKEN) throw new TypeError("full_device_live_e2e_unavailable");

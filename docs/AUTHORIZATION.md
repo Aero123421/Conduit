@@ -300,6 +300,8 @@ Initial scopes:
 
 A token scope does not imply access to every device or project.
 
+Read authentication does not create an unbounded activity log. Browser and owner-CLI session activity is touched no more than once per ten minutes, and OAuth grant use no more than once per hour. Every request still checks current status, expiry, token family, audience, scope, policy revision, and revocation. Mutation and fresh-passkey requirements are evaluated immediately; throttled timestamps never broaden authority.
+
 ## OAuth grants and connector ceilings
 
 An OAuth grant joins:
@@ -325,6 +327,8 @@ The connector policy limits:
 - artifact upload and export
 - rate-limit profile
 - maximum run and command duration
+
+Connector limiting keeps rate and weighted/byte budget state in one compact Durable Object row. An all-zero byte charge and an allowed read-only call create no idempotency row. Effectful operations use the D1 operation journal as durable idempotency authority and acquire admission plus concurrency in one Durable Object transaction. Expired windows and released leases are pruned in bounded pages. These storage optimizations do not change policy ceilings, local-deny precedence, idempotency conflicts, or concurrency enforcement.
 
 Access scopes are ordered:
 

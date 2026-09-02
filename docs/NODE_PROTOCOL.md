@@ -54,7 +54,7 @@ Limits:
 - one JSON object per frame
 - maximum encoded frame size: 65,536 bytes
 - maximum string field: 32,768 UTF-8 bytes unless a smaller field limit is defined
-- maximum event batch: 128 events and 60,000 encoded bytes
+- maximum event batch: 32 events and 60,000 encoded payload bytes (the complete frame remains below 65,536 bytes)
 - binary files, raw logs, large command output, and artifacts use content references or separate bounded upload paths
 
 A frame above the limit is rejected before JSON decoding where the runtime permits it. Oversized or malformed frames never become public adapter text.
@@ -129,6 +129,7 @@ Every post-authentication frame uses this envelope:
   "sequence": "918",
   "type": "operation.terminal",
   "correlationId": "op_...",
+  "controlAppliedThrough": "917",
   "payloadDigest": "sha256-hex",
   "payload": {}
 }
@@ -145,6 +146,10 @@ Required fields:
 - type
 - SHA-256 digest of canonical payload
 - bounded payload
+
+Optional fields:
+
+- cumulative control sequence applied by the Device when this frame was built (`controlAppliedThrough`)
 
 `correlationId` is required for an operation, run, approval, input, or reconciliation exchange. Transport acknowledgements may omit it.
 
@@ -177,6 +182,13 @@ An acknowledgement means:
 - the sender may compact those transport-outbox rows according to retention policy
 
 It does not mean that an offered operation was admitted, started, completed, or projected into every read model.
+
+The node may coalesce acknowledgements for up to 100ms or 32 control frames. The
+coalesced frame carries the highest contiguous applied sequence, and every
+ordinary node-origin frame carries the same applied-control watermark in
+`controlAppliedThrough`. A sent ACK row is eligible for bounded compaction only
+after the peer's cumulative receipt is durable; a missing or conflicting
+tombstone fails closed and triggers reconciliation.
 
 ## Control-to-node delivery
 
@@ -348,6 +360,28 @@ At-least-once queue delivery is deduplicated by Conduit event ID, run ID, and ru
 
 Each run has a persistent event sequence independent of transport connections.
 
+The node records each normalized event and its local raw provider record before
+cloud delivery. A short per-run accumulator then emits one `event.batch` when
+the first of these conditions is met:
+
+- 100ms has elapsed since the first buffered event
+- 32 events are buffered
+- the canonical encoded event payload would reach 60,000 bytes
+
+Approval requests, terminal receipts, errors, tool start/end, commands, file
+effects, Change Set, and verification events are priority events and flush the
+accumulator immediately. Adjacent assistant text deltas are coalesced only at
+the transport boundary: each normalized event, source sequence, and digest is
+retained, so concatenating visible text reconstructs the exact local bytes.
+The Device-local raw stream is independent of this cloud batching and remains
+lossless under its own capture permission and retention policy.
+
+Every cloud batch contains both the existing `fromSequence`/
+`throughSequence` range and the explicit `sourceSequenceRange` object, plus a
+`sourceRangeDigest` committing the Run ID, range, and each event digest. The
+control plane treats a batch as one durable ingestion unit; it must not split a
+single `event.batch` into one Queue message per event.
+
 A normalized event contains:
 
 - run ID
@@ -363,7 +397,10 @@ A normalized event contains:
 - bounded payload or content reference
 - content digest
 
-The event contract is defined by the trace schema. The node can batch consecutive events in `event.batch`.
+The event contract is defined by the trace schema. The node batches consecutive
+events in `event.batch` using the bounded accumulator above. A batch is accepted
+only when its source range and range digest agree with its normalized event
+records.
 
 The control plane applies a batch only when:
 
@@ -672,7 +709,21 @@ If graceful cancellation fails, a separate force-stop operation may be offered a
 
 WebSocket presence is an observation, not device authority.
 
-`DeviceRoom` uses hibernatable WebSocket auto-response for bounded ping/pong where possible. It does not use a permanent timer that prevents hibernation merely to update presence.
+`DeviceRoom` uses hibernatable WebSocket auto-response for bounded ping/pong where possible. The node sends a WebSocket protocol `Ping` roughly every 30 seconds and answers peer `Ping` frames with `Pong`; these control frames are not Conduit envelopes and do not emit `device.health`. It does not use a permanent timer that prevents hibernation merely to update presence.
+
+`device.health` is semantic state, not a keepalive. The node emits it immediately
+after authenticated connection/reconciliation completion, when node/journal/
+storage state or active-run counts change, and on fault/recovery. An unchanged
+state has a ten-minute checkpoint by default (the upper end of the
+five-to-ten-minute policy window). At that checkpoint an unchanged state replays
+the exact durable health envelope, preserving its message ID, sequence, digest,
+and observed timestamp; state changes, faults, recovery, and reconnects allocate
+a fresh sequence. Health payloads include `controlAppliedThrough`, matching the
+watermark on ordinary and reconciliation frames. Control ACKs may advance the
+applied frontier without changing semantic health; they do not invalidate the
+saved health envelope or create a health/ACK feedback loop. The next fresh
+semantic observation (or ordinary/reconciliation frame) carries the current
+frontier, while a non-ACK control application requests a health rebase.
 
 The UI distinguishes:
 

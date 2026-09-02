@@ -73,6 +73,8 @@ export interface PolicyRequest {
   responseBytes?: number;
   normalizedLogBytes?: number;
   rawLogBytes?: number;
+  concurrencyClass?: "commands" | "agentRuns" | "runtimeStarts";
+  concurrencyExpiresAt?: string;
 }
 
 export interface ConnectorPolicyAuthoritySnapshot {
@@ -111,8 +113,9 @@ export async function authorizeConnector(env: ControlPlaneEnv, actor: AuthActor,
   const requiredScope = scopeForOperation[request.operation];
   if (requiredScope === undefined || !actor.scopes.includes(requiredScope)) deny("scope_insufficient", "OAuth scope does not permit this operation");
   if (actor.policyId === undefined || actor.policyRevision === undefined || actor.grantId === undefined) deny("grant_required", "OAuth grant policy binding is missing");
-  const policy = await env.DB.prepare("SELECT * FROM connector_policies WHERE id=?1 AND revision=?2 LIMIT 1").bind(actor.policyId, actor.policyRevision).first<PolicyRow>();
-  if (policy === null || policy.status !== "active" || policy.client_id !== actor.clientId || policy.principal_id !== actor.principalId) deny("grant_reauthorization_required", "Connector policy is no longer active");
+  const joined = await env.DB.prepare("SELECT p.*,r.id AS rate_id,r.revision AS rate_revision,r.status AS rate_status,r.profile_json AS rate_profile_json FROM connector_policies p LEFT JOIN rate_limit_profiles r ON r.id=p.rate_limit_profile_id WHERE p.id=?1 AND p.revision=?2 LIMIT 1").bind(actor.policyId, actor.policyRevision).first<PolicyRow & { rate_id: string | null; rate_revision: number | null; rate_status: string | null; rate_profile_json: string | null }>();
+  if (joined === null || joined.status !== "active" || joined.client_id !== actor.clientId || joined.principal_id !== actor.principalId) deny("grant_reauthorization_required", "Connector policy is no longer active");
+  const policy: PolicyRow = joined;
   const allowedOperations = JSON.parse(policy.allowed_operations_json) as string[];
   if (!allowedOperations.includes(request.operation)) deny("operation_not_allowed", "Connector policy does not permit this operation");
   if (!includesSelector(parseSelector(policy.device_selector_json), request.deviceId)) deny("device_not_allowed", "Connector policy does not permit this Device");
@@ -133,8 +136,8 @@ export async function authorizeConnector(env: ControlPlaneEnv, actor: AuthActor,
   });
   const payloadDigest = typeof request.payloadDigest === "string" ? request.payloadDigest : await request.payloadDigest(authoritySnapshot);
   if (!/^[a-f0-9]{64}$/.test(payloadDigest)) throw new TypeError("Connector admission payload digest must be SHA-256 hex");
-  const rate = await env.DB.prepare("SELECT id,revision,status,profile_json FROM rate_limit_profiles WHERE id=?1 AND status='active' LIMIT 1").bind(policy.rate_limit_profile_id).first<RateProfileRow>();
-  if (rate === null) deny("rate_limited", "Connector rate profile is unavailable");
+  if (joined.rate_id === null || joined.rate_revision === null || joined.rate_status !== "active" || joined.rate_profile_json === null) deny("rate_limited", "Connector rate profile is unavailable");
+  const rate: RateProfileRow = { id: joined.rate_id, revision: joined.rate_revision, status: joined.rate_status, profile_json: joined.rate_profile_json };
   const profile = JSON.parse(rate.profile_json) as Record<string, unknown>;
   const requestWindows = record(profile.requestWindows, "requestWindows");
   const family = operationFamily(request.operation);
@@ -142,6 +145,9 @@ export async function authorizeConnector(env: ControlPlaneEnv, actor: AuthActor,
   const weighted = record(profile.weightedBudget, "weightedBudget");
   const weights = record(weighted.weights, "weights");
   const bytes = record(profile.bytes, "bytes");
+  const concurrency = record(profile.concurrency, "concurrency");
+  const concurrencyLimit = request.concurrencyClass === undefined ? undefined : Number(concurrency[request.concurrencyClass] ?? 0);
+  if (request.concurrencyClass !== undefined && (!Number.isSafeInteger(concurrencyLimit) || concurrencyLimit! < 1 || request.concurrencyExpiresAt === undefined)) deny("rate_limited", "Connector concurrency profile is unavailable");
   const admission: LimitAdmission = {
     operationId: request.operationId,
     idempotencyKey: request.idempotencyKey,
@@ -158,6 +164,8 @@ export async function authorizeConnector(env: ControlPlaneEnv, actor: AuthActor,
     artifactUploadBytes: request.artifactUploadBytes ?? 0,
     byteLimits: { response: Number(bytes.responseBytes ?? 0), normalizedDaily: Number(bytes.normalizedLogBytesPerDay ?? 0), rawDaily: Number(bytes.rawLogBytesPerDay ?? 0), artifactDaily: Number(bytes.artifactUploadBytesPerDay ?? 0) },
     nowMs: Date.now(),
+    effectful: !request.operation.endsWith(".read"),
+    ...(request.concurrencyClass === undefined ? {} : { concurrency: { className: request.concurrencyClass, limit: concurrencyLimit!, expiresAt: request.concurrencyExpiresAt! }, idempotencyExpiresAtMs: Date.parse(request.concurrencyExpiresAt!) }),
   };
   const decision = await env.CONNECTOR_LIMITERS.getByName(actor.grantId).admit(admission);
   if (!decision.allowed) throw new PublicError(decision.code === "idempotency_conflict" ? "idempotency_conflict" : decision.code, decision.code === "idempotency_conflict" ? 409 : 429, `Connector limit denied: ${decision.limitClass}`, decision.retryAfterSeconds);

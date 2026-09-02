@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Device enrollment</title>
+<body>
+  <h1>Device enrollment</h1>
+  <p>Enter the code displayed by the Node. Verify the hostname, platform, and public-key fingerprint before approving.</p>
+  <form id="device-enrollment-lookup">
+    <label>User code <input id="device-user-code" required autocomplete="one-time-code" maxlength="16"></label>
+    <button id="device-lookup-submit" type="submit">Review device</button>
+  </form>
+  <section id="device-review" hidden>
+    <dl><dt>Hostname</dt><dd id="device-hostname"></dd><dt>Platform</dt><dd id="device-platform"></dd><dt>Node version</dt><dd id="device-node-version"></dd><dt>Public-key fingerprint</dt><dd><code id="device-fingerprint"></code></dd><dt>Expires</dt><dd id="device-expires"></dd></dl>
+    <button id="device-approve" type="button">Verify passkey and approve</button>
+    <button id="device-deny" type="button">Verify passkey and deny</button>
+  </section>
+  <p id="device-status" role="status" aria-live="polite"></p>
+  <p><a href="/login?return_to=/device">Sign in with a passkey</a></p>
+  <script src="/static/device-enrollment.js" defer></script>
+</body>
+</html>

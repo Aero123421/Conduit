@@ -1,5 +1,6 @@
 import { canonicalJson, nowIso, sha256Hex } from "./crypto.ts";
 import type { ControlPlaneEnv } from "./types.ts";
+import { clearRetryWork, scheduleRetryWork } from "./retry-scheduler-client.ts";
 
 const LEASE_MS = 30_000;
 
@@ -67,7 +68,8 @@ export async function attemptApprovalDispatch(
   env: ControlPlaneEnv,
   approvalId: string,
   now = new Date(),
-  deliver: (frame: DeviceRoomApproval) => Promise<unknown> = (frame) => env.DEVICE_ROOMS.getByName(frame.deviceId).deliverApproval(frame),
+  deliver: ((frame: DeviceRoomApproval) => Promise<unknown>) | undefined = undefined,
+  scheduleRetry = true,
 ): Promise<void> {
   const current = await env.DB.prepare("SELECT * FROM approval_dispatch_outbox WHERE approval_id=?1 LIMIT 1").bind(approvalId).first<ApprovalDispatchRow>();
   if (current === null || current.state === "offered" || current.state === "expired") return;
@@ -83,7 +85,7 @@ export async function attemptApprovalDispatch(
   const row = await env.DB.prepare("SELECT * FROM approval_dispatch_outbox WHERE approval_id=?1 AND lease_token=?2 LIMIT 1").bind(approvalId, lease).first<ApprovalDispatchRow>();
   if (row === null) return;
   try {
-    await deliver({
+    await (deliver ?? ((frame) => env.DEVICE_ROOMS.getByName(frame.deviceId).deliverApproval(frame)))({
       deviceId: row.device_id,
       messageId: row.message_id,
       correlationId: row.approval_id,
@@ -93,12 +95,14 @@ export async function attemptApprovalDispatch(
     });
     await env.DB.prepare("UPDATE approval_dispatch_outbox SET state='offered',attempt_count=attempt_count+1,lease_token=NULL,lease_expires_at=NULL,last_error_code=NULL,updated_at=?1 WHERE approval_id=?2 AND lease_token=?3")
       .bind(now.toISOString(), approvalId, lease).run();
+    if (scheduleRetry && row.attempt_count > 0) await clearRetryWork(env, "approval", approvalId);
   } catch {
     const attempts = row.attempt_count + 1;
     const delay = Math.min(60_000, 2 ** Math.min(attempts, 6) * 1_000);
     const next = new Date(now.getTime() + delay).toISOString();
     await env.DB.prepare("UPDATE approval_dispatch_outbox SET state='pending',attempt_count=?1,next_attempt_at=?2,lease_token=NULL,lease_expires_at=NULL,last_error_code='device_room_delivery_failed',updated_at=?3 WHERE approval_id=?4 AND lease_token=?5")
       .bind(attempts, next, now.toISOString(), approvalId, lease).run();
+    if (scheduleRetry) await scheduleRetryWork(env, { kind: "approval", targetId: approvalId, dueAt: next });
   }
 }
 

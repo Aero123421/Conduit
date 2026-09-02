@@ -33,12 +33,14 @@ export class AuthRepository {
     return this.db.prepare("SELECT id, display_name, status FROM owner_principals ORDER BY created_at LIMIT 1").first();
   }
 
-  async createChallenge(input: { kind: string; principalId?: string; sessionId?: string; challenge: string; bindingDigest?: string; origin: string; rpId: string; state?: unknown }): Promise<string> {
+  async createChallenge(input: { kind: string; principalId?: string; sessionId?: string; challenge: string; bindingDigest?: string; origin: string; rpId: string; state?: unknown; sourceHash?: string }): Promise<string> {
     const id = newId("chal");
     const now = new Date();
+    const counts = await this.db.prepare("SELECT COUNT(*) AS global_count,SUM(CASE WHEN source_hash=?1 THEN 1 ELSE 0 END) AS source_count FROM auth_challenges WHERE consumed_at IS NULL AND expires_at>?2").bind(input.sourceHash ?? "", now.toISOString()).first<{ global_count: number; source_count: number | null }>();
+    if ((counts?.global_count ?? 0) >= 500 || (input.sourceHash !== undefined && (counts?.source_count ?? 0) >= 50)) throw new PublicError("rate_limited", 429, "Too many pending authentication challenges", 60);
     await this.db.prepare(
-      "INSERT INTO auth_challenges(id,kind,principal_id,session_id,challenge_hash,binding_digest,expected_origin,expected_rp_id,state_json,expires_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
-    ).bind(id, input.kind, input.principalId ?? null, input.sessionId ?? null, await keyedHash(this.pepper, input.challenge), input.bindingDigest ?? null, input.origin, input.rpId, JSON.stringify(input.state ?? {}), new Date(now.getTime() + 300_000).toISOString(), now.toISOString()).run();
+      "INSERT INTO auth_challenges(id,kind,principal_id,session_id,challenge_hash,binding_digest,expected_origin,expected_rp_id,state_json,expires_at,created_at,source_hash) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+    ).bind(id, input.kind, input.principalId ?? null, input.sessionId ?? null, await keyedHash(this.pepper, input.challenge), input.bindingDigest ?? null, input.origin, input.rpId, JSON.stringify(input.state ?? {}), new Date(now.getTime() + 300_000).toISOString(), now.toISOString(), input.sourceHash ?? null).run();
     return id;
   }
 
@@ -100,7 +102,9 @@ export class AuthRepository {
     const row = await this.db.prepare("SELECT * FROM owner_sessions WHERE verifier_hash=?1 AND status='active' AND expires_at>?2 AND last_activity_at>?3 LIMIT 1")
       .bind(await keyedHash(this.pepper, token), now, new Date(Date.now() - 86_400_000).toISOString()).first<SessionRow>();
     if (row === null) throw new PublicError("authentication_required", 401, "Browser session is invalid or expired");
-    await this.db.prepare("UPDATE owner_sessions SET last_activity_at=?1 WHERE id=?2").bind(now, row.id).run();
+    if (Date.parse(row.last_activity_at) <= Date.now() - 10 * 60_000) {
+      await this.db.prepare("UPDATE owner_sessions SET last_activity_at=?1 WHERE id=?2 AND last_activity_at<?3").bind(now, row.id, new Date(Date.now() - 10 * 60_000).toISOString()).run();
+    }
     return row;
   }
 

@@ -30,6 +30,24 @@ export const resourceSpecs = {
 
 export type ResourceName = keyof typeof resourceSpecs;
 
+const listSummaryColumns: Record<ResourceName, string> = {
+  projects: "id,name,description,status,revision,created_at,updated_at",
+  sources: "id,project_id,display_name,source_kind,revision,created_at,updated_at",
+  locations: "id,source_id,device_id,display_label,status,last_observed_at,revision,created_at,updated_at",
+  sessions: "id,project_id,title,accepted_baseline_id,status,revision,created_at,updated_at",
+  messages: "id,session_id,author_principal_id,origin,substr(body,1,1024) AS body_preview,CASE WHEN length(body)>1024 THEN 1 ELSE 0 END AS body_truncated,revision,created_at",
+  project_agents: "id,project_id,name,adapter_id,role,status,revision,created_at,updated_at",
+  assignments: "id,project_id,session_id,source_message_id,title,state,revision,created_at,updated_at",
+  runs: "id,assignment_id,project_id,session_id,device_id,runtime_kind,access_scope,approval_mode,state,revision,manifest_digest,created_at,updated_at",
+  approvals: "id,operation_id,requester_principal_id,client_id,device_id,run_id,commitment_digest,operation_type,decision,expires_at,resolved_at,created_at",
+  tasks: "id,project_id,session_id,assignment_id,title,status,revision,created_at,updated_at",
+  artifacts: "id,run_id,project_id,artifact_kind,content_digest,bytes,sensitivity,retention_class,custody,status,created_at,updated_at",
+  devices: "id,display_label,os,arch,node_version,protocol_version,status,revision,connection_epoch,last_observed_at,created_at,updated_at",
+  traces: "run_id AS id,device_id,first_sequence,last_sequence,chain_hash,observability_state,updated_at",
+  evidence: "id,run_id,evidence_kind,evidence_level,summary_json,source_digest,created_at",
+  operations: "id,device_id,project_id,session_id,assignment_id,run_id,capability,state,expires_at,created_at,updated_at",
+};
+
 function specFor(name: string): ResourceSpec {
   const candidate = resourceSpecs[name as ResourceName];
   if (candidate === undefined) throw new PublicError("not_found", 404, "Unknown API resource");
@@ -49,8 +67,9 @@ export class DomainRepository {
     const spec = specFor(resource);
     const limit = boundedLimit(url.searchParams.get("limit"));
     const cursor = url.searchParams.get("cursor") ?? "";
+    const idColumn = resource === "traces" ? "run_id" : "id";
     const result = await this.db
-      .prepare(`SELECT * FROM ${spec.table} WHERE id > ?1 ORDER BY id LIMIT ?2`)
+      .prepare(`SELECT ${listSummaryColumns[resource as ResourceName]} FROM ${spec.table} WHERE ${idColumn} > ?1 ORDER BY ${idColumn} LIMIT ?2`)
       .bind(cursor, limit)
       .all<Record<string, unknown>>();
     return result.results;
@@ -58,7 +77,8 @@ export class DomainRepository {
 
   async get(resource: string, id: string): Promise<Record<string, unknown>> {
     const spec = specFor(resource);
-    const row = await this.db.prepare(`SELECT * FROM ${spec.table} WHERE id = ?1 LIMIT 1`).bind(id).first<Record<string, unknown>>();
+    const idColumn = resource === "traces" ? "run_id" : "id";
+    const row = await this.db.prepare(`SELECT * FROM ${spec.table} WHERE ${idColumn} = ?1 LIMIT 1`).bind(id).first<Record<string, unknown>>();
     if (row === null) throw new PublicError("not_found", 404, "Record not found");
     return row;
   }

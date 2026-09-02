@@ -32,10 +32,10 @@ describe.sequential("control-plane contracts", () => {
 
   it("applies forward D1 migrations", async () => {
     const version = await env.DB.prepare("SELECT version FROM schema_versions WHERE component='control_plane'").first<{ version: number }>();
-    expect(version?.version).toBe(12);
+    expect(version?.version).toBe(13);
     const tables = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table'").all<{ name: string }>();
     const names = new Set(tables.results.map((row) => row.name));
-    for (const required of ["owner_principals", "oauth_grants", "connector_policies", "devices", "projects", "collaboration_sessions", "runs", "operation_journal", "operation_dispatch_outbox", "approval_dispatch_outbox", "assignment_run_bindings", "context_snapshots", "runtime_custody", "agent_sessions", "node_projection_receipts", "realtime_projection_outbox", "change_sets", "reviews", "baseline_revisions", "artifacts", "normalized_events", "security_events"]) expect(names.has(required)).toBe(true);
+    for (const required of ["owner_principals", "oauth_grants", "connector_policies", "devices", "projects", "collaboration_sessions", "runs", "operation_journal", "operation_dispatch_outbox", "approval_dispatch_outbox", "assignment_run_bindings", "context_snapshots", "runtime_custody", "agent_sessions", "node_projection_receipts", "realtime_projection_outbox", "realtime_delivery_receipts", "retention_cleanup_state", "change_sets", "reviews", "baseline_revisions", "artifacts", "normalized_events", "security_events"]) expect(names.has(required)).toBe(true);
   });
 
   it("keeps security events immutable", async () => {
@@ -1188,5 +1188,28 @@ describe.sequential("control-plane contracts", () => {
     const limiter = env.CONNECTOR_LIMITERS.getByName("grant-byte-test");
     const decision = await limiter.admit({ operationId: "op_test_00000002", idempotencyKey: "oversized-response", payloadDigest: "c".repeat(64), family: "read", weight: 1, requestLimit: 10, windowSeconds: 60, capacity: 10, refillPerSecond: 1, responseBytes: 1001, normalizedLogBytes: 0, rawLogBytes: 0, artifactUploadBytes: 0, byteLimits: { response: 1000, normalizedDaily: 1000, rawDaily: 0, artifactDaily: 0 }, nowMs: 1_788_192_000_000 });
     expect(decision).toMatchObject({ allowed: false, code: "resource_limit", limitClass: "response_bytes" });
+  });
+
+  it("does not persist read-only idempotency or zero-byte rows", async () => {
+    const limiter = env.CONNECTOR_LIMITERS.getByName("grant-read-cost-test");
+    const base = { operationId: "op_read_cost_000001", idempotencyKey: "read-observation", payloadDigest: "d".repeat(64), family: "read", effectful: false, weight: 1, requestLimit: 10, windowSeconds: 60, capacity: 10, refillPerSecond: 1, responseBytes: 0, normalizedLogBytes: 0, rawLogBytes: 0, artifactUploadBytes: 0, byteLimits: { response: 1000, normalizedDaily: 1000, rawDaily: 0, artifactDaily: 0 }, nowMs: 1_788_192_000_000 };
+    await expect(limiter.admit(base)).resolves.toEqual({ allowed: true, charged: true });
+    await expect(limiter.admit({ ...base, operationId: "op_read_cost_000002", payloadDigest: "e".repeat(64) })).resolves.toEqual({ allowed: true, charged: true });
+    const state = await runInDurableObject(limiter, (_instance, durable) => ({
+      idempotency: durable.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM idempotency").one().count,
+      legacyBytes: durable.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM byte_usage").one().count,
+      compactBudgets: durable.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM budget_state").one().count,
+      unusedConcurrencyTable: durable.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM sqlite_master WHERE type='table' AND name='concurrency'").one().count,
+    }));
+    expect(state).toEqual({ idempotency: 0, legacyBytes: 0, compactBudgets: 1, unusedConcurrencyTable: 0 });
+  });
+
+  it("admits and acquires connector concurrency in one limiter RPC", async () => {
+    const limiter = env.CONNECTOR_LIMITERS.getByName("grant-combined-admission-test");
+    const input = { operationId: "op_combined_limit_01", idempotencyKey: "combined-limit-1", payloadDigest: "f".repeat(64), family: "commandStart", weight: 1, requestLimit: 10, windowSeconds: 60, capacity: 10, refillPerSecond: 1, responseBytes: 0, normalizedLogBytes: 0, rawLogBytes: 0, artifactUploadBytes: 0, byteLimits: { response: 1000, normalizedDaily: 1000, rawDaily: 0, artifactDaily: 0 }, nowMs: Date.now(), concurrency: { className: "commands" as const, limit: 1, expiresAt: new Date(Date.now() + 60_000).toISOString() } };
+    await expect(limiter.admit(input)).resolves.toEqual({ allowed: true, charged: true });
+    await expect(limiter.admit({ ...input, operationId: "op_combined_limit_02", idempotencyKey: "combined-limit-2", payloadDigest: "0".repeat(64) })).resolves.toMatchObject({ allowed: false, code: "resource_limit", limitClass: "concurrency.commands" });
+    const active = await runInDurableObject(limiter, (_instance, durable) => durable.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM concurrency_leases WHERE state='active'").one().count);
+    expect(active).toBe(1);
   });
 });

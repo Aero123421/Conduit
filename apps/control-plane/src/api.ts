@@ -14,6 +14,7 @@ import { approvalOutboxInsert, attemptApprovalDispatch, buildApprovalReceipt } f
 import { scheduleBoardAssignment } from "./board-workflow.ts";
 import { acceptChangeSet, createReview } from "./review-workflow.ts";
 import { createExistingTargetControl } from "./controls.ts";
+import { projectCompositeSnapshot, sessionCompositeSnapshot } from "./snapshots.ts";
 
 const readPermissions: Partial<Record<ResourceName, string>> = {
   projects: "project.read", sources: "project.read", locations: "project.read", sessions: "session.read", messages: "board.read",
@@ -353,6 +354,16 @@ export async function handleApi(request: Request, env: ControlPlaneEnv, path: st
     if (body.idempotencyKey !== undefined && body.idempotencyKey !== key) throw new PublicError("idempotency_conflict", 409, "Body and Idempotency-Key header differ");
     body.idempotencyKey = key;
     return Response.json(await createOperation(env, auth.actor, body, { kind: auth.connector ? "connector" : "owner" }), { status: 202 });
+  }
+  const compositeSnapshot = path.match(/^\/v1\/(projects|sessions)\/([^/]+)\/snapshot$/);
+  if (request.method === "GET" && compositeSnapshot?.[1] !== undefined && compositeSnapshot[2] !== undefined) {
+    const resource = compositeSnapshot[1] === "projects" ? "projects" : "sessions";
+    const auth = await actorFor(request, env, false);
+    const authority = await resolveResourceAuthority(env.DB, resource, compositeSnapshot[2]);
+    await authorizeResource(request, env, auth.actor, auth.connector, resource, false, new URL(request.url), undefined, authority);
+    const snapshot = resource === "projects" ? await projectCompositeSnapshot(env.DB, compositeSnapshot[2]) : await sessionCompositeSnapshot(env.DB, compositeSnapshot[2]);
+    if (snapshot === null) throw new PublicError("not_found", 404, `${resource === "projects" ? "Project" : "Collaboration Session"} not found`);
+    return Response.json(snapshot, { headers: { "cache-control": "no-store" } });
   }
   const stream = path.match(/^\/v1\/sessions\/([^/]+)\/stream$/);
   if (request.method === "GET" && stream?.[1] !== undefined && request.headers.get("upgrade")?.toLowerCase() === "websocket") {

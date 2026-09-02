@@ -266,6 +266,29 @@ Control-plane audit and collaboration events remain separate. The UI can merge t
 
 Device sequence is authoritative for local activity. Wall-clock timestamps are observations.
 
+## Cloud event batches
+
+The Device commits every normalized event to its local Run stream before
+attempting cloud delivery. It may then coalesce adjacent progress events into
+one transport `event.batch` using a 100ms, 32-event, or 60,000-byte limit,
+whichever occurs first. Approval, terminal, error, tool, command, file-effect,
+Change Set, and verification events flush immediately. Coalescing is only a
+transport optimization: normalized event IDs, event sequences, event digests,
+and chain hashes remain individually present in the batch.
+
+An `event.batch` carries `fromSequence`/`throughSequence` and the explicit
+`sourceSequenceRange` with the same inclusive values. Its `sourceRangeDigest`
+commits the Run ID, range, and ordered `(sequence, eventDigest)` list. A
+receiver can therefore verify that a retry or replay covers the exact local
+source range without treating a Queue message ID as event identity. The full
+encoded frame stays below the 64KiB transport limit.
+
+Visible assistant text deltas remain byte-for-byte reconstructible by
+concatenating their visible text in source-sequence order. The local raw
+provider stream is written independently as lossless length-prefixed records;
+cloud batching, normalization, redaction, or Queue retry cannot alter that
+Device-local evidence.
+
 ## Event envelope
 
 Every event contains:
@@ -792,7 +815,9 @@ The control plane stores:
 
 The Device stores the authoritative complete normalized Stream and local raw content until retention or explicit export changes custody.
 
-High-frequency R2 Events are aggregated before D1 storage. Optional R1/R3 Objects can be uploaded to R2 under a separate permission and byte budget.
+High-frequency R2 Events are aggregated before D1 storage. Optional R1/R3 Objects can be uploaded to R2 under a separate permission and byte budget. The
+batch range and digest are retained with the cloud ingestion receipt even when
+the normalized events are later compacted under retention policy.
 
 Cloudflare Queues can ingest normalized Event batches after `DeviceRoom` has durable custody. Queue retry does not create another Conduit Event.
 

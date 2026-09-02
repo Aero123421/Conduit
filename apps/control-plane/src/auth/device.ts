@@ -3,6 +3,7 @@ import { canonicalJson, keyedHash, newId, nowIso, randomToken, sha256Hex, verify
 import { PublicError } from "../errors.ts";
 import type { ControlPlaneEnv } from "../types.ts";
 import { requireBrowserSession } from "./browser.ts";
+import { requestSourceHash } from "../abuse.ts";
 
 interface EnrollmentRow {
   id: string;
@@ -13,6 +14,8 @@ interface EnrollmentRow {
   requested_fingerprint: string;
   assigned_device_id: string | null;
   expires_at: string;
+  poll_count: number;
+  next_poll_at: string | null;
 }
 
 async function pendingEnrollment(request: Request, env: ControlPlaneEnv): Promise<Response> {
@@ -53,22 +56,33 @@ async function createEnrollment(request: Request, env: ControlPlaneEnv): Promise
   const userCode = `${randomToken(4).slice(0, 4).toUpperCase()}-${randomToken(3).slice(0, 3).toUpperCase()}`;
   const fingerprint = await sha256Hex(String(publicJwk.x));
   const now = new Date();
-  await env.DB.prepare("INSERT INTO device_enrollments(id,state,device_code_hash,user_code_hash,claims_json,requested_key_id,requested_public_jwk_json,requested_fingerprint,possession_challenge,possession_signature,created_at,expires_at) VALUES (?1,'pending_owner',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")
-    .bind(id, await keyedHash(env.TOKEN_PEPPER, deviceCode), await keyedHash(env.TOKEN_PEPPER, userCode), JSON.stringify(normalizedClaims), keyId, JSON.stringify(publicJwk), fingerprint, clientNonce, signature, now.toISOString(), new Date(now.getTime() + 600_000).toISOString()).run();
+  const sourceHash = await requestSourceHash(request, env);
+  const counts = await env.DB.prepare("SELECT COUNT(*) AS global_count,SUM(CASE WHEN source_hash=?1 THEN 1 ELSE 0 END) AS source_count FROM device_enrollments WHERE state='pending_owner' AND expires_at>?2").bind(sourceHash, now.toISOString()).first<{ global_count: number; source_count: number | null }>();
+  if ((counts?.global_count ?? 0) >= 100 || (counts?.source_count ?? 0) >= 10) throw new PublicError("rate_limited", 429, "Too many pending Device enrollments", 60);
+  await env.DB.prepare("INSERT INTO device_enrollments(id,state,device_code_hash,user_code_hash,claims_json,requested_key_id,requested_public_jwk_json,requested_fingerprint,possession_challenge,possession_signature,created_at,expires_at,source_hash,next_poll_at) VALUES (?1,'pending_owner',?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?10)")
+    .bind(id, await keyedHash(env.TOKEN_PEPPER, deviceCode), await keyedHash(env.TOKEN_PEPPER, userCode), JSON.stringify(normalizedClaims), keyId, JSON.stringify(publicJwk), fingerprint, clientNonce, signature, now.toISOString(), new Date(now.getTime() + 600_000).toISOString(), sourceHash).run();
   return Response.json({ enrollmentId: id, deviceCode, userCode, verificationUri: `${env.PUBLIC_ORIGIN}/device`, expiresIn: 600, fingerprint }, { status: 201, headers: { "cache-control": "no-store" } });
 }
 
 async function pollEnrollment(request: Request, env: ControlPlaneEnv): Promise<Response> {
   const body = record(await readJsonBounded(request));
   const deviceCode = boundedString(body.deviceCode, "deviceCode", 512);
-  const row = await env.DB.prepare("SELECT id,state,claims_json,requested_key_id,requested_public_jwk_json,requested_fingerprint,assigned_device_id,expires_at FROM device_enrollments WHERE device_code_hash=?1 LIMIT 1")
+  const row = await env.DB.prepare("SELECT id,state,claims_json,requested_key_id,requested_public_jwk_json,requested_fingerprint,assigned_device_id,expires_at,poll_count,next_poll_at FROM device_enrollments WHERE device_code_hash=?1 LIMIT 1")
     .bind(await keyedHash(env.TOKEN_PEPPER, deviceCode)).first<EnrollmentRow>();
-  if (row === null) throw new PublicError("not_found", 404, "Enrollment not found");
+  if (row === null) throw new PublicError("not_found", 404, "Enrollment not found", 30);
   if (Date.parse(row.expires_at) <= Date.now() && row.state === "pending_owner") {
     await env.DB.prepare("UPDATE device_enrollments SET state='expired',terminal_at=?1 WHERE id=?2 AND state='pending_owner'").bind(nowIso(), row.id).run();
     return Response.json({ state: "expired" }, { status: 410, headers: { "cache-control": "no-store" } });
   }
-  if (row.state !== "approved" && row.state !== "completed") return Response.json({ state: row.state }, { status: row.state === "pending_owner" ? 202 : 409, headers: { "cache-control": "no-store", "retry-after": "5" } });
+  if (row.state !== "approved" && row.state !== "completed") {
+    if (row.state !== "pending_owner") return Response.json({ state: row.state }, { status: 409, headers: { "cache-control": "no-store" } });
+    const nextMs = row.next_poll_at === null ? 0 : Date.parse(row.next_poll_at);
+    if (Number.isFinite(nextMs) && nextMs > Date.now()) throw new PublicError("rate_limited", 429, "Enrollment polling is too frequent", Math.max(1, Math.ceil((nextMs - Date.now()) / 1000)));
+    const delay = Math.min(60, 5 * 2 ** Math.min(row.poll_count, 4));
+    const next = new Date(Date.now() + delay * 1_000).toISOString();
+    await env.DB.prepare("UPDATE device_enrollments SET poll_count=poll_count+1,next_poll_at=?1 WHERE id=?2 AND state='pending_owner' AND poll_count=?3").bind(next, row.id, row.poll_count).run();
+    return Response.json({ state: row.state }, { status: 202, headers: { "cache-control": "no-store", "retry-after": String(delay) } });
+  }
   if (row.assigned_device_id === null) throw new PublicError("invalid_request", 500, "Approved enrollment is missing its Device binding");
   if (row.state === "approved") await env.DB.prepare("UPDATE device_enrollments SET state='completed',terminal_at=?1 WHERE id=?2 AND state='approved'").bind(nowIso(), row.id).run();
   const receipt = { version: 1, enrollmentId: row.id, deviceId: row.assigned_device_id, keyId: row.requested_key_id, completedAt: nowIso() };

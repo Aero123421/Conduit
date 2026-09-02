@@ -45,6 +45,7 @@ export type PostAuthFrame = {
     | "event.gap"
     | "device.health";
   correlationId?: string;
+  controlAppliedThrough?: U64Decimal;
   payloadDigest: Sha256Hex;
   payload: {
     [k: string]: unknown;

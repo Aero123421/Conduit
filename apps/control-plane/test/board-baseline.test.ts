@@ -191,4 +191,52 @@ describe.sequential("Board assignment to accepted Session Baseline", () => {
       submission: { expectedNodeRevision: 2, provenance: {} },
     })).rejects.toMatchObject({ code: "revision_conflict" });
   });
+
+  it("schedules the maximum 128 Source bindings through the bounded set query", async () => {
+    const now = new Date().toISOString();
+    const projectId = "prj_board_batch128";
+    const sessionId = "csess_board_batch128";
+    const agentId = "pagent_board_batch128";
+    const sourceRevisions = Array.from({ length: 128 }, (_, index) => {
+      const suffix = String(index).padStart(4, "0");
+      return { sourceId: `src_board_batch_${suffix}`, sourceRevision: 1, locationId: `loc_board_batch_${suffix}`, locationRevision: 1, mode: "worktree" as const, baseCommit: "1".repeat(40) };
+    });
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO projects(id,name,created_at,updated_at) VALUES (?1,'128 Source project',?2,?2)").bind(projectId, now),
+      env.DB.prepare("INSERT INTO collaboration_sessions(id,project_id,title,created_at,updated_at) VALUES (?1,?2,'128 Source session',?3,?3)").bind(sessionId, projectId, now),
+      env.DB.prepare("INSERT INTO project_agents(id,project_id,name,adapter_id,role,configuration_json,status,created_at,updated_at) VALUES (?1,?2,'Builder','codex','implementer','{}','active',?3,?3)").bind(agentId, projectId, now),
+    ]);
+    // Keep fixture setup itself within D1 batch-size limits; the production
+    // schedule path remains a single set query regardless of this count.
+    for (let offset = 0; offset < sourceRevisions.length; offset += 32) await env.DB.batch(sourceRevisions.slice(offset, offset + 32).flatMap((source) => [
+        env.DB.prepare("INSERT INTO sources(id,project_id,display_name,source_kind,repository_identity,created_at,updated_at) VALUES (?1,?2,?1,'git','batch-128',?3,?3)").bind(source.sourceId, projectId, now),
+        env.DB.prepare("INSERT INTO locations(id,source_id,device_id,opaque_local_id,display_label,observed_state_json,status,created_at,updated_at) VALUES (?1,?2,'dev_board_baseline',?1,'Batch location','{}','active',?3,?3)").bind(source.locationId, source.sourceId, now),
+      ]));
+    const response = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/board/messages", {
+      method: "POST",
+      headers: { ...authHeaders, "idempotency-key": "board-baseline-schedule-128" },
+      body: JSON.stringify({
+        sessionId,
+        body: "@builder run across all sources",
+        mentions: [{
+          type: "project_agent", targetId: agentId, startOffset: 0, endOffset: 8,
+          assignment: {
+            title: "128 Source assignment", body: "Run across all sources",
+            schedule: {
+              deviceId: "dev_board_baseline",
+              runtime: { kind: "native", providerId: "native.linux", configurationRevision: 1 },
+              model: "gpt-5.6-codex", effort: "high", accessScope: "project_full", approvalMode: "always",
+              sourceRevisions,
+              verificationPolicy: { requiredChecks: ["workspace_clean"] },
+            },
+          },
+        }],
+      }),
+    }));
+    expect(response.status).toBe(202);
+    const scheduled = await response.json() as { assignmentIds: string[] };
+    expect(scheduled.assignmentIds).toHaveLength(1);
+    const bindings = await env.DB.prepare("SELECT source_revisions_json FROM assignment_run_bindings WHERE assignment_id=?1").bind(scheduled.assignmentIds[0]).first<{ source_revisions_json: string }>();
+    expect(JSON.parse(bindings!.source_revisions_json)).toHaveLength(128);
+  });
 });

@@ -6,6 +6,18 @@ import { authorizeConnector } from "./policy.ts";
 import { resolveResourceAuthority } from "./repositories/resource-authority.ts";
 import type { ControlPlaneEnv } from "./types.ts";
 
+export async function ensureArtifactObject(bucket: R2Bucket, key: string, request: { artifactId: string; digest: string; bytes: number; body: ReadableStream; contentType: string }): Promise<"existing" | "stored"> {
+  const existing = await bucket.head(key);
+  if (existing !== null) {
+    if (existing.size !== request.bytes || existing.customMetadata?.artifactId !== request.artifactId || existing.customMetadata?.digest !== request.digest) {
+      throw new PublicError("idempotency_conflict", 409, "R2 artifact key is bound to different content");
+    }
+    return "existing";
+  }
+  await bucket.put(key, request.body, { sha256: request.digest, customMetadata: { artifactId: request.artifactId, digest: request.digest, uploadedAt: nowIso() }, httpMetadata: { contentType: request.contentType } });
+  return "stored";
+}
+
 export async function uploadArtifact(request: Request, env: ControlPlaneEnv, artifactId: string): Promise<Response> {
   const actor = await authenticateBearer(request, env);
   const lengthText = request.headers.get("content-length");
@@ -21,7 +33,7 @@ export async function uploadArtifact(request: Request, env: ControlPlaneEnv, art
   await authorizeConnector(env, actor, { operation: "artifact.upload", ...await resolveResourceAuthority(env.DB, "artifacts", artifactId), artifactUploadBytes: bytes, idempotencyKey: request.headers.get("idempotency-key") ?? `${artifactId}:${digest}`, operationId, payloadDigest: digest });
   if (request.body === null) throw new PublicError("invalid_request", 400, "Artifact body is required");
   const r2Key = `artifacts/${artifactId}/${digest}`;
-  await env.ARTIFACTS.put(r2Key, request.body, { sha256: digest, customMetadata: { artifactId, digest, uploadedAt: nowIso() }, httpMetadata: { contentType: request.headers.get("content-type") ?? "application/octet-stream" } });
+  await ensureArtifactObject(env.ARTIFACTS, r2Key, { artifactId, digest, bytes, body: request.body, contentType: request.headers.get("content-type") ?? "application/octet-stream" });
   const result = await env.DB.prepare("UPDATE artifacts SET custody='r2',r2_key=?1,status='available',updated_at=?2 WHERE id=?3 AND custody='upload_pending'").bind(r2Key, nowIso(), artifactId).run();
   if (result.meta.changes !== 1) throw new PublicError("revision_conflict", 409, "Artifact custody changed during upload");
   return Response.json({ artifactId, custody: "r2", contentDigest: digest, bytes }, { status: 201 });

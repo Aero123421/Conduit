@@ -1,5 +1,9 @@
 use crate::{
     AdmissionReceipt, Node, NodeError, OperationOffer,
+    batching::{
+        AckAccumulator, BatchError, EVENT_BATCH_MAX_EVENTS, EventAccumulator, EventBatch,
+        HealthState, HealthTracker, replay_batch,
+    },
     local::{LocalServices, PreparedSource, SourceRevision, build_manifest},
     transport::{Envelope, TransportError, WssClient},
     verify_operation_commitment,
@@ -14,6 +18,7 @@ use conduit_domain::{DeviceId, Sha256Digest};
 use conduit_node_store::{
     ControlEffectResult, DeviceIdentity, Direction, OperationState, ReceiveResult, StoreError,
 };
+use conduit_observability::RawRecord;
 use conduit_runtime::{
     DestroyRequest, IoMode, LaunchPlan, NetworkMode, ProcessSupervisor, ResourceLimits,
     RuntimeHandle, RuntimeKind, RuntimeRequest, RuntimeSignal, RuntimeState,
@@ -39,6 +44,8 @@ pub enum ServiceError {
     Node(#[from] NodeError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    #[error(transparent)]
+    Batch(#[from] BatchError),
     #[error("service configuration invalid: {0}")]
     Config(String),
     #[error("service payload unavailable: {0}")]
@@ -363,6 +370,7 @@ struct AgentActive {
     controller_epoch: u64,
     revision: u64,
     event_sequence: u64,
+    raw_sequence: u64,
     settlement_policy: AgentSettlementPolicy,
     session_state: AgentSessionState,
     idle_timeout_ms: u64,
@@ -441,6 +449,20 @@ pub struct NodeService {
     agents: HashMap<String, AgentActive>,
     runtime_custody: HashMap<String, RuntimeCustody>,
     pending_reconciliation: Option<PendingReconciliation>,
+    event_accumulators: HashMap<String, EventAccumulator>,
+    ack_accumulator: AckAccumulator,
+    health_tracker: HealthTracker,
+    /// The latest health envelope is retained in-process so an unchanged
+    /// checkpoint can replay its durable wire identity instead of allocating
+    /// another node sequence and outbox row.  A reconnect always emits a new
+    /// envelope for the new connection epoch.
+    last_health: Option<Envelope>,
+    /// ACK-only control frames advance the applied frontier but do not change
+    /// semantic health.  Only a non-ACK control frame asks the next health
+    /// observation to rebase its frontier; otherwise checkpoints replay the
+    /// exact health envelope and avoid an ACK/health feedback allocation loop.
+    health_frontier_dirty: bool,
+    health_fault: Option<String>,
 }
 impl NodeService {
     #[allow(clippy::too_many_arguments)]
@@ -553,6 +575,12 @@ impl NodeService {
             agents: HashMap::new(),
             runtime_custody,
             pending_reconciliation: None,
+            event_accumulators: HashMap::new(),
+            ack_accumulator: AckAccumulator::default(),
+            health_tracker: HealthTracker::default(),
+            last_health: None,
+            health_frontier_dirty: false,
+            health_fault: None,
         })
     }
     fn message_id(&mut self) -> String {
@@ -562,6 +590,147 @@ impl NodeService {
             &self.capability_digest[..8],
             self.message_counter
         )
+    }
+
+    fn health_state(&self, remote_work_allowed: bool) -> HealthState {
+        let node_state = if self.health_fault.is_some() {
+            "degraded"
+        } else if !remote_work_allowed {
+            "reconciling"
+        } else if !self.active.is_empty() || !self.agents.is_empty() {
+            "busy"
+        } else {
+            "ready"
+        };
+        HealthState {
+            node_state: node_state.into(),
+            journal_state: "healthy".into(),
+            storage_state: "healthy".into(),
+            active_commands: self.active.len(),
+            active_agent_runs: self.agents.len(),
+            active_runtimes: self.active.len() + self.agents.len(),
+        }
+    }
+
+    fn queue_health_if_due(
+        &mut self,
+        client: &mut WssClient,
+        force: bool,
+    ) -> Result<bool, ServiceError> {
+        let state = self.health_state(client.session.remote_work_allowed());
+        let at = Instant::now();
+        let force = force || self.health_frontier_dirty;
+        if !self.health_tracker.should_emit(&state, at, force) {
+            return Ok(false);
+        }
+        let applied = self
+            .node
+            .store()
+            .inbound_applied_through(Direction::ControlToNode)?;
+        let applied_wire = applied.to_string();
+        let replay_unchanged = !force
+            && self.health_tracker.unchanged_checkpoint_due(&state, at)
+            && self.last_health.as_ref().is_some_and(|envelope| {
+                envelope.connection_epoch == client.session.epoch().to_string()
+            });
+        if replay_unchanged {
+            // `last_health` is present by construction of the predicate.  A
+            // missing value is still handled defensively as a fresh health
+            // frame so a future state restoration cannot suppress health.
+            if let Some(envelope) = self.last_health.as_ref() {
+                client.replay_envelope(envelope)?;
+                self.health_tracker.record(state, at);
+                return Ok(true);
+            }
+        }
+        let payload = json!({
+            "observedAt": now(),
+            "nodeState": state.node_state,
+            "journalState": state.journal_state,
+            "storageState": state.storage_state,
+            "controlAppliedThrough": applied_wire,
+            "activeCommands": state.active_commands,
+            "activeAgentRuns": state.active_agent_runs,
+            "activeRuntimes": state.active_runtimes,
+        });
+        let id = self.message_id();
+        let envelope = client
+            .session
+            .queue_outbound(&id, "device.health", None, payload, 1)?;
+        self.last_health = Some(envelope);
+        self.health_frontier_dirty = false;
+        self.health_tracker.record(state, at);
+        Ok(true)
+    }
+
+    fn queue_event_batch(
+        &mut self,
+        client: &mut WssClient,
+        batch: EventBatch,
+    ) -> Result<(), ServiceError> {
+        let id = self.message_id();
+        client.session.queue_outbound(
+            &id,
+            "event.batch",
+            batch.operation_id,
+            batch.payload,
+            if batch.priority { 1 } else { 0 },
+        )?;
+        Ok(())
+    }
+
+    fn flush_due_event_batches(&mut self, client: &mut WssClient) -> Result<(), ServiceError> {
+        let now = Instant::now();
+        let mut ready = Vec::new();
+        for accumulator in self.event_accumulators.values_mut() {
+            if let Some(batch) = accumulator.flush_due(now)? {
+                ready.push(batch);
+            }
+        }
+        for batch in ready {
+            self.queue_event_batch(client, batch)?;
+        }
+        Ok(())
+    }
+
+    fn flush_all_event_batches(&mut self, client: &mut WssClient) -> Result<(), ServiceError> {
+        let mut ready = Vec::new();
+        for accumulator in self.event_accumulators.values_mut() {
+            if let Some(batch) = accumulator.flush()? {
+                ready.push(batch);
+            }
+        }
+        for batch in ready {
+            self.queue_event_batch(client, batch)?;
+        }
+        Ok(())
+    }
+
+    fn note_control_applied(&mut self, sequence: u64) {
+        self.ack_accumulator.note(sequence, Instant::now());
+    }
+
+    fn flush_ack_if_due(
+        &mut self,
+        client: &mut WssClient,
+        force: bool,
+    ) -> Result<(), ServiceError> {
+        let now = Instant::now();
+        if !force && !self.ack_accumulator.should_flush(now) {
+            return Ok(());
+        }
+        let Some(through) = self.ack_accumulator.take() else {
+            return Ok(());
+        };
+        let payload = json!({
+            "direction": "control_to_node",
+            "throughSequence": through.to_string(),
+        });
+        let id = self.message_id();
+        client
+            .session
+            .queue_outbound(&id, "transport.ack", None, payload, 0)?;
+        Ok(())
     }
     pub fn run_forever(mut self) {
         let mut delay = Duration::from_secs(1);
@@ -583,6 +752,12 @@ impl NodeService {
             &self.capability_digest,
             &self.node_boot_id,
         )?;
+        // A successful authenticated connection is the recovery observation
+        // for a transient transport fault.  Any later local fault sets this
+        // again before the connection is abandoned.
+        self.health_fault = None;
+        self.flush_all_event_batches(&mut client)?;
+        self.flush_ack_if_due(&mut client, true)?;
         let positions = self.node.store().transport_positions()?;
         client.flush_unacknowledged(positions.node_acknowledged_through.saturating_add(1))?;
         if client.reconciliation_required() {
@@ -611,29 +786,54 @@ impl NodeService {
                 .node
                 .store()
                 .inbound_applied_through(Direction::ControlToNode)?;
-            let payload = json!({"nodeBootId":self.node_boot_id,"journalGeneration":journal_generation.to_string(),"capabilityDigest":self.capability_digest,"lastControlSequenceApplied":control_applied.to_string(),"lastNodeSequenceAcknowledged":positions.node_acknowledged_through.to_string(),"lastNodeSequenceRetained":retained,"runs":runs,"retainedEventRanges":retained_event_ranges,"unresolvedCount":unresolved,"truncated":unresolved>256,"storageHealth":"healthy"});
+            let payload = json!({"nodeBootId":self.node_boot_id,"journalGeneration":journal_generation.to_string(),"capabilityDigest":self.capability_digest,"lastControlSequenceApplied":control_applied.to_string(),"controlAppliedThrough":control_applied.to_string(),"lastNodeSequenceAcknowledged":positions.node_acknowledged_through.to_string(),"lastNodeSequenceRetained":retained,"runs":runs,"retainedEventRanges":retained_event_ranges,"unresolvedCount":unresolved,"truncated":unresolved>256,"storageHealth":"healthy"});
             let id = self.message_id();
             client
                 .session
                 .queue_outbound(&id, "reconcile.summary", None, payload, 0)?;
+            // Reconnect itself is a semantic recovery observation even when
+            // the peer still requires a reconciliation plan.  Report the
+            // bounded `reconciling` state now, then emit the ready/busy state
+            // again when `reconcile.complete` is durably committed.
+            self.queue_health_if_due(&mut client, true)?;
             client.flush_unacknowledged(positions.node_acknowledged_through.saturating_add(1))?;
         } else {
-            client.session.mark_reconciliation_complete()
+            client.session.mark_reconciliation_complete();
+            self.queue_health_if_due(&mut client, true)?;
         }
-        let mut heartbeat = Instant::now();
+        let mut keepalive = Instant::now();
         loop {
-            if let Some((frame, result)) = client.poll()? {
-                self.dispatch(&mut client, frame, result)?
+            if keepalive.elapsed() >= Duration::from_secs(30) {
+                if let Err(error) = client.protocol_ping() {
+                    self.health_fault = Some("protocol_keepalive_failed".into());
+                    let _ = self.queue_health_if_due(&mut client, true);
+                    return Err(error.into());
+                }
+                keepalive = Instant::now();
             }
-            self.poll_active(&mut client)?;
-            if heartbeat.elapsed() >= Duration::from_secs(30) {
-                let payload = json!({"observedAt":now(),"nodeState":if client.session.remote_work_allowed(){"ready"}else{"reconciling"},"journalState":"healthy","storageState":"healthy","activeCommands":self.active.len(),"activeAgentRuns":self.agents.len(),"activeRuntimes":self.active.len()+self.agents.len()});
-                let id = self.message_id();
-                client
-                    .session
-                    .queue_outbound(&id, "device.health", None, payload, 1)?;
-                heartbeat = Instant::now()
+            let polled = match client.poll() {
+                Ok(value) => value,
+                Err(error) => {
+                    self.health_fault = Some("transport_receive_failed".into());
+                    let _ = self.queue_health_if_due(&mut client, true);
+                    return Err(error.into());
+                }
+            };
+            if let Some((frame, result)) = polled
+                && let Err(error) = self.dispatch(&mut client, frame, result)
+            {
+                self.health_fault = Some("control_dispatch_failed".into());
+                let _ = self.queue_health_if_due(&mut client, true);
+                return Err(error);
             }
+            if let Err(error) = self.poll_active(&mut client) {
+                self.health_fault = Some("local_runtime_poll_failed".into());
+                let _ = self.queue_health_if_due(&mut client, true);
+                return Err(error);
+            }
+            self.flush_due_event_batches(&mut client)?;
+            self.flush_ack_if_due(&mut client, false)?;
+            self.queue_health_if_due(&mut client, false)?;
             let positions = self.node.store().transport_positions()?;
             client.flush_unacknowledged(positions.node_acknowledged_through.saturating_add(1))?;
         }
@@ -657,11 +857,8 @@ impl NodeService {
             return Ok(());
         }
         if matches!(result, ReceiveResult::Duplicate) && frame.kind != "transport.ack" {
-            let ack = json!({"direction":"control_to_node","throughSequence":seq.to_string()});
-            let ack_id = self.message_id();
-            client
-                .session
-                .queue_outbound(&ack_id, "transport.ack", None, ack, 0)?;
+            self.note_control_applied(seq);
+            self.flush_ack_if_due(client, false)?;
             return Ok(());
         }
         if !client.session.control_frame_allowed(&frame.kind, seq) {
@@ -779,12 +976,16 @@ impl NodeService {
             .mark_inbound_applied(Direction::ControlToNode, seq)?;
         self.maybe_complete_reconciliation(client)?;
         if frame.kind != "transport.ack" {
-            let ack = json!({"direction":"control_to_node","throughSequence":seq.to_string()});
-            let ack_id = self.message_id();
-            client
-                .session
-                .queue_outbound(&ack_id, "transport.ack", None, ack, 0)?;
+            // `reconcile.complete` emits its recovery/ready observation from
+            // `maybe_complete_reconciliation`; avoid allocating a second
+            // health sequence for the same control frame below.
+            if frame.kind != "reconcile.complete" {
+                self.health_frontier_dirty = true;
+            }
+            self.note_control_applied(seq);
+            self.flush_ack_if_due(client, false)?;
         }
+        self.queue_health_if_due(client, false)?;
         Ok(())
     }
 
@@ -1047,7 +1248,7 @@ impl NodeService {
                 .and_then(|value| value.parse::<u64>().ok())
                 .ok_or(TransportError::Malformed)?;
             while from <= through {
-                let end = through.min(from.saturating_add(127));
+                let end = through.min(from.saturating_add(EVENT_BATCH_MAX_EVENTS as u64 - 1));
                 let frames = self
                     .node
                     .store()
@@ -1055,17 +1256,23 @@ impl NodeService {
                     .map_err(|_| {
                         ServiceError::Unavailable("event_replay_range_unavailable".into())
                     })?;
+                if frames.is_empty() {
+                    return Err(ServiceError::Unavailable(
+                        "event_replay_range_unavailable".into(),
+                    ));
+                }
                 let events = frames
                     .iter()
-                    .map(|frame| serde_json::from_slice::<Value>(&frame.frame))
+                    .map(|frame| {
+                        serde_json::from_slice::<Value>(&frame.frame)
+                            .map(|event| (frame.sequence, event))
+                    })
                     .collect::<Result<Vec<_>, _>>()
                     .map_err(|_| TransportError::Malformed)?;
                 let actual_through = frames.last().map_or(from, |frame| frame.sequence);
-                let batch = json!({"runId":run_id,"fromSequence":from.to_string(),"throughSequence":actual_through.to_string(),"traceSchema":"conduit.trace/1","events":events});
-                let message_id = self.message_id();
-                client
-                    .session
-                    .queue_outbound(&message_id, "event.batch", None, batch, 0)?;
+                let batch = replay_batch(run_id, events)
+                    .map_err(|_| ServiceError::Unavailable("event_replay_batch_invalid".into()))?;
+                self.queue_event_batch(client, batch)?;
                 if actual_through >= through {
                     break;
                 }
@@ -1144,11 +1351,16 @@ impl NodeService {
             .expect("pending reconciliation was checked");
         client.session.complete_plan(&pending.id)?;
         let positions = self.node.store().transport_positions()?;
-        let response = json!({"reconciliationId":pending.id,"lastControlSequenceApplied":self.node.store().inbound_applied_through(Direction::ControlToNode)?.to_string(),"lastNodeSequenceAcknowledged":positions.node_acknowledged_through.to_string(),"unresolvedRunIds":[]});
+        let applied = self
+            .node
+            .store()
+            .inbound_applied_through(Direction::ControlToNode)?;
+        let response = json!({"reconciliationId":pending.id,"lastControlSequenceApplied":applied.to_string(),"controlAppliedThrough":applied.to_string(),"lastNodeSequenceAcknowledged":positions.node_acknowledged_through.to_string(),"unresolvedRunIds":[]});
         let message_id = self.message_id();
         client
             .session
             .queue_outbound(&message_id, "reconcile.complete", None, response, 0)?;
+        self.queue_health_if_due(client, true)?;
         Ok(())
     }
     fn offer(&mut self, client: &mut WssClient, payload: &Value) -> Result<(), ServiceError> {
@@ -1627,6 +1839,7 @@ impl NodeService {
                             controller_epoch: 1,
                             revision: 1,
                             event_sequence: 0,
+                            raw_sequence: 0,
                             settlement_policy,
                             session_state: AgentSessionState::Running,
                             idle_timeout_ms,
@@ -1791,6 +2004,7 @@ impl NodeService {
                         controller_epoch: 1,
                         revision: 1,
                         event_sequence: 0,
+                        raw_sequence: 0,
                         settlement_policy,
                         session_state: AgentSessionState::Running,
                         idle_timeout_ms,
@@ -2555,6 +2769,7 @@ impl NodeService {
         let mut terminals = Vec::new();
         let mut approvals = Vec::new();
         let mut statuses = Vec::new();
+        let mut raw_events: HashMap<String, (String, Vec<RawRecord>)> = HashMap::new();
         for id in &ids {
             let Some(agent) = self.agents.get_mut(id) else {
                 continue;
@@ -2640,9 +2855,33 @@ impl NodeService {
             }
             for _ in 0..128 {
                 let record = match agent.child.try_read_record() {
-                    Ok(Some(record)) => record,
+                    Ok(Some(record)) => {
+                        agent.raw_sequence = agent.raw_sequence.saturating_add(1);
+                        raw_events
+                            .entry(agent.run_id.clone())
+                            .or_insert_with(|| (agent.operation_id.clone(), Vec::new()))
+                            .1
+                            .push(RawRecord {
+                                local_sequence: agent.raw_sequence,
+                                monotonic_ns: 0,
+                                direction: "adapter".into(),
+                                bytes: record.clone(),
+                            });
+                        record
+                    }
                     Ok(None) => break,
                     Err(error) => {
+                        agent.raw_sequence = agent.raw_sequence.saturating_add(1);
+                        raw_events
+                            .entry(agent.run_id.clone())
+                            .or_insert_with(|| (agent.operation_id.clone(), Vec::new()))
+                            .1
+                            .push(RawRecord {
+                                local_sequence: agent.raw_sequence,
+                                monotonic_ns: 0,
+                                direction: "adapter_error".into(),
+                                bytes: error.to_string().into_bytes(),
+                            });
                         agent.event_sequence = agent.event_sequence.saturating_add(1);
                         events.push(PendingEvent {
                             key: agent.key.clone(),
@@ -2952,6 +3191,14 @@ impl NodeService {
                 });
             }
         }
+        // Commit raw provider records before normalizing or cloud batching.
+        // A parser/redaction/queue failure must not erase the authoritative
+        // Device-local byte stream that was already read from the adapter.
+        for (run_id, (stream_id, records)) in &raw_events {
+            self.local
+                .append_raw_segments(run_id, stream_id, records)
+                .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+        }
         let terminal_ids = terminals
             .iter()
             .map(|pending| pending.id.clone())
@@ -3007,16 +3254,26 @@ impl NodeService {
                     1
                 },
             )?;
-            let payload = json!({"runId":pending.run_id,"fromSequence":pending.sequence.to_string(),"throughSequence":pending.sequence.to_string(),"traceSchema":"conduit.trace/1","events":[normalized]});
-            let message_id = self.message_id();
-            client.session.queue_outbound(
-                &message_id,
-                "event.batch",
-                Some(pending.operation_id),
-                payload,
-                1,
-            )?;
+            let priority = adapter_event_priority(pending.event.kind)
+                || normalized_event_priority(&normalized);
+            let ready = self
+                .event_accumulators
+                .entry(pending.run_id.clone())
+                .or_insert_with(|| {
+                    EventAccumulator::new(
+                        pending.run_id.clone(),
+                        Some(pending.operation_id.clone()),
+                    )
+                })
+                .push(pending.sequence, normalized, priority, Instant::now())?;
+            for batch in ready {
+                self.queue_event_batch(client, batch)?;
+            }
         }
+        // Terminal/approval/error records above are priority-flushed.  Flush
+        // any remaining normal deltas before finalizing a Run so a terminal
+        // receipt can never overtake an earlier local event.
+        self.flush_all_event_batches(client)?;
         for pending in terminals {
             if let Some(agent) = self.agents.get(&pending.id) {
                 if let Some(custody) = self.runtime_custody.get_mut(&agent.runtime_id) {
@@ -3630,6 +3887,45 @@ fn adapter_event_name(kind: AdapterEventKind) -> &'static str {
     }
 }
 
+/// Events that represent an effect boundary are never held behind the
+/// normal 100ms accumulator timer.  Assistant text deltas and usage samples
+/// remain ordinary progress events; their individual normalized records are
+/// retained in one bounded batch and concatenate byte-for-byte locally.
+fn adapter_event_priority(kind: AdapterEventKind) -> bool {
+    matches!(
+        kind,
+        AdapterEventKind::ApprovalRequest
+            | AdapterEventKind::Completed
+            | AdapterEventKind::Error
+            | AdapterEventKind::AdapterError
+            | AdapterEventKind::ToolCall
+            | AdapterEventKind::ToolResult
+            | AdapterEventKind::Command
+            | AdapterEventKind::FileEffect
+    )
+}
+
+fn normalized_event_priority(event: &Value) -> bool {
+    event
+        .get("eventType")
+        .and_then(Value::as_str)
+        .is_some_and(|event_type| {
+            [
+                "approval.",
+                "terminal.",
+                "error.",
+                "tool.",
+                "command.",
+                "file.",
+                "change_set.",
+                "changeset.",
+                "verification.",
+            ]
+            .iter()
+            .any(|prefix| event_type.starts_with(prefix))
+        })
+}
+
 fn visible_adapter_payload(event: &AdapterEvent) -> Value {
     let data = event.data.as_ref().map(|data| {
         let encoded = serde_jcs::to_vec(data).unwrap_or_default();
@@ -3648,7 +3944,10 @@ fn visible_adapter_payload(event: &AdapterEvent) -> Value {
         "vendorType": event.vendor_type,
         "nativeSessionId": event.native_session_id,
         "correlationId": event.correlation_id,
-        "text": event.text.as_deref().map(|text| bounded(text, 4_096)),
+        // AdapterEvent already bounds text at MAX_EVENT_TEXT_BYTES.  Do not
+        // apply a second 4KiB truncation here: adjacent assistant deltas must
+        // remain reconstructible from the local normalized stream.
+        "text": event.text,
         "data": data,
     });
     strip_hidden_reasoning(&mut payload);
@@ -4193,6 +4492,7 @@ mod tests {
             sequence: sequence.to_string(),
             kind: kind.into(),
             correlation_id: None,
+            control_applied_through: None,
             payload_digest: hex::encode(Sha256::digest(serde_jcs::to_vec(&payload).unwrap())),
             payload,
         }
@@ -4597,6 +4897,7 @@ mod tests {
                     controller_epoch: 1,
                     revision: 1,
                     event_sequence: 0,
+                    raw_sequence: 0,
                     settlement_policy: AgentSettlementPolicy::CloseOnSettle,
                     session_state: AgentSessionState::Running,
                     idle_timeout_ms: 0,
@@ -5201,6 +5502,7 @@ mod tests {
                 controller_epoch: 1,
                 revision: 1,
                 event_sequence: 0,
+                raw_sequence: 0,
                 settlement_policy: AgentSettlementPolicy::CloseOnSettle,
                 session_state: AgentSessionState::Running,
                 idle_timeout_ms: 0,
@@ -5463,6 +5765,7 @@ mod tests {
                 controller_epoch: 1,
                 revision: 1,
                 event_sequence: 1,
+                raw_sequence: 0,
                 settlement_policy: AgentSettlementPolicy::CloseOnSettle,
                 session_state: AgentSessionState::Running,
                 idle_timeout_ms: 0,

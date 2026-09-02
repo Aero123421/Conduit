@@ -12,6 +12,7 @@ import { PublicError } from "../errors.ts";
 import { completeEffect, reserveEffect } from "../idempotency.ts";
 import type { ControlPlaneEnv } from "../types.ts";
 import { AuthRepository, readCookie, sessionCookieHeaders, type SessionRow } from "../repositories/auth.ts";
+import { requestSourceHash } from "../abuse.ts";
 
 function equalFixed(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
@@ -81,7 +82,7 @@ async function registrationOptions(request: Request, env: ControlPlaneEnv, mode:
     timeout: 300_000,
   };
   const options = await generateRegistrationOptions(registrationInput);
-  const challengeId = await repo.createChallenge({ kind: mode === "recovery" ? "recovery_registration" : "registration", ...(principalId === undefined ? {} : { principalId }), ...(sessionId === undefined ? {} : { sessionId }), challenge: options.challenge, origin: env.PUBLIC_ORIGIN, rpId: env.WEBAUTHN_RP_ID, state: { mode, displayName } });
+  const challengeId = await repo.createChallenge({ kind: mode === "recovery" ? "recovery_registration" : "registration", ...(principalId === undefined ? {} : { principalId }), ...(sessionId === undefined ? {} : { sessionId }), challenge: options.challenge, origin: env.PUBLIC_ORIGIN, rpId: env.WEBAUTHN_RP_ID, state: { mode, displayName }, sourceHash: await requestSourceHash(request, env) });
   return responseJson({ challengeId, options });
 }
 
@@ -151,7 +152,7 @@ async function authenticationOptions(request: Request, env: ControlPlaneEnv, ste
     timeout: 300_000,
     allowCredentials: passkeys.map((passkey) => ({ id: passkey.credential_id, transports: JSON.parse(passkey.transports_json) as [] })),
   });
-  const challengeId = await repo.createChallenge({ kind: stepUp ? "step_up" : "authentication", ...(principalId === undefined ? {} : { principalId }), ...(sessionId === undefined ? {} : { sessionId }), challenge: options.challenge, origin: env.PUBLIC_ORIGIN, rpId: env.WEBAUTHN_RP_ID });
+  const challengeId = await repo.createChallenge({ kind: stepUp ? "step_up" : "authentication", ...(principalId === undefined ? {} : { principalId }), ...(sessionId === undefined ? {} : { sessionId }), challenge: options.challenge, origin: env.PUBLIC_ORIGIN, rpId: env.WEBAUTHN_RP_ID, sourceHash: await requestSourceHash(request, env) });
   return responseJson({ challengeId, options });
 }
 
@@ -197,13 +198,14 @@ interface OwnerCliToken {
   label: string;
   status: string;
   expires_at: string;
+  last_used_at: string | null;
 }
 
 async function ownerCliToken(request: Request, env: ControlPlaneEnv): Promise<OwnerCliToken> {
   const authorization = request.headers.get("authorization");
   if (authorization === null || !authorization.startsWith("Bearer conduit_owner_")) throw new PublicError("authentication_required", 401, "Owner CLI bearer token is required");
   const token = boundedString(authorization.slice(7), "owner bearer token", 512);
-  const row = await env.DB.prepare("SELECT id,principal_id,label,status,expires_at FROM owner_api_tokens WHERE verifier_hash=?1 AND expires_at>?2 LIMIT 1").bind(await keyedHash(env.TOKEN_PEPPER, token), new Date().toISOString()).first<OwnerCliToken>();
+  const row = await env.DB.prepare("SELECT id,principal_id,label,status,expires_at,last_used_at FROM owner_api_tokens WHERE verifier_hash=?1 AND expires_at>?2 LIMIT 1").bind(await keyedHash(env.TOKEN_PEPPER, token), new Date().toISOString()).first<OwnerCliToken>();
   if (row === null) throw new PublicError("authentication_required", 401, "Owner CLI bearer token is invalid or expired");
   return row;
 }
@@ -211,7 +213,10 @@ async function ownerCliToken(request: Request, env: ControlPlaneEnv): Promise<Ow
 export async function authenticateOwnerCli(request: Request, env: ControlPlaneEnv): Promise<{ principalId: string; clientId: string; scopes: string[]; tokenId: string }> {
   const row = await ownerCliToken(request, env);
   if (row.status !== "active") throw new PublicError("authentication_required", 401, "Owner CLI bearer token is invalid or expired");
-  await env.DB.prepare("UPDATE owner_api_tokens SET last_used_at=?1 WHERE id=?2").bind(new Date().toISOString(), row.id).run();
+  if (row.last_used_at === null || Date.parse(row.last_used_at) <= Date.now() - 10 * 60_000) {
+    const now = new Date().toISOString();
+    await env.DB.prepare("UPDATE owner_api_tokens SET last_used_at=?1 WHERE id=?2 AND (last_used_at IS NULL OR last_used_at<?3)").bind(now, row.id, new Date(Date.now() - 10 * 60_000).toISOString()).run();
+  }
   return { principalId: row.principal_id, clientId: "conduit.cli", scopes: ["conduit.admin"], tokenId: row.id };
 }
 

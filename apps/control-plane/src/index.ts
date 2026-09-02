@@ -7,15 +7,15 @@ import { MAX_MCP_BYTES } from "./bounds.ts";
 import { BoardRoom } from "./do/board-room.ts";
 import { ConnectorLimiter } from "./do/connector-limiter.ts";
 import { DeviceRoom } from "./do/device-room.ts";
-import { reconcileOperationDispatches } from "./dispatch.ts";
-import { reconcileApprovalDispatches } from "./approval-dispatch.ts";
+import { RetryScheduler } from "./do/retry-scheduler.ts";
 import { errorResponse, PublicError } from "./errors.ts";
 import { consumeEvents } from "./ingestion.ts";
 import { createConduitMcpServer } from "./mcp/server.ts";
 import { handlePolicyAdmin } from "./policy.ts";
 import type { ControlPlaneEnv } from "./types.ts";
+import { reconcileRetryScheduler } from "./retry-scheduler-client.ts";
 
-export { BoardRoom, ConnectorLimiter, DeviceRoom };
+export { BoardRoom, ConnectorLimiter, DeviceRoom, RetryScheduler };
 
 function withSecurityHeaders(response: Response, requestId: string): Response {
   const headers = new Headers(response.headers);
@@ -67,6 +67,6 @@ export default {
   queue: consumeEvents,
   scheduled(controller, env, ctx) {
     const at = new Date(controller.scheduledTime);
-    ctx.waitUntil(Promise.all([reconcileOperationDispatches(env, { now: at }), reconcileApprovalDispatches(env, at)]));
+    ctx.waitUntil(reconcileRetryScheduler(env, at));
   },
 } satisfies ExportedHandler<ControlPlaneEnv, unknown>;

@@ -149,6 +149,7 @@ export interface ReconcileSummaryPayload {
   journalGeneration: U64Decimal;
   capabilityDigest: Sha256Hex;
   lastControlSequenceApplied: U64Decimal;
+  controlAppliedThrough?: U64Decimal;
   lastNodeSequenceAcknowledged: U64Decimal;
   lastNodeSequenceRetained: U64Decimal;
   /**
@@ -221,6 +222,7 @@ export interface RunEventRangeRequest {
 export interface ReconcileCompletePayload {
   reconciliationId: string;
   lastControlSequenceApplied: U64Decimal;
+  controlAppliedThrough?: U64Decimal;
   lastNodeSequenceAcknowledged: U64Decimal;
   /**
    * @maxItems 256
@@ -413,10 +415,12 @@ export interface EventBatchPayload {
   runId: RunId;
   fromSequence: U64Decimal;
   throughSequence: U64Decimal;
+  sourceSequenceRange: SequenceRange;
+  sourceRangeDigest: Sha256Hex;
   traceSchema: "conduit.trace/1";
   /**
    * @minItems 1
-   * @maxItems 128
+   * @maxItems 32
    */
   events: [NormalizedEvent, ...NormalizedEvent[]];
 }
@@ -472,6 +476,7 @@ export interface DeviceHealthPayload {
   nodeState: "ready" | "busy" | "degraded" | "reconciling" | "protocol_incompatible";
   journalState: "healthy" | "degraded" | "read_only" | "corrupt";
   storageState: "healthy" | "low" | "exhausted" | "unavailable";
+  controlAppliedThrough?: U64Decimal;
   activeCommands?: number;
   activeAgentRuns?: number;
   activeRuntimes?: number;

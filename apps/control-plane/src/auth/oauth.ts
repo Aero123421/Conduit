@@ -5,6 +5,7 @@ import { completeEffect, reserveEffect } from "../idempotency.ts";
 import { readCookie } from "../repositories/auth.ts";
 import type { AuthActor, ControlPlaneEnv } from "../types.ts";
 import { requireBrowserFormSession, requireBrowserSession } from "./browser.ts";
+import { requestSourceHash } from "../abuse.ts";
 
 const SUPPORTED_SCOPES = new Set([
   "conduit.read", "conduit.board.write", "conduit.run.start", "conduit.run.control",
@@ -118,18 +119,29 @@ async function registerClient(request: Request, env: ControlPlaneEnv): Promise<R
   const authMethod = body.token_endpoint_auth_method === undefined ? "none" : boundedString(body.token_endpoint_auth_method, "token_endpoint_auth_method", 64);
   if (authMethod !== "none") throw new PublicError("invalid_request", 400, "Only public PKCE clients are supported by dynamic registration");
   const clientName = boundedString(body.client_name, "client_name", 256);
-  const clientId = `dcr_${randomToken(24)}`;
   const metadata = { client_name: clientName, redirect_uris: redirectUris, token_endpoint_auth_method: authMethod };
+  const metadataDigest = await sha256Hex(canonicalJson(metadata));
   const status = dcrMode === "owner_confirmed" ? "pending_owner" : "active";
-  const now = nowIso();
-  await env.DB.prepare("INSERT INTO oauth_clients(client_id,registration_mechanism,client_name,redirect_uris_json,token_endpoint_auth_method,metadata_digest,status,created_at,updated_at) VALUES (?1,'dynamic',?2,?3,?4,?5,?6,?7,?7)")
-    .bind(clientId, clientName, JSON.stringify(redirectUris), authMethod, await sha256Hex(JSON.stringify(metadata)), status, now).run();
+  const nowDate = new Date();
+  const now = nowDate.toISOString();
+  const expiresAt = new Date(nowDate.getTime() + 10 * 60_000).toISOString();
+  const sourceHash = await requestSourceHash(request, env);
+  if (status === "pending_owner") {
+    const existing = await env.DB.prepare("SELECT client_id FROM oauth_clients WHERE registration_mechanism='dynamic' AND metadata_digest=?1 AND source_hash=?2 AND status='pending_owner' AND expires_at>?3 ORDER BY created_at LIMIT 1").bind(metadataDigest, sourceHash, now).first<{ client_id: string }>();
+    if (existing !== null) return Response.json({ client_id: existing.client_id, client_name: clientName, redirect_uris: redirectUris, token_endpoint_auth_method: authMethod, registration_status: status }, { status: 200, headers: { "cache-control": "no-store" } });
+    const counts = await env.DB.prepare("SELECT COUNT(*) AS global_count,SUM(CASE WHEN source_hash=?1 THEN 1 ELSE 0 END) AS source_count FROM oauth_clients WHERE registration_mechanism='dynamic' AND status='pending_owner' AND expires_at>?2").bind(sourceHash, now).first<{ global_count: number; source_count: number | null }>();
+    if ((counts?.global_count ?? 0) >= 200 || (counts?.source_count ?? 0) >= 20) throw new PublicError("rate_limited", 429, "Too many pending OAuth client registrations", 60);
+  }
+  const clientId = `dcr_${randomToken(24)}`;
+  await env.DB.prepare("INSERT INTO oauth_clients(client_id,registration_mechanism,client_name,redirect_uris_json,token_endpoint_auth_method,metadata_digest,status,created_at,updated_at,source_hash,expires_at) VALUES (?1,'dynamic',?2,?3,?4,?5,?6,?7,?7,?8,?9)")
+    .bind(clientId, clientName, JSON.stringify(redirectUris), authMethod, metadataDigest, status, now, sourceHash, status === "pending_owner" ? expiresAt : null).run();
   return Response.json({ client_id: clientId, client_name: clientName, redirect_uris: redirectUris, token_endpoint_auth_method: authMethod, registration_status: status }, { status: 201, headers: { "cache-control": "no-store" } });
 }
 
 async function approveClient(request: Request, env: ControlPlaneEnv, clientId: string): Promise<Response> {
   const { repo, session } = await requireBrowserSession(request, env, { csrf: true, fresh: true });
-  const result = await env.DB.prepare("UPDATE oauth_clients SET status='active',updated_at=?1 WHERE client_id=?2 AND status='pending_owner'").bind(nowIso(), clientId).run();
+  const now = nowIso();
+  const result = await env.DB.prepare("UPDATE oauth_clients SET status='active',updated_at=?1,expires_at=NULL WHERE client_id=?2 AND status='pending_owner' AND expires_at>?1").bind(now, clientId).run();
   if (result.meta.changes !== 1) throw new PublicError("not_found", 404, "Pending OAuth client not found");
   await repo.audit("oauth_client.approved", { clientId }, session.principal_id, clientId);
   return new Response(null, { status: 204 });
@@ -320,14 +332,17 @@ export async function authenticateBearer(request: Request, env: ControlPlaneEnv)
   const authorization = request.headers.get("authorization");
   if (authorization === null || !authorization.startsWith("Bearer ")) throw new PublicError("authentication_required", 401, "Bearer token is required");
   const tokenValue = boundedString(authorization.slice(7), "bearer token", 512);
-  const row = await env.DB.prepare("SELECT g.id AS grant_id,g.principal_id,g.client_id,g.resource,g.scopes_json,g.connector_policy_id,g.connector_policy_revision,g.status AS grant_status,p.revision AS current_policy_revision,p.status AS policy_status FROM oauth_tokens t JOIN oauth_grants g ON g.id=t.grant_id JOIN connector_policies p ON p.id=g.connector_policy_id WHERE t.verifier_hash=?1 AND t.kind='access' AND t.revoked_at IS NULL AND t.expires_at>?2 LIMIT 1")
+  const row = await env.DB.prepare("SELECT g.id AS grant_id,g.principal_id,g.client_id,g.resource,g.scopes_json,g.connector_policy_id,g.connector_policy_revision,g.status AS grant_status,g.last_used_at,p.revision AS current_policy_revision,p.status AS policy_status FROM oauth_tokens t JOIN oauth_grants g ON g.id=t.grant_id JOIN connector_policies p ON p.id=g.connector_policy_id WHERE t.verifier_hash=?1 AND t.kind='access' AND t.revoked_at IS NULL AND t.expires_at>?2 LIMIT 1")
     .bind(await keyedHash(env.TOKEN_PEPPER, tokenValue), nowIso()).first<Record<string, unknown>>();
   if (row === null) throw new PublicError("authentication_required", 401, "Access token is invalid or expired");
   if (row.resource !== exactResource(env)) throw new PublicError("scope_insufficient", 403, "Access token audience is invalid");
   if (row.grant_status === "paused") throw new PublicError("grant_paused", 403, "OAuth grant is paused");
   if (row.grant_status === "revoked") throw new PublicError("grant_revoked", 403, "OAuth grant is revoked");
   if (row.grant_status !== "active" || row.policy_status !== "active" || row.connector_policy_revision !== row.current_policy_revision) throw new PublicError("grant_reauthorization_required", 403, "OAuth grant requires reauthorization");
-  await env.DB.prepare("UPDATE oauth_grants SET last_used_at=?1 WHERE id=?2").bind(nowIso(), String(row.grant_id)).run();
+  if (row.last_used_at === null || Date.parse(String(row.last_used_at)) <= Date.now() - 60 * 60_000) {
+    const now = nowIso();
+    await env.DB.prepare("UPDATE oauth_grants SET last_used_at=?1 WHERE id=?2 AND (last_used_at IS NULL OR last_used_at<?3)").bind(now, String(row.grant_id), new Date(Date.now() - 60 * 60_000).toISOString()).run();
+  }
   return { principalId: String(row.principal_id), clientId: String(row.client_id), grantId: String(row.grant_id), policyId: String(row.connector_policy_id), policyRevision: Number(row.connector_policy_revision), scopes: JSON.parse(String(row.scopes_json)) as string[] };
 }
 

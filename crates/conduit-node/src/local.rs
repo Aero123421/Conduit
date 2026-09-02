@@ -1,7 +1,8 @@
 use conduit_domain::{AnyRunId, DeviceId, LocationId, RunId, Sha256Digest, SourceId};
 use conduit_observability::{
-    CatalogEntry, EventDraft, EvidenceLevel, RedactionPolicy, RetentionClass, RunManifest,
-    RunManifestInput, Sensitivity, TraceStore,
+    CatalogEntry, EventDraft, EvidenceLevel, MAX_RAW_SEGMENT_BYTES, RawRecord,
+    RawSegmentDescriptor, RedactionPolicy, RetentionClass, RunManifest, RunManifestInput,
+    Sensitivity, TraceStore,
 };
 use conduit_runtime::WorkspaceAttachment;
 use conduit_workspace::{
@@ -545,6 +546,74 @@ impl LocalServices {
             )
             .map_err(|error| LocalServiceError::Trace(error.to_string()))?;
         serde_json::to_value(event).map_err(|error| LocalServiceError::Invalid(error.to_string()))
+    }
+
+    /// Persist a provider stream segment without passing it through
+    /// normalized-event redaction or cloud batching.  Raw capture is
+    /// Device-local and lossless; callers decide independently whether the
+    /// segment is permitted by the Run capture policy.
+    pub fn append_raw_segment(
+        &self,
+        run_id: &str,
+        stream_id: &str,
+        records: &[RawRecord],
+    ) -> Result<RawSegmentDescriptor, LocalServiceError> {
+        self.append_raw_segments(run_id, stream_id, records)?
+            .pop()
+            .ok_or_else(|| LocalServiceError::Invalid("raw segment cannot be empty".into()))
+    }
+
+    /// Append one or more bounded segments while preserving every raw record.
+    /// Adapter polling can return up to 128 records at once, which may exceed
+    /// the trace store's single-segment limit even though each record is
+    /// individually valid.
+    pub fn append_raw_segments(
+        &self,
+        run_id: &str,
+        stream_id: &str,
+        records: &[RawRecord],
+    ) -> Result<Vec<RawSegmentDescriptor>, LocalServiceError> {
+        let run = AnyRunId::parse(run_id.to_owned())
+            .map_err(|error| LocalServiceError::Invalid(error.to_string()))?;
+        if records.is_empty() {
+            return Err(LocalServiceError::Invalid(
+                "raw segment cannot be empty".into(),
+            ));
+        }
+        let mut descriptors = Vec::new();
+        let mut segment = Vec::new();
+        let mut encoded_bytes = 0usize;
+        for record in records {
+            let record_bytes = serde_jcs::to_vec(record)
+                .map_err(|error| LocalServiceError::Invalid(error.to_string()))?;
+            let framed_bytes = 4usize.saturating_add(record_bytes.len());
+            if framed_bytes > MAX_RAW_SEGMENT_BYTES {
+                return Err(LocalServiceError::Invalid(
+                    "raw record exceeds segment bound".into(),
+                ));
+            }
+            if !segment.is_empty()
+                && encoded_bytes.saturating_add(framed_bytes) > MAX_RAW_SEGMENT_BYTES
+            {
+                descriptors.push(
+                    self.trace
+                        .put_raw_segment(&run, stream_id, &segment)
+                        .map_err(|error| LocalServiceError::Trace(error.to_string()))?,
+                );
+                segment.clear();
+                encoded_bytes = 0;
+            }
+            segment.push(record.clone());
+            encoded_bytes = encoded_bytes.saturating_add(framed_bytes);
+        }
+        if !segment.is_empty() {
+            descriptors.push(
+                self.trace
+                    .put_raw_segment(&run, stream_id, &segment)
+                    .map_err(|error| LocalServiceError::Trace(error.to_string()))?,
+            );
+        }
+        Ok(descriptors)
     }
 }
 

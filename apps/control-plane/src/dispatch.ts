@@ -1,4 +1,5 @@
 import type { ControlPlaneEnv } from "./types.ts";
+import { clearRetryWork, scheduleRetryWork } from "./retry-scheduler-client.ts";
 
 const DISPATCH_LEASE_MS = 30_000;
 const MAX_RECONCILE_BATCH = 32;
@@ -166,7 +167,7 @@ async function currentResult(env: ControlPlaneEnv, row: DispatchRow): Promise<Di
 export async function attemptOperationDispatch(
   env: ControlPlaneEnv,
   operationId: string,
-  options: { force?: boolean; now?: Date; dispatcher?: OperationDispatcher } = {},
+  options: { force?: boolean; now?: Date; dispatcher?: OperationDispatcher; scheduleRetry?: boolean } = {},
 ): Promise<DispatchAttemptResult | null> {
   const now = options.now ?? new Date();
   const nowValue = now.toISOString();
@@ -216,6 +217,7 @@ export async function attemptOperationDispatch(
       env.DB.prepare("UPDATE idempotency_records SET state='offered',response_json=?1 WHERE operation_id=?2 AND EXISTS (SELECT 1 FROM operation_dispatch_outbox WHERE operation_id=?2 AND state='offered')")
         .bind(JSON.stringify(response), operationId),
     ]);
+    if (options.scheduleRetry !== false && row.attempt_count > 0) await clearRetryWork(env, "operation", operationId);
     const latest = await env.DB.prepare("SELECT * FROM operation_dispatch_outbox WHERE operation_id=?1 LIMIT 1").bind(operationId).first<DispatchRow>();
     return latest === null ? response : currentResult(env, latest);
   } catch {
@@ -233,6 +235,7 @@ export async function attemptOperationDispatch(
       env.DB.prepare("UPDATE idempotency_records SET state='queued',response_json=?1 WHERE operation_id=?2 AND EXISTS (SELECT 1 FROM operation_dispatch_outbox WHERE operation_id=?2 AND state='pending' AND result_json=?1)")
         .bind(JSON.stringify(response), operationId),
     ]);
+    if (options.scheduleRetry !== false) await scheduleRetryWork(env, { kind: "operation", targetId: operationId, dueAt: nextAttemptAt });
     const latest = await env.DB.prepare("SELECT * FROM operation_dispatch_outbox WHERE operation_id=?1 LIMIT 1").bind(operationId).first<DispatchRow>();
     if (latest !== null && latest.state !== "pending") return currentResult(env, latest);
     console.error(JSON.stringify({ message: "operation dispatch failed", operationId, deviceId: row.device_id, attemptCount, code: "device_room_offer_failed" }));

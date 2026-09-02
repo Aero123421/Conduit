@@ -1,6 +1,7 @@
 //! Linux `conduit-node`: outbound transport, durable admission, runtime
 //! orchestration, and authenticated local IPC.
 
+pub mod batching;
 pub mod ipc;
 pub mod local;
 pub mod local_ipc;

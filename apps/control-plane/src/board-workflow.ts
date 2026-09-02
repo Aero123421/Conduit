@@ -52,6 +52,17 @@ interface ScheduledReplayRow {
   created_at: string;
 }
 
+interface SourceAuthorityRow {
+  source_index: number;
+  source_project_id: string | null;
+  source_revision: number | null;
+  source_id: string | null;
+  location_source_id: string | null;
+  location_device_id: string | null;
+  location_revision: number | null;
+  location_status: string | null;
+}
+
 export interface ScheduledBoardMention {
   targetId: string;
   startOffset: number;
@@ -149,14 +160,31 @@ export async function scheduleBoardAssignment(
   if (agent.role === "reviewer" && schedule.accessScope !== "read_only") throw new PublicError("invalid_request", 409, "Reviewer Project Agents require read_only access");
   if (agent.role === "reviewer" && schedule.sourceRevisions.some((source) => source.mode !== "read_only")) throw new PublicError("invalid_request", 409, "Reviewer Project Agents require read_only Source bindings");
 
-  for (const source of schedule.sourceRevisions) {
-    const row = await env.DB.prepare(`
-      SELECT s.project_id,s.revision AS source_revision,l.source_id,l.device_id,l.revision AS location_revision,l.status
-      FROM sources s JOIN locations l ON l.source_id=s.id
-      WHERE s.id=?1 AND l.id=?2 LIMIT 1
-    `).bind(source.sourceId, source.locationId).first<{ project_id: string | null; source_revision: number; source_id: string; device_id: string; location_revision: number; status: string }>();
-    if (row === null || row.status !== "active") throw new PublicError("not_found", 404, "Active Source Location not found");
-    if (row.project_id !== session.project_id || row.source_id !== source.sourceId || row.device_id !== schedule.deviceId) throw new PublicError("invalid_request", 409, "Source Location authority does not match the scheduled Project and Device");
+  // Validate all Source/Location pairs in one json_each set query. The
+  // max-size schedule (128 Sources) therefore costs one D1 statement rather
+  // than 128 round trips, while the exact revision/device checks below remain
+  // part of the atomic INSERT ... SELECT authority predicate.
+  const sourceAuthorityRows = await env.DB.prepare(`
+    WITH requested AS (
+      SELECT CAST(key AS INTEGER) AS source_index,
+             json_extract(value,'$.sourceId') AS source_id,
+             CAST(json_extract(value,'$.sourceRevision') AS INTEGER) AS source_revision,
+             json_extract(value,'$.locationId') AS location_id,
+             CAST(json_extract(value,'$.locationRevision') AS INTEGER) AS location_revision
+      FROM json_each(?1)
+    )
+    SELECT requested.source_index,source.project_id AS source_project_id,source.revision AS source_revision,
+           source.id AS source_id,location.source_id AS location_source_id,
+           location.device_id AS location_device_id,location.revision AS location_revision,
+           location.status AS location_status
+    FROM requested
+    LEFT JOIN sources AS source ON source.id=requested.source_id
+    LEFT JOIN locations AS location ON location.id=requested.location_id AND location.source_id=requested.source_id
+  `).bind(canonicalJson(schedule.sourceRevisions)).all<SourceAuthorityRow>();
+  for (const [index, source] of schedule.sourceRevisions.entries()) {
+    const row = sourceAuthorityRows.results.find((candidate) => candidate.source_index === index);
+    if (row === undefined || row.source_id === null || row.location_status !== "active") throw new PublicError("not_found", 404, "Active Source Location not found");
+    if (row.source_project_id !== session.project_id || row.location_source_id !== source.sourceId || row.location_device_id !== schedule.deviceId) throw new PublicError("invalid_request", 409, "Source Location authority does not match the scheduled Project and Device");
     if (row.source_revision !== source.sourceRevision || row.location_revision !== source.locationRevision) throw new PublicError("revision_conflict", 409, "Source or Location revision is stale");
   }
   const sourceBaselineRevisions = session.accepted_baseline_id === null
@@ -213,22 +241,42 @@ export async function scheduleBoardAssignment(
   const itemManifest = [{ type: "board_message", recordId: messageId, revision: 1, precedence: 100, contentDigest: compiledContentDigest, bytes: new TextEncoder().encode(boardBody).byteLength, disposition: "included" }];
   const snapshot = { id: snapshotId, runId, operationId, mode: "initial", projectRevision: session.project_revision, sessionRevision: session.revision, messageId, messageRevision: 1, compilerVersion: "control-plane-board/v1", itemManifest, compiledContentDigest };
   const snapshotDigest = await digest("conduit.context-snapshot.v1", snapshot);
-  const authorityValues: Array<string | number> = [assignmentId, session.project_id, sessionId, messageId, mention.title, mention.body, createdAt];
-  const predicate = (sql: string, ...values: Array<string | number>): string => {
-    const offset = authorityValues.length;
-    authorityValues.push(...values);
-    return sql.replaceAll(/\?(\d+)/g, (_match, index: string) => `?${offset + Number(index)}`);
-  };
-  const exactAuthorityPredicates = [
-    predicate("EXISTS (SELECT 1 FROM projects WHERE id=?1 AND revision=?2 AND status='active')", session.project_id, session.project_revision),
-    predicate("EXISTS (SELECT 1 FROM collaboration_sessions WHERE id=?1 AND project_id=?2 AND revision=?3 AND status='active')", sessionId, session.project_id, session.revision),
-    predicate("EXISTS (SELECT 1 FROM project_agents WHERE id=?1 AND project_id=?2 AND revision=?3 AND status='active')", mention.targetId, session.project_id, agent.revision),
-    predicate("EXISTS (SELECT 1 FROM devices WHERE id=?1 AND revision=?2 AND status='active')", schedule.deviceId, device.revision),
+  const sourceRevisionJson = canonicalJson(schedule.sourceRevisions);
+  // Keep this statement's bound parameter count constant (19), independent
+  // of the number of Source bindings. SQLite's JSON table expansion supplies
+  // the per-Source revision/device predicates inside the same atomic insert.
+  const authorityValues: Array<string | number> = [
+    assignmentId, session.project_id, sessionId, messageId, mention.title, mention.body, createdAt,
+    session.project_id, session.project_revision,
+    sessionId, session.project_id, session.revision,
+    mention.targetId, session.project_id, agent.revision,
+    schedule.deviceId, device.revision,
+    sourceRevisionJson, schedule.sourceRevisions.length,
   ];
-  for (const source of schedule.sourceRevisions) {
-    exactAuthorityPredicates.push(predicate("EXISTS (SELECT 1 FROM sources s JOIN locations l ON l.source_id=s.id WHERE s.id=?1 AND s.revision=?2 AND s.project_id=?3 AND l.id=?4 AND l.device_id=?5 AND l.revision=?6 AND l.status='active')", source.sourceId, source.sourceRevision, session.project_id, source.locationId, schedule.deviceId, source.locationRevision));
-  }
-  const exactAuthorities = exactAuthorityPredicates.join(" AND ");
+  const exactAuthorities = `
+    EXISTS (SELECT 1 FROM projects WHERE id=?8 AND revision=?9 AND status='active')
+    AND EXISTS (SELECT 1 FROM collaboration_sessions WHERE id=?10 AND project_id=?11 AND revision=?12 AND status='active')
+    AND EXISTS (SELECT 1 FROM project_agents WHERE id=?13 AND project_id=?14 AND revision=?15 AND status='active')
+    AND EXISTS (SELECT 1 FROM devices WHERE id=?16 AND revision=?17 AND status='active')
+    AND (SELECT COUNT(*) FROM requested_sources)=?19
+    AND (SELECT COUNT(*) FROM valid_sources)=?19
+  `;
+  const exactAuthorityCte = `
+    WITH requested_sources AS (
+      SELECT json_extract(value,'$.sourceId') AS source_id,
+             CAST(json_extract(value,'$.sourceRevision') AS INTEGER) AS source_revision,
+             json_extract(value,'$.locationId') AS location_id,
+             CAST(json_extract(value,'$.locationRevision') AS INTEGER) AS location_revision
+      FROM json_each(?18)
+    ), valid_sources AS (
+      SELECT requested.source_id
+      FROM requested_sources AS requested
+      JOIN sources AS source ON source.id=requested.source_id AND source.revision=requested.source_revision AND source.project_id=?8
+      JOIN locations AS location ON location.id=requested.location_id
+        AND location.source_id=source.id AND location.device_id=?16
+        AND location.revision=requested.location_revision AND location.status='active'
+    )
+  `;
 
   const operationInput: StartOperationInput = {
     idempotencyKey,
@@ -273,7 +321,7 @@ export async function scheduleBoardAssignment(
         env.DB.prepare("INSERT INTO messages(id,session_id,author_principal_id,origin,body,revision,attachments_json,created_at) VALUES (?1,?2,?3,?4,?5,1,'[]',?6)").bind(messageId, sessionId, actor.principalId, actor.clientId, boardBody, createdAt),
         env.DB.prepare("INSERT INTO message_revisions(message_id,revision,body,editor_principal_id,created_at) VALUES (?1,1,?2,?3,?4)").bind(messageId, boardBody, actor.principalId, createdAt),
         env.DB.prepare("INSERT INTO structured_mentions(id,message_id,mention_type,target_id,start_offset,end_offset,payload_json) VALUES (?1,?2,'project_agent',?3,?4,?5,?6)").bind(mentionId, messageId, mention.targetId, mention.startOffset, mention.endOffset, canonicalJson(mention.payload)),
-        env.DB.prepare(`INSERT INTO assignments(id,project_id,session_id,source_message_id,title,body,state,revision,created_at,updated_at) SELECT ?1,?2,?3,?4,?5,?6,'queued',1,?7,?7 WHERE ${exactAuthorities}`).bind(...authorityValues),
+        env.DB.prepare(`${exactAuthorityCte} INSERT INTO assignments(id,project_id,session_id,source_message_id,title,body,state,revision,created_at,updated_at) SELECT ?1,?2,?3,?4,?5,?6,'queued',1,?7,?7 WHERE ${exactAuthorities}`).bind(...authorityValues),
         env.DB.prepare("INSERT INTO assignment_run_bindings(assignment_id,project_agent_id,project_agent_revision,project_revision,session_revision,message_revision,device_id,device_revision,runtime_kind,runtime_provider_id,runtime_configuration_revision,adapter_id,role,model,effort,access_scope,approval_mode,source_revisions_json,agent_configuration_json,verification_policy_json,request_digest,binding_digest,created_at) VALUES (?1,?2,?3,?4,?5,1,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22)").bind(assignmentId, mention.targetId, agent.revision, session.project_revision, session.revision, schedule.deviceId, device.revision, schedule.runtime.kind, schedule.runtime.providerId, schedule.runtime.configurationRevision, agent.adapter_id, agent.role, schedule.model, schedule.effort, schedule.accessScope, schedule.approvalMode, canonicalJson(schedule.sourceRevisions), canonicalJson(agentConfiguration), canonicalJson(schedule.verificationPolicy), requestDigest, bindingDigest, createdAt),
         env.DB.prepare("INSERT INTO assignment_transitions(id,assignment_id,from_state,to_state,reason_code,evidence_ref,created_at) VALUES (?1,?2,NULL,'queued','board_schedule',?3,?4)").bind(newId("asgt"), assignmentId, bindingDigest, createdAt),
         env.DB.prepare("INSERT INTO runs(id,assignment_id,project_id,session_id,device_id,runtime_kind,access_scope,approval_mode,state,revision,manifest_digest,manifest_json,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',1,?9,?10,?11,?11)").bind(runId, assignmentId, session.project_id, sessionId, schedule.deviceId, schedule.runtime.kind, schedule.accessScope, schedule.approvalMode, manifestDigest, manifestJson, createdAt),

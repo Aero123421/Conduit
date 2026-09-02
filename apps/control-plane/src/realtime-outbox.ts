@@ -1,5 +1,6 @@
 import { nowIso } from "./crypto.ts";
 import type { ControlPlaneEnv } from "./types.ts";
+import { clearRetryWork, scheduleRetryWork } from "./retry-scheduler-client.ts";
 
 export interface RealtimeProjectionEvent {
   sessionId: string;
@@ -11,6 +12,7 @@ export interface RealtimeProjectionEvent {
 
 export interface RealtimeProjectionPublisher {
   publish(event: RealtimeProjectionEvent): Promise<number>;
+  publishBatch?(events: RealtimeProjectionEvent[]): Promise<Array<{ sequence: number }>>;
 }
 
 interface RealtimeOutboxRow {
@@ -26,6 +28,7 @@ interface RealtimeOutboxRow {
   next_attempt_at: string;
   lease_token: string | null;
   lease_expires_at: string | null;
+  coalesce_key: string | null;
 }
 
 interface ProjectionReceiptRow {
@@ -62,6 +65,15 @@ function retryAt(now: Date, attemptCount: number): string {
 
 function eventFromRow(row: RealtimeOutboxRow): RealtimeProjectionEvent {
   return JSON.parse(row.event_json) as RealtimeProjectionEvent;
+}
+
+function pendingCoalesceKey(event: RealtimeProjectionEvent): string | null {
+  const type = event.type.toLowerCase();
+  if (/(^|\.)(message|approval|terminal|review|baseline|security|failure|failed|error|cancelled|completed|ready_for_review)(\.|$)/.test(type)) return null;
+  const family = type.split(".", 1)[0];
+  return family === "operation" || family === "run" || family === "runtime" || family === "device"
+    ? `${event.sessionId}:${event.recordId}:${family}`
+    : null;
 }
 
 function recoverReceiptEvent(row: ProjectionReceiptRow): RealtimeProjectionEvent | null {
@@ -102,8 +114,21 @@ export async function persistRealtimeProjection(
 ): Promise<RealtimeOutboxRow> {
   const eventJson = JSON.stringify({ sessionId: event.sessionId, eventId: event.eventId, type: event.type, recordId: event.recordId, revision: event.revision });
   const at = now.toISOString();
-  await env.DB.prepare("INSERT OR IGNORE INTO realtime_projection_outbox(event_id,device_id,session_id,event_type,record_id,revision,event_json,state,next_attempt_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?8,?8)")
-    .bind(event.eventId, deviceId, event.sessionId, event.type, event.recordId, event.revision, eventJson, at).run();
+  const existing = await rowFor(env, event.eventId);
+  if (existing !== null) {
+    if (existing.device_id !== deviceId || existing.session_id !== event.sessionId || existing.event_type !== event.type || existing.record_id !== event.recordId || existing.revision !== event.revision || existing.event_json !== eventJson) throw new TypeError("realtime projection event ID is bound to another projection");
+    return existing;
+  }
+  const coalesceKey = pendingCoalesceKey(event);
+  const insert = env.DB.prepare("INSERT OR IGNORE INTO realtime_projection_outbox(event_id,device_id,session_id,event_type,record_id,revision,event_json,state,next_attempt_at,created_at,updated_at,coalesce_key) VALUES (?1,?2,?3,?4,?5,?6,?7,'pending',?8,?8,?8,?9)")
+    .bind(event.eventId, deviceId, event.sessionId, event.type, event.recordId, event.revision, eventJson, at, coalesceKey);
+  if (coalesceKey === null) await insert.run();
+  else {
+    await env.DB.batch([
+      env.DB.prepare("DELETE FROM realtime_projection_outbox WHERE coalesce_key=?1 AND state='pending' AND event_id<>?2").bind(coalesceKey, event.eventId),
+      insert,
+    ]);
+  }
   const row = await rowFor(env, event.eventId);
   if (row === null) throw new TypeError("realtime projection outbox insert was not durable");
   if (row.device_id !== deviceId || row.session_id !== event.sessionId || row.event_type !== event.type || row.record_id !== event.recordId || row.revision !== event.revision || row.event_json !== eventJson) {
@@ -115,7 +140,7 @@ export async function persistRealtimeProjection(
 export async function attemptRealtimeProjection(
   env: ControlPlaneEnv,
   eventId: string,
-  options: { now?: Date; force?: boolean; publisher?: RealtimeProjectionPublisher } = {},
+  options: { now?: Date; force?: boolean; publisher?: RealtimeProjectionPublisher; scheduleRetry?: boolean } = {},
 ): Promise<RealtimeProjectionAttempt> {
   const now = options.now ?? new Date();
   const at = now.toISOString();
@@ -148,6 +173,7 @@ export async function attemptRealtimeProjection(
     const nextAttemptAt = retryAt(now, attemptCount);
     await env.DB.prepare("UPDATE realtime_projection_outbox SET state='pending',attempt_count=?1,next_attempt_at=?2,lease_token=NULL,lease_expires_at=NULL,last_error_code='board_room_publish_failed',updated_at=?3 WHERE event_id=?4 AND lease_token=?5")
       .bind(attemptCount, nextAttemptAt, at, eventId, leaseToken).run();
+    if (options.scheduleRetry !== false) await scheduleRetryWork(env, { kind: "realtime", targetId: row.device_id, dueAt: nextAttemptAt });
     return { eventId, state: "pending", attemptCount, nextAttemptAt };
   }
 }
@@ -176,34 +202,89 @@ async function recoverMissingNodeProjections(env: ControlPlaneEnv, deviceId: str
     ORDER BY receipt.created_at,receipt.message_id
     LIMIT ?2
   `).bind(deviceId, limit).all<ProjectionReceiptRow>();
-  let recovered = 0;
+  const candidates: Array<{ event: RealtimeProjectionEvent; eventJson: string }> = [];
   for (const row of rows.results) {
     const event = recoverReceiptEvent(row);
     if (event === null) continue;
-    await persistRealtimeProjection(env, deviceId, event, now);
-    recovered += 1;
+    candidates.push({ event, eventJson: JSON.stringify({ sessionId: event.sessionId, eventId: event.eventId, type: event.type, recordId: event.recordId, revision: event.revision }) });
   }
-  return recovered;
+  if (candidates.length === 0) return 0;
+  const idsJson = JSON.stringify(candidates.map(({ event }) => event.eventId));
+  const existing = await env.DB.prepare("SELECT event_id,device_id,session_id,event_type,record_id,revision,event_json FROM realtime_projection_outbox WHERE event_id IN (SELECT value FROM json_each(?1))")
+    .bind(idsJson).all<Pick<RealtimeOutboxRow, "event_id" | "device_id" | "session_id" | "event_type" | "record_id" | "revision" | "event_json">>();
+  const byId = new Map(existing.results.map((row) => [row.event_id, row]));
+  for (const candidate of candidates) {
+    const row = byId.get(candidate.event.eventId);
+    if (row !== undefined && (row.device_id !== deviceId || row.session_id !== candidate.event.sessionId || row.event_type !== candidate.event.type || row.record_id !== candidate.event.recordId || row.revision !== candidate.event.revision || row.event_json !== candidate.eventJson)) {
+      throw new TypeError("recovered realtime event ID is bound to another projection");
+    }
+  }
+  const fresh = candidates.filter(({ event }) => !byId.has(event.eventId));
+  if (fresh.length === 0) return 0;
+  const at = now.toISOString();
+  await env.DB.prepare(`
+    INSERT OR IGNORE INTO realtime_projection_outbox(event_id,device_id,session_id,event_type,record_id,revision,event_json,state,next_attempt_at,created_at,updated_at)
+    SELECT json_extract(value,'$.eventId'),?1,json_extract(value,'$.sessionId'),json_extract(value,'$.type'),json_extract(value,'$.recordId'),json_extract(value,'$.revision'),json_extract(value,'$.eventJson'),'pending',?2,?2,?2
+    FROM json_each(?3)
+  `).bind(deviceId, at, JSON.stringify(fresh.map(({ event, eventJson }) => ({ ...event, eventJson })))).run();
+  return fresh.length;
 }
 
 export async function reconcileRealtimeProjections(
   env: ControlPlaneEnv,
   deviceId: string,
-  options: { now?: Date; limit?: number; publisher?: RealtimeProjectionPublisher } = {},
+  options: { now?: Date; limit?: number; publisher?: RealtimeProjectionPublisher; scheduleRetry?: boolean } = {},
 ): Promise<RealtimeProjectionReconciliation> {
   const now = options.now ?? new Date();
   const limit = Math.max(1, Math.min(options.limit ?? DEFAULT_LIMIT, 128));
   const recovered = await recoverMissingNodeProjections(env, deviceId, now, limit);
-  const rows = await env.DB.prepare("SELECT event_id FROM realtime_projection_outbox WHERE device_id=?1 AND ((state='pending' AND next_attempt_at<=?2) OR (state='publishing' AND lease_expires_at<=?2)) ORDER BY next_attempt_at,event_id LIMIT ?3")
-    .bind(deviceId, now.toISOString(), limit).all<{ event_id: string }>();
+  const leaseToken = crypto.randomUUID();
+  const at = now.toISOString();
+  const leaseExpiresAt = new Date(now.getTime() + LEASE_MS).toISOString();
+  const rows = await env.DB.prepare(`
+    UPDATE realtime_projection_outbox
+    SET state='publishing',lease_token=?1,lease_expires_at=?2,updated_at=?3
+    WHERE event_id IN (
+      SELECT event_id FROM realtime_projection_outbox
+      WHERE device_id=?4 AND ((state='pending' AND next_attempt_at<=?3) OR (state='publishing' AND lease_expires_at<=?3))
+      ORDER BY next_attempt_at,event_id LIMIT ?5
+    )
+    RETURNING *
+  `).bind(leaseToken, leaseExpiresAt, at, deviceId, limit).all<RealtimeOutboxRow>();
   let published = 0;
   let pending = 0;
-  for (const row of rows.results) {
-    const result = await attemptRealtimeProjection(env, row.event_id, { now, ...(options.publisher === undefined ? {} : { publisher: options.publisher }) });
-    if (result.state === "published") published += 1; else pending += 1;
+  const publisher = options.publisher ?? {
+    publish: (event: RealtimeProjectionEvent) => env.BOARD_ROOMS.getByName(event.sessionId).publish(event),
+    publishBatch: (events: RealtimeProjectionEvent[]) => env.BOARD_ROOMS.getByName(events[0]!.sessionId).publishBatch(events),
+  };
+  const sessions = new Map<string, RealtimeOutboxRow[]>();
+  for (const row of rows.results) sessions.set(row.session_id, [...(sessions.get(row.session_id) ?? []), row]);
+  for (const sessionRows of sessions.values()) {
+    const events = sessionRows.map(eventFromRow);
+    const eventIds = JSON.stringify(sessionRows.map((row) => row.event_id));
+    try {
+      if (publisher.publishBatch === undefined) {
+        for (const event of events) await publisher.publish(event);
+      } else {
+        await publisher.publishBatch(events);
+      }
+      const finalized = await env.DB.prepare("UPDATE realtime_projection_outbox SET state='published',attempt_count=attempt_count+1,lease_token=NULL,lease_expires_at=NULL,last_error_code=NULL,published_at=?1,updated_at=?1 WHERE lease_token=?2 AND event_id IN (SELECT value FROM json_each(?3))")
+        .bind(at, leaseToken, eventIds).run();
+      published += finalized.meta.changes ?? 0;
+    } catch {
+      const attemptCount = Math.max(...sessionRows.map((row) => row.attempt_count + 1));
+      const nextAttemptAt = retryAt(now, attemptCount);
+      const released = await env.DB.prepare("UPDATE realtime_projection_outbox SET state='pending',attempt_count=attempt_count+1,next_attempt_at=?1,lease_token=NULL,lease_expires_at=NULL,last_error_code='board_room_publish_failed',updated_at=?2 WHERE lease_token=?3 AND event_id IN (SELECT value FROM json_each(?4))")
+        .bind(nextAttemptAt, at, leaseToken, eventIds).run();
+      pending += released.meta.changes ?? 0;
+    }
   }
   const next = await env.DB.prepare("SELECT MIN(CASE WHEN state='publishing' THEN lease_expires_at ELSE next_attempt_at END) AS next_attempt_at FROM realtime_projection_outbox WHERE device_id=?1 AND state IN ('pending','publishing')")
     .bind(deviceId).first<{ next_attempt_at: string | null }>();
   const continuation = next?.next_attempt_at ?? (recovered === limit ? new Date(now.getTime() + 1_000).toISOString() : null);
+  if (options.scheduleRetry !== false) {
+    if (continuation === null) await clearRetryWork(env, "realtime", deviceId);
+    else await scheduleRetryWork(env, { kind: "realtime", targetId: deviceId, dueAt: continuation });
+  }
   return { recovered, attempted: rows.results.length, published, pending, nextAttemptAt: continuation };
 }

@@ -7,7 +7,10 @@ import { PublicError } from "../errors.ts";
 import { projectNodeState, type NodeProjectionEvent } from "../node-projection.ts";
 import { queueRealtimeProjection, reconcileRealtimeProjections } from "../realtime-outbox.ts";
 import { projectDeviceTerminalSubmission } from "../review-workflow.ts";
-import type { ControlPlaneEnv, QueueEventMessage } from "../types.ts";
+import { commitDurableInboxBatch, enqueueEventBatch, eventIngestionMode, parseEventBatch } from "../ingestion.ts";
+import { planReconciliationSets } from "../reconciliation-set.ts";
+import { usageProfileForEnv } from "../usage-profile.ts";
+import type { ControlPlaneEnv } from "../types.ts";
 
 interface SocketAttachment {
   deviceId: string;
@@ -33,6 +36,7 @@ interface StoredOutboundFrame {
   payload_digest: string;
   frame_json: string;
   state: "queued" | "sent";
+  kind: "control" | "ack";
   expires_at: string;
   dispatch_attempts: number;
   next_attempt_at: string;
@@ -45,17 +49,20 @@ interface StoredDispatchReceipt {
   payload_digest: string;
   sequence: number;
   state: "queued" | "sent" | "acknowledged";
+  kind: "control" | "ack";
   expires_at: string;
 }
 
 interface StoredControlReplayIntent {
-  [key: string]: string | number;
+  [key: string]: string | number | null;
   request_sequence: number;
   request_message_id: string;
   from_sequence: number;
   through_sequence: number;
   attempt_count: number;
   next_attempt_at: string;
+  lease_token: string | null;
+  lease_expires_at: string | null;
 }
 
 interface ValidatedControlReplay {
@@ -63,7 +70,63 @@ interface ValidatedControlReplay {
   frames: StoredOutboundFrame[];
 }
 
+interface RoomWorkMarker {
+  [key: string]: string | number | null;
+  singleton: number;
+  pending: number;
+  min_due_at: number | null;
+  retention_pending: number;
+  retention_due_at: number | null;
+  realtime_pending: number;
+  realtime_min_due_at: number | null;
+  realtime_device_id: string | null;
+  ack_pending_through: number;
+  ack_pending_at: number | null;
+  ack_sent_through: number;
+  ack_message_id: string | null;
+  health_semantic_json: string | null;
+  health_last_projected_at: number | null;
+  updated_at: string;
+}
+
+interface RetentionCompactionRow {
+  [key: string]: string | number | null;
+  direction: string;
+  compacted_through: number;
+  compacted_digest: string;
+  updated_at: string;
+}
+
+interface OutboundMessageTombstone {
+  [key: string]: string | number | null;
+  message_id: string;
+  correlation_id: string | null;
+  payload_digest: string;
+  sequence: number;
+  kind: "control" | "ack";
+  state: "queued" | "sent" | "acknowledged";
+  expires_at: string;
+  created_at: string;
+}
+
 const MAX_CONTROL_REPLAY_FRAMES = 32;
+const MAX_INBOUND_FRAMES = 512;
+const MAX_OUTBOUND_TOMBSTONES = 512;
+const MAX_AUTH_CHALLENGES = 128;
+const MAX_RECONCILIATION_SESSIONS = 64;
+const MAX_TERMINAL_RECEIPTS = 256;
+const PROJECTION_LEASE_MS = 5 * 60_000;
+// Node health frames may arrive every 5--10 minutes, but unchanged semantic
+// health is projected to D1 at most once per 15 minutes.  This keeps the
+// durable-object checkpoint useful while staying inside the daily write
+// budget for an idle device.
+const HEALTH_CHECKPOINT_MS = 15 * 60_000;
+const HOT_RETENTION_MS = 24 * 60 * 60_000;
+const RECEIPT_RETENTION_MS = 7 * 24 * 60 * 60_000;
+// ACKs are protocol custody receipts, not effectful work. Keep their exact
+// digest/sequence proof long enough for reconnect/replay, but do not make a
+// five-minute ACK expiry turn every heartbeat into a retention alarm.
+const ACK_RETENTION_MS = HOT_RETENTION_MS;
 const EFFECTFUL_CONTROL_TYPES = new Set<NodeV1PostAuthFrame["type"]>([
   "operation.offer",
   "operation.input",
@@ -71,8 +134,17 @@ const EFFECTFUL_CONTROL_TYPES = new Set<NodeV1PostAuthFrame["type"]>([
   "runtime.control",
   "operation.approval",
 ]);
+const ACK_IMMEDIATE_TYPES = new Set<NodeV1PostAuthFrame["type"]>([
+  "reconcile.summary",
+  "reconcile.complete",
+  "operation.terminal",
+  "transport.error",
+  "transport.replay_required",
+]);
 
 export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
+  private alarmActive = false;
+
   constructor(ctx: DurableObjectState, env: ControlPlaneEnv) {
     super(ctx, env);
     ctx.blockConcurrencyWhile(async () => {
@@ -81,15 +153,25 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
         CREATE TABLE IF NOT EXISTS connection_state(singleton INTEGER PRIMARY KEY CHECK(singleton=1), device_id TEXT NOT NULL, epoch INTEGER NOT NULL, key_id TEXT, connection_id TEXT, protocol TEXT, capability_digest TEXT, reconciliation_state TEXT NOT NULL, updated_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS transport_positions(direction TEXT PRIMARY KEY, durable_sequence INTEGER NOT NULL, acknowledged_sequence INTEGER NOT NULL);
         CREATE TABLE IF NOT EXISTS outbound_frames(sequence INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, correlation_id TEXT, payload_digest TEXT NOT NULL, frame_json TEXT NOT NULL, state TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS inbound_frames(sequence INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, correlation_id TEXT, payload_digest TEXT NOT NULL, frame_json TEXT NOT NULL, projected INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS inbound_frames(sequence INTEGER PRIMARY KEY, message_id TEXT NOT NULL UNIQUE, correlation_id TEXT, payload_digest TEXT NOT NULL, frame_json TEXT NOT NULL, projected INTEGER NOT NULL DEFAULT 0, projection_claimed_at TEXT, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS auth_challenges(connection_id TEXT PRIMARY KEY, key_id TEXT NOT NULL, client_nonce TEXT NOT NULL, server_nonce TEXT NOT NULL, server_time TEXT NOT NULL, protocol TEXT NOT NULL, capability_digest TEXT NOT NULL, node_boot_id TEXT NOT NULL, expires_at TEXT NOT NULL, consumed INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE IF NOT EXISTS reconciliation_sessions(id TEXT PRIMARY KEY, epoch INTEGER NOT NULL, state TEXT NOT NULL, summary_json TEXT, plan_json TEXT, created_at TEXT NOT NULL, completed_at TEXT);
         CREATE TABLE IF NOT EXISTS terminal_receipt_cache(operation_id TEXT PRIMARY KEY, request_digest TEXT NOT NULL, receipt_json TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS outbound_message_receipts(message_id TEXT PRIMARY KEY, correlation_id TEXT, payload_digest TEXT NOT NULL, sequence INTEGER NOT NULL, state TEXT NOT NULL CHECK(state IN ('queued','sent','acknowledged')), expires_at TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS control_replay_intents(request_sequence INTEGER PRIMARY KEY, request_message_id TEXT NOT NULL UNIQUE, from_sequence INTEGER NOT NULL, through_sequence INTEGER NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS control_replay_intents(request_sequence INTEGER PRIMARY KEY, request_message_id TEXT NOT NULL UNIQUE, from_sequence INTEGER NOT NULL, through_sequence INTEGER NOT NULL, attempt_count INTEGER NOT NULL DEFAULT 0, next_attempt_at TEXT NOT NULL, lease_token TEXT, lease_expires_at TEXT, created_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS room_work_marker(singleton INTEGER PRIMARY KEY CHECK(singleton=1), pending INTEGER NOT NULL DEFAULT 0, min_due_at INTEGER, retention_pending INTEGER NOT NULL DEFAULT 0, retention_due_at INTEGER, realtime_pending INTEGER NOT NULL DEFAULT 0, realtime_min_due_at INTEGER, realtime_device_id TEXT, ack_pending_through INTEGER NOT NULL DEFAULT 0, ack_pending_at INTEGER, ack_sent_through INTEGER NOT NULL DEFAULT 0, ack_message_id TEXT, health_semantic_json TEXT, health_last_projected_at INTEGER, updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS transport_compaction(direction TEXT PRIMARY KEY, compacted_through INTEGER NOT NULL DEFAULT 0, compacted_digest TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS outbound_message_tombstones(message_id TEXT PRIMARY KEY, correlation_id TEXT, payload_digest TEXT NOT NULL, sequence INTEGER NOT NULL, kind TEXT NOT NULL, state TEXT NOT NULL, expires_at TEXT NOT NULL, created_at TEXT NOT NULL);
         CREATE INDEX IF NOT EXISTS outbound_receipt_expiry_idx ON outbound_message_receipts(expires_at);
         CREATE INDEX IF NOT EXISTS control_replay_due_idx ON control_replay_intents(next_attempt_at,request_sequence);
+        CREATE INDEX IF NOT EXISTS inbound_projection_idx ON inbound_frames(projected,sequence);
+        CREATE INDEX IF NOT EXISTS auth_challenge_expiry_idx ON auth_challenges(expires_at,consumed);
+        CREATE INDEX IF NOT EXISTS reconciliation_session_created_idx ON reconciliation_sessions(created_at,state);
+        CREATE INDEX IF NOT EXISTS terminal_receipt_created_idx ON terminal_receipt_cache(created_at);
+        CREATE INDEX IF NOT EXISTS outbound_tombstone_created_idx ON outbound_message_tombstones(created_at);
         INSERT OR IGNORE INTO transport_positions(direction,durable_sequence,acknowledged_sequence) VALUES ('control_to_node',0,0),('node_to_control',0,0);
+        INSERT OR IGNORE INTO transport_compaction(direction,compacted_through,compacted_digest,updated_at) VALUES ('control_to_node',0,'',datetime('now')),('node_to_control',0,'',datetime('now'));
+        INSERT OR IGNORE INTO room_work_marker(singleton,pending,updated_at) VALUES (1,0,datetime('now'));
         INSERT OR IGNORE INTO _sql_schema_migrations(id,applied_at) VALUES (1,datetime('now'));
       `);
       const challengeColumns = new Set(this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(auth_challenges)").toArray().map((column) => column.name));
@@ -99,11 +181,531 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       const outboundColumns = new Set(this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(outbound_frames)").toArray().map((column) => column.name));
       if (!outboundColumns.has("dispatch_attempts")) this.ctx.storage.sql.exec("ALTER TABLE outbound_frames ADD COLUMN dispatch_attempts INTEGER NOT NULL DEFAULT 0");
       if (!outboundColumns.has("next_attempt_at")) this.ctx.storage.sql.exec("ALTER TABLE outbound_frames ADD COLUMN next_attempt_at TEXT NOT NULL DEFAULT '1970-01-01T00:00:00.000Z'");
+      if (!outboundColumns.has("kind")) this.ctx.storage.sql.exec("ALTER TABLE outbound_frames ADD COLUMN kind TEXT NOT NULL DEFAULT 'control'");
       this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS outbound_dispatch_due_idx ON outbound_frames(state,next_attempt_at,expires_at)");
+      const receiptColumns = new Set(this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(outbound_message_receipts)").toArray().map((column) => column.name));
+      if (!receiptColumns.has("kind")) this.ctx.storage.sql.exec("ALTER TABLE outbound_message_receipts ADD COLUMN kind TEXT NOT NULL DEFAULT 'control'");
+      const positionColumns = new Set(this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(transport_positions)").toArray().map((column) => column.name));
+      if (!positionColumns.has("retained_sequence")) this.ctx.storage.sql.exec("ALTER TABLE transport_positions ADD COLUMN retained_sequence INTEGER NOT NULL DEFAULT 0");
+      if (!positionColumns.has("projected_sequence")) this.ctx.storage.sql.exec("ALTER TABLE transport_positions ADD COLUMN projected_sequence INTEGER NOT NULL DEFAULT 0");
+      const inboundColumns = new Set(this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(inbound_frames)").toArray().map((column) => column.name));
+      if (!inboundColumns.has("kind")) this.ctx.storage.sql.exec("ALTER TABLE inbound_frames ADD COLUMN kind TEXT NOT NULL DEFAULT 'app'");
+      if (!inboundColumns.has("projection_claimed_at")) this.ctx.storage.sql.exec("ALTER TABLE inbound_frames ADD COLUMN projection_claimed_at TEXT");
+      const replayColumns = new Set(this.ctx.storage.sql.exec<{ name: string }>("PRAGMA table_info(control_replay_intents)").toArray().map((column) => column.name));
+      if (!replayColumns.has("lease_token")) this.ctx.storage.sql.exec("ALTER TABLE control_replay_intents ADD COLUMN lease_token TEXT");
+      if (!replayColumns.has("lease_expires_at")) this.ctx.storage.sql.exec("ALTER TABLE control_replay_intents ADD COLUMN lease_expires_at TEXT");
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO _sql_schema_migrations(id,applied_at) VALUES (3,datetime('now'))");
       this.ctx.storage.sql.exec("INSERT OR IGNORE INTO _sql_schema_migrations(id,applied_at) VALUES (4,datetime('now'))");
       this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
     });
+  }
+
+  private workMarker(): RoomWorkMarker {
+    return this.ctx.storage.sql.exec<RoomWorkMarker>("SELECT * FROM room_work_marker WHERE singleton=1").one();
+  }
+
+  /**
+   * Mark work before returning custody of a row. The marker is deliberately
+   * local to this DO: it is the durable wake-up hint, not a second source of
+   * truth for any protocol record.
+   */
+  private notePending(dueAt = Date.now()): void {
+    if (!Number.isFinite(dueAt)) dueAt = Date.now();
+    const marker = this.workMarker();
+    const minDueAt = marker.min_due_at === null ? dueAt : Math.min(marker.min_due_at, dueAt);
+    if (marker.pending === 1 && marker.min_due_at === minDueAt) return;
+    this.ctx.storage.sql.exec(
+      "UPDATE room_work_marker SET pending=1,min_due_at=?,updated_at=? WHERE singleton=1",
+      minDueAt,
+      nowIso(),
+    );
+  }
+
+  private noteRealtimePending(deviceId: string, dueAt = Date.now()): void {
+    if (!Number.isFinite(dueAt)) dueAt = Date.now();
+    const marker = this.workMarker();
+    const minDueAt = marker.realtime_min_due_at === null ? dueAt : Math.min(marker.realtime_min_due_at, dueAt);
+    this.ctx.storage.sql.exec(
+      "UPDATE room_work_marker SET realtime_pending=1,realtime_min_due_at=?,realtime_device_id=?,pending=1,min_due_at=CASE WHEN min_due_at IS NULL OR min_due_at>? THEN ? ELSE min_due_at END,updated_at=? WHERE singleton=1",
+      minDueAt,
+      deviceId,
+      minDueAt,
+      minDueAt,
+      nowIso(),
+    );
+  }
+
+  private noteAckPending(throughSequence: number, immediate = false): void {
+    if (!Number.isSafeInteger(throughSequence) || throughSequence < 1) return;
+    const marker = this.workMarker();
+    // `transport_positions.durable_sequence` is the authoritative contiguous
+    // receive frontier. Once an ACK is pending, later frames only advance that
+    // position; repeatedly rewriting the marker for every health heartbeat is
+    // needless DO row churn. The flush path reads the latest frontier when it
+    // emits the cumulative ACK. An immediate boundary may pull the due time
+    // forward once, but still never rewrites the watermark per frame.
+    if (marker.ack_pending_through > marker.ack_sent_through) {
+      if (immediate && (marker.ack_pending_at === null || marker.ack_pending_at > Date.now())) {
+        const now = Date.now();
+        this.ctx.storage.sql.exec(
+          "UPDATE room_work_marker SET ack_pending_at=?,min_due_at=CASE WHEN min_due_at IS NULL OR min_due_at>? THEN ? ELSE min_due_at END,updated_at=? WHERE singleton=1",
+          now,
+          now,
+          now,
+          nowIso(),
+        );
+      }
+      return;
+    }
+    const ackCoalesceMs = usageProfileForEnv(this.env).ackCoalesceMs;
+    const pendingAt = immediate ? Date.now() : marker.ack_pending_at ?? Date.now();
+    const dueAt = immediate ? Date.now() : pendingAt + ackCoalesceMs;
+    const nextThrough = Math.max(marker.ack_pending_through, throughSequence);
+    this.ctx.storage.sql.exec(
+      "UPDATE room_work_marker SET ack_pending_through=?,ack_pending_at=?,pending=1,min_due_at=CASE WHEN min_due_at IS NULL OR min_due_at>? THEN ? ELSE min_due_at END,updated_at=? WHERE singleton=1",
+      nextThrough,
+      pendingAt,
+      dueAt,
+      dueAt,
+      nowIso(),
+    );
+  }
+
+  private setHealthMarker(semanticJson: string, projectedAt?: number): void {
+    const marker = this.workMarker();
+    const at = projectedAt ?? marker.health_last_projected_at;
+    if (marker.health_semantic_json === semanticJson && marker.health_last_projected_at === at) return;
+    this.ctx.storage.sql.exec(
+      "UPDATE room_work_marker SET health_semantic_json=?,health_last_projected_at=?,updated_at=? WHERE singleton=1",
+      semanticJson,
+      at,
+      nowIso(),
+    );
+  }
+
+  private setRealtimeResult(deviceId: string, nextAttemptAt: string | null | undefined): void {
+    // A pending outbox result without a due timestamp is still pending. Keep a
+    // durable local wake-up rather than accidentally clearing the marker.
+    if (nextAttemptAt === undefined) {
+      const marker = this.workMarker();
+      this.noteRealtimePending(deviceId, marker.realtime_min_due_at ?? Date.now() + 30_000);
+      return;
+    }
+    if (nextAttemptAt === null) {
+      this.ctx.storage.sql.exec(
+        "UPDATE room_work_marker SET realtime_pending=0,realtime_min_due_at=NULL,realtime_device_id=NULL,updated_at=? WHERE singleton=1",
+        nowIso(),
+      );
+      return;
+    }
+    const dueAt = Date.parse(nextAttemptAt);
+    this.noteRealtimePending(deviceId, Number.isFinite(dueAt) ? dueAt : Date.now());
+  }
+
+  private healthSemantic(frame: Extract<NodeV1PostAuthFrame, { type: "device.health" }>): string {
+    const payload = frame.payload;
+    return canonicalJson({
+      nodeState: payload.nodeState,
+      journalState: payload.journalState,
+      storageState: payload.storageState,
+      activeCommands: payload.activeCommands ?? 0,
+      activeAgentRuns: payload.activeAgentRuns ?? 0,
+      activeRuntimes: payload.activeRuntimes ?? 0,
+    });
+  }
+
+  private hasCurrentAuthenticatedSocket(): boolean {
+    const connection = this.ctx.storage.sql.exec<{ epoch: number }>("SELECT epoch FROM connection_state WHERE singleton=1").toArray()[0];
+    return connection !== undefined && this.ctx.getWebSockets().some((candidate) => {
+      const item = candidate.deserializeAttachment() as SocketAttachment | null;
+      return item?.stage === "authenticated" && item.epoch === String(connection.epoch);
+    });
+  }
+
+  private shouldProjectHealth(frame: Extract<NodeV1PostAuthFrame, { type: "device.health" }>, now = Date.now()): boolean {
+    const marker = this.workMarker();
+    const semantic = this.healthSemantic(frame);
+    if (marker.health_semantic_json !== semantic) return true;
+    const d1HealthTouchMs = usageProfileForEnv(this.env).d1HealthTouchMs;
+    return marker.health_last_projected_at === null || now - marker.health_last_projected_at >= Math.max(HEALTH_CHECKPOINT_MS, d1HealthTouchMs);
+  }
+
+  private async syncWorkMarker(): Promise<void> {
+    const marker = this.workMarker();
+    const nowMs = Date.now();
+    const now = new Date(nowMs).toISOString();
+    const cutoff = new Date(nowMs - HOT_RETENTION_MS).toISOString();
+    const status = this.ctx.storage.sql.exec<{
+      inbound_pending: number;
+      outbound_due: string | null;
+      replay_due: string | null;
+      retention_pending: number;
+      inbound_retention_from: string | null;
+      receipt_retention_due: string | null;
+      auth_retention_due: string | null;
+      reconciliation_retention_from: string | null;
+      terminal_retention_from: string | null;
+    }>(
+      `SELECT
+         EXISTS(SELECT 1 FROM inbound_frames WHERE projected=0 OR (projected=3 AND (projection_claimed_at IS NULL OR projection_claimed_at<=?))) AS inbound_pending,
+         (SELECT MIN(next_attempt_at) FROM outbound_frames WHERE state='queued') AS outbound_due,
+         (SELECT MIN(next_attempt_at) FROM control_replay_intents) AS replay_due,
+         CASE WHEN
+           EXISTS(SELECT 1 FROM inbound_frames WHERE projected IN (1,2) AND NOT (kind='app' AND json_extract(frame_json,'$.type')='device.health' AND sequence=(SELECT MAX(sequence) FROM inbound_frames WHERE kind='app' AND json_extract(frame_json,'$.type')='device.health')) AND created_at<=?)
+           OR (SELECT COUNT(*) FROM inbound_frames WHERE projected IN (1,2))>?
+           OR EXISTS(SELECT 1 FROM outbound_message_receipts WHERE
+             (state='acknowledged' AND updated_at<=?)
+             OR (expires_at<=? AND NOT (kind='ack' AND state IN ('queued','sent') AND sequence=(SELECT MAX(sequence) FROM outbound_message_receipts WHERE kind='ack' AND state IN ('queued','sent'))))
+             OR (kind='ack' AND state='sent' AND sequence <= (SELECT acknowledged_sequence FROM transport_positions WHERE direction='control_to_node'))
+             OR (kind='ack' AND state IN ('queued','sent') AND sequence < (SELECT MAX(sequence) FROM outbound_message_receipts WHERE kind='ack' AND state IN ('queued','sent'))))
+           OR (SELECT COUNT(*) FROM outbound_message_tombstones)>?
+           OR EXISTS(SELECT 1 FROM auth_challenges WHERE expires_at<=? OR (consumed=1 AND expires_at<=?))
+           OR (SELECT COUNT(*) FROM auth_challenges)>?
+           OR EXISTS(SELECT 1 FROM reconciliation_sessions WHERE state='complete' AND created_at<=?)
+           OR (SELECT COUNT(*) FROM reconciliation_sessions WHERE epoch IS NOT (SELECT epoch FROM connection_state WHERE singleton=1))>?
+           OR EXISTS(SELECT 1 FROM terminal_receipt_cache WHERE created_at<=?)
+           OR (SELECT COUNT(*) FROM terminal_receipt_cache)>?
+         THEN 1 ELSE 0 END AS retention_pending,
+         (SELECT MIN(created_at) FROM inbound_frames WHERE projected IN (1,2) AND NOT (kind='app' AND json_extract(frame_json,'$.type')='device.health' AND sequence=(SELECT MAX(sequence) FROM inbound_frames WHERE kind='app' AND json_extract(frame_json,'$.type')='device.health'))) AS inbound_retention_from,
+         (SELECT MIN(expires_at) FROM outbound_message_receipts WHERE NOT (kind='ack' AND state IN ('queued','sent') AND sequence=(SELECT MAX(sequence) FROM outbound_message_receipts WHERE kind='ack' AND state IN ('queued','sent')))) AS receipt_retention_due,
+         (SELECT MIN(expires_at) FROM auth_challenges) AS auth_retention_due,
+         (SELECT MIN(created_at) FROM reconciliation_sessions WHERE state='complete') AS reconciliation_retention_from,
+         (SELECT MIN(created_at) FROM terminal_receipt_cache) AS terminal_retention_from`,
+      new Date(nowMs - PROJECTION_LEASE_MS).toISOString(),
+      cutoff,
+      MAX_INBOUND_FRAMES,
+      cutoff,
+      now,
+      MAX_OUTBOUND_TOMBSTONES,
+      now,
+      cutoff,
+      MAX_AUTH_CHALLENGES,
+      cutoff,
+      MAX_RECONCILIATION_SESSIONS,
+      new Date(nowMs - RECEIPT_RETENTION_MS).toISOString(),
+      MAX_TERMINAL_RECEIPTS,
+    ).one();
+
+    const hasAuthenticatedSocket = this.hasCurrentAuthenticatedSocket();
+    const replayPending = status.replay_due !== null && !hasAuthenticatedSocket;
+    const retentionDueCandidates: number[] = [];
+    if (status.retention_pending !== 0) retentionDueCandidates.push(nowMs);
+    const addRetentionDue = (value: string | null, retentionMs: number): void => {
+      if (value === null) return;
+      const parsed = Date.parse(value);
+      if (Number.isFinite(parsed)) retentionDueCandidates.push(parsed + retentionMs);
+    };
+    addRetentionDue(status.inbound_retention_from, HOT_RETENTION_MS);
+    addRetentionDue(status.receipt_retention_due, 0);
+    addRetentionDue(status.auth_retention_due, 0);
+    addRetentionDue(status.reconciliation_retention_from, HOT_RETENTION_MS);
+    addRetentionDue(status.terminal_retention_from, RECEIPT_RETENTION_MS);
+    const retentionDueAt = retentionDueCandidates.length > 0 ? Math.min(...retentionDueCandidates) : null;
+    const retentionScheduled = retentionDueAt !== null;
+    const dueCandidates: number[] = [];
+    if (status.inbound_pending !== 0) dueCandidates.push(nowMs);
+    if (status.outbound_due !== null) {
+      const due = Date.parse(status.outbound_due);
+      if (Number.isFinite(due)) dueCandidates.push(due);
+    }
+    if (replayPending) {
+      const due = Date.parse(status.replay_due!);
+      if (Number.isFinite(due)) dueCandidates.push(due);
+    }
+    if (marker.ack_pending_through > marker.ack_sent_through) dueCandidates.push((marker.ack_pending_at ?? nowMs) + usageProfileForEnv(this.env).ackCoalesceMs);
+    if (marker.realtime_pending !== 0) dueCandidates.push(marker.realtime_min_due_at ?? nowMs);
+    if (retentionDueAt !== null) dueCandidates.push(retentionDueAt);
+    const pending = status.inbound_pending !== 0
+      || status.outbound_due !== null
+      || replayPending
+      || retentionScheduled
+      || marker.realtime_pending !== 0
+      || marker.ack_pending_through > marker.ack_sent_through;
+    const minDueAt = pending && dueCandidates.length > 0 ? Math.min(...dueCandidates) : null;
+    const markerChanged = marker.pending !== (pending ? 1 : 0)
+      || marker.min_due_at !== minDueAt
+      || marker.retention_pending !== (retentionScheduled ? 1 : 0)
+      || marker.retention_due_at !== retentionDueAt;
+    if (markerChanged) {
+      this.ctx.storage.sql.exec(
+        "UPDATE room_work_marker SET pending=?,min_due_at=?,retention_pending=?,retention_due_at=?,updated_at=? WHERE singleton=1",
+        pending ? 1 : 0,
+        minDueAt,
+        retentionScheduled ? 1 : 0,
+        retentionDueAt,
+        nowIso(),
+      );
+    }
+
+    if (this.alarmActive) return;
+    const scheduled = await this.ctx.storage.getAlarm();
+    if (!pending) {
+      if (scheduled !== null) await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    if (minDueAt === null) return;
+    if (scheduled === null || minDueAt < scheduled) await this.ctx.storage.setAlarm(Math.max(Date.now() + 1, minDueAt));
+  }
+
+  private async projectAndSync(frame: NodeV1PostAuthFrame): Promise<void> {
+    // Projection can cross the D1 boundary and may yield while publishing a
+    // realtime event. Claim the durable inbox row first so an alarm waking at
+    // the same time as the websocket handler cannot project the same terminal
+    // receipt twice. `3` is an in-flight value local to this DO; failures put
+    // the row back to `0`, while the approval dead-letter path deliberately
+    // changes it to `2`.
+    const claimedAt = nowIso();
+    const staleBefore = new Date(Date.now() - PROJECTION_LEASE_MS).toISOString();
+    let claimed = false;
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("UPDATE inbound_frames SET projected=3,projection_claimed_at=? WHERE sequence=? AND (projected=0 OR (projected=3 AND (projection_claimed_at IS NULL OR projection_claimed_at<=?)))", claimedAt, Number(frame.sequence), staleBefore);
+      claimed = this.ctx.storage.sql.exec<{ changes: number }>("SELECT changes() AS changes").one().changes === 1;
+    });
+    if (!claimed) return;
+    try {
+      if (frame.type === "operation.approval_request") await this.projectApprovalOrDeadletter(frame);
+      else await this.project(frame);
+      this.ctx.storage.sql.exec("UPDATE inbound_frames SET projected=1,projection_claimed_at=NULL WHERE sequence=? AND projected=3 AND projection_claimed_at=?", Number(frame.sequence), claimedAt);
+    } catch (error) {
+      this.ctx.storage.sql.exec("UPDATE inbound_frames SET projected=0,projection_claimed_at=NULL WHERE sequence=? AND projected=3 AND projection_claimed_at=?", Number(frame.sequence), claimedAt);
+      throw error;
+    } finally {
+      await this.syncWorkMarker();
+    }
+  }
+
+  /**
+   * Refresh the D1 observation timestamp for an exact health replay without
+   * manufacturing a new node sequence or projection receipt. The original
+   * health frame already owns the receipt and its semantic state; a replay is
+   * only a fresh observation of that same state. A newer health sequence wins
+   * over an old replay, so this helper is deliberately a no-op in that case.
+   */
+  private async projectExactHealthCheckpoint(frame: Extract<NodeV1PostAuthFrame, { type: "device.health" }>): Promise<void> {
+    const device = await this.env.DB.prepare("SELECT connection_epoch,health_sequence FROM devices WHERE id=?1 AND status='active' LIMIT 1")
+      .bind(frame.deviceId)
+      .first<{ connection_epoch: string; health_sequence: string }>();
+    if (device === null || device.connection_epoch !== frame.connectionEpoch) {
+      throw new TypeError("stale_connection_epoch");
+    }
+    if (BigInt(device.health_sequence) !== BigInt(frame.sequence)) return;
+    const observedAt = nowIso();
+    await this.env.DB.prepare("UPDATE devices SET last_observed_at=?1,updated_at=?1 WHERE id=?2 AND status='active' AND connection_epoch=?3 AND health_sequence=?4")
+      .bind(observedAt, frame.deviceId, frame.connectionEpoch, frame.sequence)
+      .run();
+  }
+
+  private compactedThrough(direction: "control_to_node" | "node_to_control"): number {
+    return this.ctx.storage.sql.exec<RetentionCompactionRow>("SELECT * FROM transport_compaction WHERE direction=?", direction).toArray()[0]?.compacted_through ?? 0;
+  }
+
+  private isLatestUnacknowledgedAck(sequence: number): boolean {
+    const latest = this.ctx.storage.sql.exec<{ sequence: number | null }>(
+      "SELECT MAX(sequence) AS sequence FROM outbound_message_receipts WHERE kind='ack' AND state IN ('queued','sent')",
+    ).one().sequence;
+    return latest === sequence;
+  }
+
+  private async compactInboundFrames(now = Date.now()): Promise<number> {
+    const cutoff = new Date(now - HOT_RETENTION_MS).toISOString();
+    const projectionStaleAt = new Date(now - PROJECTION_LEASE_MS).toISOString();
+    const oldestUnprojected = this.ctx.storage.sql.exec<{ sequence: number | null }>("SELECT MIN(sequence) AS sequence FROM inbound_frames WHERE projected=0 OR (projected=3 AND (projection_claimed_at IS NULL OR projection_claimed_at<=?))", projectionStaleAt).one().sequence;
+    const retentionBatch = usageProfileForEnv(this.env).retentionBatchRows;
+    const rows = this.ctx.storage.sql.exec<{ sequence: number; payload_digest: string }>(
+      "SELECT sequence,payload_digest FROM inbound_frames WHERE projected IN (1,2) AND sequence<? AND NOT (kind='app' AND json_extract(frame_json,'$.type')='device.health' AND sequence=(SELECT MAX(sequence) FROM inbound_frames WHERE kind='app' AND json_extract(frame_json,'$.type')='device.health')) AND (created_at<=? OR sequence <= (SELECT COALESCE(MAX(sequence)-?,0) FROM inbound_frames WHERE projected IN (1,2))) ORDER BY sequence LIMIT ?",
+      oldestUnprojected ?? Number.MAX_SAFE_INTEGER,
+      cutoff,
+      MAX_INBOUND_FRAMES,
+      retentionBatch,
+    ).toArray();
+    if (rows.length === 0) return 0;
+    const current = this.ctx.storage.sql.exec<RetentionCompactionRow>("SELECT * FROM transport_compaction WHERE direction='node_to_control'").toArray()[0];
+    let compactedDigest = current?.compacted_digest ?? "";
+    for (const row of rows) compactedDigest = await sha256Hex(canonicalJson({ previous: compactedDigest, sequence: String(row.sequence), payloadDigest: row.payload_digest }));
+    const through = Math.max(current?.compacted_through ?? 0, ...rows.map((row) => row.sequence));
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM inbound_frames WHERE sequence IN (SELECT sequence FROM inbound_frames WHERE projected IN (1,2) AND sequence<? AND NOT (kind='app' AND json_extract(frame_json,'$.type')='device.health' AND sequence=(SELECT MAX(sequence) FROM inbound_frames WHERE kind='app' AND json_extract(frame_json,'$.type')='device.health')) AND (created_at<=? OR sequence <= (SELECT COALESCE(MAX(sequence)-?,0) FROM inbound_frames WHERE projected IN (1,2))) ORDER BY sequence LIMIT ?)", oldestUnprojected ?? Number.MAX_SAFE_INTEGER, cutoff, MAX_INBOUND_FRAMES, retentionBatch);
+      this.ctx.storage.sql.exec("UPDATE transport_compaction SET compacted_through=?,compacted_digest=?,updated_at=? WHERE direction='node_to_control'", through, compactedDigest, nowIso());
+      this.ctx.storage.sql.exec("UPDATE transport_positions SET retained_sequence=MAX(retained_sequence,?),projected_sequence=MAX(projected_sequence,?) WHERE direction='node_to_control'", through, through);
+    });
+    return rows.length;
+  }
+
+  private async compactOutboundReceipts(now = Date.now()): Promise<number> {
+    const nowIsoValue = new Date(now).toISOString();
+    const retentionBatch = usageProfileForEnv(this.env).retentionBatchRows;
+    const acknowledgedThrough = this.ctx.storage.sql.exec<{ acknowledged_sequence: number }>("SELECT acknowledged_sequence FROM transport_positions WHERE direction='control_to_node'").one().acknowledged_sequence;
+    const rows = this.ctx.storage.sql.exec<OutboundMessageTombstone>(
+      "SELECT message_id,correlation_id,payload_digest,sequence,kind,state,expires_at,created_at FROM outbound_message_receipts WHERE (state='acknowledged' AND updated_at<=?) OR (expires_at<=? AND NOT (kind='ack' AND state IN ('queued','sent') AND sequence=(SELECT MAX(sequence) FROM outbound_message_receipts WHERE kind='ack' AND state IN ('queued','sent')))) OR (kind='ack' AND state='sent' AND sequence<=?) OR (kind='ack' AND state IN ('queued','sent') AND sequence < (SELECT MAX(sequence) FROM outbound_message_receipts WHERE kind='ack' AND state IN ('queued','sent'))) ORDER BY updated_at,sequence LIMIT ?",
+      new Date(now - HOT_RETENTION_MS).toISOString(),
+      nowIsoValue,
+      acknowledgedThrough,
+      retentionBatch,
+    ).toArray();
+    if (rows.length === 0) return 0;
+    const current = this.ctx.storage.sql.exec<RetentionCompactionRow>("SELECT * FROM transport_compaction WHERE direction='control_to_node'").toArray()[0];
+    let compactedDigest = current?.compacted_digest ?? "";
+    for (const row of [...rows].sort((left, right) => left.sequence - right.sequence)) {
+      compactedDigest = await sha256Hex(canonicalJson({ previous: compactedDigest, sequence: String(row.sequence), payloadDigest: row.payload_digest }));
+    }
+    const through = Math.max(current?.compacted_through ?? 0, ...rows.map((row) => row.sequence));
+    this.ctx.storage.transactionSync(() => {
+      for (const row of rows) {
+        this.ctx.storage.sql.exec(
+          "INSERT OR REPLACE INTO outbound_message_tombstones(message_id,correlation_id,payload_digest,sequence,kind,state,expires_at,created_at) VALUES (?,?,?,?,?,?,?,?)",
+          row.message_id,
+          row.correlation_id,
+          row.payload_digest,
+          row.sequence,
+          row.kind,
+          row.state,
+          row.expires_at,
+          row.created_at,
+        );
+        this.ctx.storage.sql.exec("DELETE FROM outbound_message_receipts WHERE message_id=?", row.message_id);
+        this.ctx.storage.sql.exec("DELETE FROM outbound_frames WHERE message_id=? AND (expires_at<=? OR state='sent')", row.message_id, nowIsoValue);
+      }
+      this.ctx.storage.sql.exec("DELETE FROM outbound_message_tombstones WHERE rowid IN (SELECT rowid FROM outbound_message_tombstones ORDER BY created_at,message_id LIMIT (SELECT CASE WHEN COUNT(*)>? THEN COUNT(*)-? ELSE 0 END FROM outbound_message_tombstones))", MAX_OUTBOUND_TOMBSTONES, MAX_OUTBOUND_TOMBSTONES);
+      this.ctx.storage.sql.exec("UPDATE transport_compaction SET compacted_through=?,compacted_digest=?,updated_at=? WHERE direction='control_to_node'", through, compactedDigest, nowIso());
+      this.ctx.storage.sql.exec("UPDATE transport_positions SET retained_sequence=MAX(retained_sequence,?) WHERE direction='control_to_node'", through);
+    });
+    return rows.length;
+  }
+
+  private compactAuthChallenges(now = Date.now()): number {
+    const cutoff = new Date(now - HOT_RETENTION_MS).toISOString();
+    const nowValue = new Date(now).toISOString();
+    const result = this.ctx.storage.sql.exec<{ count: number }>(
+      "SELECT COUNT(*) AS count FROM auth_challenges WHERE expires_at<=? OR (consumed=1 AND expires_at<=?)",
+      nowValue,
+      cutoff,
+    ).one();
+    const over = this.ctx.storage.sql.exec<{ count: number }>("SELECT CASE WHEN COUNT(*)>? THEN COUNT(*)-? ELSE 0 END AS count FROM auth_challenges", MAX_AUTH_CHALLENGES, MAX_AUTH_CHALLENGES).one().count;
+    const limit = Math.min(usageProfileForEnv(this.env).retentionBatchRows, Math.max(result.count, over));
+    if (limit === 0) return 0;
+    // If an attacker or a crashed client leaves more than the local cap,
+    // evict the oldest challenge (consumed first). The evicted proof fails
+    // closed; keeping an unbounded set would turn challenge custody into a
+    // durable write amplifier.
+    this.ctx.storage.sql.exec("DELETE FROM auth_challenges WHERE rowid IN (SELECT rowid FROM auth_challenges WHERE expires_at<=? OR (consumed=1 AND expires_at<=?) OR ?>0 ORDER BY consumed DESC,expires_at,connection_id LIMIT ?)", nowValue, cutoff, over, limit);
+    return limit;
+  }
+
+  private compactReconciliationSessions(now = Date.now()): number {
+    const cutoff = new Date(now - HOT_RETENTION_MS).toISOString();
+    const currentEpoch = this.ctx.storage.sql.exec<{ epoch: number | null }>("SELECT epoch FROM connection_state WHERE singleton=1").toArray()[0]?.epoch ?? null;
+    const old = this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM reconciliation_sessions WHERE state='complete' AND created_at<=?", cutoff).one().count;
+    const over = this.ctx.storage.sql.exec<{ count: number }>("SELECT CASE WHEN COUNT(*)>? THEN COUNT(*)-? ELSE 0 END AS count FROM reconciliation_sessions WHERE epoch IS NOT ?", MAX_RECONCILIATION_SESSIONS, MAX_RECONCILIATION_SESSIONS, currentEpoch).one().count;
+    const limit = Math.min(usageProfileForEnv(this.env).retentionBatchRows, Math.max(old, over));
+    if (limit === 0) return 0;
+    this.ctx.storage.sql.exec("DELETE FROM reconciliation_sessions WHERE rowid IN (SELECT rowid FROM reconciliation_sessions WHERE (state='complete' AND created_at<=?) OR (epoch IS NOT ? AND ?>0) ORDER BY CASE WHEN state='complete' THEN 0 ELSE 1 END,created_at,id LIMIT ?)", cutoff, currentEpoch, over, limit);
+    return limit;
+  }
+
+  private compactTerminalReceipts(now = Date.now()): number {
+    const cutoff = new Date(now - RECEIPT_RETENTION_MS).toISOString();
+    const old = this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM terminal_receipt_cache WHERE created_at<=?", cutoff).one().count;
+    const over = this.ctx.storage.sql.exec<{ count: number }>("SELECT CASE WHEN COUNT(*)>? THEN COUNT(*)-? ELSE 0 END AS count FROM terminal_receipt_cache", MAX_TERMINAL_RECEIPTS, MAX_TERMINAL_RECEIPTS).one().count;
+    const limit = Math.min(usageProfileForEnv(this.env).retentionBatchRows, Math.max(old, over));
+    if (limit === 0) return 0;
+    this.ctx.storage.sql.exec("DELETE FROM terminal_receipt_cache WHERE rowid IN (SELECT rowid FROM terminal_receipt_cache ORDER BY created_at,operation_id LIMIT ?)", limit);
+    return limit;
+  }
+
+  private compactTombstones(): number {
+    const count = this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_message_tombstones").one().count;
+    const limit = Math.min(usageProfileForEnv(this.env).retentionBatchRows, Math.max(count - MAX_OUTBOUND_TOMBSTONES, 0));
+    if (limit === 0) return 0;
+    this.ctx.storage.sql.exec("DELETE FROM outbound_message_tombstones WHERE rowid IN (SELECT rowid FROM outbound_message_tombstones ORDER BY created_at,message_id LIMIT ?)", limit);
+    return limit;
+  }
+
+  private async runRetentionMaintenance(now = Date.now()): Promise<number> {
+    let removed = 0;
+    removed += await this.compactInboundFrames(now);
+    removed += await this.compactOutboundReceipts(now);
+    removed += this.compactAuthChallenges(now);
+    removed += this.compactReconciliationSessions(now);
+    removed += this.compactTerminalReceipts(now);
+    removed += this.compactTombstones();
+    return removed;
+  }
+
+  private async acknowledgeControlThrough(through: bigint): Promise<void> {
+    if (through < 0n || through > BigInt(Number.MAX_SAFE_INTEGER)) throw new TypeError("acknowledgement_out_of_range");
+    const position = this.ctx.storage.sql.exec<{ durable_sequence: number; acknowledged_sequence: number }>("SELECT durable_sequence,acknowledged_sequence FROM transport_positions WHERE direction='control_to_node'").one();
+    if (through > BigInt(position.durable_sequence)) throw new TypeError("acknowledgement_out_of_range");
+    if (through <= BigInt(position.acknowledged_sequence)) return;
+    const acknowledged = Number(through);
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("UPDATE transport_positions SET acknowledged_sequence=? WHERE direction='control_to_node'", acknowledged);
+      this.ctx.storage.sql.exec("UPDATE outbound_message_receipts SET state='acknowledged',updated_at=? WHERE sequence<=?", nowIso(), acknowledged);
+      this.ctx.storage.sql.exec("DELETE FROM outbound_frames WHERE sequence<=?", acknowledged);
+      this.ctx.storage.sql.exec("DELETE FROM control_replay_intents WHERE through_sequence<=?", acknowledged);
+    });
+  }
+
+  private async flushPendingAck(preferredSocket?: WebSocket, force = false): Promise<void> {
+    const marker = this.workMarker();
+    const receivePosition = this.ctx.storage.sql.exec<{ durable_sequence: number }>("SELECT durable_sequence FROM transport_positions WHERE direction='node_to_control'").one().durable_sequence;
+    const through = Math.max(marker.ack_pending_through, receivePosition);
+    if (through <= marker.ack_sent_through) {
+      if (marker.ack_pending_through !== 0 || marker.ack_pending_at !== null || marker.ack_message_id !== null) {
+        this.ctx.storage.sql.exec("UPDATE room_work_marker SET ack_pending_through=0,ack_pending_at=NULL,ack_message_id=NULL,updated_at=? WHERE singleton=1", nowIso());
+      }
+      return;
+    }
+    if (!force && marker.ack_pending_at !== null && marker.ack_pending_at + usageProfileForEnv(this.env).ackCoalesceMs > Date.now()) return;
+
+    let messageId = marker.ack_message_id;
+    let existing = messageId === null
+      ? undefined
+      : this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE message_id=?", messageId).toArray()[0];
+    if (existing !== undefined && existing.state === "sent") {
+      // A sent ACK already covers this watermark only when the durable marker
+      // was advanced with the send. Allocate a fresh identity for a newer one.
+      messageId = null;
+      existing = undefined;
+    }
+    if (messageId !== null && existing === undefined) {
+      // The previous ACK may have been frontier-pruned (or acknowledged by a
+      // reconciliation update) while its marker update was still in flight.
+      // Never reuse that durable identity for a different throughSequence.
+      const priorReceipt = this.ctx.storage.sql.exec<StoredDispatchReceipt>("SELECT * FROM outbound_message_receipts WHERE message_id=?", messageId).toArray()[0];
+      const priorTombstone = this.ctx.storage.sql.exec<OutboundMessageTombstone>("SELECT * FROM outbound_message_tombstones WHERE message_id=?", messageId).toArray()[0];
+      if (priorReceipt !== undefined || priorTombstone !== undefined) messageId = null;
+    }
+    if (messageId === null) {
+      messageId = newId("cmsg_ack");
+      this.ctx.storage.sql.exec("UPDATE room_work_marker SET ack_message_id=?,updated_at=? WHERE singleton=1", messageId, nowIso());
+    }
+
+    const payload = { direction: "node_to_control", throughSequence: String(through) };
+    if (existing !== undefined && existing.state === "queued") {
+      const digest = await sha256Hex(canonicalJson(payload));
+      const parsed = JSON.parse(existing.frame_json) as Record<string, unknown>;
+      const previousPayload = parsed.payload;
+      const previousThrough = previousPayload !== null && typeof previousPayload === "object" && !Array.isArray(previousPayload) && typeof (previousPayload as Record<string, unknown>).throughSequence === "string"
+        ? BigInt((previousPayload as Record<string, unknown>).throughSequence as string)
+        : 0n;
+      if (previousThrough < BigInt(through)) {
+        parsed.payload = payload;
+        parsed.payloadDigest = digest;
+        this.ctx.storage.transactionSync(() => {
+          const ackExpiresAt = new Date(Date.now() + ACK_RETENTION_MS).toISOString();
+          this.ctx.storage.sql.exec("UPDATE outbound_frames SET payload_digest=?,frame_json=?,expires_at=? WHERE message_id=? AND state='queued'", digest, JSON.stringify(parsed), ackExpiresAt, messageId);
+          this.ctx.storage.sql.exec("UPDATE outbound_message_receipts SET payload_digest=?,expires_at=?,updated_at=? WHERE message_id=? AND state='queued'", digest, ackExpiresAt, nowIso(), messageId);
+        });
+        existing = this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE message_id=?", messageId).toArray()[0];
+      }
+    }
+    const delivery = existing === undefined
+      ? await this.enqueueControlFrame("transport.ack", payload, undefined, new Date(Date.now() + ACK_RETENTION_MS).toISOString(), preferredSocket, messageId)
+      : { sequence: String(existing.sequence), delivered: await this.sendStoredFrame(existing, preferredSocket) };
+    if (!delivery.delivered) {
+      this.notePending(Date.now() + 30_000);
+      await this.syncWorkMarker();
+    }
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -132,6 +734,17 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     if (attachment.stage === "new") { await this.hello(ws, attachment, body); return; }
     if (attachment.stage === "challenged") { await this.authenticate(ws, attachment, body); return; }
     await this.acceptFrame(ws, attachment, body);
+  }
+
+  override async webSocketClose(): Promise<void> {
+    // Replay intents are intentionally quiet while a current socket is
+    // connected. Reconcile the marker after disconnect so the same durable
+    // intent gets one retry alarm without requiring a periodic keepalive.
+    await this.syncWorkMarker();
+  }
+
+  override async webSocketError(): Promise<void> {
+    await this.syncWorkMarker();
   }
 
   private async hello(ws: WebSocket, attachment: SocketAttachment, body: Record<string, unknown>): Promise<void> {
@@ -178,7 +791,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     const controlStored = positions.find((item) => item.direction === "control_to_node")?.durable_sequence ?? 0;
     const nodeStored = positions.find((item) => item.direction === "node_to_control")?.durable_sequence ?? 0;
     ws.send(JSON.stringify({ type: "transport.accepted", connectionId: attachment.connectionId, deviceId: attachment.deviceId, connectionEpoch: String(epoch), selectedProtocol: attachment.selectedProtocol, controlNextSequence: String(controlStored + 1), nodeStoredThroughSequence: String(nodeStored), reconciliationRequired: true }));
-    await this.scheduleOutboxAlarm(Date.now() + 1_000);
+    await this.syncWorkMarker();
   }
 
   private async acceptFrame(ws: WebSocket, attachment: SocketAttachment, body: Record<string, unknown>): Promise<void> {
@@ -189,6 +802,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     const digest = await sha256Hex(canonicalJson(body.payload));
     if (digest !== body.payloadDigest) { ws.close(1008, "payload_digest_mismatch"); return; }
     const sequence = BigInt(body.sequence);
+    if (sequence < 1n || sequence > BigInt(Number.MAX_SAFE_INTEGER)) { ws.close(1008, "sequence_out_of_range"); return; }
     const position = this.ctx.storage.sql.exec<{ durable_sequence: number }>("SELECT durable_sequence FROM transport_positions WHERE direction='node_to_control'").one().durable_sequence;
     if (sequence <= BigInt(position)) {
       const prior = this.ctx.storage.sql.exec<{ message_id: string; payload_digest: string; frame_json: string; projected: number }>("SELECT message_id,payload_digest,frame_json,projected FROM inbound_frames WHERE sequence=?", Number(sequence)).toArray()[0];
@@ -197,52 +811,107 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
           const intent = this.ctx.storage.sql.exec<StoredControlReplayIntent>("SELECT * FROM control_replay_intents WHERE request_sequence=? AND request_message_id=?", Number(sequence), body.messageId).toArray()[0];
           if (intent !== undefined) await this.dispatchControlReplayIntent(intent, ws);
         }
-        if (prior.projected === 0) {
-          const persisted = parseWireDocumentText(schemaIds.nodeV1, prior.frame_json);
-          if ("protocol" in persisted) {
-            if (persisted.type === "operation.approval_request") await this.projectApprovalOrDeadletter(persisted);
-            else if (persisted.type === "operation.terminal") await this.project(persisted);
-            else this.ctx.waitUntil(this.project(persisted));
+        const persisted = parseWireDocumentText(schemaIds.nodeV1, prior.frame_json);
+        if ("protocol" in persisted) {
+          if (body.type === "device.health") {
+            // Node health checkpoints may intentionally replay the last exact
+            // frame instead of allocating a fresh transport sequence. Such a
+            // replay is already in custody: do not append an inbound row,
+            // advance the receive frontier, or emit another ACK. Only refresh
+            // the D1 observation after the bounded semantic checkpoint.
+            const persistedHealth = persisted as Extract<NodeV1PostAuthFrame, { type: "device.health" }>;
+            const priorAck = this.ctx.storage.sql.exec<StoredOutboundFrame>(
+              "SELECT * FROM outbound_frames WHERE kind='ack' AND state IN ('queued','sent') AND json_extract(frame_json,'$.payload.direction')='node_to_control' AND json_extract(frame_json,'$.payload.throughSequence')=? ORDER BY sequence DESC LIMIT 1",
+              body.sequence,
+            ).toArray()[0];
+            if (priorAck !== undefined) this.resendStoredAckWithoutMutation(priorAck, ws);
+            if (prior.projected === 0 || prior.projected === 3) {
+              this.notePending(Date.now());
+              await this.projectAndSync(persistedHealth);
+            } else if (this.shouldProjectHealth(persistedHealth)) {
+              await this.projectExactHealthCheckpoint(persistedHealth);
+              this.setHealthMarker(this.healthSemantic(persistedHealth), Date.now());
+            }
+          } else if (prior.projected === 0 || prior.projected === 3) {
+            this.notePending(Date.now());
+            this.ctx.waitUntil(this.projectAndSync(persisted));
           }
         }
-        if (body.type !== "transport.ack") await this.enqueueControlFrame("transport.ack", { direction: "node_to_control", throughSequence: String(position) }, undefined, new Date(Date.now() + 300_000).toISOString(), ws);
+        if (body.type !== "transport.ack" && body.type !== "device.health") {
+          this.noteAckPending(Number(sequence), ACK_IMMEDIATE_TYPES.has(body.type as NodeV1PostAuthFrame["type"]));
+          await this.flushPendingAck(ws, ACK_IMMEDIATE_TYPES.has(body.type as NodeV1PostAuthFrame["type"]));
+        }
+        await this.syncWorkMarker();
+        return;
+      }
+      if (sequence <= BigInt(this.compactedThrough("node_to_control"))) {
+        await this.enqueueControlFrame("transport.error", {
+          code: "reconciliation_required",
+          retryable: true,
+          retryAfterMs: 1_000,
+          details: { direction: "node_to_control", sequence: body.sequence, reason: "duplicate_retention_expired" },
+        }, undefined, new Date(Date.now() + 300_000).toISOString(), ws, `cmsg_reconciliation_required_${body.sequence}`);
+        await this.syncWorkMarker();
         return;
       }
       ws.close(1008, "sequence_conflict"); return;
     }
-    if (sequence !== BigInt(position) + 1n) { await this.enqueueControlFrame("transport.replay_required", { direction: "node_to_control", expectedSequence: String(position + 1), receivedSequence: String(sequence) }, undefined, new Date(Date.now() + 300_000).toISOString(), ws); return; }
+    if (sequence !== BigInt(position) + 1n) {
+      await this.enqueueControlFrame("transport.replay_required", { direction: "node_to_control", expectedSequence: String(position + 1), receivedSequence: String(sequence) }, undefined, new Date(Date.now() + 300_000).toISOString(), ws);
+      await this.syncWorkMarker();
+      return;
+    }
     const frame = body as unknown as NodeV1PostAuthFrame;
     const replay = frame.type === "transport.replay_required" ? await this.validateControlReplayRequest(ws, frame) : undefined;
     if (frame.type === "transport.replay_required" && replay === null) return;
-    if (replay !== undefined && replay !== null) await this.scheduleOutboxAlarm(Date.now() + 1_000);
+    const payloadAppliedThrough = frame.type === "device.health" ? frame.payload.controlAppliedThrough : undefined;
+    if (frame.controlAppliedThrough !== undefined && payloadAppliedThrough !== undefined && frame.controlAppliedThrough !== payloadAppliedThrough) {
+      ws.close(1008, "reconciliation_position_invalid"); return;
+    }
+    const controlAppliedThrough = frame.controlAppliedThrough ?? payloadAppliedThrough;
+    if (controlAppliedThrough !== undefined) {
+      const applied = BigInt(controlAppliedThrough);
+      const controlStored = this.ctx.storage.sql.exec<{ durable_sequence: number }>("SELECT durable_sequence FROM transport_positions WHERE direction='control_to_node'").one().durable_sequence;
+      if (applied > BigInt(controlStored) || applied > BigInt(Number.MAX_SAFE_INTEGER)) { ws.close(1008, "reconciliation_position_invalid"); return; }
+    }
+    const healthProject = frame.type === "device.health" ? this.shouldProjectHealth(frame) : true;
+    const inlineProjection = frame.type === "operation.approval_request" || frame.type === "operation.terminal" || frame.type === "device.health";
     this.ctx.storage.transactionSync(() => {
-      this.ctx.storage.sql.exec("INSERT INTO inbound_frames(sequence,message_id,correlation_id,payload_digest,frame_json,created_at) VALUES (?,?,?,?,?,?)", Number(sequence), frame.messageId, frame.correlationId ?? null, frame.payloadDigest, JSON.stringify(frame), nowIso());
+      const projected = frame.type === "transport.ack" || (frame.type === "device.health" && !healthProject) ? 1 : 0;
+      this.ctx.storage.sql.exec("INSERT INTO inbound_frames(sequence,message_id,correlation_id,payload_digest,frame_json,projected,kind,created_at) VALUES (?,?,?,?,?,?,?,?)", Number(sequence), frame.messageId, frame.correlationId ?? null, frame.payloadDigest, JSON.stringify(frame), projected, frame.type === "transport.ack" ? "ack" : "app", nowIso());
       this.ctx.storage.sql.exec("UPDATE transport_positions SET durable_sequence=? WHERE direction='node_to_control'", Number(sequence));
+      if (projected === 0) this.notePending(Date.now());
+      if (frame.type !== "transport.ack" && frame.type !== "device.health") this.noteAckPending(Number(sequence), ACK_IMMEDIATE_TYPES.has(frame.type));
       if (replay !== undefined && replay !== null) this.ctx.storage.sql.exec("INSERT INTO control_replay_intents(request_sequence,request_message_id,from_sequence,through_sequence,next_attempt_at,created_at) VALUES (?,?,?,?,?,?)", replay.intent.request_sequence, replay.intent.request_message_id, replay.intent.from_sequence, replay.intent.through_sequence, replay.intent.next_attempt_at, nowIso());
       if (frame.type === "operation.terminal" && typeof frame.payload.operationId === "string" && typeof frame.payload.requestDigest === "string") this.ctx.storage.sql.exec("INSERT OR REPLACE INTO terminal_receipt_cache(operation_id,request_digest,receipt_json,created_at) VALUES (?,?,?,?)", frame.payload.operationId, frame.payload.requestDigest, JSON.stringify(frame.payload), nowIso());
+      if (frame.type === "device.health" && healthProject) this.ctx.storage.sql.exec("UPDATE room_work_marker SET health_semantic_json=?,updated_at=? WHERE singleton=1", this.healthSemantic(frame), nowIso());
     });
-    await this.scheduleOutboxAlarm(Date.now() + 1_000);
     if (frame.type === "reconcile.summary") await this.planReconciliation(ws, attachment, frame);
     if (frame.type === "reconcile.complete") await this.completeReconciliation(ws, attachment, frame);
     if (replay !== undefined && replay !== null) await this.dispatchControlReplayIntent(replay.intent, ws, replay.frames);
-    if (frame.type === "operation.approval_request") {
-      await this.projectApprovalOrDeadletter(frame);
+    if (frame.type === "operation.approval_request") await this.projectAndSync(frame);
+    if (frame.type === "operation.terminal") await this.projectAndSync(frame);
+    if (frame.type === "device.health" && healthProject) {
+      await this.projectAndSync(frame);
+      this.setHealthMarker(this.healthSemantic(frame), Date.now());
     }
-    if (frame.type === "operation.terminal") await this.project(frame);
+    if (controlAppliedThrough !== undefined) {
+      try { await this.acknowledgeControlThrough(BigInt(controlAppliedThrough)); }
+      catch { ws.close(1008, "reconciliation_position_invalid"); return; }
+    }
     if (frame.type === "transport.ack") {
-      const acknowledged = BigInt(frame.payload.throughSequence);
-      const controlPosition = this.ctx.storage.sql.exec<{ durable_sequence: number; acknowledged_sequence: number }>("SELECT durable_sequence,acknowledged_sequence FROM transport_positions WHERE direction='control_to_node'").one();
-      if (acknowledged > BigInt(controlPosition.durable_sequence)) { ws.close(1008, "acknowledgement_out_of_range"); return; }
-      if (acknowledged > BigInt(controlPosition.acknowledged_sequence)) this.ctx.storage.transactionSync(() => {
-        this.ctx.storage.sql.exec("UPDATE transport_positions SET acknowledged_sequence=? WHERE direction='control_to_node'", Number(acknowledged));
-        this.ctx.storage.sql.exec("UPDATE outbound_message_receipts SET state='acknowledged',updated_at=? WHERE sequence<=?", nowIso(), Number(acknowledged));
-        this.ctx.storage.sql.exec("DELETE FROM outbound_frames WHERE sequence<=?", Number(acknowledged));
-        this.ctx.storage.sql.exec("DELETE FROM control_replay_intents WHERE through_sequence<=?", Number(acknowledged));
-      });
+      try { await this.acknowledgeControlThrough(BigInt(frame.payload.throughSequence)); }
+      catch { ws.close(1008, "acknowledgement_out_of_range"); return; }
     } else {
-      await this.enqueueControlFrame("transport.ack", { direction: "node_to_control", throughSequence: frame.sequence }, undefined, new Date(Date.now() + 300_000).toISOString(), ws);
+      await this.flushPendingAck(ws, frame.type === "device.health" || ACK_IMMEDIATE_TYPES.has(frame.type));
     }
-    if (frame.type !== "operation.approval_request" && frame.type !== "operation.terminal") this.ctx.waitUntil(this.project(frame));
+    // event.batch is deliberately left in the DO inbox for the bounded alarm
+    // worker. That path commits the whole batch in one ingestion operation (or
+    // emits one Queue envelope in queue mode) after custody is durable.
+    if (!inlineProjection && frame.type !== "transport.ack" && frame.type !== "event.batch") {
+      this.ctx.waitUntil(this.projectAndSync(frame));
+    }
+    await this.syncWorkMarker();
   }
 
   private async validateControlReplayRequest(ws: WebSocket, frame: Extract<NodeV1PostAuthFrame, { type: "transport.replay_required" }>): Promise<ValidatedControlReplay | null> {
@@ -256,10 +925,32 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     const chunkThrough = through < chunkEnd ? through : chunkEnd;
     const chunkLength = Number(chunkThrough - expected + 1n);
     const rows = this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE sequence BETWEEN ? AND ? ORDER BY sequence", Number(expected), Number(chunkThrough)).toArray();
-    if (rows.length !== chunkLength) { ws.close(1011, "replay_range_unavailable"); return null; }
+    if (rows.length !== chunkLength) {
+      if (expected <= BigInt(this.compactedThrough("control_to_node"))) {
+        await this.enqueueControlFrame("transport.error", {
+          code: "reconciliation_required",
+          retryable: true,
+          retryAfterMs: 1_000,
+          details: { direction: "control_to_node", expectedSequence: String(expected), throughSequence: String(through), reason: "replay_retention_expired" },
+        }, frame.correlationId, new Date(Date.now() + 300_000).toISOString(), ws, `cmsg_replay_retention_${String(expected)}_${String(through)}`);
+        return null;
+      }
+      ws.close(1011, "replay_range_unavailable"); return null;
+    }
     if (chunkThrough < through) {
       const sentinel = this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE sequence=?", Number(through)).toArray()[0];
-      if (sentinel === undefined) { ws.close(1011, "replay_range_unavailable"); return null; }
+      if (sentinel === undefined) {
+        if (through <= BigInt(this.compactedThrough("control_to_node"))) {
+          await this.enqueueControlFrame("transport.error", {
+            code: "reconciliation_required",
+            retryable: true,
+            retryAfterMs: 1_000,
+            details: { direction: "control_to_node", expectedSequence: String(expected), throughSequence: String(through), reason: "replay_retention_expired" },
+          }, frame.correlationId, new Date(Date.now() + 300_000).toISOString(), ws, `cmsg_replay_retention_${String(expected)}_${String(through)}`);
+          return null;
+        }
+        ws.close(1011, "replay_range_unavailable"); return null;
+      }
       rows.push(sentinel);
     }
     for (let index = 0; index < rows.length; index += 1) {
@@ -269,12 +960,14 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       if (persisted === null || typeof persisted !== "object" || Array.isArray(persisted)) { ws.close(1011, "replay_record_invalid"); return null; }
       const wire = persisted as Record<string, unknown>;
       const expectedSequence = index < chunkLength ? expected + BigInt(index) : through;
-      if (!Number.isSafeInteger(row.sequence) || BigInt(row.sequence) !== expectedSequence || !["queued", "sent"].includes(row.state) || wire.protocol !== "conduit.node/1" || wire.direction !== "control_to_node" || wire.sequence !== String(expectedSequence) || wire.messageId !== row.message_id || (wire.correlationId ?? null) !== row.correlation_id || wire.payloadDigest !== row.payload_digest || wire.payload === null || typeof wire.payload !== "object" || Array.isArray(wire.payload) || await sha256Hex(canonicalJson(wire.payload)) !== row.payload_digest || Date.parse(row.expires_at) <= Date.now()) {
+      const expired = Date.parse(row.expires_at) <= Date.now();
+      const retainedLatestAck = row.kind === "ack" && this.isLatestUnacknowledgedAck(row.sequence);
+      if (!Number.isSafeInteger(row.sequence) || BigInt(row.sequence) !== expectedSequence || !["queued", "sent"].includes(row.state) || wire.protocol !== "conduit.node/1" || wire.direction !== "control_to_node" || wire.sequence !== String(expectedSequence) || wire.messageId !== row.message_id || (wire.correlationId ?? null) !== row.correlation_id || wire.payloadDigest !== row.payload_digest || wire.payload === null || typeof wire.payload !== "object" || Array.isArray(wire.payload) || await sha256Hex(canonicalJson(wire.payload)) !== row.payload_digest || (expired && !retainedLatestAck)) {
         ws.close(1011, "replay_record_invalid"); return null;
       }
     }
     return {
-      intent: { request_sequence: Number(frame.sequence), request_message_id: frame.messageId, from_sequence: Number(expected), through_sequence: Number(through), attempt_count: 0, next_attempt_at: nowIso() },
+      intent: { request_sequence: Number(frame.sequence), request_message_id: frame.messageId, from_sequence: Number(expected), through_sequence: Number(through), attempt_count: 0, next_attempt_at: nowIso(), lease_token: null, lease_expires_at: null },
       frames: rows,
     };
   }
@@ -295,16 +988,41 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
   }
 
   private async dispatchControlReplayIntent(intent: StoredControlReplayIntent, socket?: WebSocket, validatedFrames?: StoredOutboundFrame[]): Promise<void> {
+    const now = Date.now();
+    const leaseToken = newId("replay_lease");
+    const leaseExpiresAt = new Date(now + 30_000).toISOString();
+    let claimed = false;
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec(
+        "UPDATE control_replay_intents SET attempt_count=attempt_count+1,lease_token=?,lease_expires_at=? WHERE request_sequence=? AND next_attempt_at<=? AND (lease_token IS NULL OR lease_expires_at<=?)",
+        leaseToken,
+        leaseExpiresAt,
+        intent.request_sequence,
+        new Date(now).toISOString(),
+        new Date(now).toISOString(),
+      );
+      claimed = this.ctx.storage.sql.exec<{ changes: number }>("SELECT changes() AS changes").one().changes === 1;
+    });
+    if (!claimed) return;
+    const claimedIntent = this.ctx.storage.sql.exec<StoredControlReplayIntent>("SELECT * FROM control_replay_intents WHERE request_sequence=? AND lease_token=?", intent.request_sequence, leaseToken).toArray()[0];
+    if (claimedIntent === undefined) return;
     let frames: StoredOutboundFrame[];
-    try { frames = validatedFrames ?? this.controlReplayFrames(intent); } catch {
-      this.ctx.storage.sql.exec("DELETE FROM control_replay_intents WHERE request_sequence=?", intent.request_sequence);
+    try { frames = validatedFrames ?? this.controlReplayFrames(claimedIntent); } catch {
+      this.ctx.storage.sql.exec("DELETE FROM control_replay_intents WHERE request_sequence=? AND lease_token=?", intent.request_sequence, leaseToken);
+      await this.syncWorkMarker();
       return;
     }
-    for (const frame of frames) await this.sendStoredFrame(frame, socket);
-    const attempts = intent.attempt_count + 1;
-    const delay = Math.min(60_000, 2 ** Math.min(attempts, 6) * 1_000);
+    let allDelivered = true;
+    for (const frame of frames) allDelivered = (await this.sendStoredFrame(frame, socket)) && allDelivered;
+    const attempts = claimedIntent.attempt_count;
+    // A successful replay does not need a tight alarm loop: the node's
+    // cumulative ACK/reconciliation frontier is the durable confirmation.
+    // Keep a slower recovery retry for a disconnect between send and ACK, and
+    // use the normal exponential backoff when any frame could not be sent.
+    const delay = allDelivered ? 60_000 : Math.min(60_000, 2 ** Math.min(attempts, 6) * 1_000);
     const next = new Date(Date.now() + delay).toISOString();
-    this.ctx.storage.sql.exec("UPDATE control_replay_intents SET attempt_count=?,next_attempt_at=? WHERE request_sequence=?", attempts, next, intent.request_sequence);
+    this.ctx.storage.sql.exec("UPDATE control_replay_intents SET next_attempt_at=?,lease_token=NULL,lease_expires_at=NULL WHERE request_sequence=? AND lease_token=?", next, intent.request_sequence, leaseToken);
+    this.notePending(Date.parse(next));
     await this.scheduleOutboxAlarm(Date.parse(next));
   }
 
@@ -313,26 +1031,20 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     const summary = frame.payload;
     const controlStored = this.ctx.storage.sql.exec<{ durable_sequence: number }>("SELECT durable_sequence FROM transport_positions WHERE direction='control_to_node'").one().durable_sequence;
     const applied = BigInt(summary.lastControlSequenceApplied);
-    if (applied > BigInt(controlStored)) { ws.close(1008, "reconciliation_position_invalid"); return; }
+    const nodeStored = this.ctx.storage.sql.exec<{ durable_sequence: number }>("SELECT durable_sequence FROM transport_positions WHERE direction='node_to_control'").one().durable_sequence;
+    const observedNodeAck = BigInt(summary.lastNodeSequenceAcknowledged);
+    if (applied > BigInt(controlStored) || observedNodeAck > BigInt(nodeStored) || applied > BigInt(Number.MAX_SAFE_INTEGER) || observedNodeAck > BigInt(Number.MAX_SAFE_INTEGER)) { ws.close(1008, "reconciliation_position_invalid"); return; }
+    await this.acknowledgeControlThrough(applied);
+    if (observedNodeAck > 0n) this.ctx.storage.sql.exec("UPDATE transport_positions SET acknowledged_sequence=MAX(acknowledged_sequence,?) WHERE direction='node_to_control'", Number(observedNodeAck));
     const controlReplay = applied < BigInt(controlStored) ? [{ from: String(applied + 1n), through: String(controlStored) }] : [];
-    const eventReplay: Array<{ runId: string; from: string; through: string }> = [];
-    for (const range of summary.retainedEventRanges.slice(0, 512)) {
-      const local = await this.env.DB.prepare("SELECT last_sequence FROM trace_indexes WHERE run_id=?1 LIMIT 1").bind(range.runId).first<{ last_sequence: string }>();
-      const next = local === null ? BigInt(range.fromSequence) : BigInt(local.last_sequence) + 1n;
-      const floor = BigInt(range.fromSequence);
-      const from = next > floor ? next : floor;
-      if (from <= BigInt(range.throughSequence)) eventReplay.push({ runId: range.runId, from: String(from), through: range.throughSequence });
-    }
-    const statusRunIds: string[] = [];
-    const cancelOperationIds: string[] = [];
-    const quarantineRunIds: string[] = [];
-    for (const run of summary.runs.slice(0, 256)) {
-      const intended = await this.env.DB.prepare("SELECT payload_digest,state FROM operation_journal WHERE id=?1 LIMIT 1").bind(run.operationId).first<{ payload_digest: string; state: string }>();
-      if (intended === null || intended.payload_digest !== run.requestDigest) quarantineRunIds.push(run.runId);
-      else if (intended.state === "cancelled") cancelOperationIds.push(run.operationId);
-      else if (!["completed", "failed", "cancelled", "expired", "rejected"].includes(intended.state)) statusRunIds.push(run.runId);
-    }
-    const payload = { reconciliationId: attachment.reconciliationId, controlReplay, nodeReplay: [], eventReplay, statusRunIds: [...new Set(statusRunIds)], cancelOperationIds: [...new Set(cancelOperationIds)], quarantineRunIds: [...new Set(quarantineRunIds)] };
+    // Resolve the bounded summary sets with the two json_each joins. This is
+    // the same maximum-size path used by reconciliation-set tests and avoids
+    // one D1 round trip per run/range during a reconnect storm.
+    const setPlan = await planReconciliationSets(this.env, {
+      retainedEventRanges: summary.retainedEventRanges.slice(0, 512),
+      runs: summary.runs.slice(0, 256),
+    });
+    const payload = { reconciliationId: attachment.reconciliationId, controlReplay, nodeReplay: [], eventReplay: setPlan.eventReplay, statusRunIds: setPlan.statusRunIds, cancelOperationIds: setPlan.cancelOperationIds, quarantineRunIds: setPlan.quarantineRunIds };
     const delivery = await this.enqueueControlFrame("reconcile.plan", payload, attachment.reconciliationId, new Date(Date.now() + 300_000).toISOString(), ws);
     this.ctx.storage.sql.exec("UPDATE reconciliation_sessions SET state='plan_sent',summary_json=?,plan_json=? WHERE id=? AND epoch=?", JSON.stringify(summary), JSON.stringify({ payload, planSequence: delivery.sequence }), attachment.reconciliationId, Number(attachment.epoch));
     this.ctx.storage.sql.exec("UPDATE connection_state SET reconciliation_state='plan_sent',updated_at=? WHERE singleton=1", nowIso());
@@ -346,11 +1058,15 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     const positions = this.ctx.storage.sql.exec<{ direction: string; durable_sequence: number }>("SELECT direction,durable_sequence FROM transport_positions").toArray();
     const controlStored = positions.find((item) => item.direction === "control_to_node")?.durable_sequence ?? 0;
     const nodeStored = positions.find((item) => item.direction === "node_to_control")?.durable_sequence ?? 0;
-    if (BigInt(frame.payload.lastControlSequenceApplied) < BigInt(plan.planSequence) || BigInt(frame.payload.lastControlSequenceApplied) > BigInt(controlStored) || BigInt(frame.payload.lastNodeSequenceAcknowledged) > BigInt(nodeStored) || frame.payload.unresolvedRunIds.length > 0) {
+    const lastControlApplied = BigInt(frame.payload.lastControlSequenceApplied);
+    const lastNodeAcknowledged = BigInt(frame.payload.lastNodeSequenceAcknowledged);
+    if (lastControlApplied < BigInt(plan.planSequence) || lastControlApplied > BigInt(controlStored) || lastNodeAcknowledged > BigInt(nodeStored) || lastControlApplied > BigInt(Number.MAX_SAFE_INTEGER) || lastNodeAcknowledged > BigInt(Number.MAX_SAFE_INTEGER) || frame.payload.unresolvedRunIds.length > 0) {
       this.ctx.storage.sql.exec("UPDATE reconciliation_sessions SET state='review_required' WHERE id=?", attachment.reconciliationId);
       await this.enqueueControlFrame("transport.error", { code: "reconciliation_incomplete", retryable: true }, attachment.reconciliationId, new Date(Date.now() + 300_000).toISOString(), ws);
       return;
     }
+    await this.acknowledgeControlThrough(lastControlApplied);
+    if (lastNodeAcknowledged > 0n) this.ctx.storage.sql.exec("UPDATE transport_positions SET acknowledged_sequence=MAX(acknowledged_sequence,?) WHERE direction='node_to_control'", Number(lastNodeAcknowledged));
     this.ctx.storage.transactionSync(() => {
       this.ctx.storage.sql.exec("UPDATE reconciliation_sessions SET state='complete',completed_at=? WHERE id=?", nowIso(), attachment.reconciliationId);
       this.ctx.storage.sql.exec("UPDATE connection_state SET reconciliation_state='complete',updated_at=? WHERE singleton=1", nowIso());
@@ -490,12 +1206,16 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
         }
       }
     }
-    if (frame.type === "event.batch" && Array.isArray(frame.payload.events)) {
-      for (const event of frame.payload.events.slice(0, 128)) {
-        if (event !== null && typeof event === "object" && !Array.isArray(event)) await this.env.EVENT_INGESTION.send(event as QueueEventMessage, { contentType: "json" });
-      }
+    if (frame.type === "event.batch") {
+      const parsed = parseEventBatch(frame, frame.messageId);
+      if (parsed === null) throw new TypeError("event batch payload is invalid");
+      // The Device inbox row is already durable before this hook runs. The
+      // free profile commits the whole bounded node batch from that custody;
+      // Queue mode sends exactly one queue envelope for the node batch (with
+      // the producer's byte/count safeguards applied by the adapter).
+      if (eventIngestionMode(this.env) === "queue") await enqueueEventBatch(this.env, parsed.batch);
+      else await commitDurableInboxBatch(this.env, parsed.batch, { messageId: frame.messageId });
     }
-    this.ctx.storage.sql.exec("UPDATE inbound_frames SET projected=1 WHERE sequence=?", Number(frame.sequence));
   }
 
   private async projectControlTransportError(frame: Extract<NodeV1PostAuthFrame, { type: "transport.error" }>): Promise<void> {
@@ -558,8 +1278,13 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
   }
 
   private async publishProjection(deviceId: string, event: NodeProjectionEvent): Promise<void> {
+    // Set the local wake-up marker before crossing the D1 boundary. If the
+    // isolate is evicted after D1 custody but before the publisher returns,
+    // the next alarm still knows that reconciliation is required.
+    this.noteRealtimePending(deviceId, Date.now());
     const result = await queueRealtimeProjection(this.env, deviceId, event);
-    if (result.state === "pending" && result.nextAttemptAt !== undefined) await this.scheduleOutboxAlarm(Date.parse(result.nextAttemptAt));
+    this.setRealtimeResult(deviceId, result.state === "pending" ? result.nextAttemptAt ?? null : null);
+    await this.syncWorkMarker();
   }
 
   private async projectApprovalOrDeadletter(frame: Extract<NodeV1PostAuthFrame, { type: "operation.approval_request" }>): Promise<void> {
@@ -570,7 +1295,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       const reason = error instanceof Error ? error.message.slice(0, 192) : "approval_projection_failed";
       await this.env.DB.prepare("INSERT INTO security_events(id,event_type,device_id,metadata_json,created_at) VALUES (?1,'agent_approval.invalid_request',?2,?3,?4)")
         .bind(newId("sevt"), frame.deviceId, JSON.stringify({ approvalId: frame.payload.approvalId, operationId: frame.payload.operationId, reason }), nowIso()).run();
-      this.ctx.storage.sql.exec("UPDATE inbound_frames SET projected=2 WHERE sequence=?", Number(frame.sequence));
+      this.ctx.storage.sql.exec("UPDATE inbound_frames SET projected=2,projection_claimed_at=NULL WHERE sequence=?", Number(frame.sequence));
     }
   }
 
@@ -587,6 +1312,14 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     if (receipt !== undefined) {
       if (receipt.payload_digest !== payloadDigest || receipt.correlation_id !== (correlationId ?? null)) throw new TypeError("control message id is bound to another payload");
       return { sequence: String(receipt.sequence), delivered: receipt.state === "acknowledged" || receipt.state === "sent" };
+    }
+    const tombstone = suppliedMessageId === undefined ? undefined : this.ctx.storage.sql.exec<OutboundMessageTombstone>("SELECT * FROM outbound_message_tombstones WHERE message_id=?", suppliedMessageId).toArray()[0];
+    if (tombstone !== undefined) {
+      if (tombstone.payload_digest !== payloadDigest || tombstone.correlation_id !== (correlationId ?? null)) throw new TypeError("control message id is bound to another payload");
+      // A compacted, already-custodied message is an idempotent success. The
+      // tombstone remains the exact digest/correlation proof and prevents a
+      // later retry from creating a second effect.
+      return { sequence: String(tombstone.sequence), delivered: true };
     }
     const connection = this.ctx.storage.sql.exec<{ epoch: number; reconciliation_state: string }>("SELECT epoch,reconciliation_state FROM connection_state WHERE singleton=1").toArray()[0];
     const onlineReconciliation = connection?.reconciliation_state !== "complete" && this.ctx.getWebSockets().some((candidate) => {
@@ -605,10 +1338,12 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     const wire = { protocol: "conduit.node/1", messageId, deviceId: state?.device_id ?? payloadDeviceId ?? targetDeviceId ?? "unconnected", connectionEpoch: String(state?.epoch ?? 0), direction: "control_to_node", sequence: String(sequence), type, ...(correlationId === undefined ? {} : { correlationId }), payloadDigest, payload };
     parseWireDocumentText(schemaIds.nodeV1, JSON.stringify(wire));
     const createdAt = nowIso();
+    const kind = type === "transport.ack" ? "ack" : "control";
     this.ctx.storage.transactionSync(() => {
-      this.ctx.storage.sql.exec("INSERT INTO outbound_frames(sequence,message_id,correlation_id,payload_digest,frame_json,state,expires_at,created_at,dispatch_attempts,next_attempt_at) VALUES (?,?,?,?,?,'queued',?,?,0,?)", sequence, messageId, correlationId ?? null, payloadDigest, JSON.stringify(wire), expiresAt, createdAt, createdAt);
-      this.ctx.storage.sql.exec("INSERT INTO outbound_message_receipts(message_id,correlation_id,payload_digest,sequence,state,expires_at,created_at,updated_at) VALUES (?,?,?,?,'queued',?,?,?)", messageId, correlationId ?? null, payloadDigest, sequence, expiresAt, createdAt, createdAt);
+      this.ctx.storage.sql.exec("INSERT INTO outbound_frames(sequence,message_id,correlation_id,payload_digest,frame_json,state,kind,expires_at,created_at,dispatch_attempts,next_attempt_at) VALUES (?,?,?,?,?,'queued',?,?,?,0,?)", sequence, messageId, correlationId ?? null, payloadDigest, JSON.stringify(wire), kind, expiresAt, createdAt, createdAt);
+      this.ctx.storage.sql.exec("INSERT INTO outbound_message_receipts(message_id,correlation_id,payload_digest,sequence,state,kind,expires_at,created_at,updated_at) VALUES (?,?,?,?,'queued',?,?,?,?)", messageId, correlationId ?? null, payloadDigest, sequence, kind, expiresAt, createdAt, createdAt);
       this.ctx.storage.sql.exec("UPDATE transport_positions SET durable_sequence=? WHERE direction='control_to_node'", sequence);
+      this.notePending(Date.now());
     });
     const stored = this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE sequence=?", sequence).one();
     return { sequence: String(sequence), delivered: await this.sendStoredFrame(stored, preferredSocket) };
@@ -625,39 +1360,95 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
   }
 
   private async scheduleOutboxAlarm(at: number): Promise<void> {
+    if (!Number.isFinite(at)) return;
+    if (this.alarmActive) return;
+    const marker = this.workMarker();
+    // An alarm is a wake-up for durable work, never a keepalive.  Callers may
+    // race with marker reconciliation, so re-check the marker immediately
+    // before reserving the alarm.
+    if (marker.pending === 0) return;
+    const dueAt = marker.min_due_at === null ? at : Math.min(marker.min_due_at, at);
     const scheduled = await this.ctx.storage.getAlarm();
-    if (scheduled === null || at < scheduled) await this.ctx.storage.setAlarm(at);
+    if (scheduled === null || dueAt < scheduled) await this.ctx.storage.setAlarm(Math.max(Date.now() + 1, dueAt));
+  }
+
+  /**
+   * Replay an already-custodied ACK without touching its durable state. This
+   * is used only by an exact health replay: the original ACK envelope remains
+   * the proof of custody, while a reconnect may need the bytes sent again if
+   * the peer disconnected before observing them. The normal outbox path still
+   * records state transitions and retries every effectful/control message.
+   */
+  private resendStoredAckWithoutMutation(frame: StoredOutboundFrame, preferredSocket?: WebSocket): boolean {
+    // The latest unacknowledged cumulative ACK is intentionally retained as a
+    // bounded replay proof even after its nominal hot expiry. Older/superseded
+    // ACKs are removed by compactOutboundReceipts before this path can use
+    // them, so expiry must not make the retained latest ACK unreplayable.
+    if (frame.kind !== "ack" || !["queued", "sent"].includes(frame.state)) return false;
+    const socket = preferredSocket ?? this.eligibleSocket(frame);
+    if (socket === undefined) return false;
+    const connection = this.ctx.storage.sql.exec<{ device_id: string; epoch: number }>("SELECT device_id,epoch FROM connection_state WHERE singleton=1").toArray()[0];
+    const persisted: unknown = JSON.parse(frame.frame_json);
+    if (persisted === null || typeof persisted !== "object" || Array.isArray(persisted)) return false;
+    const wire = { ...(persisted as Record<string, unknown>), ...(connection === undefined ? {} : { deviceId: connection.device_id, connectionEpoch: String(connection.epoch) }) } as Record<string, unknown>;
+    try {
+      parseWireDocumentText(schemaIds.nodeV1, JSON.stringify(wire));
+      socket.send(JSON.stringify(wire));
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private async sendStoredFrame(frame: StoredOutboundFrame, preferredSocket?: WebSocket): Promise<boolean> {
-    if (Date.parse(frame.expires_at) <= Date.now()) {
+    if (Date.parse(frame.expires_at) <= Date.now() && !this.isLatestUnacknowledgedAck(frame.sequence)) {
       this.ctx.storage.sql.exec("DELETE FROM outbound_frames WHERE sequence=? AND state='queued'", frame.sequence);
+      await this.syncWorkMarker();
       return false;
     }
     const socket = preferredSocket ?? this.eligibleSocket(frame);
     if (socket === undefined) {
       const next = new Date(Date.now() + 30_000).toISOString();
       this.ctx.storage.sql.exec("UPDATE outbound_frames SET state='queued',next_attempt_at=? WHERE sequence=?", next, frame.sequence);
+      this.notePending(Date.parse(next));
       await this.scheduleOutboxAlarm(Date.parse(next));
       return false;
     }
     const connection = this.ctx.storage.sql.exec<{ device_id: string; epoch: number }>("SELECT device_id,epoch FROM connection_state WHERE singleton=1").toArray()[0];
     const persisted: unknown = JSON.parse(frame.frame_json);
     if (persisted === null || typeof persisted !== "object" || Array.isArray(persisted)) throw new TypeError("persisted control frame is invalid");
-    const wire = { ...(persisted as Record<string, unknown>), ...(connection === undefined ? {} : { deviceId: connection.device_id, connectionEpoch: String(connection.epoch) }) };
+    const wire = { ...(persisted as Record<string, unknown>), ...(connection === undefined ? {} : { deviceId: connection.device_id, connectionEpoch: String(connection.epoch) }) } as Record<string, unknown>;
     parseWireDocumentText(schemaIds.nodeV1, JSON.stringify(wire));
     try {
       socket.send(JSON.stringify(wire));
+      const ackPayload = wire.type === "transport.ack" && wire.payload !== null && typeof wire.payload === "object" && !Array.isArray(wire.payload)
+        ? wire.payload as Record<string, unknown>
+        : null;
+      const ackThrough = ackPayload !== null && ackPayload.direction === "node_to_control" && typeof ackPayload.throughSequence === "string" && /^\d+$/.test(ackPayload.throughSequence)
+        ? Number(ackPayload.throughSequence)
+        : null;
       this.ctx.storage.transactionSync(() => {
         this.ctx.storage.sql.exec("UPDATE outbound_frames SET state='sent',frame_json=?,dispatch_attempts=dispatch_attempts+1 WHERE sequence=?", JSON.stringify(wire), frame.sequence);
         this.ctx.storage.sql.exec("UPDATE outbound_message_receipts SET state='sent',updated_at=? WHERE message_id=?", nowIso(), frame.message_id);
+        if (ackThrough !== null && Number.isSafeInteger(ackThrough)) {
+          this.ctx.storage.sql.exec(
+            "UPDATE room_work_marker SET ack_sent_through=MAX(ack_sent_through,?),ack_pending_through=CASE WHEN ack_pending_through<=? THEN 0 ELSE ack_pending_through END,ack_pending_at=CASE WHEN ack_pending_through<=? THEN NULL ELSE ack_pending_at END,ack_message_id=CASE WHEN ack_pending_through<=? THEN NULL ELSE ack_message_id END,updated_at=? WHERE singleton=1",
+            ackThrough,
+            ackThrough,
+            ackThrough,
+            ackThrough,
+            nowIso(),
+          );
+        }
       });
+      await this.syncWorkMarker();
       return true;
     } catch {
       const attempts = frame.dispatch_attempts + 1;
       const delay = Math.min(60_000, 2 ** Math.min(attempts, 6) * 1_000);
       const next = new Date(Date.now() + delay).toISOString();
       this.ctx.storage.sql.exec("UPDATE outbound_frames SET state='queued',dispatch_attempts=?,next_attempt_at=? WHERE sequence=?", attempts, next, frame.sequence);
+      this.notePending(Date.parse(next));
       await this.scheduleOutboxAlarm(Date.parse(next));
       return false;
     }
@@ -665,29 +1456,62 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
 
   private async dispatchQueuedFrames(): Promise<void> {
     const now = nowIso();
-    this.ctx.storage.sql.exec("DELETE FROM outbound_frames WHERE state='queued' AND expires_at<=?", now);
-    this.ctx.storage.sql.exec("DELETE FROM outbound_message_receipts WHERE expires_at<=?", now);
+    this.ctx.storage.sql.exec("DELETE FROM outbound_frames WHERE state='queued' AND expires_at<=? AND NOT (kind='ack' AND sequence=(SELECT MAX(sequence) FROM outbound_message_receipts WHERE kind='ack' AND state IN ('queued','sent')))", now);
     const rows = this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE state='queued' AND next_attempt_at<=? ORDER BY sequence LIMIT 32", now).toArray();
     for (const row of rows) await this.sendStoredFrame(row);
-    const replayIntents = this.ctx.storage.sql.exec<StoredControlReplayIntent>("SELECT * FROM control_replay_intents WHERE next_attempt_at<=? ORDER BY next_attempt_at,request_sequence LIMIT 8", now).toArray();
-    for (const intent of replayIntents) await this.dispatchControlReplayIntent(intent);
-    const next = this.ctx.storage.sql.exec<{ next_attempt_at: string }>("SELECT next_attempt_at FROM (SELECT next_attempt_at FROM outbound_frames WHERE state='queued' UNION ALL SELECT next_attempt_at FROM control_replay_intents) ORDER BY next_attempt_at LIMIT 1").toArray()[0];
-    if (next !== undefined) await this.scheduleOutboxAlarm(Math.max(Date.now() + 1_000, Date.parse(next.next_attempt_at)));
+    // A current authenticated socket owns explicit replay requests.  Letting
+    // the alarm claim the same intent while that request is being validated
+    // can send a replay plan before the websocket path has installed its
+    // lease, which is both wasteful and observable as a duplicate replay.
+    // Once the socket disconnects, the durable intent remains available for
+    // the next alarm retry.
+    const hasAuthenticatedSocket = this.hasCurrentAuthenticatedSocket();
+    if (!hasAuthenticatedSocket) {
+      const replayIntents = this.ctx.storage.sql.exec<StoredControlReplayIntent>("SELECT * FROM control_replay_intents WHERE next_attempt_at<=? ORDER BY next_attempt_at,request_sequence LIMIT 8", now).toArray();
+      for (const intent of replayIntents) await this.dispatchControlReplayIntent(intent);
+    }
+    const next = this.ctx.storage.sql.exec<{ next_attempt_at: string }>(hasAuthenticatedSocket
+      ? "SELECT next_attempt_at FROM outbound_frames WHERE state='queued' ORDER BY next_attempt_at LIMIT 1"
+      : "SELECT next_attempt_at FROM (SELECT next_attempt_at FROM outbound_frames WHERE state='queued' UNION ALL SELECT next_attempt_at FROM control_replay_intents) ORDER BY next_attempt_at LIMIT 1").toArray()[0];
+    if (next !== undefined) {
+      this.notePending(Date.parse(next.next_attempt_at));
+      await this.scheduleOutboxAlarm(Math.max(Date.now() + 1_000, Date.parse(next.next_attempt_at)));
+    }
+    await this.syncWorkMarker();
   }
 
   override async alarm(): Promise<void> {
-    const unprojected = this.ctx.storage.sql.exec<{ frame_json: string }>("SELECT frame_json FROM inbound_frames WHERE projected=0 ORDER BY sequence LIMIT 32").toArray();
-    for (const row of unprojected) {
-      const frame = JSON.parse(row.frame_json) as NodeV1PostAuthFrame;
-      if (frame.type === "operation.approval_request") await this.projectApprovalOrDeadletter(frame);
-      else await this.project(frame);
+    this.alarmActive = true;
+    try {
+      // Alarm delivery consumes the platform reservation. Recompute from the
+      // local marker/table state before doing any work so an idle wake-up is a
+      // no-op and does not recreate a periodic alarm loop. Scheduling is
+      // deferred until the single final marker sync below.
+      await this.syncWorkMarker();
+      const marker = this.workMarker();
+      if (marker.pending === 0) return;
+      const now = Date.now();
+      if (marker.ack_pending_through > marker.ack_sent_through && (marker.ack_pending_at === null || marker.ack_pending_at + usageProfileForEnv(this.env).ackCoalesceMs <= now)) {
+        await this.flushPendingAck(undefined, false);
+      }
+      const projectionStaleAt = new Date(now - PROJECTION_LEASE_MS).toISOString();
+      const unprojected = this.ctx.storage.sql.exec<{ frame_json: string }>("SELECT frame_json FROM inbound_frames WHERE projected=0 OR (projected=3 AND (projection_claimed_at IS NULL OR projection_claimed_at<=?)) ORDER BY sequence LIMIT 32", projectionStaleAt).toArray();
+      for (const row of unprojected) {
+        const frame = JSON.parse(row.frame_json) as NodeV1PostAuthFrame;
+        await this.projectAndSync(frame);
+      }
+      const afterProjection = this.workMarker();
+      if (afterProjection.realtime_pending !== 0 && afterProjection.realtime_device_id !== null && (afterProjection.realtime_min_due_at === null || afterProjection.realtime_min_due_at <= now)) {
+        const realtime = await reconcileRealtimeProjections(this.env, afterProjection.realtime_device_id);
+        this.setRealtimeResult(afterProjection.realtime_device_id, realtime.nextAttemptAt);
+      }
+      const afterRealtime = this.workMarker();
+      if (afterRealtime.retention_pending !== 0 && (afterRealtime.retention_due_at === null || afterRealtime.retention_due_at <= now)) await this.runRetentionMaintenance(now);
+      await this.dispatchQueuedFrames();
+    } finally {
+      this.alarmActive = false;
+      await this.syncWorkMarker();
     }
-    const connection = this.ctx.storage.sql.exec<{ device_id: string }>("SELECT device_id FROM connection_state WHERE singleton=1").toArray()[0];
-    if (connection !== undefined) {
-      const realtime = await reconcileRealtimeProjections(this.env, connection.device_id);
-      if (realtime.nextAttemptAt !== null) await this.scheduleOutboxAlarm(Math.max(Date.now() + 1_000, Date.parse(realtime.nextAttemptAt)));
-    }
-    await this.dispatchQueuedFrames();
   }
 
   async offer(frame: DeviceRoomOffer): Promise<{ sequence: string; delivered: boolean }> {

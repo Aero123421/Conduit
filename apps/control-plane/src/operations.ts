@@ -118,6 +118,8 @@ export async function createOperation(
   const operationId = options.operationId ?? newId("op");
   const now = new Date();
   const expiresInSeconds = Math.min(Math.max(input.expiresInSeconds ?? 600, 30), 3600);
+  const operationExpiresAt = new Date(now.getTime() + expiresInSeconds * 1000).toISOString();
+  const limitClass = authorization.kind === "connector" ? concurrencyClass(input.capability) : undefined;
   const snapshottedRiskClasses = (snapshot: ConnectorPolicyAuthoritySnapshot | undefined) => {
     const authoritative = snapshot?.requiredApprovalRiskClasses ?? [];
     return input.approvalMode === "risk_classes" && authoritative.length === 0
@@ -141,6 +143,7 @@ export async function createOperation(
       ...input,
       requiredApprovalRiskClasses: snapshottedRiskClasses(snapshot),
     }),
+    ...(limitClass === undefined ? {} : { concurrencyClass: limitClass, concurrencyExpiresAt: operationExpiresAt }),
   };
   if (input.projectId !== undefined) policyRequest.projectId = input.projectId;
   const authorized = authorization.kind === "connector" ? await authorizeConnector(env, effectiveActor, policyRequest) : undefined;
@@ -174,7 +177,7 @@ export async function createOperation(
     sourceRevisions: input.sourceRevisions,
     arguments: input.arguments,
     issuedAt: now.toISOString(),
-    expiresAt: new Date(now.getTime() + expiresInSeconds * 1000).toISOString(),
+    expiresAt: operationExpiresAt,
     validForMs: expiresInSeconds * 1000,
   };
   const digest = await operationDigest(requestWithoutDigest);
@@ -187,14 +190,6 @@ export async function createOperation(
     const retried = await attemptOperationDispatch(env, existing.operation_id, { force: true, dispatcher });
     if (retried !== null) return { ...retried, replay: true };
     return existing.response_json === null ? { operationId: existing.operation_id, state: existing.state, replay: true } : { ...(JSON.parse(existing.response_json) as Record<string, unknown>), replay: true };
-  }
-  const limitClass = authorization.kind === "connector" ? concurrencyClass(input.capability) : undefined;
-  if (limitClass !== undefined) {
-    if (authorized === undefined || effectiveActor.grantId === undefined) throw new PublicError("grant_required", 403, "Connector operation requires a grant and rate-limit profile");
-    const profile = JSON.parse(authorized.rate.profile_json) as Record<string, unknown>;
-    const configured = profile.concurrency;
-    const limit = configured !== null && typeof configured === "object" && !Array.isArray(configured) ? Number((configured as Record<string, unknown>)[limitClass] ?? 0) : 0;
-    if (!Number.isSafeInteger(limit) || limit < 1 || !await env.CONNECTOR_LIMITERS.getByName(effectiveActor.grantId).acquire(operationId, limitClass, limit, request.expiresAt)) throw new PublicError("resource_limit", 429, `Connector concurrency limit denied: ${limitClass}`);
   }
   const row = { operationId, state: "queued", payloadDigest: digest, expiresAt: request.expiresAt };
   const createdAt = nowIso();

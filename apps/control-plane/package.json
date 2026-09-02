@@ -6,7 +6,7 @@
   "scripts": {
     "check": "npm run types:check && npm run typecheck && npm test && npm run deploy:check",
     "predeploy:check": "node ../../node_modules/typescript/bin/tsc -p ../../packages/conduit-schema/tsconfig.json",
-    "deploy:check": "wrangler deploy --dry-run --outdir .wrangler/dry-run",
+    "deploy:check": "node scripts/check-deployment-profile.mjs && wrangler deploy --dry-run --outdir .wrangler/dry-run",
     "predev": "node ../../node_modules/typescript/bin/tsc -p ../../packages/conduit-schema/tsconfig.json",
     "dev": "wrangler dev --local",
     "migrate:local": "wrangler d1 migrations apply conduit-control-plane --local",

@@ -10,6 +10,7 @@ import { authorizeConnector } from "../policy.ts";
 import { DomainRepository, type ResourceName } from "../repositories/domain.ts";
 import { combineResourceAuthorities, resolveInputAuthority, resolveResourceAuthority, type ResourceAuthority } from "../repositories/resource-authority.ts";
 import type { AccessScope, ApprovalMode, AuthActor, ControlPlaneEnv } from "../types.ts";
+import { projectCompositeSnapshot, sessionCompositeSnapshot } from "../snapshots.ts";
 
 const id = z.string().min(8).max(128);
 const requestKey = z.string().min(16).max(256);
@@ -50,6 +51,26 @@ export function createConduitMcpServer(env: ControlPlaneEnv, actor: AuthActor): 
     try { return result(await readOne(env, actor, "projects", projectId, "project.read", key)); } catch (error) { return toolFailure(error); }
   });
 
+  server.registerTool("project_snapshot_get", { title: "Get Project snapshot", description: "Read one bounded Project dashboard snapshot instead of polling each resource independently.", inputSchema: z.object({ projectId: id, requestKey }), annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true } }, async ({ projectId, requestKey: key }) => {
+    try {
+      const target = await resolveResourceAuthority(env.DB, "projects", projectId);
+      await authorizeConnector(env, actor, { operation: "project.read", ...target, idempotencyKey: key, operationId: newId("op"), payloadDigest: await operationDigest({ projectId, kind: "project_snapshot" }) });
+      const snapshot = await projectCompositeSnapshot(env.DB, projectId);
+      if (snapshot === null) throw new PublicError("not_found", 404, "Project not found");
+      return result(snapshot);
+    } catch (error) { return toolFailure(error); }
+  });
+
+  server.registerTool("session_snapshot_get", { title: "Get Session snapshot", description: "Read one bounded Collaboration Session snapshot before applying Board stream events.", inputSchema: z.object({ sessionId: id, requestKey }), annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true } }, async ({ sessionId, requestKey: key }) => {
+    try {
+      const target = await authorityForSession(env, sessionId);
+      await authorizeConnector(env, actor, { operation: "session.read", ...target, idempotencyKey: key, operationId: newId("op"), payloadDigest: await operationDigest({ sessionId, kind: "session_snapshot" }) });
+      const snapshot = await sessionCompositeSnapshot(env.DB, sessionId);
+      if (snapshot === null) throw new PublicError("not_found", 404, "Collaboration Session not found");
+      return result(snapshot);
+    } catch (error) { return toolFailure(error); }
+  });
+
   server.registerTool("source_location_get", { title: "Get Source Location", description: "Read opaque Source/Location metadata. Project and Device authority are resolved from the stored Location and Source.", inputSchema: z.object({ locationId: id, requestKey }), annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true } }, async ({ locationId, requestKey: key }) => {
     try { return result(await readOne(env, actor, "locations", locationId, "project.read", key)); } catch (error) { return toolFailure(error); }
   });
@@ -58,7 +79,7 @@ export function createConduitMcpServer(env: ControlPlaneEnv, actor: AuthActor): 
     try {
       const target = await authorityForSession(env, sessionId);
       await authorizeConnector(env, actor, { operation: "board.read", ...target, idempotencyKey: key, operationId: newId("op"), payloadDigest: await operationDigest({ sessionId, afterId, limit }) });
-      const rows = await env.DB.prepare("SELECT * FROM messages WHERE session_id=?1 AND id>?2 ORDER BY id LIMIT ?3").bind(sessionId, afterId, limit).all<Record<string, unknown>>();
+      const rows = await env.DB.prepare("SELECT id,session_id,author_principal_id,origin,body,revision,attachments_json,created_at FROM messages WHERE session_id=?1 AND id>?2 ORDER BY id LIMIT ?3").bind(sessionId, afterId, limit).all<Record<string, unknown>>();
       return result({ items: rows.results, nextCursor: rows.results.at(-1)?.id ?? null });
     } catch (error) { return toolFailure(error); }
   });
@@ -204,7 +225,7 @@ export function createConduitMcpServer(env: ControlPlaneEnv, actor: AuthActor): 
     try {
       const target = await authorityForRun(env, runId);
       await authorizeConnector(env, actor, { operation: "logs.summary.read", ...target, idempotencyKey: key, operationId: newId("op"), payloadDigest: await operationDigest({ runId }) });
-      const [trace, evidence] = await Promise.all([env.DB.prepare("SELECT * FROM trace_indexes WHERE run_id=?1 LIMIT 1").bind(runId).first<Record<string, unknown>>(), env.DB.prepare("SELECT * FROM evidence_summaries WHERE run_id=?1 ORDER BY created_at DESC LIMIT 100").bind(runId).all<Record<string, unknown>>()]);
+      const [trace, evidence] = await Promise.all([env.DB.prepare("SELECT run_id,device_id,first_sequence,last_sequence,chain_hash,observability_state,event_counts_json,updated_at FROM trace_indexes WHERE run_id=?1 LIMIT 1").bind(runId).first<Record<string, unknown>>(), env.DB.prepare("SELECT id,run_id,evidence_kind,evidence_level,summary_json,source_digest,created_at FROM evidence_summaries WHERE run_id=?1 ORDER BY created_at DESC LIMIT 100").bind(runId).all<Record<string, unknown>>()]);
       return result({ trace, evidence: evidence.results });
     } catch (error) { return toolFailure(error); }
   });
@@ -213,7 +234,7 @@ export function createConduitMcpServer(env: ControlPlaneEnv, actor: AuthActor): 
     try {
       const target = await authorityForRun(env, runId);
       await authorizeConnector(env, actor, { operation: "logs.summary.read", ...target, idempotencyKey: key, operationId: newId("op"), payloadDigest: await operationDigest({ runId, kinds: ["skill", "instruction"] }) });
-      const rows = await env.DB.prepare("SELECT * FROM evidence_summaries WHERE run_id=?1 AND (evidence_kind LIKE 'skill.%' OR evidence_kind LIKE 'instruction.%') ORDER BY created_at LIMIT 200").bind(runId).all<Record<string, unknown>>();
+      const rows = await env.DB.prepare("SELECT id,run_id,evidence_kind,evidence_level,summary_json,source_digest,created_at FROM evidence_summaries WHERE run_id=?1 AND (evidence_kind LIKE 'skill.%' OR evidence_kind LIKE 'instruction.%') ORDER BY created_at LIMIT 200").bind(runId).all<Record<string, unknown>>();
       return result({ items: rows.results });
     } catch (error) { return toolFailure(error); }
   });
@@ -222,7 +243,7 @@ export function createConduitMcpServer(env: ControlPlaneEnv, actor: AuthActor): 
     try {
       const target = await resolveResourceAuthority(env.DB, "evidence", summaryId);
       await authorizeConnector(env, actor, { operation: "logs.summary.read", ...target, idempotencyKey: key, operationId: newId("op"), payloadDigest: await operationDigest({ summaryId }) });
-      const row = await env.DB.prepare("SELECT * FROM evidence_summaries WHERE id=?1 AND evidence_kind IN ('comparison','evaluation') LIMIT 1").bind(summaryId).first<Record<string, unknown>>();
+      const row = await env.DB.prepare("SELECT id,run_id,evidence_kind,evidence_level,summary_json,source_digest,created_at FROM evidence_summaries WHERE id=?1 AND evidence_kind IN ('comparison','evaluation') LIMIT 1").bind(summaryId).first<Record<string, unknown>>();
       if (row === null) throw new PublicError("not_found", 404, "Comparison or evaluation not found");
       return result(row);
     } catch (error) { return toolFailure(error); }

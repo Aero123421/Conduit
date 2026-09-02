@@ -111,6 +111,24 @@ describe("schema-derived wire documents", () => {
     >().toEqualTypeOf<never>();
   });
 
+  it("requires the bounded source range commitment on event batches", async () => {
+    const fixture = await readJson(
+      `${repositoryRoot}/spec/examples/node-protocol/event-batch.json`,
+    ) as Record<string, any>;
+    expect(validateWireDocument(schemaIds.nodeV1, fixture)).toBe(true);
+
+    const missingCommitment = structuredClone(fixture);
+    delete missingCommitment.payload.sourceRangeDigest;
+    expect(validateWireDocument(schemaIds.nodeV1, missingCommitment)).toBe(false);
+
+    const oversized = structuredClone(fixture);
+    oversized.payload.events = Array.from(
+      { length: 33 },
+      () => structuredClone(fixture.payload.events[0]),
+    );
+    expect(validateWireDocument(schemaIds.nodeV1, oversized)).toBe(false);
+  });
+
   it("decodes Node text only after enforcing its UTF-8 byte limit", async () => {
     const path = `${repositoryRoot}/spec/examples/node-protocol/operation-offer.json`;
     const text = await readFile(path, "utf8");

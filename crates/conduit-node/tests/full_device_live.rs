@@ -846,6 +846,19 @@ fn ticket(
     let operation_digest = hex::encode(Sha256::digest(
         format!("live-operation:{}", plan.operation_id).as_bytes(),
     ));
+    let is_control = !matches!(
+        &operation,
+        PrivilegedOperation::Prepare | PrivilegedOperation::Start
+    );
+    let control_digest = is_control.then(|| "77".repeat(32));
+    let ticket_operation_id = if is_control {
+        format!(
+            "op_{}",
+            &hex::encode(Sha256::digest(ticket_id.as_bytes()))[..24]
+        )
+    } else {
+        plan.operation_id.clone()
+    };
     SignedClaims::sign(
         issuer_id.clone(),
         PrivilegeTicketClaims {
@@ -865,22 +878,15 @@ fn ticket(
             device_policy_revision: 1,
             device_revision: 1,
             expected_uid: bundle["uid"].as_u64().unwrap() as u32,
-            operation_id: plan.operation_id.clone(),
+            operation_id: ticket_operation_id,
             idempotency_key_digest: idempotency_digest,
-            operation_request_digest: operation_digest,
+            operation_request_digest: control_digest.clone().unwrap_or(operation_digest),
             run_manifest_digest: "66".repeat(32),
             run_id: plan.run_id.clone(),
             runtime_id: plan.runtime_id.clone(),
             runtime_spec_digest: request.spec_digest.clone(),
             launch_plan_digest: "44".repeat(32),
-            control_digest: if matches!(
-                operation,
-                PrivilegedOperation::Prepare | PrivilegedOperation::Start
-            ) {
-                None
-            } else {
-                Some("77".repeat(32))
-            },
+            control_digest,
             local_execution_plan_digest: plan.digest().unwrap(),
             controller_epoch: 1,
             connector_policy_id: Some("cpol_full_device_live".into()),

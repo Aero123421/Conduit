@@ -295,6 +295,7 @@ sudo -n "$conduit_helper" admin pin-ticket-key \
 sudo -n "$conduit_helper" admin policy \
   --uid "$(id -u)" \
   --allow-unrestricted-launch true \
+  --allowed-adapters codex \
   --allowed-launch-profiles full-device-live \
   --output json > "$conduit_user_evidence/root-policy-opt-in.json"
 sudo -n "$conduit_helper" admin enable \

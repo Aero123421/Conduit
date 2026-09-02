@@ -2,6 +2,11 @@
 //! Public evidence contains bounded booleans and digests, never host paths.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use conduit_adapters::{
+    AdapterEventKind, AdapterKind, AdapterState, ApprovalBridgeOwnership, ApprovalContext,
+    ApprovalRiskClassSet, EffectiveAccessScope, EffectiveApprovalPolicy, EffectiveSandboxPolicy,
+    LaunchRequest, ProtocolDriver, ProtocolFrame,
+};
 use conduit_node::privileged::PrivilegedNodeRuntime;
 use conduit_node_store::DeviceIdentity;
 use conduit_privileged_helper::capture_file_identity;
@@ -208,6 +213,10 @@ fn exercise() {
     cases.insert(
         "rootMarker".into(),
         root_marker(&provider, &issuer, &bundle, &evidence),
+    );
+    cases.insert(
+        "structuredCodexAgent".into(),
+        structured_codex_agent(&runtime, &provider, &issuer, &bundle, &evidence),
     );
     let (plan, request, started) = leave_active(&provider, &issuer, &bundle, &evidence);
     write_json(
@@ -678,6 +687,206 @@ fn root_marker(
         "independentSignedCleanup":true,"cleanupLaunchUid":removed.final_helper_receipt().claims.effective_uid})
 }
 
+fn structured_codex_agent(
+    runtime: &PrivilegedNodeRuntime,
+    provider: &PrivilegedNativeProvider,
+    issuer: &SigningKey,
+    bundle: &Value,
+    evidence: &Path,
+) -> Value {
+    let python = existing(&["/usr/bin/python3", "/bin/python3"]);
+    let fixture = r#"import json,sys
+for line in sys.stdin:
+    message=json.loads(line)
+    method=message.get("method")
+    request_id=message.get("id")
+    if method == "initialize":
+        print(json.dumps({"id":request_id,"result":{"serverInfo":{"name":"conduit-live-fixture","version":"1"}}}),flush=True)
+    elif method == "thread/start":
+        print(json.dumps({"id":request_id,"result":{"thread":{"id":"codex-thread-live"}}}),flush=True)
+    elif method == "turn/start":
+        print(json.dumps({"id":request_id,"result":{"turn":{"id":"codex-turn-live"}}}),flush=True)
+        print(json.dumps({"method":"item/completed","params":{"item":{"id":"codex-item-live","type":"agentMessage","text":"bounded live fixture response"}}}),flush=True)
+        print(json.dumps({"method":"turn/completed","params":{"turn":{"id":"codex-turn-live","status":{"type":"completed"}}}}),flush=True)
+        print("bounded-live-stderr",file=sys.stderr,flush=True)
+    elif method == "test/exit":
+        break
+"#;
+    let (mut plan, request) = case_plan(
+        "codex_agent",
+        python,
+        vec!["python3".into(), "-u".into(), "-c".into(), fixture.into()],
+        StdioMode::Pipes,
+        30_000_000,
+        evidence,
+    );
+    plan.adapter_id = Some("codex".into());
+    plan.launch_profile_id = None;
+    let prepared = provider
+        .prepare_privileged(
+            &request,
+            ticket(
+                issuer,
+                bundle,
+                &plan,
+                &request,
+                PrivilegedOperation::Prepare,
+                "ptkt_live_codex_prepare",
+            ),
+            plan.clone(),
+        )
+        .unwrap();
+    let mut managed = provider
+        .start_managed_privileged(
+            &prepared.runtime,
+            ticket(
+                issuer,
+                bundle,
+                &plan,
+                &request,
+                PrivilegedOperation::Start,
+                "ptkt_live_codex_start",
+            ),
+            &plan,
+        )
+        .unwrap();
+    assert_eq!(
+        managed.receipt.final_helper_receipt().claims.effective_uid,
+        Some(0)
+    );
+
+    let launch = LaunchRequest {
+        cwd: evidence.into(),
+        prompt: Some("run the bounded live fixture".into()),
+        native_session_id: None,
+        model: None,
+        effort: None,
+        session_data_dir: None,
+    };
+    let mut driver = ProtocolDriver::new_with_authority_context(
+        AdapterKind::Codex,
+        &launch,
+        EffectiveAccessScope::FullDevice,
+        EffectiveSandboxPolicy::External,
+        ApprovalContext {
+            effective_policy: EffectiveApprovalPolicy::Always,
+            bridge: ApprovalBridgeOwnership::Typed,
+            required_risk_classes: ApprovalRiskClassSet::EMPTY,
+        },
+    )
+    .unwrap();
+    assert_eq!(driver.state(), AdapterState::Starting);
+    let mut frames = driver.start().unwrap();
+    let mut stdout_cursor = 0;
+    let mut stderr_cursor = 0;
+    let mut pending = Vec::new();
+    let mut prompt_accepted = false;
+    let mut completed = false;
+    let mut assistant_observed = false;
+    let mut input_index = 0_u32;
+    let root_liveness_before_prompt = managed.receipt.runtime.state == RuntimeState::Running;
+    assert!(root_liveness_before_prompt && !prompt_accepted);
+
+    for _ in 0..24_u32 {
+        for frame in frames.drain(..) {
+            queue_adapter_input(runtime, issuer, bundle, &plan, &request, input_index);
+            managed.io.write_input(&frame.0).unwrap();
+            input_index += 1;
+        }
+        let page = managed.io.read_stdout(stdout_cursor, 64 * 1024).unwrap();
+        stdout_cursor = page.next_cursor;
+        pending.extend(page.bytes);
+        let mut next = Vec::new();
+        while let Some(offset) = pending.iter().position(|byte| *byte == b'\n') {
+            let record: Vec<u8> = pending.drain(..=offset).collect();
+            let (outbound, events) = driver.on_record(&record).unwrap();
+            next.extend(outbound);
+            for event in events {
+                prompt_accepted |= event.kind == AdapterEventKind::PromptAccepted;
+                assistant_observed |= matches!(
+                    event.kind,
+                    AdapterEventKind::AssistantMessage | AdapterEventKind::AssistantMessageDelta
+                );
+                completed |= event.kind == AdapterEventKind::Completed;
+            }
+        }
+        frames = next;
+        if completed && frames.is_empty() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(prompt_accepted);
+    assert!(assistant_observed);
+    assert!(completed);
+    assert_eq!(driver.state(), AdapterState::Completed);
+
+    queue_adapter_input(runtime, issuer, bundle, &plan, &request, 100);
+    managed
+        .io
+        .write_input(
+            &ProtocolFrame::json(&json!({"method":"test/exit"}))
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+    let mut stderr = Vec::new();
+    for _ in 0..100 {
+        let page = managed.io.read_stderr(stderr_cursor, 16 * 1024).unwrap();
+        stderr_cursor = page.next_cursor;
+        stderr.extend(page.bytes);
+        if String::from_utf8_lossy(&stderr).contains("bounded-live-stderr") {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(String::from_utf8_lossy(&stderr).contains("bounded-live-stderr"));
+    let mut terminal_signed = false;
+    for _ in 0..100 {
+        let reconciled = provider
+            .attach_reconciled_privileged(plan.clone(), request.spec_digest.clone())
+            .unwrap();
+        for receipt in &reconciled.helper_receipts {
+            receipt.verify(runtime.receipt_key()).unwrap();
+        }
+        if matches!(
+            reconciled.runtime.state,
+            RuntimeState::Stopped | RuntimeState::Failed
+        ) {
+            terminal_signed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(terminal_signed);
+    json!({
+        "passed":true,"adapter":"codex","effectiveUid":0,
+        "rootLivenessBeforePromptAcceptance":root_liveness_before_prompt,
+        "promptAccepted":prompt_accepted,"assistantOutput":assistant_observed,
+        "agentSettled":completed,"stderr":true,"terminalReceiptVerified":terminal_signed
+    })
+}
+
+fn queue_adapter_input(
+    runtime: &PrivilegedNodeRuntime,
+    issuer: &SigningKey,
+    bundle: &Value,
+    plan: &LocalExecutionPlan,
+    request: &RuntimeRequest,
+    index: u32,
+) {
+    runtime
+        .queue_ticket(ticket(
+            issuer,
+            bundle,
+            plan,
+            request,
+            PrivilegedOperation::Input,
+            &format!("ptkt_live_codex_input_{index}"),
+        ))
+        .unwrap();
+}
+
 fn leave_active(
     provider: &PrivilegedNativeProvider,
     issuer: &SigningKey,
@@ -900,7 +1109,11 @@ fn ticket(
             access_scope: "full_device".into(),
             approval_mode: "always".into(),
             approval_receipt_digest: Some("55".repeat(32)),
-            approval_enforcement: ApprovalEnforcement::ExactCommand,
+            approval_enforcement: if plan.adapter_id.is_some() {
+                ApprovalEnforcement::AdapterMediated
+            } else {
+                ApprovalEnforcement::ExactCommand
+            },
             required_approval_risk_classes: vec![],
             allowed_operation: operation,
             resource_ceilings: plan.resources.clone(),

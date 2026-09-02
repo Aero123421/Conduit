@@ -81,6 +81,15 @@ PID birth, and state revision form process custody. Controls target that exact
 custody, never an arbitrary PID. Ordinary controls use systemd unit/cgroup
 operations; pidfd is used for a direct signal when supported.
 
+The WebSocket connection epoch and Runtime controller epoch are separate
+authorities. A reconnect advances only the courier epoch used to authenticate
+and fence transport frames. Every effectful control request carries the exact
+Runtime controller epoch from durable custody; the Control Plane verifies it
+against the immutable control operation and current Runtime or Agent custody,
+then copies that epoch into the helper ticket. It never substitutes the current
+WebSocket epoch. This permits control after a Node reconnect without widening
+the target or authorizing a replacement Runtime.
+
 ### Signed evidence and projection
 
 The helper has a root-owned receipt key. Capability, admission, start, control,

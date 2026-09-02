@@ -625,6 +625,7 @@ export interface PrivilegeTicketRequestPayload {
       | "adapter_approval"
       | "adapter_protocol_response"
       | "agent_lifecycle_stop";
+    targetControllerEpoch: U64Decimal;
     approvalId?: string | null;
     approvalReceiptDigest?: Sha256Hex | null;
     terminal?: "completed" | "failed" | "cancelled" | "timed_out";

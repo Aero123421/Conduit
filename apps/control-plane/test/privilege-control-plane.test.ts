@@ -229,26 +229,28 @@ describe.sequential("privileged helper Control Plane", () => {
     const agentRequest = { ...JSON.parse(originalOperation.request_json), capability: "agent.run.start", arguments: { adapterId: "codex" } };
     await env.DB.batch([
       env.DB.prepare("UPDATE operation_journal SET request_json=?1 WHERE id='op_privilegeflow01'").bind(canonicalJson(agentRequest)),
+      env.DB.prepare("INSERT INTO runtime_custody(runtime_id,run_id,start_operation_id,device_id,provider_id,handle_digest,target_digest,controller_epoch,state,revision,created_at,updated_at) VALUES ('rt_privilegeflow01','run_privilegeflow01','op_privilegeflow01','dev_privilegeflow01','privileged-native',?1,?2,'7','running',1,?3,?3)").bind("9".repeat(64), "8".repeat(64), now),
       env.DB.prepare("UPDATE privilege_policy_attestations SET public_summary_json=?1 WHERE installation_id='phinst_privilegeflow01' AND revision=1").bind(canonicalJson({ ...JSON.parse(storedRootPolicy.public_summary_json), allowedAdapters: ["codex"], allowedLaunchProfiles: ["safe"], launchProfileExecutableDigests: {}, allowedCredentialProfiles: ["cred_allowed01", "cred_rootonly01"] })),
       env.DB.prepare("UPDATE device_user_policy_attestations SET public_summary_json=?1 WHERE device_id='dev_privilegeflow01' AND revision=1").bind(canonicalJson({ ...JSON.parse(storedDevicePolicy.public_summary_json), capabilities: ["command.start", "agent.run.start"], launchProfiles: ["safe"], credentialProfiles: ["cred_allowed01"] })),
     ]);
     const initialAgentInput = await deviceSignedFrame("privilege.ticket_request", "nmsg_privinitialin1", "4", {
       ...ticketPayload, requestId: "ptreq_privinitialin1", idempotencyKey: "privilege-initial-agent-input-01", controlRequestDigest: "6".repeat(64),
-      controlAuthority: { kind: "initial_agent_input", agentStateRevision: "1" }, approvalEnforcement: "adapter_mediated", allowedOperation: "input", redactedSummary: { operation: "input", adapter: "codex", credentialProfiles: [] },
+      controlAuthority: { kind: "initial_agent_input", agentStateRevision: "1", targetControllerEpoch: "7" }, approvalEnforcement: "adapter_mediated", allowedOperation: "input", redactedSummary: { operation: "input", adapter: "codex", credentialProfiles: [] },
     }, devicePrivate);
     await expect(projectPrivilegeFrame(env, initialAgentInput)).resolves.toMatchObject({ status: "issued", ticket: { claims: { operationId: "op_privilegeflow01", allowedOperation: "input", controlDigest: "6".repeat(64) } } });
     const duplicateInitialAgentInput = await deviceSignedFrame("privilege.ticket_request", "nmsg_privinitialin2", "4", {
       ...ticketPayload, requestId: "ptreq_privinitialin2", idempotencyKey: "privilege-initial-agent-input-02", controlRequestDigest: "6".repeat(64),
-      controlAuthority: { kind: "initial_agent_input", agentStateRevision: "1" }, approvalEnforcement: "adapter_mediated", allowedOperation: "input", redactedSummary: { operation: "input", adapter: "codex", credentialProfiles: [] },
+      controlAuthority: { kind: "initial_agent_input", agentStateRevision: "1", targetControllerEpoch: "7" }, approvalEnforcement: "adapter_mediated", allowedOperation: "input", redactedSummary: { operation: "input", adapter: "codex", credentialProfiles: [] },
     }, devicePrivate);
     await expect(projectPrivilegeFrame(env, duplicateInitialAgentInput)).rejects.toMatchObject({ code: "privilege_ticket_conflict" });
     await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM privilege_ticket_requests WHERE operation_id='op_privilegeflow01' AND control_authority_kind='initial_agent_input' AND control_authority_revision='1'").first()).resolves.toEqual({ count: 1 });
     const unauthorizedLifecycle = await deviceSignedFrame("privilege.ticket_request", "nmsg_privinternbad1", "4", {
       ...ticketPayload, requestId: "ptreq_privinternbad1", idempotencyKey: "privilege-internal-lifecycle-deny", controlRequestDigest: "6".repeat(64),
-      controlAuthority: { kind: "agent_lifecycle_stop", terminal: "completed", reasonCode: null, agentStateRevision: "1" }, approvalEnforcement: "adapter_mediated", allowedOperation: "force_stop", redactedSummary: { operation: "force_stop", adapter: "codex" },
+      controlAuthority: { kind: "agent_lifecycle_stop", terminal: "completed", reasonCode: null, agentStateRevision: "1", targetControllerEpoch: "7" }, approvalEnforcement: "adapter_mediated", allowedOperation: "force_stop", redactedSummary: { operation: "force_stop", adapter: "codex" },
     }, devicePrivate);
     await expect(projectPrivilegeFrame(env, unauthorizedLifecycle)).rejects.toMatchObject({ code: "privilege_ticket_invalid" });
     await env.DB.batch([
+      env.DB.prepare("DELETE FROM runtime_custody WHERE runtime_id='rt_privilegeflow01'"),
       env.DB.prepare("UPDATE operation_journal SET request_json=?1 WHERE id='op_privilegeflow01'").bind(originalOperation.request_json),
       env.DB.prepare("UPDATE privilege_policy_attestations SET public_summary_json=?1 WHERE installation_id='phinst_privilegeflow01' AND revision=1").bind(canonicalJson({ ...JSON.parse(storedRootPolicy.public_summary_json), allowedLaunchProfiles: ["safe"], launchProfileExecutableDigests: {}, allowedCredentialProfiles: ["cred_allowed01", "cred_rootonly01"] })),
       env.DB.prepare("UPDATE device_user_policy_attestations SET public_summary_json=?1 WHERE device_id='dev_privilegeflow01' AND revision=1").bind(canonicalJson({ ...JSON.parse(storedDevicePolicy.public_summary_json), launchProfiles: ["safe"], credentialProfiles: ["cred_allowed01"] })),
@@ -259,7 +261,7 @@ describe.sequential("privileged helper Control Plane", () => {
     const requestPayload = (overrides: Record<string, unknown> = {}) => ({
       requestId: "ptreq_privcontrol001", idempotencyKey: "privilege-runtime-control-0001", installationId: "phinst_privilegeflow01", deviceKeyId: "dkey_privilegeflow01",
       operationId: "op_privcontrol001", runId: "run_privilegeflow01", runtimeId: "rt_privilegeflow01", runtimeSpecDigest, launchPlanDigest, localExecutionPlanDigest: localPlanDigest,
-      controlRequestDigest: "8".repeat(64), controlAuthority: { kind: "external_control" }, runManifestDigest: manifestDigest, helperPolicyRevision: 1, helperPolicyDigest: rootPolicyDigest, devicePolicyRevision: 1,
+      controlRequestDigest: "8".repeat(64), controlAuthority: { kind: "external_control", targetControllerEpoch: "7" }, runManifestDigest: manifestDigest, helperPolicyRevision: 1, helperPolicyDigest: rootPolicyDigest, devicePolicyRevision: 1,
       approvalReceiptDigest: null, approvalEnforcement: "exact_command", allowedOperation: "pause",
       resourceCeilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, redactedSummary: { operation: "pause" },
       requestedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 120_000).toISOString(), ...overrides,
@@ -278,15 +280,23 @@ describe.sequential("privileged helper Control Plane", () => {
     const legacyStartId = await deviceSignedFrame("privilege.ticket_request", "nmsg_privcontrolold1", "7", requestPayload({ requestId: "ptreq_privcontrolold1", idempotencyKey: "privilege-control-old-start-0001", operationId: "op_privilegeflow01", controlRequestDigest: controlDigest }), devicePrivate);
     await expect(projectPrivilegeFrame(env, legacyStartId)).rejects.toMatchObject({ code: "privilege_ticket_invalid" });
 
-    const valid = await deviceSignedFrame("privilege.ticket_request", "nmsg_privcontrol001", "7", requestPayload({ controlRequestDigest: controlDigest }), devicePrivate);
+    await env.DB.prepare("UPDATE devices SET connection_epoch='8' WHERE id='dev_privilegeflow01'").run();
+    const valid = await deviceSignedFrame("privilege.ticket_request", "nmsg_privcontrol001", "7", requestPayload({ controlRequestDigest: controlDigest }), devicePrivate, "8");
     const measured = instrumentD1(env.DB);
     const measuredEnv = new Proxy(env as ControlPlaneEnv, { get: (target, property, receiver) => property === "DB" ? measured.db : Reflect.get(target, property, receiver) });
     const issued = await projectPrivilegeFrame(measuredEnv, valid) as { ticket: { claims: Record<string, unknown> } };
     assertFreeD1Ceilings(measured.snapshot());
-    expect(issued.ticket.claims).toMatchObject({ operationId: "op_privcontrol001", operationRequestDigest: controlDigest, controlDigest, allowedOperation: "pause" });
+    expect(issued.ticket.claims).toMatchObject({ operationId: "op_privcontrol001", operationRequestDigest: controlDigest, controlDigest, allowedOperation: "pause", controllerEpoch: 7 });
+    const courierEpochSubstitution = await deviceSignedFrame("privilege.ticket_request", "nmsg_privcontrolepoch", "8", requestPayload({
+      requestId: "ptreq_privcontrolepoch",
+      idempotencyKey: "privilege-control-courier-epoch-01",
+      controlRequestDigest: controlDigest,
+      controlAuthority: { kind: "external_control", targetControllerEpoch: "8" },
+    }), devicePrivate, "8");
+    await expect(projectPrivilegeFrame(env, courierEpochSubstitution)).rejects.toMatchObject({ code: "privilege_ticket_invalid" });
 
     await env.DB.prepare("UPDATE operation_journal SET state='failed' WHERE id='op_privcontrol001'").run();
-    const terminal = await deviceSignedFrame("privilege.ticket_request", "nmsg_privcontrolterm", "8", requestPayload({ requestId: "ptreq_privcontrolterm", idempotencyKey: "privilege-control-terminal-0001", controlRequestDigest: controlDigest }), devicePrivate);
+    const terminal = await deviceSignedFrame("privilege.ticket_request", "nmsg_privcontrolterm", "8", requestPayload({ requestId: "ptreq_privcontrolterm", idempotencyKey: "privilege-control-terminal-0001", controlRequestDigest: controlDigest }), devicePrivate, "8");
     await expect(projectPrivilegeFrame(env, terminal)).rejects.toMatchObject({ code: "privilege_ticket_expired" });
 
     const other = await keyPair();
@@ -299,6 +309,7 @@ describe.sequential("privileged helper Control Plane", () => {
     const collisionPayload = requestPayload({ idempotencyKey: "privilege-cross-device-collision-1", deviceKeyId: "dkey_privilegeother1" });
     const collision = await deviceSignedFrame("privilege.ticket_request", "nmsg_privcrossdevice1", "1", collisionPayload, other.privateKey, "1", "dev_privilegeother1");
     await expect(projectPrivilegeFrame(env, collision)).rejects.toMatchObject({ code: "privilege_ticket_conflict" });
+    await env.DB.prepare("UPDATE devices SET connection_epoch='7' WHERE id='dev_privilegeflow01'").run();
   });
 
   it("activates signed narrowing immediately and holds post-enable broadening for fresh Owner approval", async () => {

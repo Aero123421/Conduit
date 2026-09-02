@@ -597,9 +597,10 @@
             {
               "type": "object",
               "additionalProperties": false,
-              "required": ["kind"],
+              "required": ["kind", "targetControllerEpoch"],
               "properties": {
                 "kind": { "enum": ["external_control", "initial_agent_input", "adapter_approval", "adapter_protocol_response", "agent_lifecycle_stop"] },
+                "targetControllerEpoch": { "$ref": "#/$defs/U64Decimal" },
                 "approvalId": { "type": ["string", "null"], "pattern": "^appr_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
                 "approvalReceiptDigest": { "anyOf": [{ "$ref": "#/$defs/Sha256Hex" }, { "type": "null" }] },
                 "terminal": { "enum": ["completed", "failed", "cancelled", "timed_out"] },

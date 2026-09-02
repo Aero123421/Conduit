@@ -1929,10 +1929,21 @@ impl NodeService {
         } else {
             "exact_command"
         };
+        let target_controller_epoch = matches!(phase, PrivilegedStartPhase::InitialInput)
+            .then(|| {
+                self.runtime_custody
+                    .get(&context.offer.runtime.runtime_id)
+                    .map(|custody| custody.controller_epoch.to_string())
+                    .ok_or_else(|| {
+                        ServiceError::Unavailable("privileged_runtime_recovery_required".into())
+                    })
+            })
+            .transpose()?;
         let control_authority = matches!(phase, PrivilegedStartPhase::InitialInput).then(|| {
             json!({
                 "kind": "initial_agent_input",
-                "agentStateRevision": "1"
+                "agentStateRevision": "1",
+                "targetControllerEpoch": target_controller_epoch
             })
         });
         let mut payload = json!({
@@ -2089,9 +2100,19 @@ impl NodeService {
             .agents
             .get(start_operation_id)
             .map(|agent| agent.revision.to_string());
+        let target_controller_epoch = self
+            .runtime_custody
+            .get(&context.offer.runtime.runtime_id)
+            .map(|custody| custody.controller_epoch.to_string())
+            .ok_or_else(|| {
+                ServiceError::Unavailable("privileged_runtime_recovery_required".into())
+            })?;
         let control_authority = match &control {
             PendingPrivilegedControl::Agent { .. } | PendingPrivilegedControl::Runtime { .. } => {
-                json!({"kind": "external_control"})
+                json!({
+                    "kind": "external_control",
+                    "targetControllerEpoch": target_controller_epoch
+                })
             }
             PendingPrivilegedControl::Approval {
                 payload,
@@ -2100,12 +2121,14 @@ impl NodeService {
                 "kind": "adapter_approval",
                 "approvalId": approval_id,
                 "approvalReceiptDigest": payload.get("receiptDigest").cloned().unwrap_or(Value::Null),
-                "agentStateRevision": agent_revision
+                "agentStateRevision": agent_revision,
+                "targetControllerEpoch": target_controller_epoch
             }),
             PendingPrivilegedControl::AdapterFrames { approval_id, .. } => json!({
                 "kind": if approval_id.is_some() { "adapter_approval" } else { "adapter_protocol_response" },
                 "approvalId": approval_id,
-                "agentStateRevision": agent_revision
+                "agentStateRevision": agent_revision,
+                "targetControllerEpoch": target_controller_epoch
             }),
             PendingPrivilegedControl::StopAgent {
                 terminal, reason, ..
@@ -2113,7 +2136,8 @@ impl NodeService {
                 "kind": "agent_lifecycle_stop",
                 "terminal": terminal_state_name(*terminal),
                 "reasonCode": reason,
-                "agentStateRevision": agent_revision
+                "agentStateRevision": agent_revision,
+                "targetControllerEpoch": target_controller_epoch
             }),
         };
         let mut payload = json!({

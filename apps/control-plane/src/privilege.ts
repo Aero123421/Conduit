@@ -667,27 +667,29 @@ const INTERNAL_CONTROL_KINDS = new Set(["initial_agent_input", "adapter_approval
 function parseControlAuthority(value: unknown): Record<string, unknown> | null {
   if (value === null) return null;
   const authority = record(value, "controlAuthority");
-  exactKeys(authority, ["kind", "approvalId", "approvalReceiptDigest", "terminal", "reasonCode", "agentStateRevision"], "controlAuthority");
+  exactKeys(authority, ["kind", "targetControllerEpoch", "approvalId", "approvalReceiptDigest", "terminal", "reasonCode", "agentStateRevision"], "controlAuthority");
   const kind = stringField(authority, "kind", 64);
+  const targetControllerEpoch = stringField(authority, "targetControllerEpoch", 20);
+  if (!/^(0|[1-9][0-9]{0,19})$/.test(targetControllerEpoch)) throw new TypeError("controlAuthority.targetControllerEpoch is invalid");
   if (kind === "external_control") {
-    if (Object.keys(authority).length !== 1) throw new TypeError("external controlAuthority cannot carry internal authority fields");
+    if (Object.keys(authority).length !== 2) throw new TypeError("external controlAuthority cannot carry internal authority fields");
     return authority;
   }
   if (!INTERNAL_CONTROL_KINDS.has(kind)) throw new TypeError("controlAuthority.kind is unsupported");
   const revision = stringField(authority, "agentStateRevision", 20);
   if (!/^(0|[1-9][0-9]{0,19})$/.test(revision)) throw new TypeError("controlAuthority.agentStateRevision is invalid");
   if (kind === "initial_agent_input") {
-    if (revision !== "1" || Object.keys(authority).some((key) => !["kind", "agentStateRevision"].includes(key))) throw new TypeError("initial agent input authority must bind revision 1 only");
+    if (revision !== "1" || Object.keys(authority).some((key) => !["kind", "agentStateRevision", "targetControllerEpoch"].includes(key))) throw new TypeError("initial agent input authority must bind revision 1 only");
   } else if (kind === "adapter_approval") {
     idField(authority, "approvalId");
     digestField(authority, "approvalReceiptDigest");
-    if (Object.keys(authority).some((key) => !["kind", "approvalId", "approvalReceiptDigest", "agentStateRevision"].includes(key))) throw new TypeError("adapter approval authority contains unrelated fields");
+    if (Object.keys(authority).some((key) => !["kind", "approvalId", "approvalReceiptDigest", "agentStateRevision", "targetControllerEpoch"].includes(key))) throw new TypeError("adapter approval authority contains unrelated fields");
   } else if (kind === "adapter_protocol_response") {
-    if (authority.approvalId !== null || Object.keys(authority).some((key) => !["kind", "approvalId", "agentStateRevision"].includes(key))) throw new TypeError("adapter protocol response authority cannot claim an approval");
+    if (authority.approvalId !== null || Object.keys(authority).some((key) => !["kind", "approvalId", "agentStateRevision", "targetControllerEpoch"].includes(key))) throw new TypeError("adapter protocol response authority cannot claim an approval");
   } else {
     if (!["completed", "failed", "cancelled", "timed_out"].includes(String(authority.terminal))) throw new TypeError("agent lifecycle authority terminal is invalid");
     if (authority.reasonCode !== null && (typeof authority.reasonCode !== "string" || !/^[a-z][a-z0-9_.-]{0,127}$/.test(authority.reasonCode))) throw new TypeError("agent lifecycle authority reasonCode is invalid");
-    if (Object.keys(authority).some((key) => !["kind", "terminal", "reasonCode", "agentStateRevision"].includes(key))) throw new TypeError("agent lifecycle authority contains unrelated fields");
+    if (Object.keys(authority).some((key) => !["kind", "terminal", "reasonCode", "agentStateRevision", "targetControllerEpoch"].includes(key))) throw new TypeError("agent lifecycle authority contains unrelated fields");
   }
   return authority;
 }
@@ -719,6 +721,7 @@ async function verifyControlTicketBinding(
   controlDigest: string | null,
   runtimeId: string,
   payload: Record<string, unknown>,
+  targetControllerEpoch: string,
 ): Promise<OperationAuthorityRow> {
   if (!CONTROL_ACTIONS.has(allowedOperation) || controlDigest === null || controlDigest !== authority.payload_digest || expectedControlAction(authority, controlRequest) !== allowedOperation) {
     throw new PublicError("privilege_ticket_invalid", 409, "Privilege control ticket is not bound to the exact Control Plane operation");
@@ -728,6 +731,9 @@ async function verifyControlTicketBinding(
   }
   if (controlRequest.operationId !== authority.id || controlRequest.targetRunId !== authority.run_id || controlRequest.targetDigest !== authority.target_digest || controlRequest.targetControllerEpoch !== authority.target_controller_epoch || controlRequest.expectedState !== authority.expected_target_state || String(controlRequest.expectedRevision) !== String(authority.expected_target_revision)) {
     throw new PublicError("privilege_ticket_invalid", 409, "Privilege control request differs from durable target custody");
+  }
+  if (targetControllerEpoch !== authority.target_controller_epoch) {
+    throw new PublicError("privilege_ticket_invalid", 409, "Privilege control ticket differs from the exact target controller epoch");
   }
   if (authority.operation_kind === "runtime_control" && (authority.target_runtime_id !== runtimeId || controlRequest.targetRuntimeId !== runtimeId)) {
     throw new PublicError("privilege_ticket_invalid", 409, "Privilege runtime control targets another Runtime");
@@ -770,13 +776,17 @@ async function verifyInternalControlTicketBinding(env: ControlPlaneEnv, authorit
   if ((kind === "initial_agent_input" || kind === "adapter_approval" || kind === "adapter_protocol_response") && allowedOperation !== "input") throw new PublicError("privilege_ticket_invalid", 409, "Internal Agent input authority cannot request another helper operation");
   if (kind === "agent_lifecycle_stop" && !["graceful_stop", "force_stop"].includes(allowedOperation)) throw new PublicError("privilege_ticket_invalid", 409, "Agent lifecycle authority is limited to stop operations");
   const revision = Number(controlAuthority.agentStateRevision);
-  const agent = await env.DB.prepare("SELECT start_operation_id,device_id,run_id,state,revision FROM agent_sessions WHERE start_operation_id=?1 AND device_id=?2 AND run_id=?3 LIMIT 1")
-    .bind(authority.id, authority.device_id, authority.run_id).first<{ start_operation_id: string; device_id: string; run_id: string; state: string; revision: number }>();
+  const targetControllerEpoch = String(controlAuthority.targetControllerEpoch);
+  const runtimeCustody = await env.DB.prepare("SELECT controller_epoch,state FROM runtime_custody WHERE start_operation_id=?1 AND device_id=?2 AND run_id=?3 LIMIT 1")
+    .bind(authority.id, authority.device_id, authority.run_id).first<{ controller_epoch: string; state: string }>();
+  if (runtimeCustody === null || runtimeCustody.controller_epoch !== targetControllerEpoch || !["running", "paused"].includes(runtimeCustody.state)) throw new PublicError("privilege_ticket_invalid", 409, "Internal Agent control differs from Runtime controller custody");
+  const agent = await env.DB.prepare("SELECT start_operation_id,device_id,run_id,controller_epoch,state,revision FROM agent_sessions WHERE start_operation_id=?1 AND device_id=?2 AND run_id=?3 LIMIT 1")
+    .bind(authority.id, authority.device_id, authority.run_id).first<{ start_operation_id: string; device_id: string; run_id: string; controller_epoch: string; state: string; revision: number }>();
   if (kind === "initial_agent_input") {
     if (agent !== null && (agent.revision !== 1 || !["starting", "running", "waiting_input"].includes(agent.state))) throw new PublicError("privilege_ticket_invalid", 409, "Initial Agent input no longer matches revision 1 custody");
     return authority;
   }
-  if (agent === null || agent.revision !== revision || !["starting", "running", "waiting_input", "waiting_approval", "closing"].includes(agent.state)) throw new PublicError("privilege_ticket_invalid", 409, "Internal Agent control custody changed before ticket issuance");
+  if (agent === null || agent.controller_epoch !== targetControllerEpoch || agent.revision !== revision || !["starting", "running", "waiting_input", "waiting_approval", "closing"].includes(agent.state)) throw new PublicError("privilege_ticket_invalid", 409, "Internal Agent control custody changed before ticket issuance");
   if (kind === "adapter_approval") {
     const approvalId = idField(controlAuthority, "approvalId");
     const receiptDigest = digestField(controlAuthority, "approvalReceiptDigest")!;
@@ -826,7 +836,7 @@ async function issueTicket(env: ControlPlaneEnv, frame: PrivilegeTransportFrame)
   const controlDigest = digestField(payload, "controlRequestDigest", true);
   const executionAuthority = CONTROL_ACTIONS.has(allowedOperation)
     ? controlAuthority?.kind === "external_control"
-      ? await verifyControlTicketBinding(env, authority, operationRequest, allowedOperation, controlDigest, runtimeId, payload)
+      ? await verifyControlTicketBinding(env, authority, operationRequest, allowedOperation, controlDigest, runtimeId, payload, String(controlAuthority.targetControllerEpoch))
       : controlAuthority !== null && INTERNAL_CONTROL_KINDS.has(String(controlAuthority.kind))
         ? await verifyInternalControlTicketBinding(env, authority, operationRequest, controlAuthority, allowedOperation)
         : (() => { throw new PublicError("privilege_ticket_invalid", 409, "Effectful control lacks an exact controlAuthority"); })()
@@ -924,7 +934,7 @@ async function issueTicket(env: ControlPlaneEnv, frame: PrivilegeTransportFrame)
     deviceId: frame.deviceId, deviceKeyId, devicePolicyRevision: installation.device_policy_revision, expectedUid: installation.expected_uid,
     operationId, idempotencyKeyDigest, operationRequestDigest, runManifestDigest, runId, runtimeId,
     runtimeSpecDigest: digestField(payload, "runtimeSpecDigest")!, launchPlanDigest: digestField(payload, "launchPlanDigest")!, controlDigest, localExecutionPlanDigest: digestField(payload, "localExecutionPlanDigest")!,
-    controllerEpoch: Number(frame.connectionEpoch), connectorPolicyId: authority.connector_policy_id, connectorPolicyRevision: authority.connector_policy_revision,
+    controllerEpoch: controlAuthority === null ? Number(frame.connectionEpoch) : Number(controlAuthority.targetControllerEpoch), connectorPolicyId: authority.connector_policy_id, connectorPolicyRevision: authority.connector_policy_revision,
     projectId: authority.project_id, projectRevision: authority.binding_project_revision, assignmentId: authority.assignment_id,
     projectAgentId: authority.project_agent_id, projectAgentRevision: authority.project_agent_revision,
     deviceRevision: authority.current_device_revision, runtimeConfigurationRevision,

@@ -149,7 +149,12 @@ conduit_cleanup() {
     sudo -n find "$conduit_root_stage" -xdev -depth -delete
   fi
   if ((conduit_cleanup_package_ok)); then
-    sudo -n systemctl reset-failed 'conduit-elevated-live-*' >/dev/null 2>&1 || true
+    # Runtime IDs in this suite are `rt_live_*`, so the derived transient unit
+    # names are `conduit-elevated-rt_live_*`. Stop retained exited/failed units
+    # before resetting their state; RemainAfterExit otherwise keeps the host in
+    # a degraded state even after the root journal and package are purged.
+    sudo -n systemctl stop 'conduit-elevated-rt_live_*' >/dev/null 2>&1 || true
+    sudo -n systemctl reset-failed 'conduit-elevated-rt_live_*' >/dev/null 2>&1 || true
     sudo -n rmdir "$conduit_root_parent" >/dev/null 2>&1 || true
   else
     echo "automatic cleanup could not prove terminal custody; root staging was retained for explicit recovery" >&2
@@ -866,8 +871,9 @@ for conduit_removed in \
     exit 4
   fi
 done
-sudo -n systemctl reset-failed 'conduit-elevated-live-*'
-[[ -z "$(systemctl list-units --all 'conduit-elevated-live-*' --no-legend --plain)" ]] || {
+sudo -n systemctl stop 'conduit-elevated-rt_live_*'
+sudo -n systemctl reset-failed 'conduit-elevated-rt_live_*'
+[[ -z "$(systemctl list-units --all 'conduit-elevated-rt_live_*' --no-legend --plain)" ]] || {
   echo "live Full Device E2E cleanup left a transient target unit" >&2
   exit 4
 }

@@ -606,7 +606,7 @@ fn root_marker(
     let (create_plan, create_request) = case_plan(
         "marker_create",
         existing(&["/usr/bin/touch", "/bin/touch"]),
-        vec![marker.to_string_lossy().into()],
+        vec!["touch".into(), marker.to_string_lossy().into()],
         StdioMode::Pipes,
         10_000_000,
         evidence,
@@ -653,7 +653,7 @@ fn root_marker(
     let (remove_plan, remove_request) = case_plan(
         "marker_remove",
         existing(&["/usr/bin/rm", "/bin/rm"]),
-        vec!["--".into(), marker.to_string_lossy().into()],
+        vec!["rm".into(), "--".into(), marker.to_string_lossy().into()],
         StdioMode::Pipes,
         10_000_000,
         evidence,

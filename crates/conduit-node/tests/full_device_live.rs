@@ -322,7 +322,7 @@ fn never_allowed() {
     let (plan, request) = case_plan(
         "never_allowed",
         existing(&["/usr/bin/sleep", "/bin/sleep"]),
-        vec!["sleep".into(), "1".into()],
+        vec!["sleep".into(), "30".into()],
         StdioMode::Pipes,
         30_000_000,
         &evidence,
@@ -357,35 +357,11 @@ fn never_allowed() {
     let prepared = provider
         .prepare_privileged(&request, prepare_ticket, plan.clone())
         .unwrap();
-    let (start_result, _) = control_plane_ticket_result(
-        &bundle,
-        &identity,
-        &plan,
-        &request,
-        &manifest_digest,
-        &operation_digest,
-        PrivilegedOperation::Start,
-        true,
-    );
-    let start_ticket: PrivilegeTicket =
-        serde_json::from_value(start_result["ticket"].clone()).unwrap();
-    let started = provider
-        .start_privileged(&prepared.runtime, start_ticket, &plan)
-        .unwrap();
-    assert_eq!(started.final_helper_receipt().claims.effective_uid, Some(0));
-    let stopped = loop {
-        let receipt = provider
-            .inspect_privileged(&started.runtime.handle)
-            .unwrap();
-        if receipt.runtime.state == RuntimeState::Stopped {
-            break receipt;
-        }
-        thread::sleep(Duration::from_millis(25));
-    };
+    assert_eq!(prepared.runtime.state, RuntimeState::Prepared);
     let local_denial = read_json(&evidence.join("never-local-denial.json"));
     write_json(
         &evidence.join("never-summary.json"),
-        &json!({"schemaVersion":1,"rootDisabled":local_denial,"server":server_enabled,"rootOptIn":true,"approvalReceiptPresent":false,"rootStartSucceeded":true,"terminalState":state_name(stopped.runtime.state)}),
+        &json!({"schemaVersion":1,"rootDisabled":local_denial,"server":server_enabled,"rootOptIn":true,"approvalReceiptPresent":false,"rootPrepareAccepted":true,"rootStartDeferredToNodeServiceE2E":true}),
     );
 }
 

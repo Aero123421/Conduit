@@ -509,6 +509,13 @@ cargo test --locked -p conduit-node --test full_device_live \
 export CONDUIT_FULL_DEVICE_E2E_PHASE=never_allowed
 cargo test --locked -p conduit-node --test full_device_live \
   -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+sudo -n "$conduit_helper" admin stop-active --uid "$(id -u)" --output json \
+  > "$conduit_user_evidence/never-prepared-cleanup.json"
+grep -Eq '"activeRuntimeCountAfter"[[:space:]]*:[[:space:]]*0' \
+  "$conduit_user_evidence/never-prepared-cleanup.json" || {
+    echo "Never prepare cleanup did not reach terminal root custody" >&2
+    exit 4
+  }
 
 # Exercise the production NodeService/WssClient event loop, real Worker
 # upgrade route, DeviceRoom durable outbox, D1 projection, and privileged

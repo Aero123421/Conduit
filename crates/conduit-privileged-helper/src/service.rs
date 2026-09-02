@@ -377,6 +377,42 @@ impl<M: SystemdManager> HelperEngine<M> {
         Ok(receipt)
     }
 
+    /// Close a previously started custody record only after the system manager
+    /// proves the exact unit no longer exists. The result is failed, not
+    /// completed, because exit status and final stream positions are gone.
+    pub fn fail_missing_runtime_for_admin(&self, runtime_id: &str) -> Result<HelperReceipt> {
+        let runtime = self
+            .journal
+            .runtime(runtime_id)?
+            .ok_or_else(|| HelperError::Denied("privileged_runtime_not_prepared".into()))?;
+        if !matches!(
+            runtime.state.as_str(),
+            "starting"
+                | "running"
+                | "active"
+                | "activating"
+                | "frozen"
+                | "paused"
+                | "recovery_required"
+        ) || runtime.invocation_id.is_none()
+            || self.systemd.inspect_optional(&runtime.unit_name)?.is_some()
+        {
+            return Err(HelperError::RecoveryRequired(
+                "active_runtime_identity_missing".into(),
+            ));
+        }
+        let receipt = self.receipt(
+            &runtime.authority_ticket,
+            "admin_stop_missing_unit",
+            "failed",
+            None,
+            runtime.state_revision + 1,
+        )?;
+        self.journal
+            .record_observation(&receipt, "failed", None, None)?;
+        Ok(receipt)
+    }
+
     /// Reconcile durable root custody with systemd before the server exposes
     /// an admission socket. Callers must treat any error as a startup failure.
     pub fn reconcile_before_admission(&self) -> Result<Vec<HelperReceipt>> {
@@ -493,7 +529,12 @@ impl<M: SystemdManager> HelperEngine<M> {
                         .record_observation(&receipt, "recovery_required", None, None)?;
                     receipts.push(receipt)
                 }
-                Ok(None) if matches!(runtime.state.as_str(), "starting" | "running" | "paused") => {
+                Ok(None)
+                    if matches!(
+                        runtime.state.as_str(),
+                        "starting" | "running" | "active" | "activating" | "frozen" | "paused"
+                    ) =>
+                {
                     let ticket = runtime.authority_ticket.clone();
                     let receipt = self.receipt(
                         &ticket,
@@ -3096,6 +3137,49 @@ mod tests {
         );
         let receipt = engine.cancel_unstarted_for_admin(&plan.runtime_id).unwrap();
         assert_eq!(receipt.claims.transition, "cancelled");
+        receipt.verify(receipt_key.as_bytes()).unwrap();
+        assert_eq!(engine.journal.active_runtime_count().unwrap(), 0);
+    }
+
+    #[test]
+    fn local_root_stop_fails_closed_when_started_unit_was_collected() {
+        let (engine, backend, plan, issuer, receipt_key) = setup();
+        engine
+            .prepare(
+                ticket(
+                    &engine,
+                    &issuer,
+                    &plan,
+                    PrivilegedOperation::Prepare,
+                    "ptkt_admin_missing_prepare",
+                ),
+                plan.clone(),
+                vec![],
+            )
+            .unwrap();
+        engine
+            .start(
+                ticket(
+                    &engine,
+                    &issuer,
+                    &plan,
+                    PrivilegedOperation::Start,
+                    "ptkt_admin_missing_start",
+                ),
+                plan.digest().unwrap(),
+            )
+            .unwrap();
+        backend.forget_unit(&plan.systemd_unit);
+        let recovery = engine.reconcile_before_admission().unwrap();
+        assert_eq!(
+            recovery.last().unwrap().claims.transition,
+            "recovery_required"
+        );
+        let receipt = engine
+            .fail_missing_runtime_for_admin(&plan.runtime_id)
+            .unwrap();
+        assert_eq!(receipt.claims.transition, "failed");
+        assert_eq!(receipt.claims.exit_code, None);
         receipt.verify(receipt_key.as_bytes()).unwrap();
         assert_eq!(engine.journal.active_runtime_count().unwrap(), 0);
     }

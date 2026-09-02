@@ -1289,11 +1289,10 @@ fn stop_active_runtimes(
             receipts.push(engine.cancel_unstarted_for_admin(&runtime.runtime_id)?);
             continue;
         }
-        let observation = backend.inspect(&runtime.unit_name).map_err(|_| {
-            conduit_privileged_helper::HelperError::RecoveryRequired(
-                "active_runtime_identity_missing".into(),
-            )
-        })?;
+        let Some(observation) = backend.inspect_optional(&runtime.unit_name)? else {
+            receipts.push(engine.fail_missing_runtime_for_admin(&runtime.runtime_id)?);
+            continue;
+        };
         if !runtime_identity_matches(runtime, &observation) {
             return Err(conduit_privileged_helper::HelperError::RecoveryRequired(
                 "active_runtime_identity_mismatch".into(),

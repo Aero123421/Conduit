@@ -301,14 +301,16 @@ describe.sequential("DeviceRoom steady-state custody", () => {
     expect(probe.setAlarm - beforeCheckpoint.setAlarm).toBe(0);
 
     // The release budget uses the configured ten-minute unchanged-health
-    // replay cadence (144 replays/day) and the independent fifteen-minute D1
-    // observation throttle (96 projections/day). Exact replay performs no DO
-    // write; only the 15-minute local marker checkpoint is charged.
+    // replay cadence (144 replays/day). A ten-minute observation first reaches
+    // the fifteen-minute D1 threshold at the following checkpoint, so the
+    // connected cadence produces 72 projections/day. Exact replay performs no
+    // DO write; only that bounded local marker checkpoint is charged.
     const unchangedReplayPerDay = Math.ceil((24 * 60) / 10);
-    const unchangedD1ProjectionPerDay = Math.ceil((24 * 60) / 15);
+    const unchangedD1ProjectionPerDay = Math.floor(unchangedReplayPerDay / Math.ceil(15 / 10));
     const checkpointDoRows = Math.max(0, probe.sqlRowsWritten - beforeCheckpoint.sqlRowsWritten);
     const unchangedDoRowsPerDay = checkpointDoRows * unchangedD1ProjectionPerDay;
     const unchangedD1RowsPerDay = 1 * unchangedD1ProjectionPerDay;
+    expect(unchangedD1ProjectionPerDay).toBe(72);
     expect(unchangedDoRowsPerDay).toBeLessThanOrEqual(1_000);
     expect(unchangedD1RowsPerDay).toBeLessThanOrEqual(300);
     expect(probe.setAlarm - afterFirst.setAlarm).toBeLessThanOrEqual(10);
@@ -547,9 +549,9 @@ describe.sequential("DeviceRoom steady-state custody", () => {
     // following are conservative arithmetic estimates, not account analytics;
     // the real WebSocket event.batch counters above are reported separately.
     const activeEightHourBudget = [
-      { idleDevices: 1, activeHealthObservations: 49, activeD1HealthProjections: 33, workerRequests: 1_301, d1RowsRead: 34_737, d1RowsWritten: 11_579, doRequests: 1_301, doRowsRead: 6_058, doRowsWritten: 7_879, queueOperations: 0 },
-      { idleDevices: 5, activeHealthObservations: 49, activeD1HealthProjections: 33, workerRequests: 1_893, d1RowsRead: 37_077, d1RowsWritten: 12_359, doRequests: 1_893, doRowsRead: 9_570, doRowsWritten: 8_331, queueOperations: 0 },
-      { idleDevices: 10, activeHealthObservations: 49, activeD1HealthProjections: 33, workerRequests: 2_633, d1RowsRead: 40_002, d1RowsWritten: 13_334, doRequests: 2_633, doRowsRead: 13_960, doRowsWritten: 8_896, queueOperations: 0 },
+      { idleDevices: 1, activeHealthObservations: 49, activeD1HealthProjections: 33, workerRequests: 1_301, d1RowsRead: 34_377, d1RowsWritten: 11_459, doRequests: 1_301, doRowsRead: 6_058, doRowsWritten: 7_855, queueOperations: 0 },
+      { idleDevices: 5, activeHealthObservations: 49, activeD1HealthProjections: 33, workerRequests: 1_893, d1RowsRead: 35_277, d1RowsWritten: 11_759, doRequests: 1_893, doRowsRead: 9_570, doRowsWritten: 8_211, queueOperations: 0 },
+      { idleDevices: 10, activeHealthObservations: 49, activeD1HealthProjections: 33, workerRequests: 2_633, d1RowsRead: 36_402, d1RowsWritten: 12_134, doRequests: 2_633, doRowsRead: 13_960, doRowsWritten: 8_656, queueOperations: 0 },
     ] as const;
     for (const budget of activeEightHourBudget) {
       expect(budget.activeHealthObservations).toBe(49);

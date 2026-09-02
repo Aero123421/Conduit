@@ -12,7 +12,8 @@ The repository is defining the product model and the first Linux vertical slice.
 - `docs/RUNTIME_AND_SECURITY.md`: runtime providers, access, approvals, and credentials
 - `docs/AUTHORIZATION.md`: owner, browser, OAuth client, device, enrollment, connector ceiling, and rate-limit contracts
 - `docs/NODE_PROTOCOL.md`: device connection, durable delivery, operation admission, offline behavior, and reconciliation
-- `docs/OBSERVABILITY.md`: run manifests, events, logs, and evaluations
+- `docs/TRACE_FORMAT.md`: immutable Run Manifest, Context Snapshot, normalized Event, local content, cursor, and retention contracts
+- `docs/OBSERVABILITY.md`: debugging, reports, comparisons, and evaluation behavior
 - `docs/MVP.md`: implementation order and acceptance criteria
 - `spec/schemas/`: machine-checkable protocol and durable-record schemas
 
@@ -35,6 +36,8 @@ Do not introduce a second meaning for `Project`, `Session`, `Assignment`, `Run`,
 - An MCP client cannot raise its own connector ceiling.
 - Transport delivery, node admission, runtime start, and terminal completion are separate receipts.
 - Ambiguous effectful work is never automatically repeated.
+- A Run Manifest is immutable after commit; later facts are Events or Context Snapshots.
+- Skill and instruction use must retain evidence level; inferred behavior is not reported as explicit invocation.
 
 ## Implementation rules
 
@@ -44,6 +47,8 @@ Do not introduce a second meaning for `Project`, `Session`, `Assignment`, `Run`,
 - Persist an operation or message before acknowledging custody of it.
 - Use persistent per-device sequences across reconnects; connection epoch fences stale sockets.
 - Never treat a WebSocket ACK or queue delivery as proof that an operation ran.
+- Persist the Run Manifest before requesting Runtime start.
+- Keep normalized Events bounded; use immutable Content Objects and raw Segments for larger data.
 - Never expose a host container or VM-management socket inside an agent runtime.
 - Never mount an entire user home directory only to reuse agent credentials.
 - Unknown provider events remain visible as bounded adapter errors; do not silently discard them.
@@ -51,6 +56,7 @@ Do not introduce a second meaning for `Project`, `Session`, `Assignment`, `Run`,
 - Keep Linux behavior complete before claiming equivalent Windows or macOS support.
 - Require fresh passkey authentication before broadening device, connector, raw-log, credential, or full-access authority.
 - Do not accept OAuth bearer tokens as device credentials or browser cookies at the MCP protected resource.
+- Run `python scripts/validate_spec.py` after changing a schema or example.
 
 ## Documentation style
 

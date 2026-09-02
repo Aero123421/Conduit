@@ -1,0 +1,80 @@
+{
+  "schemaVersion": 1,
+  "kind": "context_snapshot",
+  "snapshotId": "ctxs_conduit_initial_01",
+  "snapshotDigest": "9a2c0fc5478e4337e0098377f39c9e9beaf08dbd2395d241120409af27bf9c3e",
+  "runId": "run_conduit_codex_01",
+  "inputOperationId": "op_conduit_codex_01",
+  "mode": "initial",
+  "controllerEpoch": "1",
+  "projectContextRevision": 5,
+  "sessionRevision": 18,
+  "instructionCatalogDigest": "6edb811794d2379507aa69fed89b6c95c4664294f4478206675d22045d9c41b1",
+  "skillCatalogDigest": "3bd2f93d53ec2dbdb984c8b9bb06b8074310dfd67f6aa8cdaef356589552fa39",
+  "compiler": {
+    "id": "conduit-context-compiler",
+    "version": "0.1.0-dev",
+    "digest": "b1b191733bb939c077e55263e21e30a8ddfb3647a8e48fcb217818169f0c03ee"
+  },
+  "items": [
+    {
+      "itemType": "assignment_message",
+      "sourceId": "msg_assignment_01",
+      "sourceRevision": 1,
+      "precedence": 10,
+      "contentDigest": "8a045536f249990a6fc7389147aca5b49d7a78924014b357ef031eb5290f6a2d",
+      "bytes": 612,
+      "state": "included",
+      "sensitivity": "project_content"
+    },
+    {
+      "itemType": "project_context",
+      "sourceId": "project-context:prj_conduit_01",
+      "sourceRevision": 5,
+      "precedence": 20,
+      "contentDigest": "89bb007b847983498b5b2aa09dfec96817fdade5f3bbb29f891af0f44762bd8a",
+      "bytes": 8430,
+      "state": "summarized",
+      "reason": "project context exceeded direct inclusion budget",
+      "sensitivity": "project_content"
+    },
+    {
+      "itemType": "board_message",
+      "sourceId": "msg_design_decision_01",
+      "sourceRevision": 1,
+      "precedence": 30,
+      "contentDigest": "451c0899babbe369a6f6248d357e2c4d7c86767c489b2a8446ee50feea7d52aa",
+      "bytes": 328,
+      "state": "included",
+      "sensitivity": "project_content"
+    },
+    {
+      "itemType": "instruction_catalog",
+      "sourceId": "instruction-catalog:6edb8117",
+      "sourceRevision": 1,
+      "precedence": 40,
+      "contentDigest": "6edb811794d2379507aa69fed89b6c95c4664294f4478206675d22045d9c41b1",
+      "bytes": 3176,
+      "state": "referenced",
+      "reason": "provider discovers project guidance independently",
+      "sensitivity": "project_content"
+    },
+    {
+      "itemType": "skill_catalog",
+      "sourceId": "skill-catalog:3bd2f93d",
+      "sourceRevision": 1,
+      "precedence": 50,
+      "contentDigest": "3bd2f93d53ec2dbdb984c8b9bb06b8074310dfd67f6aa8cdaef356589552fa39",
+      "bytes": 7020,
+      "state": "referenced",
+      "reason": "skills are loaded on demand",
+      "sensitivity": "project_content"
+    }
+  ],
+  "estimatedBytes": 12410,
+  "estimatedTokens": 3100,
+  "capturePolicyId": "capture_standard_01",
+  "redactionPolicyId": "redact_default_01",
+  "compiledContentDigest": "f2c0c55bd6edfa03514718102346f21ec5135226c611c7eb94632de43964032d",
+  "createdAt": "2026-09-01T10:00:03Z"
+}

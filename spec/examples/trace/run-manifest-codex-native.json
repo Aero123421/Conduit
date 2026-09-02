@@ -1,0 +1,232 @@
+{
+  "schemaVersion": 1,
+  "kind": "run_manifest",
+  "manifestId": "rman_conduit_codex_01",
+  "manifestDigest": "04c5a17f91dd94e345c4b4046e6ac97dc5bb5cbbe72f583f0de9476b7c6f2ec9",
+  "runId": "run_conduit_codex_01",
+  "assignmentId": "asg_conduit_codex_01",
+  "projectId": "prj_conduit_01",
+  "sessionId": "csess_architecture_01",
+  "operationId": "op_conduit_codex_01",
+  "requestDigest": "7dc482742b169f279a993bda9e091c379acc6e1ab917452109330aa8d5931aae",
+  "idempotencyKeyDigest": "06e614f72d7841c14fba70f820e67c691e69dc79bfef7ac05ea47e297078131a",
+  "actorPrincipalId": "prin_owner_01",
+  "clientId": "https://client.example/dashboard/conduit",
+  "projectAgentId": "pagent_codex_builder_01",
+  "createdAt": "2026-09-01T10:00:00Z",
+  "admittedAt": "2026-09-01T10:00:02Z",
+  "device": {
+    "deviceId": "dev_sahur_pc_01",
+    "displayLabel": "sahur-pc",
+    "nodeVersion": "0.1.0-dev",
+    "nodeProtocolVersion": "conduit.node/1",
+    "os": "linux",
+    "arch": "x86_64",
+    "nodeBootId": "boot-2026-09-01T09-58-00Z-01",
+    "capabilityDigest": "670bc59d639c283f6645aacf980d57d6a12d18defe1b93b83a0df7c6c857e521",
+    "localPolicyRevision": 3,
+    "storageProfileRevision": 2
+  },
+  "runtime": {
+    "kind": "native",
+    "providerId": "native.linux",
+    "providerVersion": "0.1.0-dev",
+    "capabilityReceiptDigest": "1bd9931fa5bc270494f8d3108eb92c52e8454832853283677f3228809fd46acd",
+    "configurationRevision": 1,
+    "identityClass": "signed_in_user",
+    "resources": {
+      "cpu": 4,
+      "memoryBytes": 8589934592,
+      "storageBytes": 21474836480,
+      "gpuCount": 0
+    },
+    "networkMode": "open",
+    "isolation": {
+      "distinctOsIdentity": false,
+      "filesystemRestricted": false,
+      "processNamespace": false,
+      "networkIsolated": false,
+      "containerBoundary": false,
+      "vmBoundary": false,
+      "elevationAvailable": false,
+      "hostControlSocketExposed": false,
+      "notes": [
+        "Native execution under the signed-in user; no filesystem isolation is claimed."
+      ]
+    }
+  },
+  "authority": {
+    "requestedAccessScope": "project_full",
+    "effectiveAccessScope": "project_full",
+    "requestedApprovalMode": "never",
+    "effectiveApprovalMode": "never",
+    "connectorPolicyId": "cpol_dashboard_owner_01",
+    "connectorPolicyRevision": 4,
+    "projectPolicyRevision": 2,
+    "devicePolicyRevision": 3,
+    "approvedRiskClasses": [],
+    "operationExpiresAt": "2026-09-01T10:10:00Z",
+    "admittedValidForMs": 600000
+  },
+  "sources": [
+    {
+      "sourceId": "src_conduit_repo_01",
+      "locationId": "loc_sahur_conduit_01",
+      "locationRevision": 3,
+      "workspaceMode": "worktree",
+      "path": {
+        "reference": "pathref_conduit_run_01",
+        "displayPath": "~/Conduit worktree"
+      },
+      "repositoryIdentityDigest": "b714a0d5ef4c9b8e180a560360f44ee3cbed837285d766398965476e450e1d6a",
+      "baseCommit": "905920194c03bc39bccda1ed69e153f25593379b",
+      "branch": "conduit/run-conduit-codex-01",
+      "upstream": "origin/main",
+      "dirtyStateDigest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "dirtySummary": {
+        "changed": 0,
+        "untracked": 0,
+        "conflicted": 0,
+        "truncated": false
+      },
+      "gitFeatures": {
+        "submodules": false,
+        "lfs": false,
+        "sparseCheckout": false,
+        "partialClone": false
+      },
+      "initialState": "git_commit",
+      "initialStateDigest": "905920194c03bc39bccda1ed69e153f25593379b000000000000000000000000"
+    }
+  ],
+  "adapter": {
+    "adapterId": "codex",
+    "contractVersion": "conduit.codex/1",
+    "implementationVersion": "0.1.0-dev",
+    "executable": {
+      "path": {
+        "reference": "pathref_codex_executable_01",
+        "displayPath": "codex"
+      },
+      "identityDigest": "2154e5e9702bd43f4d6c6dc3bbf982332f2a0e5c6e55115523321c1d5a597b05",
+      "fileDigest": "ec6144674cda3bb3b5f51ebf067591db618776418a07513f536e1286f50ef8a5",
+      "packageIdentity": "openai/codex",
+      "version": "0.149.1",
+      "evidenceLevel": "observed"
+    },
+    "requestedModel": "gpt-5.6",
+    "requestedEffort": "high",
+    "authenticationState": "authenticated",
+    "authenticationEvidence": "explicit",
+    "capabilityReceiptDigest": "eadad0aa3849ab67404648e401584aa5e2ac4b7d97c03cf2f8a49e91225bf51c",
+    "launchPlanDigest": "a42a319143c97456e61f91f7dbd4d679e02b10af4186b555a95bce5a9110f5e5",
+    "toolCatalogDigest": "c57ea7e625201e3393db545c856d89ab76164813290193f3c62bbd7c4fc21ac4",
+    "nativeSessionMode": "app_server_new_thread"
+  },
+  "context": {
+    "projectContextRevision": 5,
+    "sessionRevision": 18,
+    "assignmentMessageRevision": 1,
+    "messageIds": [
+      "msg_assignment_01",
+      "msg_design_decision_01"
+    ],
+    "artifactIds": [],
+    "changeSetIds": [],
+    "compiler": {
+      "id": "conduit-context-compiler",
+      "version": "0.1.0-dev",
+      "digest": "b1b191733bb939c077e55263e21e30a8ddfb3647a8e48fcb217818169f0c03ee"
+    },
+    "configurationDigest": "b8b57524b24e06647163c89d53ef089818cbf3bac35cda771b172926db42232e",
+    "estimatedBytes": 27104,
+    "estimatedTokens": 6700
+  },
+  "instructions": {
+    "catalogDigest": "6edb811794d2379507aa69fed89b6c95c4664294f4478206675d22045d9c41b1",
+    "discoveryFilenames": [
+      "AGENTS.md",
+      "AGENTS.override.md"
+    ],
+    "perFileByteLimit": 32768,
+    "aggregateByteLimit": 32768,
+    "discoveredBytes": 3176,
+    "items": [
+      {
+        "instructionId": "ins_conduit_root_01",
+        "kind": "AGENTS.md",
+        "path": {
+          "reference": "pathref_agents_root_01",
+          "displayPath": "AGENTS.md"
+        },
+        "contentDigest": "601345d59dfeaf86e535506d4e5924104cc07f220ce17f63dcdd3b19c4ad3c7a",
+        "bytes": 3176,
+        "discoverySource": "codex_project_guidance_scan",
+        "scope": ".",
+        "precedence": 0,
+        "eligible": true,
+        "initialState": "discovered",
+        "evidenceLevel": "observed"
+      }
+    ],
+    "errors": []
+  },
+  "skills": {
+    "catalogDigest": "3bd2f93d53ec2dbdb984c8b9bb06b8074310dfd67f6aa8cdaef356589552fa39",
+    "items": [
+      {
+        "skillId": "skill_conduit_protocol_01",
+        "name": "conduit-protocol-design",
+        "descriptionDigest": "74bf9203d9c96640a3fa29211fb0c14d59134eb926c8f9abe2512594169c15f2",
+        "skillFileDigest": "c79cbcf26985b49a422bb3e275195437370f9ff9b8e64de040c9ecb4ac553476",
+        "skillFileBytes": 4210,
+        "source": "project",
+        "version": "1.0.0",
+        "compatibilityDigest": "f4f851a928adf1090ae2d341546724ba8953da15084467ff2a55a5e30b4d6d0d",
+        "discoveryScope": "project",
+        "eligibleAdapters": [
+          "codex"
+        ],
+        "eligibility": "eligible",
+        "precedence": 0,
+        "resources": [
+          {
+            "kind": "reference",
+            "relativePath": "references/protocol-checklist.md",
+            "contentDigest": "0248028da40c7731732a01abe3f33317e129360c9bc386192a25717a51e94ad8",
+            "bytes": 2810
+          }
+        ]
+      }
+    ]
+  },
+  "capture": {
+    "policyId": "capture_standard_01",
+    "revision": 1,
+    "redactionPolicyId": "redact_default_01",
+    "redactionPolicyRevision": 1,
+    "retentionPolicyId": "retain_default_01",
+    "retentionPolicyRevision": 1,
+    "visibleMessages": "bounded",
+    "toolArguments": "summary",
+    "toolResults": "summary",
+    "commandOutput": "bounded",
+    "fileDiffs": "hash",
+    "rawProviderProtocol": "full_local",
+    "screenshots": "none",
+    "maxInlinePayloadBytes": 8192,
+    "maxContentObjectBytes": 8388608,
+    "maxSegmentBytes": 4194304
+  },
+  "evaluation": {
+    "caseId": "case_trace_schema_01",
+    "experimentId": "experiment_manifest_v1",
+    "variantId": "codex_native_high",
+    "replicate": 0,
+    "comparisonGroup": "trace_v1_design",
+    "expectedChecks": [
+      "json_schema_valid",
+      "references_resolve"
+    ]
+  }
+}

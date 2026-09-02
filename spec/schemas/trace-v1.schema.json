@@ -1,0 +1,967 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conduit.dev/spec/schemas/trace-v1.schema.json",
+  "title": "Conduit run manifest and trace records v1",
+  "description": "Immutable run inputs, context snapshots, normalized device events, content objects, raw segments, and cursors.",
+  "oneOf": [
+    { "$ref": "#/$defs/RunManifest" },
+    { "$ref": "#/$defs/ContextSnapshot" },
+    { "$ref": "#/$defs/NormalizedEvent" },
+    { "$ref": "#/$defs/ContentObject" },
+    { "$ref": "#/$defs/SegmentDescriptor" },
+    { "$ref": "#/$defs/TraceCursor" }
+  ],
+  "$defs": {
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "U64Decimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$"
+    },
+    "Sha256Hex": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "HexTraceId": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{32}$"
+    },
+    "HexSpanId": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{16}$"
+    },
+    "RunId": {
+      "type": "string",
+      "pattern": "^(run|lrun)_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ManifestId": {
+      "type": "string",
+      "pattern": "^rman_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ContextSnapshotId": {
+      "type": "string",
+      "pattern": "^ctxs_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "EventId": {
+      "type": "string",
+      "pattern": "^evt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ContentObjectId": {
+      "type": "string",
+      "pattern": "^obj_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "SegmentId": {
+      "type": "string",
+      "pattern": "^seg_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "DeviceId": {
+      "type": "string",
+      "pattern": "^dev_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "PrincipalId": {
+      "type": "string",
+      "pattern": "^prin_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ProjectId": {
+      "type": "string",
+      "pattern": "^prj_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "SessionId": {
+      "type": "string",
+      "pattern": "^csess_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "AssignmentId": {
+      "type": "string",
+      "pattern": "^asg_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "OperationId": {
+      "type": "string",
+      "pattern": "^op_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ProjectAgentId": {
+      "type": "string",
+      "pattern": "^pagent_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "SourceId": {
+      "type": "string",
+      "pattern": "^src_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "LocationId": {
+      "type": "string",
+      "pattern": "^loc_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "InstructionId": {
+      "type": "string",
+      "pattern": "^ins_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "SkillId": {
+      "type": "string",
+      "pattern": "^skill_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ArtifactId": {
+      "type": "string",
+      "pattern": "^art_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "MessageId": {
+      "type": "string",
+      "pattern": "^msg_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ChangeSetId": {
+      "type": "string",
+      "pattern": "^chg_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "EvidenceLevel": {
+      "type": "string",
+      "enum": ["explicit", "observed", "inferred", "unknown"]
+    },
+    "SensitivityClass": {
+      "type": "string",
+      "enum": ["public", "metadata", "project_content", "raw_log", "credential_reference", "secret"]
+    },
+    "RetentionClass": {
+      "type": "string",
+      "enum": ["R0", "R1", "R2", "R3"]
+    },
+    "AccessScope": {
+      "type": "string",
+      "enum": ["read_only", "selected_sources", "project_full", "full_user", "full_device", "custom"]
+    },
+    "ApprovalMode": {
+      "type": "string",
+      "enum": ["always", "outside_scope", "risk_classes", "never"]
+    },
+    "RuntimeKind": {
+      "type": "string",
+      "enum": ["native", "restricted_native", "container", "vm"]
+    },
+    "WorkspaceMode": {
+      "type": "string",
+      "enum": ["read_only", "direct", "worktree", "managed_copy"]
+    },
+    "CaptureMode": {
+      "type": "string",
+      "enum": ["none", "hash", "summary", "bounded", "full_local", "upload_allowed"]
+    },
+    "ContentState": {
+      "type": "string",
+      "enum": ["complete", "redacted", "partial", "corrupt", "missing", "expired"]
+    },
+    "EvidenceState": {
+      "type": "string",
+      "enum": ["complete", "content_redacted", "raw_not_captured", "retention_gap", "segment_corrupt", "event_chain_mismatch", "local_store_unavailable", "upload_incomplete"]
+    },
+    "OpaquePathReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference", "displayPath"],
+      "properties": {
+        "reference": {
+          "type": "string",
+          "pattern": "^pathref_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+        },
+        "displayPath": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 512
+        }
+      }
+    },
+    "IdentityVersion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "version": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "digest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    },
+    "IsolationCapabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "distinctOsIdentity",
+        "filesystemRestricted",
+        "processNamespace",
+        "networkIsolated",
+        "containerBoundary",
+        "vmBoundary",
+        "elevationAvailable",
+        "hostControlSocketExposed"
+      ],
+      "properties": {
+        "distinctOsIdentity": { "type": "boolean" },
+        "filesystemRestricted": { "type": "boolean" },
+        "processNamespace": { "type": "boolean" },
+        "networkIsolated": { "type": "boolean" },
+        "containerBoundary": { "type": "boolean" },
+        "vmBoundary": { "type": "boolean" },
+        "elevationAvailable": { "type": "boolean" },
+        "hostControlSocketExposed": { "type": "boolean" },
+        "notes": {
+          "type": "array",
+          "maxItems": 32,
+          "items": { "type": "string", "maxLength": 256 }
+        }
+      }
+    },
+    "DeviceManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "deviceId",
+        "displayLabel",
+        "nodeVersion",
+        "nodeProtocolVersion",
+        "os",
+        "arch",
+        "nodeBootId",
+        "capabilityDigest",
+        "localPolicyRevision",
+        "storageProfileRevision"
+      ],
+      "properties": {
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "displayLabel": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "nodeVersion": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "nodeProtocolVersion": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "os": { "enum": ["linux", "windows", "macos", "unknown"] },
+        "arch": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "nodeBootId": { "type": "string", "minLength": 16, "maxLength": 128 },
+        "capabilityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "localPolicyRevision": { "type": "integer", "minimum": 1 },
+        "storageProfileRevision": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "RuntimeManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "providerId",
+        "providerVersion",
+        "capabilityReceiptDigest",
+        "configurationRevision",
+        "identityClass",
+        "resources",
+        "networkMode",
+        "isolation"
+      ],
+      "properties": {
+        "kind": { "$ref": "#/$defs/RuntimeKind" },
+        "providerId": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "providerVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "capabilityReceiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "configurationRevision": { "type": "integer", "minimum": 1 },
+        "identityClass": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "resources": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["cpu", "memoryBytes", "storageBytes", "gpuCount"],
+          "properties": {
+            "cpu": { "type": "number", "minimum": 0, "maximum": 1024 },
+            "memoryBytes": { "type": "integer", "minimum": 0 },
+            "storageBytes": { "type": "integer", "minimum": 0 },
+            "gpuCount": { "type": "integer", "minimum": 0, "maximum": 64 }
+          }
+        },
+        "networkMode": { "enum": ["open", "restricted", "offline", "lan_explicit"] },
+        "isolation": { "$ref": "#/$defs/IsolationCapabilities" },
+        "environmentDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "imageReference": { "type": "string", "maxLength": 512 }
+      }
+    },
+    "AuthorityManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "requestedAccessScope",
+        "effectiveAccessScope",
+        "requestedApprovalMode",
+        "effectiveApprovalMode",
+        "connectorPolicyId",
+        "connectorPolicyRevision",
+        "projectPolicyRevision",
+        "devicePolicyRevision",
+        "operationExpiresAt",
+        "admittedValidForMs"
+      ],
+      "properties": {
+        "requestedAccessScope": { "$ref": "#/$defs/AccessScope" },
+        "effectiveAccessScope": { "$ref": "#/$defs/AccessScope" },
+        "requestedApprovalMode": { "$ref": "#/$defs/ApprovalMode" },
+        "effectiveApprovalMode": { "$ref": "#/$defs/ApprovalMode" },
+        "connectorPolicyId": { "type": "string", "pattern": "^cpol_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "connectorPolicyRevision": { "type": "integer", "minimum": 1 },
+        "projectPolicyRevision": { "type": "integer", "minimum": 1 },
+        "devicePolicyRevision": { "type": "integer", "minimum": 1 },
+        "approvedRiskClasses": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "type": "string", "maxLength": 128 }
+        },
+        "operationExpiresAt": { "$ref": "#/$defs/Timestamp" },
+        "admittedValidForMs": { "type": "integer", "minimum": 1, "maximum": 2592000000 }
+      }
+    },
+    "SourceManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceId",
+        "locationId",
+        "locationRevision",
+        "workspaceMode",
+        "path",
+        "initialState"
+      ],
+      "properties": {
+        "sourceId": { "$ref": "#/$defs/SourceId" },
+        "locationId": { "$ref": "#/$defs/LocationId" },
+        "locationRevision": { "type": "integer", "minimum": 1 },
+        "workspaceMode": { "$ref": "#/$defs/WorkspaceMode" },
+        "path": { "$ref": "#/$defs/OpaquePathReference" },
+        "repositoryIdentityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "baseCommit": { "type": "string", "pattern": "^[A-Fa-f0-9]{7,64}$" },
+        "branch": { "type": "string", "maxLength": 512 },
+        "upstream": { "type": "string", "maxLength": 512 },
+        "dirtyStateDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "dirtySummary": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "changed": { "type": "integer", "minimum": 0 },
+            "untracked": { "type": "integer", "minimum": 0 },
+            "conflicted": { "type": "integer", "minimum": 0 },
+            "truncated": { "type": "boolean" }
+          }
+        },
+        "gitFeatures": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "submodules": { "type": "boolean" },
+            "lfs": { "type": "boolean" },
+            "sparseCheckout": { "type": "boolean" },
+            "partialClone": { "type": "boolean" }
+          }
+        },
+        "initialState": { "enum": ["git_commit", "bounded_manifest", "unknown"] },
+        "initialStateDigest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    },
+    "ExecutableIdentity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "identityDigest", "evidenceLevel"],
+      "properties": {
+        "path": { "$ref": "#/$defs/OpaquePathReference" },
+        "identityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "fileDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "packageIdentity": { "type": "string", "maxLength": 256 },
+        "version": { "type": "string", "maxLength": 128 },
+        "evidenceLevel": { "$ref": "#/$defs/EvidenceLevel" }
+      }
+    },
+    "AdapterManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "adapterId",
+        "contractVersion",
+        "implementationVersion",
+        "executable",
+        "requestedModel",
+        "requestedEffort",
+        "authenticationState",
+        "authenticationEvidence",
+        "capabilityReceiptDigest",
+        "launchPlanDigest",
+        "toolCatalogDigest"
+      ],
+      "properties": {
+        "adapterId": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "contractVersion": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "implementationVersion": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "executable": { "$ref": "#/$defs/ExecutableIdentity" },
+        "wrapper": { "$ref": "#/$defs/ExecutableIdentity" },
+        "interpreter": { "$ref": "#/$defs/ExecutableIdentity" },
+        "cliVersion": { "type": "string", "maxLength": 128 },
+        "requestedModel": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "effectiveModel": { "type": "string", "maxLength": 256 },
+        "requestedEffort": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "effectiveEffort": { "type": "string", "maxLength": 128 },
+        "authenticationState": { "enum": ["authenticated", "needs_login", "unknown", "unavailable"] },
+        "authenticationEvidence": { "$ref": "#/$defs/EvidenceLevel" },
+        "capabilityReceiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "launchPlanDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "toolCatalogDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "nativeSessionMode": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "InstructionItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "instructionId",
+        "kind",
+        "path",
+        "contentDigest",
+        "bytes",
+        "discoverySource",
+        "scope",
+        "precedence",
+        "eligible",
+        "initialState",
+        "evidenceLevel"
+      ],
+      "properties": {
+        "instructionId": { "$ref": "#/$defs/InstructionId" },
+        "kind": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "path": { "$ref": "#/$defs/OpaquePathReference" },
+        "contentDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "bytes": { "type": "integer", "minimum": 0, "maximum": 16777216 },
+        "discoverySource": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "scope": { "type": "string", "maxLength": 512 },
+        "precedence": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "eligible": { "type": "boolean" },
+        "initialState": { "enum": ["discovered", "skipped", "unsupported", "missing", "unknown"] },
+        "evidenceLevel": { "$ref": "#/$defs/EvidenceLevel" }
+      }
+    },
+    "InstructionCatalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "catalogDigest",
+        "discoveryFilenames",
+        "perFileByteLimit",
+        "aggregateByteLimit",
+        "discoveredBytes",
+        "items"
+      ],
+      "properties": {
+        "catalogDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "discoveryFilenames": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "type": "string", "maxLength": 128 }
+        },
+        "perFileByteLimit": { "type": "integer", "minimum": 0, "maximum": 16777216 },
+        "aggregateByteLimit": { "type": "integer", "minimum": 0, "maximum": 67108864 },
+        "discoveredBytes": { "type": "integer", "minimum": 0, "maximum": 268435456 },
+        "items": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/InstructionItem" }
+        },
+        "errors": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "type": "string", "maxLength": 256 }
+        }
+      }
+    },
+    "SkillResource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "relativePath", "contentDigest"],
+      "properties": {
+        "kind": { "enum": ["script", "reference", "template", "asset", "other"] },
+        "relativePath": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "contentDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "bytes": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "SkillItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "skillId",
+        "name",
+        "descriptionDigest",
+        "skillFileDigest",
+        "skillFileBytes",
+        "source",
+        "discoveryScope",
+        "eligibleAdapters",
+        "eligibility",
+        "precedence"
+      ],
+      "properties": {
+        "skillId": { "$ref": "#/$defs/SkillId" },
+        "name": { "type": "string", "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$", "maxLength": 64 },
+        "descriptionDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "skillFileDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "skillFileBytes": { "type": "integer", "minimum": 0, "maximum": 16777216 },
+        "source": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "version": { "type": "string", "maxLength": 128 },
+        "compatibilityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "discoveryScope": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "eligibleAdapters": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": { "type": "string", "maxLength": 128 }
+        },
+        "eligibility": { "enum": ["eligible", "ineligible", "unknown"] },
+        "precedence": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "resources": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/SkillResource" }
+        }
+      }
+    },
+    "SkillCatalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["catalogDigest", "items"],
+      "properties": {
+        "catalogDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "items": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/SkillItem" }
+        }
+      }
+    },
+    "ContextSelection": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "projectContextRevision",
+        "sessionRevision",
+        "assignmentMessageRevision",
+        "messageIds",
+        "artifactIds",
+        "changeSetIds",
+        "compiler",
+        "configurationDigest",
+        "estimatedBytes"
+      ],
+      "properties": {
+        "projectContextRevision": { "type": "integer", "minimum": 0 },
+        "sessionRevision": { "type": "integer", "minimum": 0 },
+        "assignmentMessageRevision": { "type": "integer", "minimum": 0 },
+        "messageIds": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/MessageId" }
+        },
+        "artifactIds": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ArtifactId" }
+        },
+        "changeSetIds": {
+          "type": "array",
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ChangeSetId" }
+        },
+        "compiler": { "$ref": "#/$defs/IdentityVersion" },
+        "configurationDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "estimatedBytes": { "type": "integer", "minimum": 0 },
+        "estimatedTokens": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "CapturePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "policyId",
+        "revision",
+        "redactionPolicyId",
+        "redactionPolicyRevision",
+        "retentionPolicyId",
+        "retentionPolicyRevision",
+        "visibleMessages",
+        "toolArguments",
+        "toolResults",
+        "commandOutput",
+        "fileDiffs",
+        "rawProviderProtocol",
+        "screenshots",
+        "maxInlinePayloadBytes",
+        "maxContentObjectBytes",
+        "maxSegmentBytes"
+      ],
+      "properties": {
+        "policyId": { "type": "string", "maxLength": 128 },
+        "revision": { "type": "integer", "minimum": 1 },
+        "redactionPolicyId": { "type": "string", "maxLength": 128 },
+        "redactionPolicyRevision": { "type": "integer", "minimum": 1 },
+        "retentionPolicyId": { "type": "string", "maxLength": 128 },
+        "retentionPolicyRevision": { "type": "integer", "minimum": 1 },
+        "visibleMessages": { "$ref": "#/$defs/CaptureMode" },
+        "toolArguments": { "$ref": "#/$defs/CaptureMode" },
+        "toolResults": { "$ref": "#/$defs/CaptureMode" },
+        "commandOutput": { "$ref": "#/$defs/CaptureMode" },
+        "fileDiffs": { "$ref": "#/$defs/CaptureMode" },
+        "rawProviderProtocol": { "$ref": "#/$defs/CaptureMode" },
+        "screenshots": { "$ref": "#/$defs/CaptureMode" },
+        "maxInlinePayloadBytes": { "type": "integer", "minimum": 0, "maximum": 65536 },
+        "maxContentObjectBytes": { "type": "integer", "minimum": 1024, "maximum": 67108864 },
+        "maxSegmentBytes": { "type": "integer", "minimum": 1024, "maximum": 67108864 }
+      }
+    },
+    "EvaluationTags": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "caseId": { "type": "string", "maxLength": 256 },
+        "experimentId": { "type": "string", "maxLength": 256 },
+        "variantId": { "type": "string", "maxLength": 256 },
+        "replicate": { "type": "integer", "minimum": 0 },
+        "comparisonGroup": { "type": "string", "maxLength": 256 },
+        "expectedChecks": {
+          "type": "array",
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": { "type": "string", "maxLength": 128 }
+        }
+      }
+    },
+    "RunManifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "manifestId",
+        "manifestDigest",
+        "runId",
+        "operationId",
+        "requestDigest",
+        "idempotencyKeyDigest",
+        "actorPrincipalId",
+        "clientId",
+        "createdAt",
+        "admittedAt",
+        "device",
+        "runtime",
+        "authority",
+        "sources",
+        "context",
+        "instructions",
+        "skills",
+        "capture"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "run_manifest" },
+        "manifestId": { "$ref": "#/$defs/ManifestId" },
+        "manifestDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "assignmentId": { "$ref": "#/$defs/AssignmentId" },
+        "projectId": { "$ref": "#/$defs/ProjectId" },
+        "sessionId": { "$ref": "#/$defs/SessionId" },
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "requestDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "idempotencyKeyDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "actorPrincipalId": { "$ref": "#/$defs/PrincipalId" },
+        "clientId": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "projectAgentId": { "$ref": "#/$defs/ProjectAgentId" },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "admittedAt": { "$ref": "#/$defs/Timestamp" },
+        "device": { "$ref": "#/$defs/DeviceManifest" },
+        "runtime": { "$ref": "#/$defs/RuntimeManifest" },
+        "authority": { "$ref": "#/$defs/AuthorityManifest" },
+        "sources": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/SourceManifest" }
+        },
+        "adapter": { "$ref": "#/$defs/AdapterManifest" },
+        "context": { "$ref": "#/$defs/ContextSelection" },
+        "instructions": { "$ref": "#/$defs/InstructionCatalog" },
+        "skills": { "$ref": "#/$defs/SkillCatalog" },
+        "capture": { "$ref": "#/$defs/CapturePolicy" },
+        "evaluation": { "$ref": "#/$defs/EvaluationTags" }
+      }
+    },
+    "ContextItem": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "itemType",
+        "sourceId",
+        "sourceRevision",
+        "precedence",
+        "contentDigest",
+        "bytes",
+        "state",
+        "sensitivity"
+      ],
+      "properties": {
+        "itemType": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "sourceId": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "sourceRevision": { "type": "integer", "minimum": 0 },
+        "precedence": { "type": "integer", "minimum": 0, "maximum": 65535 },
+        "contentDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "state": { "enum": ["included", "summarized", "referenced", "omitted", "unavailable"] },
+        "reason": { "type": "string", "maxLength": 256 },
+        "sensitivity": { "$ref": "#/$defs/SensitivityClass" }
+      }
+    },
+    "ContextSnapshot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "snapshotId",
+        "snapshotDigest",
+        "runId",
+        "inputOperationId",
+        "mode",
+        "controllerEpoch",
+        "projectContextRevision",
+        "sessionRevision",
+        "instructionCatalogDigest",
+        "skillCatalogDigest",
+        "compiler",
+        "items",
+        "estimatedBytes",
+        "capturePolicyId",
+        "redactionPolicyId",
+        "compiledContentDigest",
+        "createdAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "context_snapshot" },
+        "snapshotId": { "$ref": "#/$defs/ContextSnapshotId" },
+        "snapshotDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "inputOperationId": { "$ref": "#/$defs/OperationId" },
+        "mode": { "enum": ["initial", "answer", "follow_up", "steer", "resume", "queued_instruction"] },
+        "controllerEpoch": { "$ref": "#/$defs/U64Decimal" },
+        "projectContextRevision": { "type": "integer", "minimum": 0 },
+        "sessionRevision": { "type": "integer", "minimum": 0 },
+        "instructionCatalogDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "skillCatalogDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "compiler": { "$ref": "#/$defs/IdentityVersion" },
+        "items": {
+          "type": "array",
+          "maxItems": 16384,
+          "items": { "$ref": "#/$defs/ContextItem" }
+        },
+        "estimatedBytes": { "type": "integer", "minimum": 0 },
+        "estimatedTokens": { "type": "integer", "minimum": 0 },
+        "capturePolicyId": { "type": "string", "maxLength": 128 },
+        "redactionPolicyId": { "type": "string", "maxLength": 128 },
+        "compiledContentDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "compiledContentRef": { "$ref": "#/$defs/ContentReference" },
+        "createdAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "ContentReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["objectId", "contentDigest", "bytes", "sensitivity", "retentionClass"],
+      "properties": {
+        "objectId": { "$ref": "#/$defs/ContentObjectId" },
+        "contentDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "sensitivity": { "$ref": "#/$defs/SensitivityClass" },
+        "retentionClass": { "$ref": "#/$defs/RetentionClass" }
+      }
+    },
+    "NormalizedEvent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "eventId",
+        "runId",
+        "deviceId",
+        "sequence",
+        "eventType",
+        "source",
+        "observedAt",
+        "nodeBootId",
+        "evidenceLevel",
+        "sensitivity",
+        "retentionClass",
+        "payloadDigest",
+        "eventDigest",
+        "previousChainHash",
+        "chainHash",
+        "payload"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "normalized_event" },
+        "eventId": { "$ref": "#/$defs/EventId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "sequence": { "$ref": "#/$defs/U64Decimal" },
+        "eventType": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "source": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "observedAt": { "$ref": "#/$defs/Timestamp" },
+        "monotonicNanos": { "$ref": "#/$defs/U64Decimal" },
+        "nodeBootId": { "type": "string", "minLength": 16, "maxLength": 128 },
+        "correlationId": { "type": "string", "maxLength": 256 },
+        "parentEventId": { "$ref": "#/$defs/EventId" },
+        "traceId": { "$ref": "#/$defs/HexTraceId" },
+        "spanId": { "$ref": "#/$defs/HexSpanId" },
+        "parentSpanId": { "$ref": "#/$defs/HexSpanId" },
+        "evidenceLevel": { "$ref": "#/$defs/EvidenceLevel" },
+        "sensitivity": { "$ref": "#/$defs/SensitivityClass" },
+        "retentionClass": { "$ref": "#/$defs/RetentionClass" },
+        "payloadDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "eventDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "previousChainHash": { "$ref": "#/$defs/Sha256Hex" },
+        "chainHash": { "$ref": "#/$defs/Sha256Hex" },
+        "payload": {
+          "type": "object",
+          "maxProperties": 128
+        },
+        "contentReference": { "$ref": "#/$defs/ContentReference" }
+      }
+    },
+    "RedactionRecord": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ruleId", "ruleVersion", "contentClass", "replacement", "evidenceLevel"],
+      "properties": {
+        "ruleId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "ruleVersion": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "contentClass": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "replacement": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "keyedDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "evidenceLevel": { "$ref": "#/$defs/EvidenceLevel" }
+      }
+    },
+    "ContentObject": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "objectId",
+        "runId",
+        "contentKind",
+        "sensitivity",
+        "retentionClass",
+        "compression",
+        "uncompressedBytes",
+        "storedBytes",
+        "contentDigest",
+        "storedDigest",
+        "storageProvider",
+        "opaqueLocator",
+        "state",
+        "createdAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "content_object" },
+        "objectId": { "$ref": "#/$defs/ContentObjectId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "contentKind": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "sensitivity": { "$ref": "#/$defs/SensitivityClass" },
+        "retentionClass": { "$ref": "#/$defs/RetentionClass" },
+        "compression": { "enum": ["none", "zstd"] },
+        "uncompressedBytes": { "type": "integer", "minimum": 0, "maximum": 67108864 },
+        "storedBytes": { "type": "integer", "minimum": 0, "maximum": 67108864 },
+        "contentDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "storedDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "encryption": { "enum": ["none", "device_at_rest", "envelope"] },
+        "redactions": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/RedactionRecord" }
+        },
+        "storageProvider": { "enum": ["device", "r2", "export_bundle"] },
+        "opaqueLocator": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "state": { "$ref": "#/$defs/ContentState" },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "expiresAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "SegmentDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "segmentId",
+        "runId",
+        "streamId",
+        "fromSequence",
+        "throughSequence",
+        "recordCount",
+        "compression",
+        "uncompressedBytes",
+        "storedBytes",
+        "contentDigest",
+        "storedDigest",
+        "storageProvider",
+        "opaqueLocator",
+        "state",
+        "createdAt",
+        "finalizedAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "segment_descriptor" },
+        "segmentId": { "$ref": "#/$defs/SegmentId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "streamId": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "fromSequence": { "$ref": "#/$defs/U64Decimal" },
+        "throughSequence": { "$ref": "#/$defs/U64Decimal" },
+        "recordCount": { "type": "integer", "minimum": 1 },
+        "compression": { "enum": ["none", "zstd"] },
+        "uncompressedBytes": { "type": "integer", "minimum": 0, "maximum": 67108864 },
+        "storedBytes": { "type": "integer", "minimum": 0, "maximum": 67108864 },
+        "contentDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "storedDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "storageProvider": { "enum": ["device", "r2", "export_bundle"] },
+        "opaqueLocator": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "state": { "$ref": "#/$defs/ContentState" },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "finalizedAt": { "$ref": "#/$defs/Timestamp" },
+        "evidenceState": { "$ref": "#/$defs/EvidenceState" }
+      }
+    },
+    "TraceCursor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "deviceId",
+        "runId",
+        "provider",
+        "position",
+        "storeGeneration",
+        "filterDigest",
+        "capturePolicyRevision",
+        "mac"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "trace_cursor" },
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "provider": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "position": { "$ref": "#/$defs/U64Decimal" },
+        "storeGeneration": { "$ref": "#/$defs/U64Decimal" },
+        "filterDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "capturePolicyRevision": { "type": "integer", "minimum": 1 },
+        "mac": { "type": "string", "pattern": "^[A-Za-z0-9_-]+$", "maxLength": 256 }
+      }
+    }
+  }
+}

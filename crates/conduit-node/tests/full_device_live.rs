@@ -12,9 +12,11 @@ use conduit_node_store::{
     CredentialMetadata, CredentialStore, DeviceIdentity, NodeStore, ProjectionKind,
 };
 use conduit_privileged_helper::capture_file_identity;
+use conduit_privileged_helper::{SeqpacketClient, SystemdBackend, SystemdManager};
 use conduit_privileged_protocol::{
-    ApprovalEnforcement, CredentialDescriptor, LocalExecutionPlan, PrivilegeTicket,
-    PrivilegeTicketClaims, PrivilegedOperation, ResourceCeilings, SignedClaims, StdioMode, key_id,
+    ApprovalEnforcement, CredentialDescriptor, HelperRequest, HelperResponse, LocalExecutionPlan,
+    PrivilegeTicket, PrivilegeTicketClaims, PrivilegedOperation, ResourceCeilings, SignedClaims,
+    StdioMode, key_id,
 };
 use conduit_runtime::{
     IoMode, LaunchPlan, NativeProvider, NetworkMode, PrivilegedNativeProvider, ProcessSupervisor,
@@ -46,6 +48,8 @@ fn full_device_live_systemd_root_e2e() {
         "full_user" => full_user(),
         "never_denied" => never_denied(),
         "never_allowed" => never_allowed(),
+        "lost_start_issue" => lost_start_issue(),
+        "lost_start_recover" => lost_start_recover(),
         "exercise" => exercise(),
         "recover" => recover(),
         phase => panic!("unknown Full Device E2E phase {phase}"),
@@ -300,6 +304,10 @@ fn exercise() {
         root_exact_and_replay(&runtime, &provider, &issuer, &bundle, &evidence),
     );
     cases.insert(
+        "lostStartResponse".into(),
+        read_json(&evidence.join("lost-start-summary.json")),
+    );
+    cases.insert(
         "ptyInputResize".into(),
         pty_input_resize(&provider, &issuer, &bundle, &evidence),
     );
@@ -339,8 +347,9 @@ fn exercise() {
     write_json(&evidence.join("live-cases.json"), &Value::Object(cases));
 }
 
-/// Runs as a new Node process after update and helper restart. Reconciliation
-/// must attach the same invocation; no start ticket is issued on this path.
+/// Runs as a new live-driver process after update and helper restart.
+/// Reconciliation must attach the same invocation; no start ticket is issued
+/// on this path. This does not claim to exercise the `NodeService` event loop.
 fn recover() {
     let evidence = evidence_dir();
     let active = read_json(&evidence.join("active-runtime.json"));
@@ -394,11 +403,224 @@ fn recover() {
                 "execveat":capability.claims.execveat,"pty":capability.claims.pty,
                 "streamReplay":capability.claims.stream_replay,
                 "unavailableReason":capability.claims.unavailable_reason},
-        "nodeRestart":{"newNodeEpoch":true,"durableAttach":true,"duplicateStart":false,"invocationPreserved":true},
+        "driverProcessRestart":{"newHelperClientEpoch":true,"durableAttach":true,"duplicateStart":false,"invocationPreserved":true},
             "helperRestart":{"durableAttach":true,"processCustodyPreserved":true,"invocationPreserved":true},
             "terminalState":"stopped","recoveredTerminalReceiptDigest":stopped.final_helper_receipt().digest().unwrap()
         }),
     );
+}
+
+/// Sends an authenticated Start request and closes the seqpacket connection
+/// without reading its response. The helper necessarily attempts that response
+/// only after `StartTransientUnit` and both receipt boundaries have completed.
+/// A typed systemd observation proves that the effect became visible while the
+/// caller had no response bytes in its custody.
+fn lost_start_issue() {
+    let evidence = evidence_dir();
+    let (runtime, bundle, issuer) = connect("full-device-live-lost-start-issue");
+    let provider = runtime.provider();
+    let (plan, request) = case_plan(
+        "lost_start",
+        existing(&["/usr/bin/sleep", "/bin/sleep"]),
+        vec!["sleep".into(), "120".into()],
+        StdioMode::Pipes,
+        120_000_000,
+        &evidence,
+    );
+    let prepare_ticket = ticket(
+        &issuer,
+        &bundle,
+        &plan,
+        &request,
+        PrivilegedOperation::Prepare,
+        "ptkt_live_lost_start_prepare",
+    );
+    provider
+        .prepare_privileged(&request, prepare_ticket.clone(), plan.clone())
+        .unwrap();
+    let start_ticket = ticket(
+        &issuer,
+        &bundle,
+        &plan,
+        &request,
+        PrivilegedOperation::Start,
+        "ptkt_live_lost_start_start",
+    );
+    let identity = DeviceIdentity::load_or_create(evidence.join("device.ed25519")).unwrap();
+    send_start_without_receiving(
+        Path::new(&required("CONDUIT_FULL_DEVICE_E2E_SOCKET")),
+        &required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),
+        "full-device-live-lost-start-fault",
+        &identity,
+        start_ticket.clone(),
+        plan.digest().unwrap(),
+    );
+
+    let systemd = SystemdBackend::connect_system().unwrap();
+    let observation = (0..200)
+        .find_map(|_| match systemd.inspect(&plan.systemd_unit) {
+            Ok(value) if value.active_state == "active" && value.invocation_id.is_some() => {
+                Some(value)
+            }
+            _ => {
+                thread::sleep(Duration::from_millis(20));
+                None
+            }
+        })
+        .expect("systemd did not expose the started invocation after the response was dropped");
+    write_json(
+        &evidence.join("lost-start-runtime.json"),
+        &json!({
+            "plan": plan,
+            "request": request,
+            "prepareTicket": prepare_ticket,
+            "startTicket": start_ticket,
+            "invocationId": observation.invocation_id,
+            "responseReceiveAttempted": false
+        }),
+    );
+}
+
+/// Runs in a fresh live-driver process. Replaying Prepare reconstructs only
+/// Node-side provider state; replaying the identical Start ticket must return
+/// the helper's durable signed receipt chain without replacing the systemd
+/// invocation. A second exact replay proves stable receipt bytes as well.
+fn lost_start_recover() {
+    let evidence = evidence_dir();
+    let state = read_json(&evidence.join("lost-start-runtime.json"));
+    let plan: LocalExecutionPlan = serde_json::from_value(state["plan"].clone()).unwrap();
+    let request: RuntimeRequest = serde_json::from_value(state["request"].clone()).unwrap();
+    let prepare_ticket: PrivilegeTicket =
+        serde_json::from_value(state["prepareTicket"].clone()).unwrap();
+    let start_ticket: PrivilegeTicket =
+        serde_json::from_value(state["startTicket"].clone()).unwrap();
+    let expected_invocation = state["invocationId"].as_str().unwrap();
+    assert_eq!(state["responseReceiveAttempted"], false);
+
+    let (runtime, bundle, issuer) = connect("full-device-live-lost-start-recover");
+    let provider = runtime.provider();
+    let prepared = provider
+        .prepare_privileged(&request, prepare_ticket, plan.clone())
+        .unwrap();
+    let systemd = SystemdBackend::connect_system().unwrap();
+    let before = systemd.inspect(&plan.systemd_unit).unwrap();
+    assert_eq!(before.invocation_id.as_deref(), Some(expected_invocation));
+
+    let replay = (0..200)
+        .find_map(|_| {
+            match provider.start_privileged(&prepared.runtime, start_ticket.clone(), &plan) {
+                Ok(value) => Some(value),
+                Err(error) if error.to_string().contains("start outcome uncertain") => {
+                    thread::sleep(Duration::from_millis(20));
+                    None
+                }
+                Err(error) => panic!("lost Start response replay failed: {error}"),
+            }
+        })
+        .expect("helper did not complete the original Start receipt boundary");
+    let transitions = replay
+        .helper_receipts
+        .iter()
+        .map(|receipt| receipt.claims.transition.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(transitions, ["unit_created", "running"]);
+    for receipt in &replay.helper_receipts {
+        receipt.verify(runtime.receipt_key()).unwrap();
+    }
+    assert_eq!(
+        replay
+            .final_helper_receipt()
+            .claims
+            .invocation_id
+            .as_deref(),
+        Some(expected_invocation)
+    );
+    let exact_replay = provider
+        .start_privileged(&prepared.runtime, start_ticket, &plan)
+        .unwrap();
+    assert_eq!(exact_replay.helper_receipts, replay.helper_receipts);
+    let after = systemd.inspect(&plan.systemd_unit).unwrap();
+    assert_eq!(after.invocation_id, before.invocation_id);
+
+    let stopped = stop(
+        &provider,
+        &issuer,
+        &bundle,
+        &plan,
+        &request,
+        &replay.runtime.handle,
+        RuntimeSignal::GracefulStop,
+        "ptkt_live_lost_start_stop",
+    );
+    write_json(
+        &evidence.join("lost-start-summary.json"),
+        &json!({
+            "passed": true,
+            "requestSentWithoutReceive": true,
+            "newLiveDriverProcess": true,
+            "signedReceiptReplay": true,
+            "exactReceiptBytesStable": true,
+            "duplicateStart": false,
+            "invocationPreserved": true,
+            "transitions": transitions,
+            "terminalState": state_name(stopped.runtime.state)
+        }),
+    );
+}
+
+fn send_start_without_receiving(
+    socket: &Path,
+    device_id: &str,
+    node_boot_id: &str,
+    identity: &DeviceIdentity,
+    ticket: PrivilegeTicket,
+    plan_digest: String,
+) {
+    let client = SeqpacketClient::connect(socket).unwrap();
+    let nonce = getrandom::u64().unwrap();
+    let hello = HelperRequest::Hello {
+        protocol_versions: vec![conduit_privileged_protocol::PROTOCOL.into()],
+        device_id: device_id.into(),
+        node_boot_id: node_boot_id.into(),
+        nonce: hex::encode(nonce.to_ne_bytes()),
+    };
+    let challenge = match raw_response(client.call(&hello, &[]).unwrap()) {
+        HelperResponse::Challenge(value) => value,
+        value => panic!("unexpected helper challenge response: {value:?}"),
+    };
+    let signature =
+        URL_SAFE_NO_PAD.encode(identity.sign_bytes(&serde_jcs::to_vec(&challenge).unwrap()));
+    match raw_response(
+        client
+            .call(
+                &HelperRequest::Prove {
+                    challenge,
+                    signature,
+                },
+                &[],
+            )
+            .unwrap(),
+    ) {
+        HelperResponse::Accepted { protocol, .. }
+            if protocol == conduit_privileged_protocol::PROTOCOL => {}
+        value => panic!("unexpected helper authentication response: {value:?}"),
+    }
+    client
+        .send(
+            &serde_jcs::to_vec(&HelperRequest::Start {
+                ticket: Box::new(ticket),
+                plan_digest,
+            })
+            .unwrap(),
+            &[],
+        )
+        .unwrap();
+    drop(client);
+}
+
+fn raw_response(packet: conduit_privileged_helper::Packet) -> HelperResponse {
+    assert!(packet.descriptors.is_empty());
+    conduit_privileged_protocol::decode_packet(&packet.bytes).unwrap()
 }
 
 fn connect(boot: &str) -> (std::sync::Arc<PrivilegedNodeRuntime>, Value, SigningKey) {
@@ -533,7 +755,7 @@ time.sleep(120)
         "spaceArgumentPreserved":true,"unicodeArgumentPreserved":true,
         "emptyArgumentPreserved":true,"leadingDashArgumentPreserved":true,
         "shellReconstruction":false,"prepareReplaySameReceipt":true,
-        "lostStartResponseReplaySameReceipt":true,"duplicateStart":false,"invocationPreserved":true,
+        "exactStartReplaySameReceipt":true,"duplicateStart":false,"invocationPreserved":true,
         "terminalState":state_name(stopped.runtime.state)})
 }
 

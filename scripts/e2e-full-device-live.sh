@@ -418,6 +418,17 @@ export CONDUIT_FULL_DEVICE_E2E_PHASE=never_allowed
 cargo test --locked -p conduit-node --test full_device_live \
   -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
 
+# The first process sends an authenticated Start frame and intentionally drops
+# its local seqpacket endpoint without receiving. It exits only after typed
+# systemd observation proves the root invocation exists. The second process
+# replays the exact durable tickets and must attach the same invocation.
+export CONDUIT_FULL_DEVICE_E2E_PHASE=lost_start_issue
+cargo test --locked -p conduit-node --test full_device_live \
+  -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+export CONDUIT_FULL_DEVICE_E2E_PHASE=lost_start_recover
+cargo test --locked -p conduit-node --test full_device_live \
+  -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+
 export CONDUIT_FULL_DEVICE_E2E_PHASE=exercise
 cargo test --locked -p conduit-node --test full_device_live \
   -- --ignored --exact full_device_live_systemd_root_e2e --nocapture

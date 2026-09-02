@@ -130,7 +130,7 @@ describe.sequential("privileged helper Control Plane", () => {
     const ticketPayload = {
       requestId: "ptreq_privilegeflow01", idempotencyKey: "privilege-action-prepare-0001", installationId: "phinst_privilegeflow01", deviceKeyId: "dkey_privilegeflow01",
       operationId: "op_privilegeflow01", runId: "run_privilegeflow01", runtimeId: "rt_privilegeflow01", runtimeSpecDigest, launchPlanDigest, localExecutionPlanDigest: localPlanDigest,
-      controlRequestDigest: null, runManifestDigest: manifestDigest, helperPolicyRevision: 1, helperPolicyDigest: rootPolicyDigest, devicePolicyRevision: 1,
+      controlRequestDigest: null, controlAuthority: null, runManifestDigest: manifestDigest, helperPolicyRevision: 1, helperPolicyDigest: rootPolicyDigest, devicePolicyRevision: 1,
       approvalReceiptDigest: null, approvalEnforcement: "exact_command", allowedOperation: "prepare",
       resourceCeilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, redactedSummary: { adapter: null, operation: "prepare", credentialProfiles: ["cred_allowed01"] },
       requestedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 120_000).toISOString(),
@@ -183,14 +183,36 @@ describe.sequential("privileged helper Control Plane", () => {
     const unauthorizedClaims = { ...receiptClaims, receiptId: "prcpt_privbadact001", stateRevision: 2, transition: "failed", previousReceiptDigest: verified.receiptDigest, observedAt: new Date().toISOString() };
     const unauthorized = await deviceSignedFrame("privilege.receipt", "nmsg_privbadreceipt1", "4", { receipt: { keyId: "hkey_privilegeflow01", claims: unauthorizedClaims, signature: await sign(helperPrivate, unauthorizedClaims) }, deviceKeyId: "dkey_privilegeflow01" }, devicePrivate);
     await expect(projectPrivilegeFrame(env, unauthorized)).rejects.toMatchObject({ code: "privilege_ticket_invalid" });
-    await env.DB.prepare("UPDATE privilege_policy_attestations SET public_summary_json=?1 WHERE installation_id='phinst_privilegeflow01' AND revision=1").bind(canonicalJson({ ...JSON.parse(storedRootPolicy.public_summary_json), allowedLaunchProfiles: ["safe"], launchProfileExecutableDigests: {}, allowedCredentialProfiles: ["cred_allowed01", "cred_rootonly01"] })).run();
+    const originalOperation = await env.DB.prepare("SELECT request_json FROM operation_journal WHERE id='op_privilegeflow01'").first<{ request_json: string }>();
+    if (originalOperation === null) throw new Error("privilege start operation disappeared");
+    const agentRequest = { ...JSON.parse(originalOperation.request_json), capability: "agent.run.start", arguments: { adapterId: "codex" } };
+    await env.DB.batch([
+      env.DB.prepare("UPDATE operation_journal SET request_json=?1 WHERE id='op_privilegeflow01'").bind(canonicalJson(agentRequest)),
+      env.DB.prepare("UPDATE privilege_policy_attestations SET public_summary_json=?1 WHERE installation_id='phinst_privilegeflow01' AND revision=1").bind(canonicalJson({ ...JSON.parse(storedRootPolicy.public_summary_json), allowedAdapters: ["codex"], allowedLaunchProfiles: ["safe"], launchProfileExecutableDigests: {}, allowedCredentialProfiles: ["cred_allowed01", "cred_rootonly01"] })),
+      env.DB.prepare("UPDATE device_user_policy_attestations SET public_summary_json=?1 WHERE device_id='dev_privilegeflow01' AND revision=1").bind(canonicalJson({ ...JSON.parse(storedDevicePolicy.public_summary_json), capabilities: ["command.start", "agent.run.start"], launchProfiles: ["safe"], credentialProfiles: ["cred_allowed01"] })),
+    ]);
+    const initialAgentInput = await deviceSignedFrame("privilege.ticket_request", "nmsg_privinitialin1", "4", {
+      ...ticketPayload, requestId: "ptreq_privinitialin1", idempotencyKey: "privilege-initial-agent-input-01", controlRequestDigest: "6".repeat(64),
+      controlAuthority: { kind: "initial_agent_input", agentStateRevision: "1" }, approvalEnforcement: "adapter_mediated", allowedOperation: "input", redactedSummary: { operation: "input", adapter: "codex", credentialProfiles: ["cred_allowed01"] },
+    }, devicePrivate);
+    await expect(projectPrivilegeFrame(env, initialAgentInput)).resolves.toMatchObject({ status: "issued", ticket: { claims: { operationId: "op_privilegeflow01", allowedOperation: "input", controlDigest: "6".repeat(64) } } });
+    const unauthorizedLifecycle = await deviceSignedFrame("privilege.ticket_request", "nmsg_privinternbad1", "4", {
+      ...ticketPayload, requestId: "ptreq_privinternbad1", idempotencyKey: "privilege-internal-lifecycle-deny", controlRequestDigest: "6".repeat(64),
+      controlAuthority: { kind: "agent_lifecycle_stop", terminal: "completed", reasonCode: null, agentStateRevision: "1" }, approvalEnforcement: "adapter_mediated", allowedOperation: "force_stop", redactedSummary: { operation: "force_stop", adapter: "codex" },
+    }, devicePrivate);
+    await expect(projectPrivilegeFrame(env, unauthorizedLifecycle)).rejects.toMatchObject({ code: "privilege_ticket_invalid" });
+    await env.DB.batch([
+      env.DB.prepare("UPDATE operation_journal SET request_json=?1 WHERE id='op_privilegeflow01'").bind(originalOperation.request_json),
+      env.DB.prepare("UPDATE privilege_policy_attestations SET public_summary_json=?1 WHERE installation_id='phinst_privilegeflow01' AND revision=1").bind(canonicalJson({ ...JSON.parse(storedRootPolicy.public_summary_json), allowedLaunchProfiles: ["safe"], launchProfileExecutableDigests: {}, allowedCredentialProfiles: ["cred_allowed01", "cred_rootonly01"] })),
+      env.DB.prepare("UPDATE device_user_policy_attestations SET public_summary_json=?1 WHERE device_id='dev_privilegeflow01' AND revision=1").bind(canonicalJson({ ...JSON.parse(storedDevicePolicy.public_summary_json), launchProfiles: ["safe"], credentialProfiles: ["cred_allowed01"] })),
+    ]);
   });
 
   it("binds control tickets to their own operation and rejects terminal or cross-Device request reuse", async () => {
     const requestPayload = (overrides: Record<string, unknown> = {}) => ({
       requestId: "ptreq_privcontrol001", idempotencyKey: "privilege-runtime-control-0001", installationId: "phinst_privilegeflow01", deviceKeyId: "dkey_privilegeflow01",
       operationId: "op_privcontrol001", runId: "run_privilegeflow01", runtimeId: "rt_privilegeflow01", runtimeSpecDigest, launchPlanDigest, localExecutionPlanDigest: localPlanDigest,
-      controlRequestDigest: "8".repeat(64), runManifestDigest: manifestDigest, helperPolicyRevision: 1, helperPolicyDigest: rootPolicyDigest, devicePolicyRevision: 1,
+      controlRequestDigest: "8".repeat(64), controlAuthority: { kind: "external_control" }, runManifestDigest: manifestDigest, helperPolicyRevision: 1, helperPolicyDigest: rootPolicyDigest, devicePolicyRevision: 1,
       approvalReceiptDigest: null, approvalEnforcement: "exact_command", allowedOperation: "pause",
       resourceCeilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, redactedSummary: { operation: "pause" },
       requestedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 120_000).toISOString(), ...overrides,
@@ -377,7 +399,7 @@ describe.sequential("privileged helper Control Plane", () => {
 
       const ticketRequestId = "ptreq_privbudget0001";
       const ticketSequence = String(sequence);
-      await sendFrame("privilege.ticket_request", { requestId: ticketRequestId, idempotencyKey: "privilege-device-room-budget-0001", installationId: "phinst_privilegeflow01", deviceKeyId, operationId: "op_privilegeflow01", runId: "run_privilegeflow01", runtimeId: "rt_privilegeflow01", runtimeSpecDigest, launchPlanDigest, localExecutionPlanDigest: localPlanDigest, controlRequestDigest: null, runManifestDigest: manifestDigest, helperPolicyRevision: 4, helperPolicyDigest: reattestation.digest, devicePolicyRevision: 1, approvalReceiptDigest: null, approvalEnforcement: "exact_command", allowedOperation: "prepare", resourceCeilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, redactedSummary: { operation: "prepare" }, requestedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 120_000).toISOString() }, ticketRequestId);
+      await sendFrame("privilege.ticket_request", { requestId: ticketRequestId, idempotencyKey: "privilege-device-room-budget-0001", installationId: "phinst_privilegeflow01", deviceKeyId, operationId: "op_privilegeflow01", runId: "run_privilegeflow01", runtimeId: "rt_privilegeflow01", runtimeSpecDigest, launchPlanDigest, localExecutionPlanDigest: localPlanDigest, controlRequestDigest: null, controlAuthority: null, runManifestDigest: manifestDigest, helperPolicyRevision: 4, helperPolicyDigest: reattestation.digest, devicePolicyRevision: 1, approvalReceiptDigest: null, approvalEnforcement: "exact_command", allowedOperation: "prepare", resourceCeilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, redactedSummary: { operation: "prepare" }, requestedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 120_000).toISOString() }, ticketRequestId);
       const ticketFrames = [parseWireDocumentText(schemaIds.nodeV1, await next()), parseWireDocumentText(schemaIds.nodeV1, await next())];
       const result = ticketFrames.find((frame) => frame.type === "privilege.ticket_result");
       expect(ticketFrames.find((frame) => frame.type === "transport.ack")).toMatchObject({ payload: { throughSequence: ticketSequence } });

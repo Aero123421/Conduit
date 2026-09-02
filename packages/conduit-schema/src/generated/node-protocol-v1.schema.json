@@ -578,7 +578,7 @@
     },
     "PrivilegeTicketRequestPayload": {
       "type": "object", "additionalProperties": false,
-      "required": ["requestId", "idempotencyKey", "installationId", "deviceKeyId", "operationId", "runId", "runtimeId", "runtimeSpecDigest", "launchPlanDigest", "localExecutionPlanDigest", "controlRequestDigest", "runManifestDigest", "helperPolicyRevision", "helperPolicyDigest", "devicePolicyRevision", "approvalReceiptDigest", "approvalEnforcement", "allowedOperation", "resourceCeilings", "redactedSummary", "requestedAt", "expiresAt", "deviceSignature"],
+      "required": ["requestId", "idempotencyKey", "installationId", "deviceKeyId", "operationId", "runId", "runtimeId", "runtimeSpecDigest", "launchPlanDigest", "localExecutionPlanDigest", "controlRequestDigest", "controlAuthority", "runManifestDigest", "helperPolicyRevision", "helperPolicyDigest", "devicePolicyRevision", "approvalReceiptDigest", "approvalEnforcement", "allowedOperation", "resourceCeilings", "redactedSummary", "requestedAt", "expiresAt", "deviceSignature"],
       "properties": {
         "requestId": { "type": "string", "pattern": "^ptreq_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
         "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 256 },
@@ -591,6 +591,24 @@
         "launchPlanDigest": { "$ref": "#/$defs/Sha256Hex" },
         "localExecutionPlanDigest": { "$ref": "#/$defs/Sha256Hex" },
         "controlRequestDigest": { "anyOf": [{ "$ref": "#/$defs/Sha256Hex" }, { "type": "null" }] },
+        "controlAuthority": {
+          "anyOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["kind"],
+              "properties": {
+                "kind": { "enum": ["external_control", "initial_agent_input", "adapter_approval", "adapter_protocol_response", "agent_lifecycle_stop"] },
+                "approvalId": { "type": ["string", "null"], "pattern": "^appr_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+                "approvalReceiptDigest": { "anyOf": [{ "$ref": "#/$defs/Sha256Hex" }, { "type": "null" }] },
+                "terminal": { "enum": ["completed", "failed", "cancelled", "timed_out"] },
+                "reasonCode": { "type": ["string", "null"], "maxLength": 128 },
+                "agentStateRevision": { "$ref": "#/$defs/U64Decimal" }
+              }
+            }
+          ]
+        },
         "runManifestDigest": { "$ref": "#/$defs/Sha256Hex" },
         "helperPolicyRevision": { "type": "integer", "minimum": 1 },
         "helperPolicyDigest": { "$ref": "#/$defs/Sha256Hex" },

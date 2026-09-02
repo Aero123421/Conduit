@@ -236,7 +236,7 @@ describe.sequential("DeviceRoom steady-state custody", () => {
     const unsigned = {
       requestId, idempotencyKey: "privilege-route-replay-0001", installationId: "phinst_roomprivroute01", deviceKeyId: keyId,
       operationId: "op_roomprivroute01", runId, runtimeId: "rt_roomprivroute01", runtimeSpecDigest: "1".repeat(64), launchPlanDigest: "2".repeat(64),
-      localExecutionPlanDigest: "3".repeat(64), controlRequestDigest: null, runManifestDigest: "4".repeat(64), helperPolicyRevision: 1,
+      localExecutionPlanDigest: "3".repeat(64), controlRequestDigest: null, controlAuthority: null, runManifestDigest: "4".repeat(64), helperPolicyRevision: 1,
       helperPolicyDigest: "5".repeat(64), devicePolicyRevision: 1, approvalReceiptDigest: null, approvalEnforcement: "exact_command", allowedOperation: "prepare",
       resourceCeilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, redactedSummary: { operation: "prepare" },
       requestedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 120_000).toISOString(),

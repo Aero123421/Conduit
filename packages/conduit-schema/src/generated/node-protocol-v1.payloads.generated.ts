@@ -615,6 +615,19 @@ export interface PrivilegeTicketRequestPayload {
   launchPlanDigest: Sha256Hex;
   localExecutionPlanDigest: Sha256Hex;
   controlRequestDigest: Sha256Hex | null;
+  controlAuthority: null | {
+    kind:
+      | "external_control"
+      | "initial_agent_input"
+      | "adapter_approval"
+      | "adapter_protocol_response"
+      | "agent_lifecycle_stop";
+    approvalId?: string | null;
+    approvalReceiptDigest?: Sha256Hex | null;
+    terminal?: "completed" | "failed" | "cancelled" | "timed_out";
+    reasonCode?: string | null;
+    agentStateRevision?: U64Decimal;
+  };
   runManifestDigest: Sha256Hex;
   helperPolicyRevision: number;
   helperPolicyDigest: Sha256Hex;

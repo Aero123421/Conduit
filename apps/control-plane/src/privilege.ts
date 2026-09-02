@@ -588,6 +588,35 @@ function devicePolicyAllows(summaryJson: string, request: Record<string, unknown
 const CONTROL_ACTIONS = new Set(["input", "resize_pty", "pause", "resume", "graceful_stop", "force_stop"]);
 const TERMINAL_OPERATION_STATES = new Set(["completed", "failed", "cancelled", "expired", "rejected", "uncertain"]);
 const TERMINAL_RUN_STATES = new Set(["ready_for_review", "accepted", "rejected", "cancelled", "failed", "completed"]);
+const INTERNAL_CONTROL_KINDS = new Set(["initial_agent_input", "adapter_approval", "adapter_protocol_response", "agent_lifecycle_stop"]);
+
+function parseControlAuthority(value: unknown): Record<string, unknown> | null {
+  if (value === null) return null;
+  const authority = record(value, "controlAuthority");
+  exactKeys(authority, ["kind", "approvalId", "approvalReceiptDigest", "terminal", "reasonCode", "agentStateRevision"], "controlAuthority");
+  const kind = stringField(authority, "kind", 64);
+  if (kind === "external_control") {
+    if (Object.keys(authority).length !== 1) throw new TypeError("external controlAuthority cannot carry internal authority fields");
+    return authority;
+  }
+  if (!INTERNAL_CONTROL_KINDS.has(kind)) throw new TypeError("controlAuthority.kind is unsupported");
+  const revision = stringField(authority, "agentStateRevision", 20);
+  if (!/^(0|[1-9][0-9]{0,19})$/.test(revision)) throw new TypeError("controlAuthority.agentStateRevision is invalid");
+  if (kind === "initial_agent_input") {
+    if (revision !== "1" || Object.keys(authority).some((key) => !["kind", "agentStateRevision"].includes(key))) throw new TypeError("initial agent input authority must bind revision 1 only");
+  } else if (kind === "adapter_approval") {
+    idField(authority, "approvalId");
+    digestField(authority, "approvalReceiptDigest");
+    if (Object.keys(authority).some((key) => !["kind", "approvalId", "approvalReceiptDigest", "agentStateRevision"].includes(key))) throw new TypeError("adapter approval authority contains unrelated fields");
+  } else if (kind === "adapter_protocol_response") {
+    if (authority.approvalId !== null || Object.keys(authority).some((key) => !["kind", "approvalId", "agentStateRevision"].includes(key))) throw new TypeError("adapter protocol response authority cannot claim an approval");
+  } else {
+    if (!["completed", "failed", "cancelled", "timed_out"].includes(String(authority.terminal))) throw new TypeError("agent lifecycle authority terminal is invalid");
+    if (authority.reasonCode !== null && (typeof authority.reasonCode !== "string" || !/^[a-z][a-z0-9_.-]{0,127}$/.test(authority.reasonCode))) throw new TypeError("agent lifecycle authority reasonCode is invalid");
+    if (Object.keys(authority).some((key) => !["kind", "terminal", "reasonCode", "agentStateRevision"].includes(key))) throw new TypeError("agent lifecycle authority contains unrelated fields");
+  }
+  return authority;
+}
 
 function expectedControlAction(authority: OperationAuthorityRow, request: Record<string, unknown>): string | null {
   if (authority.operation_kind === "agent_control") {
@@ -661,10 +690,36 @@ async function verifyControlTicketBinding(
   return startAuthority;
 }
 
+async function verifyInternalControlTicketBinding(env: ControlPlaneEnv, authority: OperationAuthorityRow, request: Record<string, unknown>, controlAuthority: Record<string, unknown>, allowedOperation: string): Promise<OperationAuthorityRow> {
+  if (authority.operation_kind !== "start" || request.capability !== "agent.run.start" || authority.run_id === null) throw new PublicError("privilege_ticket_invalid", 409, "Internal control authority is not bound to an Agent start operation");
+  const kind = String(controlAuthority.kind);
+  if ((kind === "initial_agent_input" || kind === "adapter_approval" || kind === "adapter_protocol_response") && allowedOperation !== "input") throw new PublicError("privilege_ticket_invalid", 409, "Internal Agent input authority cannot request another helper operation");
+  if (kind === "agent_lifecycle_stop" && !["graceful_stop", "force_stop"].includes(allowedOperation)) throw new PublicError("privilege_ticket_invalid", 409, "Agent lifecycle authority is limited to stop operations");
+  const revision = Number(controlAuthority.agentStateRevision);
+  const agent = await env.DB.prepare("SELECT start_operation_id,device_id,run_id,state,revision FROM agent_sessions WHERE start_operation_id=?1 AND device_id=?2 AND run_id=?3 LIMIT 1")
+    .bind(authority.id, authority.device_id, authority.run_id).first<{ start_operation_id: string; device_id: string; run_id: string; state: string; revision: number }>();
+  if (kind === "initial_agent_input") {
+    if (agent !== null && (agent.revision !== 1 || !["starting", "running", "waiting_input"].includes(agent.state))) throw new PublicError("privilege_ticket_invalid", 409, "Initial Agent input no longer matches revision 1 custody");
+    return authority;
+  }
+  if (agent === null || agent.revision !== revision || !["starting", "running", "waiting_input", "waiting_approval", "closing"].includes(agent.state)) throw new PublicError("privilege_ticket_invalid", 409, "Internal Agent control custody changed before ticket issuance");
+  if (kind === "adapter_approval") {
+    const approvalId = idField(controlAuthority, "approvalId");
+    const receiptDigest = digestField(controlAuthority, "approvalReceiptDigest")!;
+    const approval = await env.DB.prepare("SELECT approval.operation_id,approval.device_id,approval.run_id,approval.decision,approval.expires_at,outbox.payload_json,outbox.state FROM approvals AS approval JOIN approval_dispatch_outbox AS outbox ON outbox.approval_id=approval.id WHERE approval.id=?1 LIMIT 1")
+      .bind(approvalId).first<{ operation_id: string; device_id: string; run_id: string | null; decision: string | null; expires_at: string; payload_json: string; state: string }>();
+    let durableReceiptDigest: unknown = null;
+    try { durableReceiptDigest = approval === null ? null : (JSON.parse(approval.payload_json) as Record<string, unknown>).receiptDigest; } catch { durableReceiptDigest = null; }
+    if (approval === null || approval.operation_id !== authority.id || approval.device_id !== authority.device_id || approval.run_id !== authority.run_id || approval.decision !== "approved" || approval.state !== "offered" || Date.parse(approval.expires_at) <= Date.now() || durableReceiptDigest !== receiptDigest) throw new PublicError("approval_required", 409, "Adapter approval authority is absent, expired, or not durably delivered");
+  }
+  return authority;
+}
+
 async function issueTicket(env: ControlPlaneEnv, frame: PrivilegeTransportFrame): Promise<Record<string, unknown>> {
   const payload = frame.payload;
-  exactKeys(payload, ["requestId", "idempotencyKey", "installationId", "deviceKeyId", "operationId", "runId", "runtimeId", "runtimeSpecDigest", "launchPlanDigest", "localExecutionPlanDigest", "controlRequestDigest", "runManifestDigest", "helperPolicyRevision", "helperPolicyDigest", "devicePolicyRevision", "approvalReceiptDigest", "approvalEnforcement", "allowedOperation", "resourceCeilings", "redactedSummary", "requestedAt", "expiresAt", "deviceSignature"], "ticket request");
+  exactKeys(payload, ["requestId", "idempotencyKey", "installationId", "deviceKeyId", "operationId", "runId", "runtimeId", "runtimeSpecDigest", "launchPlanDigest", "localExecutionPlanDigest", "controlRequestDigest", "controlAuthority", "runManifestDigest", "helperPolicyRevision", "helperPolicyDigest", "devicePolicyRevision", "approvalReceiptDigest", "approvalEnforcement", "allowedOperation", "resourceCeilings", "redactedSummary", "requestedAt", "expiresAt", "deviceSignature"], "ticket request");
   const redactedSummary = safeRedactedSummary(payload.redactedSummary);
+  const controlAuthority = parseControlAuthority(payload.controlAuthority);
   const requestId = idField(payload, "requestId");
   const idempotencyKey = stringField(payload, "idempotencyKey", 256);
   if (idempotencyKey.length < 16) throw new TypeError("ticket idempotency key is too short");
@@ -693,11 +748,15 @@ async function issueTicket(env: ControlPlaneEnv, frame: PrivilegeTransportFrame)
   const allowedOperation = stringField(payload, "allowedOperation", 32);
   const controlDigest = digestField(payload, "controlRequestDigest", true);
   const executionAuthority = CONTROL_ACTIONS.has(allowedOperation)
-    ? await verifyControlTicketBinding(env, authority, operationRequest, allowedOperation, controlDigest, runtimeId, payload)
+    ? controlAuthority?.kind === "external_control"
+      ? await verifyControlTicketBinding(env, authority, operationRequest, allowedOperation, controlDigest, runtimeId, payload)
+      : controlAuthority !== null && INTERNAL_CONTROL_KINDS.has(String(controlAuthority.kind))
+        ? await verifyInternalControlTicketBinding(env, authority, operationRequest, controlAuthority, allowedOperation)
+        : (() => { throw new PublicError("privilege_ticket_invalid", 409, "Effectful control lacks an exact controlAuthority"); })()
     : authority;
   let request: Record<string, unknown>;
   try { request = JSON.parse(executionAuthority.request_json) as Record<string, unknown>; } catch { request = {}; }
-  if (!CONTROL_ACTIONS.has(allowedOperation) && (authority.operation_kind !== "start" || controlDigest !== null)) {
+  if (!CONTROL_ACTIONS.has(allowedOperation) && (authority.operation_kind !== "start" || controlDigest !== null || controlAuthority !== null)) {
     throw new PublicError("privilege_ticket_invalid", 409, "Privilege launch ticket is not bound to a start operation");
   }
   const runtime = request.runtime === null || typeof request.runtime !== "object" || Array.isArray(request.runtime) ? {} : request.runtime as Record<string, unknown>;

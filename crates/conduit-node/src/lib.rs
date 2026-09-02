@@ -1314,7 +1314,7 @@ mod tests {
             interpreter: None,
             argv: vec!["probe".into()],
             cwd: file("opaque-cwd"),
-            systemd_unit: "conduit-elevated-test.service".into(),
+            systemd_unit: format!("conduit-elevated-{}.service", request.runtime.runtime_id),
             adapter_id: None,
             launch_profile_id: Some("test-profile".into()),
             environment: BTreeMap::new(),

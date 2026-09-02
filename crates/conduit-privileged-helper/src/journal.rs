@@ -646,7 +646,7 @@ mod tests {
             interpreter: None,
             argv: vec!["true".into()],
             cwd: file("/tmp"),
-            systemd_unit: "conduit-elevated-journal0001.service".into(),
+            systemd_unit: "conduit-elevated-rt_journal0001.service".into(),
             adapter_id: None,
             launch_profile_id: Some("journal-test".into()),
             environment: BTreeMap::new(),

@@ -355,9 +355,7 @@ impl LocalExecutionPlan {
                 "environment value commitment".into(),
             ));
         }
-        if !self.systemd_unit.starts_with("conduit-elevated-")
-            || !self.systemd_unit.ends_with(".service")
-        {
+        if self.systemd_unit != format!("conduit-elevated-{}.service", self.runtime_id) {
             return Err(ProtocolError::Invalid("systemd unit name".into()));
         }
         if self.adapter_id.is_some() == self.launch_profile_id.is_some()

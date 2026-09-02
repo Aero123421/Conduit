@@ -2215,7 +2215,7 @@ mod tests {
             interpreter: None,
             argv: vec!["true".into()],
             cwd: capture_file_identity(Path::new("/tmp"), false).unwrap(),
-            systemd_unit: "conduit-elevated-service0001.service".into(),
+            systemd_unit: "conduit-elevated-rt_service0001.service".into(),
             adapter_id: None,
             launch_profile_id: Some("service-test".into()),
             environment: BTreeMap::new(),
@@ -3082,7 +3082,7 @@ mod tests {
             candidate.runtime_id = format!("rt_page{index:04}x");
             candidate.run_id = format!("run_page{index:04}x");
             candidate.operation_id = format!("op_page{index:04}x");
-            candidate.systemd_unit = format!("conduit-elevated-page{index:04}.service");
+            candidate.systemd_unit = format!("conduit-elevated-{}.service", candidate.runtime_id);
             engine
                 .prepare(
                     ticket(

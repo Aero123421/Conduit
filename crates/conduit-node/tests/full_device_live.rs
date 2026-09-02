@@ -2076,6 +2076,7 @@ fn case_plan(
 ) -> (LocalExecutionPlan, RuntimeRequest) {
     let runtime_id = format!("rt_live_{label}_{}", std::process::id());
     let run_id = format!("run_live_{label}_{}", std::process::id());
+    let systemd_unit = format!("conduit-elevated-{runtime_id}.service");
     let resources = ResourceCeilings {
         cpu_quota_per_sec_usec: None,
         memory_max_bytes: Some(64 * 1024 * 1024),
@@ -2092,10 +2093,7 @@ fn case_plan(
         interpreter: None,
         argv,
         cwd: capture_file_identity(evidence, false).unwrap(),
-        systemd_unit: format!(
-            "conduit-elevated-live-{label}-{}.service",
-            std::process::id()
-        ),
+        systemd_unit,
         adapter_id: None,
         launch_profile_id: Some("full-device-live".into()),
         environment: BTreeMap::new(),

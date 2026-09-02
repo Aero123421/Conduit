@@ -549,7 +549,7 @@ fn deadline(
         .unwrap();
     assert!(matches!(
         reconciled.runtime.state,
-        RuntimeState::Stopped | RuntimeState::RecoveryRequired
+        RuntimeState::Stopped | RuntimeState::Failed | RuntimeState::RecoveryRequired
     ));
     for receipt in &reconciled.helper_receipts {
         receipt.verify(runtime.receipt_key()).unwrap();

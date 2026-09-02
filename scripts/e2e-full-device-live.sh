@@ -134,6 +134,7 @@ conduit_cleanup() {
     sudo -n find "$conduit_root_stage" -xdev -depth -delete
   fi
   if ((conduit_cleanup_package_ok)); then
+    sudo -n systemctl reset-failed 'conduit-elevated-live-*' >/dev/null 2>&1 || true
     sudo -n rmdir "$conduit_root_parent" >/dev/null 2>&1 || true
   else
     echo "automatic cleanup could not prove terminal custody; root staging was retained for explicit recovery" >&2
@@ -481,6 +482,11 @@ for conduit_removed in \
     exit 4
   fi
 done
+sudo -n systemctl reset-failed 'conduit-elevated-live-*'
+[[ -z "$(systemctl list-units --all 'conduit-elevated-live-*' --no-legend --plain)" ]] || {
+  echo "live Full Device E2E cleanup left a transient target unit" >&2
+  exit 4
+}
 
 conduit_kernel="$(uname -r)"
 conduit_systemd="$(systemctl --version | sed -nE '1s/^systemd ([0-9]+).*$/\1/p')"

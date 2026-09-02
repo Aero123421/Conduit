@@ -366,9 +366,9 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
   async acknowledgeFullDeviceLiveRegistrationE2E(token: string, installationId: string): Promise<void> {
     const liveEnv = this.env as ControlPlaneEnv & { FULL_DEVICE_LIVE_E2E?: string; FULL_DEVICE_LIVE_E2E_TOKEN?: string };
     if (liveEnv.FULL_DEVICE_LIVE_E2E !== "enabled" || liveEnv.FULL_DEVICE_LIVE_E2E_TOKEN === undefined || token !== liveEnv.FULL_DEVICE_LIVE_E2E_TOKEN) throw new TypeError("full_device_live_e2e_unavailable");
-    const messageId = `cmsg_preg_${installationId}`;
-    const queued = this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_frames WHERE message_id=?", messageId).one().count;
-    if (queued !== 1) throw new TypeError("full_device_live_registration_delivery_missing");
+    const queued = this.ctx.storage.sql.exec<{ message_id: string }>("SELECT message_id FROM outbound_frames WHERE correlation_id=? AND json_extract(frame_json,'$.type')='privilege.registration_result' ORDER BY sequence", installationId).toArray();
+    if (queued.length !== 1 || queued[0] === undefined) throw new TypeError("full_device_live_registration_delivery_missing");
+    const messageId = queued[0].message_id;
     // Model the isolated client's application plus cumulative ACK. Removing
     // this exact test delivery permits a later policy attestation to reuse the
     // production registration correlation identity during the same live run.

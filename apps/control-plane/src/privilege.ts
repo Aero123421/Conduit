@@ -953,8 +953,8 @@ function receiptTransitionAllowed(previous: string | null, next: string): boolea
   if (previous === null) return next === "admitted";
   const allowed: Record<string, readonly string[]> = {
     admitted: ["prepared", "failed", "cancelled", "uncertain"], prepared: ["unit_created", "failed", "cancelled", "uncertain"],
-    unit_created: ["running", "failed", "cancelled", "uncertain", "recovery_required"], running: ["paused", "input_applied", "pty_resized", "stopping", "completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"],
-    paused: ["resumed", "input_applied", "pty_resized", "stopping", "failed", "cancelled", "uncertain", "recovery_required"], resumed: ["running", "paused", "input_applied", "pty_resized", "stopping", "completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"],
+    unit_created: ["running", "failed", "cancelled", "uncertain", "recovery_required"], running: ["running", "paused", "input_applied", "pty_resized", "stopping", "completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"],
+    paused: ["paused", "resumed", "input_applied", "pty_resized", "stopping", "failed", "cancelled", "uncertain", "recovery_required"], resumed: ["running", "paused", "input_applied", "pty_resized", "stopping", "completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"],
     input_applied: ["running", "paused", "input_applied", "pty_resized", "stopping", "completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"],
     pty_resized: ["running", "paused", "input_applied", "pty_resized", "stopping", "completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"],
     stopping: ["completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"],

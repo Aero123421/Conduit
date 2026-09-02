@@ -91,6 +91,10 @@ and terminal status.
 
 The Node verifies the active helper key and exact bindings before recording an
 elevated transition. The Control Plane independently verifies the same chain.
+A privileged Runtime is never polled through the ordinary unauthenticated
+provider inspection method. The Node uses bounded-cadence helper inspection,
+records every monotonic helper-signed observation, and permits signed stable
+`running` or `paused` observations without treating them as a new effect.
 A Native host `full_device` Run cannot become running, terminal, or
 ready-for-review from an ordinary Node claim alone. D1 retains bounded public
 metadata and digests, never local canonical paths, private keys, credential

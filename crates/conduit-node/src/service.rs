@@ -42,6 +42,8 @@ use std::{
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
+const PRIVILEGED_INSPECT_INTERVAL: Duration = Duration::from_secs(5);
+
 #[derive(Debug, thiserror::Error)]
 pub enum ServiceError {
     #[error(transparent)]
@@ -385,6 +387,7 @@ pub struct ManifestOperation<'a> {
     pub context_content_digest: Option<&'a str>,
     pub context_bytes: Option<u64>,
 }
+#[derive(Clone)]
 struct Active {
     key: String,
     operation_id: String,
@@ -635,6 +638,7 @@ pub struct NodeService {
     privileged_custody: HashMap<String, PrivilegedCustodyContext>,
     pending_privilege_requests: HashMap<String, PendingPrivilegeRequest>,
     pending_privileged_controls: HashMap<String, PendingPrivilegedControlRequest>,
+    privileged_inspect_due: HashMap<String, Instant>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -839,6 +843,7 @@ impl NodeService {
             privileged_custody: HashMap::new(),
             pending_privilege_requests: HashMap::new(),
             pending_privileged_controls: HashMap::new(),
+            privileged_inspect_due: HashMap::new(),
         })
     }
 
@@ -4284,14 +4289,83 @@ impl NodeService {
         self.poll_agents(client)?;
         let ids = self.active.keys().cloned().collect::<Vec<_>>();
         for id in ids {
-            let Some(active) = self.active.get(&id) else {
+            let Some(active) = self.active.get(&id).cloned() else {
                 continue;
             };
-            let state = self
-                .node
-                .inspect_runtime(&active.provider_id, &active.handle)?;
+            let key = active.key.clone();
+            let provider_id = active.provider_id.clone();
+            let handle = active.handle.clone();
+            let (state, privilege_receipt_digest, observed_revision) =
+                if provider_id == "privileged-native" {
+                    let observed_at = Instant::now();
+                    let due = self
+                        .privileged_inspect_due
+                        .entry(id.clone())
+                        .or_insert_with(|| observed_at + PRIVILEGED_INSPECT_INTERVAL);
+                    if observed_at < *due {
+                        continue;
+                    }
+                    *due = observed_at + PRIVILEGED_INSPECT_INTERVAL;
+                    let privileged = self.privileged.clone().ok_or_else(|| {
+                        ServiceError::Unavailable("privileged_helper_not_installed".into())
+                    })?;
+                    if !privileged.active() {
+                        return Err(ServiceError::Unavailable(
+                            "privileged_helper_registration_missing".into(),
+                        ));
+                    }
+                    let context = self.privileged_custody.get(&id).cloned().ok_or_else(|| {
+                        ServiceError::Unavailable("privilege_ticket_required".into())
+                    })?;
+                    let observed = privileged
+                        .provider()
+                        .inspect_privileged(&handle)
+                        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                    let mut digest = None;
+                    let mut revision = active.revision;
+                    for receipt in &observed.helper_receipts {
+                        let ticket_record = self
+                            .node
+                            .store()
+                            .privilege_ticket_for_operation(&key, &receipt.claims.ticket_id)?
+                            .ok_or_else(|| {
+                                ServiceError::Unavailable("privilege_ticket_required".into())
+                            })?;
+                        let signed_ticket =
+                            ticket_record.signed_ticket.as_deref().ok_or_else(|| {
+                                ServiceError::Unavailable("privilege_ticket_required".into())
+                            })?;
+                        let ticket: PrivilegeTicket = serde_json::from_slice(signed_ticket)
+                            .map_err(|_| {
+                                ServiceError::Unavailable("privilege_ticket_invalid".into())
+                            })?;
+                        let issuer_key =
+                            privileged.issuer_key(&ticket.key_id).ok_or_else(|| {
+                                ServiceError::Unavailable("privilege_ticket_invalid".into())
+                            })?;
+                        digest = Some(self.node.verify_and_record_privileged_receipt(
+                            &context.offer,
+                            receipt,
+                            privileged.receipt_key(),
+                            &issuer_key,
+                        )?);
+                        revision = receipt.claims.state_revision;
+                        self.queue_privileged_receipt(client, receipt)?;
+                    }
+                    (observed.runtime, digest, revision)
+                } else {
+                    (
+                        self.node.inspect_runtime(&provider_id, &handle)?,
+                        None,
+                        active.revision,
+                    )
+                };
+            if let Some(active) = self.active.get_mut(&id) {
+                active.revision = observed_revision;
+            }
             if let Some(custody) = self.runtime_custody.get_mut(&active.handle.runtime_id) {
                 custody.state = state.state;
+                custody.revision = observed_revision;
             }
             if state.state == RuntimeState::Stopped {
                 let terminal = if state.exit_code == Some(0) {
@@ -4310,6 +4384,11 @@ impl NodeService {
                     )?;
                 }
                 let mut payload = json!({"operationId":active.operation_id,"runId":active.run_id,"state":if terminal==OperationState::Completed{"completed"}else{"failed"},"requestDigest":active.request_digest,"lastRunEventSequence":"0","observedAt":now()});
+                if let Some(receipt_digest) = privilege_receipt_digest {
+                    payload["privilegeReceiptDigest"] = Value::String(receipt_digest);
+                    payload["targetRuntimeId"] = Value::String(active.handle.runtime_id.clone());
+                    payload["controllerEpoch"] = Value::String(active.controller_epoch.to_string());
+                }
                 let digest = hex::encode(Sha256::digest(
                     serde_jcs::to_vec(&payload).map_err(|_| TransportError::Malformed)?,
                 ));
@@ -4326,6 +4405,7 @@ impl NodeService {
                     0,
                 )?;
                 self.active.remove(&id);
+                self.privileged_inspect_due.remove(&id);
             }
         }
         Ok(())

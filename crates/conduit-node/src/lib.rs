@@ -1530,6 +1530,67 @@ mod tests {
     }
 
     #[test]
+    fn privileged_control_authority_uses_distinct_operation_and_digest() {
+        let directory = tempdir().unwrap();
+        let request = offer(directory.path());
+        let (ticket_key, receipt_key, ticket, plan, capability) = privileged_authority(&request);
+        let control_operation_id = "op_controlticket0001";
+        let control_idempotency_key = "idem-control-ticket-0001";
+        let control_digest = "ab".repeat(32);
+        let control = SignedClaims::sign(
+            ticket.key_id,
+            PrivilegeTicketClaims {
+                ticket_id: "ptkt_control0001".into(),
+                operation_id: control_operation_id.into(),
+                idempotency_key_digest: hex::encode(Sha256::digest(
+                    control_idempotency_key.as_bytes(),
+                )),
+                operation_request_digest: control_digest.clone(),
+                control_digest: Some(control_digest.clone()),
+                allowed_operation: PrivilegedOperation::Input,
+                nonce: "ticket-nonce-control0001".into(),
+                ..ticket.claims
+            },
+            &ticket_key,
+        )
+        .unwrap();
+        VerifiedPrivilegedAdmission::verify_control_for_operation(
+            &request,
+            "never",
+            "dev_test0001",
+            "https://control.invalid",
+            ticket_key.verifying_key().as_bytes(),
+            receipt_key.verifying_key().as_bytes(),
+            control_idempotency_key,
+            control_operation_id,
+            &control_digest,
+            PrivilegedOperation::Input,
+            control.clone(),
+            plan.clone(),
+            capability.clone(),
+        )
+        .unwrap();
+        assert!(matches!(
+            VerifiedPrivilegedAdmission::verify_control_for_operation(
+                &request,
+                "never",
+                "dev_test0001",
+                "https://control.invalid",
+                ticket_key.verifying_key().as_bytes(),
+                receipt_key.verifying_key().as_bytes(),
+                control_idempotency_key,
+                "op_othercontrol0001",
+                &control_digest,
+                PrivilegedOperation::Input,
+                control,
+                plan,
+                capability,
+            ),
+            Err(NodeError::Rejected(reason)) if reason == "privilege_ticket_invalid"
+        ));
+    }
+
+    #[test]
     fn canonical_operation_commitment_rejects_mutation() {
         let d = tempdir().unwrap();
         let mut value: serde_json::Value =

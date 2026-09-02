@@ -44,6 +44,8 @@ fn full_device_live_systemd_root_e2e() {
         "bootstrap" => bootstrap(),
         "registration" => registration(),
         "full_user" => full_user(),
+        "never_denied" => never_denied(),
+        "never_allowed" => never_allowed(),
         "exercise" => exercise(),
         "recover" => recover(),
         phase => panic!("unknown Full Device E2E phase {phase}"),
@@ -186,11 +188,113 @@ fn full_user() {
     );
 }
 
+fn never_denied() {
+    let evidence = evidence_dir();
+    let (runtime, bundle, issuer) = connect("full-device-live-node-never-denied");
+    let provider = runtime.provider();
+    let (plan, request) = case_plan(
+        "never-denied",
+        existing(&["/usr/bin/sleep", "/bin/sleep"]),
+        vec!["sleep".into(), "30".into()],
+        StdioMode::Pipes,
+        30_000_000,
+        &evidence,
+    );
+    let error = provider
+        .prepare_privileged(
+            &request,
+            ticket_with_approval(
+                &issuer,
+                &bundle,
+                &plan,
+                &request,
+                PrivilegedOperation::Prepare,
+                "ptkt_live_never_denied_prepare",
+                "never",
+            ),
+            plan,
+        )
+        .expect_err("Never must fail before the separate root-owned opt-in");
+    assert!(
+        error
+            .to_string()
+            .contains("full_device_never_local_opt_in_required")
+    );
+    write_json(
+        &evidence.join("never-local-denial.json"),
+        &json!({"schemaVersion":1,"rootOptIn":false,"deniedBeforeRootEffect":true,"reason":"full_device_never_local_opt_in_required"}),
+    );
+}
+
+fn never_allowed() {
+    let evidence = evidence_dir();
+    let (runtime, bundle, issuer) = connect("full-device-live-node-never-allowed");
+    let provider = runtime.provider();
+    let (plan, request) = case_plan(
+        "never-allowed",
+        existing(&["/usr/bin/sleep", "/bin/sleep"]),
+        vec!["sleep".into(), "30".into()],
+        StdioMode::Pipes,
+        30_000_000,
+        &evidence,
+    );
+    let prepared = provider
+        .prepare_privileged(
+            &request,
+            ticket_with_approval(
+                &issuer,
+                &bundle,
+                &plan,
+                &request,
+                PrivilegedOperation::Prepare,
+                "ptkt_live_never_allowed_prepare",
+                "never",
+            ),
+            plan.clone(),
+        )
+        .unwrap();
+    let started = provider
+        .start_privileged(
+            &prepared.runtime,
+            ticket_with_approval(
+                &issuer,
+                &bundle,
+                &plan,
+                &request,
+                PrivilegedOperation::Start,
+                "ptkt_live_never_allowed_start",
+                "never",
+            ),
+            &plan,
+        )
+        .unwrap();
+    assert_eq!(started.final_helper_receipt().claims.effective_uid, Some(0));
+    let stopped = stop(
+        &provider,
+        &issuer,
+        &bundle,
+        &plan,
+        &request,
+        &started.runtime.handle,
+        RuntimeSignal::GracefulStop,
+        "ptkt_live_never_allowed_stop",
+    );
+    let local_denial = read_json(&evidence.join("never-local-denial.json"));
+    write_json(
+        &evidence.join("never-summary.json"),
+        &json!({"schemaVersion":1,"rootDisabled":local_denial,"serverCeilingsEnabled":true,"rootOptIn":true,"approvalReceiptPresent":false,"rootStartSucceeded":true,"terminalState":state_name(stopped.runtime.state)}),
+    );
+}
+
 fn exercise() {
     let evidence = evidence_dir();
     let (runtime, bundle, issuer) = connect("full-device-live-node-boot-1");
     let provider = runtime.provider();
     let mut cases = serde_json::Map::new();
+    cases.insert(
+        "neverDualOptIn".into(),
+        read_json(&evidence.join("never-summary.json")),
+    );
     cases.insert(
         "rootExactArgv".into(),
         root_exact_and_replay(&runtime, &provider, &issuer, &bundle, &evidence),
@@ -1182,6 +1286,20 @@ fn ticket(
     operation: PrivilegedOperation,
     ticket_id: &str,
 ) -> PrivilegeTicket {
+    ticket_with_approval(
+        issuer, bundle, plan, request, operation, ticket_id, "always",
+    )
+}
+
+fn ticket_with_approval(
+    issuer: &SigningKey,
+    bundle: &Value,
+    plan: &LocalExecutionPlan,
+    request: &RuntimeRequest,
+    operation: PrivilegedOperation,
+    ticket_id: &str,
+    approval_mode: &str,
+) -> PrivilegeTicket {
     let issuer_id = key_id("pkey", issuer.verifying_key().as_bytes());
     let capability: conduit_privileged_protocol::SignedCapability =
         serde_json::from_value(bundle["signedCapability"].clone()).unwrap();
@@ -1243,8 +1361,8 @@ fn ticket(
             project_agent_revision: None,
             runtime_configuration_revision: 1,
             access_scope: "full_device".into(),
-            approval_mode: "always".into(),
-            approval_receipt_digest: Some("55".repeat(32)),
+            approval_mode: approval_mode.into(),
+            approval_receipt_digest: (approval_mode != "never").then(|| "55".repeat(32)),
             approval_enforcement: if plan.adapter_id.is_some() {
                 ApprovalEnforcement::AdapterMediated
             } else {

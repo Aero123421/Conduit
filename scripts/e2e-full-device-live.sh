@@ -382,6 +382,42 @@ done
 sudo -n test -S "/run/conduit/privileged/$(id -u).sock"
 test "$(sudo -n stat -c '%u:%a' "/run/conduit/privileged/$(id -u).sock")" = "$(id -u):600"
 
+# `never` is a distinct root-owned opt-in. First prove that otherwise valid
+# server-side authority is rejected by the live helper before any root effect.
+export CONDUIT_FULL_DEVICE_E2E_PHASE=never_denied
+cargo test --locked -p conduit-node --test full_device_live \
+  -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+sudo -n "$conduit_helper" admin package-status --uid "$(id -u)" --output json \
+  > "$conduit_user_evidence/never-denied-status.json"
+grep -Eq '"activeRuntimeCount"[[:space:]]*:[[:space:]]*0' \
+  "$conduit_user_evidence/never-denied-status.json" || {
+  echo "Never denial created unexpected root Runtime custody" >&2
+  exit 4
+}
+
+# Broaden only the independent Never flag through an explicit local root
+# action. Re-attest and repeat Owner activation against that exact revision.
+sudo -n "$conduit_helper" admin policy \
+  --uid "$(id -u)" \
+  --allow-never true \
+  --output json > "$conduit_user_evidence/root-never-opt-in.json"
+grep -Eq '"allowNever"[[:space:]]*:[[:space:]]*true' \
+  "$conduit_user_evidence/root-never-opt-in.json" || {
+  echo "root Never opt-in was not made effective" >&2
+  exit 4
+}
+sudo -n systemctl restart "conduit-privileged-helper@$(id -u).service"
+sudo -n "$conduit_helper" admin registration-bundle \
+  --uid "$(id -u)" \
+  --output json > "$conduit_registration_bundle"
+chmod 0600 "$conduit_registration_bundle"
+export CONDUIT_FULL_DEVICE_E2E_PHASE=registration
+cargo test --locked -p conduit-node --test full_device_live \
+  -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+export CONDUIT_FULL_DEVICE_E2E_PHASE=never_allowed
+cargo test --locked -p conduit-node --test full_device_live \
+  -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+
 export CONDUIT_FULL_DEVICE_E2E_PHASE=exercise
 cargo test --locked -p conduit-node --test full_device_live \
   -- --ignored --exact full_device_live_systemd_root_e2e --nocapture

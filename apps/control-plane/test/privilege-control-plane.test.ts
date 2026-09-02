@@ -196,6 +196,12 @@ describe.sequential("privileged helper Control Plane", () => {
       controlAuthority: { kind: "initial_agent_input", agentStateRevision: "1" }, approvalEnforcement: "adapter_mediated", allowedOperation: "input", redactedSummary: { operation: "input", adapter: "codex", credentialProfiles: [] },
     }, devicePrivate);
     await expect(projectPrivilegeFrame(env, initialAgentInput)).resolves.toMatchObject({ status: "issued", ticket: { claims: { operationId: "op_privilegeflow01", allowedOperation: "input", controlDigest: "6".repeat(64) } } });
+    const duplicateInitialAgentInput = await deviceSignedFrame("privilege.ticket_request", "nmsg_privinitialin2", "4", {
+      ...ticketPayload, requestId: "ptreq_privinitialin2", idempotencyKey: "privilege-initial-agent-input-02", controlRequestDigest: "6".repeat(64),
+      controlAuthority: { kind: "initial_agent_input", agentStateRevision: "1" }, approvalEnforcement: "adapter_mediated", allowedOperation: "input", redactedSummary: { operation: "input", adapter: "codex", credentialProfiles: [] },
+    }, devicePrivate);
+    await expect(projectPrivilegeFrame(env, duplicateInitialAgentInput)).rejects.toMatchObject({ code: "privilege_ticket_conflict" });
+    await expect(env.DB.prepare("SELECT COUNT(*) AS count FROM privilege_ticket_requests WHERE operation_id='op_privilegeflow01' AND control_authority_kind='initial_agent_input' AND control_authority_revision='1'").first()).resolves.toEqual({ count: 1 });
     const unauthorizedLifecycle = await deviceSignedFrame("privilege.ticket_request", "nmsg_privinternbad1", "4", {
       ...ticketPayload, requestId: "ptreq_privinternbad1", idempotencyKey: "privilege-internal-lifecycle-deny", controlRequestDigest: "6".repeat(64),
       controlAuthority: { kind: "agent_lifecycle_stop", terminal: "completed", reasonCode: null, agentStateRevision: "1" }, approvalEnforcement: "adapter_mediated", allowedOperation: "force_stop", redactedSummary: { operation: "force_stop", adapter: "codex" },

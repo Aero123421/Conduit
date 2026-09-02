@@ -735,6 +735,15 @@ describe.sequential("control-plane contracts", () => {
     const tools = await call(2, "tools/list", {});
     expect(tools).toMatchObject({ result: { tools: expect.arrayContaining([expect.objectContaining({ name: "project_get" }), expect.objectContaining({ name: "quick_command_start" }), expect.objectContaining({ name: "runtime_vm_lifecycle" })]) } });
     expect(JSON.stringify(tools)).not.toContain("requiredApprovalRiskClasses");
+    for (const forbidden of ["privileged_helper_install", "privileged_helper_enable", "privileged_helper_policy_update"]) {
+      expect(JSON.stringify(tools)).not.toContain(`\"name\":\"${forbidden}\"`);
+    }
+    const privilegeCountsBefore = await env.DB.prepare("SELECT (SELECT COUNT(*) FROM device_privilege_installations) AS installations,(SELECT COUNT(*) FROM privilege_policy_attestations) AS policies").first();
+    for (const [offset, forbidden] of ["privileged_helper_install", "privileged_helper_enable", "privileged_helper_policy_update"].entries()) {
+      const denied = await call(20 + offset, "tools/call", { name: forbidden, arguments: { idempotencyKey: `remote-root-admin-denied-${offset}` } });
+      expect(denied).toMatchObject({ error: { code: -32602, message: `Tool ${forbidden} not found` } });
+    }
+    await expect(env.DB.prepare("SELECT (SELECT COUNT(*) FROM device_privilege_installations) AS installations,(SELECT COUNT(*) FROM privilege_policy_attestations) AS policies").first()).resolves.toEqual(privilegeCountsBefore);
     const project = await call(3, "tools/call", { name: "project_get", arguments: { projectId: "prj_board_contract", requestKey: "mcp-project-read-000001" } });
     expect(project).toMatchObject({ result: { structuredContent: { id: "prj_board_contract", name: "Board" } } });
     const injected = await call(4, "tools/call", { name: "quick_command_start", arguments: { idempotencyKey: "mcp-risk-injection-000001", deviceId: "dev_handshake01", runtime: { kind: "native", providerId: "native.linux", configurationRevision: 1 }, accessScope: "read_only", approvalMode: "always", sourceRevisions: [], arguments: {}, requiredApprovalRiskClasses: [] } });

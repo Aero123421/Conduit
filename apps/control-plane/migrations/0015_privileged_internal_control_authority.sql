@@ -1,0 +1,8 @@
+ALTER TABLE privilege_ticket_requests ADD COLUMN control_authority_kind TEXT;
+ALTER TABLE privilege_ticket_requests ADD COLUMN control_authority_revision TEXT;
+ALTER TABLE privilege_ticket_requests ADD COLUMN control_authority_approval_id TEXT;
+
+CREATE UNIQUE INDEX privilege_ticket_requests_initial_agent_input_idx
+  ON privilege_ticket_requests(operation_id,control_authority_kind,control_authority_revision)
+  WHERE control_authority_kind='initial_agent_input';
+

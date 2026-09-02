@@ -1,11 +1,14 @@
-import { env } from "cloudflare:workers";
-import { parseWireDocument, schemaIds } from "@conduit/schema";
+import { env, exports } from "cloudflare:workers";
+import { runInDurableObject } from "cloudflare:test";
+import { parseWireDocument, parseWireDocumentText, schemaIds } from "@conduit/schema";
 import { beforeAll, describe, expect, it } from "vitest";
 import { base64url, canonicalJson, sha256Hex } from "../src/crypto.ts";
 import { parsePrivilegeTransportFrame, projectPrivilegeFrame, requireVerifiedPrivilegeReceipt, type PrivilegeTransportFrame } from "../src/privilege.ts";
 import { assertFreeD1Ceilings, instrumentD1 } from "../src/usage-instrumentation.ts";
 import type { ControlPlaneEnv } from "../src/types.ts";
 import { projectNodeState } from "../src/node-projection.ts";
+import type { DeviceRoom } from "../src/do/device-room.ts";
+import { cleanupHotData } from "../src/retention.ts";
 
 async function keyPair(): Promise<{ privateKey: CryptoKey; publicJwk: JsonWebKey }> {
   const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]) as CryptoKeyPair;
@@ -161,7 +164,7 @@ describe.sequential("privileged helper Control Plane", () => {
       policyVersion: 1, installationId: "phinst_privilegeflow01", deviceId: "dev_privilegeflow01", uid: 1000, revision, enabled: true, origin: env.PUBLIC_ORIGIN,
       ticketKeyIds: ["pkey_testissuer0001"], allowedOperations: narrowed ? ["prepare", "start"] : allOperations,
       allowedAdapters: [], allowedLaunchProfiles: [], ceilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null },
-      allowNever: !narrowed, allowUnrestrictedLaunch: !narrowed, allowPersistentSessions: false, allowOfflineControl: false, receiptRetentionSeconds: 86400,
+      allowNever: true, allowUnrestrictedLaunch: !narrowed, allowPersistentSessions: false, allowOfflineControl: false, receiptRetentionSeconds: 86400,
     });
     const initialSummary = { enabled: true, allowedOperations: allOperations, allowedAdapters: [], approvalEnforcements: ["exact_command"], allowNever: true, allowUnrestrictedLaunch: true };
     const devicePolicy = {
@@ -203,5 +206,156 @@ describe.sequential("privileged helper Control Plane", () => {
     await env.DB.prepare("UPDATE devices SET connection_epoch='8' WHERE id='dev_privilegeflow01'").run();
     const replay = await deviceSignedFrame("privilege.receipt", "nmsg_privreceiptreplay", "6", { receipt: durableReceipt, deviceKeyId: "dkey_privilegeflow01" }, devicePrivate, "8");
     await expect(projectPrivilegeFrame(env, replay)).resolves.toMatchObject({ status: "verified", replay: true });
+  });
+
+  it("bounds registration, policy, ticket, and receipt through real DeviceRoom WebSocket invocations", async () => {
+    const deviceId = "dev_privilegeflow01";
+    const deviceKeyId = "dkey_privilegeflow01";
+    const response = await exports.default.fetch(new Request(`https://conduit.example.com/v1/devices/${deviceId}/connect`, { headers: { upgrade: "websocket" } }));
+    expect(response.status).toBe(101);
+    const socket = response.webSocket!;
+    socket.accept();
+    const queued: string[] = [];
+    const waiters: Array<(message: string) => void> = [];
+    let closed = "open";
+    socket.addEventListener("close", (event) => { closed = `${event.code}:${event.reason}`; });
+    socket.addEventListener("message", (event) => { const waiter = waiters.shift(); if (waiter === undefined) queued.push(String(event.data)); else waiter(String(event.data)); });
+    let responseOrdinal = 0;
+    const next = () => Promise.race([
+      queued.length > 0 ? Promise.resolve(queued.shift()!) : new Promise<string>((resolve) => waiters.push(resolve)),
+      new Promise<string>((_resolve, reject) => setTimeout(() => reject(new Error(`privilege DeviceRoom response ${responseOrdinal} timeout (${closed})`)), 2_000)),
+    ]).then((message) => { responseOrdinal += 1; return message; });
+    const clientNonce = base64url(crypto.getRandomValues(new Uint8Array(24)));
+    socket.send(JSON.stringify({ type: "device.hello", deviceId, keyId: deviceKeyId, supportedProtocols: ["conduit.node/1"], capabilityDigest: "a".repeat(64), clientNonce, nodeBootId: "node-boot-privilege-budget-0001" }));
+    const challenge = parseWireDocumentText(schemaIds.nodeV1, await next());
+    if (challenge.type !== "device.challenge") throw new Error("expected Device challenge");
+    const authTranscript = { domain: "conduit.device-auth.v1", origin: env.PUBLIC_ORIGIN, clientNonce, connectionId: challenge.connectionId, deviceId, keyId: deviceKeyId, protocol: challenge.selectedProtocol, serverNonce: challenge.serverNonce, serverTime: challenge.serverTime };
+    socket.send(JSON.stringify({ type: "device.proof", connectionId: challenge.connectionId, deviceId, keyId: deviceKeyId, signature: await sign(devicePrivate, authTranscript) }));
+    const accepted = parseWireDocumentText(schemaIds.nodeV1, await next());
+    if (accepted.type !== "transport.accepted") throw new Error("expected transport acceptance");
+    let sequence = 1;
+    const sendFrame = async (type: PrivilegeTransportFrame["type"] | "reconcile.summary" | "reconcile.complete" | "transport.ack", unsigned: Record<string, unknown>, correlationId?: string) => {
+      const payload = type.startsWith("privilege.")
+        ? { ...unsigned, deviceSignature: await sign(devicePrivate, { domain: `conduit.${type}.v1`, deviceId, connectionEpoch: accepted.connectionEpoch, payload: unsigned }) }
+        : unsigned;
+      socket.send(JSON.stringify({ protocol: "conduit.node/1", messageId: `nmsg_privbudget_${sequence.toString().padStart(4, "0")}`, deviceId, connectionEpoch: accepted.connectionEpoch, direction: "node_to_control", sequence: String(sequence++), type, ...(correlationId === undefined ? {} : { correlationId }), payloadDigest: await sha256Hex(canonicalJson(payload)), payload }));
+    };
+    await sendFrame("reconcile.summary", { nodeBootId: "node-boot-privilege-budget-0001", journalGeneration: "1", capabilityDigest: "a".repeat(64), lastControlSequenceApplied: "0", lastNodeSequenceAcknowledged: "0", lastNodeSequenceRetained: "1", runs: [], retainedEventRanges: [], unresolvedCount: 0, truncated: false, storageHealth: "healthy" }, accepted.connectionId);
+    const reconciliation = [parseWireDocumentText(schemaIds.nodeV1, await next()), parseWireDocumentText(schemaIds.nodeV1, await next())];
+    const plan = reconciliation.find((frame) => frame.type === "reconcile.plan");
+    if (plan?.type !== "reconcile.plan") throw new Error("expected reconcile plan");
+    await sendFrame("reconcile.complete", { reconciliationId: plan.payload.reconciliationId, lastControlSequenceApplied: plan.sequence, lastNodeSequenceAcknowledged: "1", unresolvedRunIds: [] }, plan.payload.reconciliationId);
+    expect(parseWireDocumentText(schemaIds.nodeV1, await next()).type).toBe("transport.ack");
+    await sendFrame("transport.ack", { direction: "control_to_node", throughSequence: plan.sequence });
+
+    const room = env.DEVICE_ROOMS.getByName(deviceId);
+    const measured = instrumentD1(env.DB);
+    let originalEnv: ControlPlaneEnv | undefined;
+    await runInDurableObject(room, (instance: DeviceRoom) => {
+      const holder = instance as unknown as { env: ControlPlaneEnv };
+      originalEnv = holder.env;
+      Object.defineProperty(instance, "env", { value: new Proxy(holder.env, { get: (target, property, receiver) => property === "DB" ? measured.db : Reflect.get(target, property, receiver) }), configurable: true });
+    });
+    const assertInvocation = () => {
+      const snapshot = measured.snapshot();
+      assertFreeD1Ceilings(snapshot);
+      expect(snapshot.statements).toBeGreaterThan(0);
+      expect(snapshot.bindingCalls).toBeLessThanOrEqual(40);
+      expect(snapshot.maxBoundParameters).toBeLessThanOrEqual(90);
+      measured.reset();
+    };
+    const receiveAck = async (through: string) => {
+      const frame = parseWireDocumentText(schemaIds.nodeV1, await next());
+      expect(frame).toMatchObject({ type: "transport.ack", payload: { throughSequence: through } });
+    };
+    const devicePolicySummary = { enabled: true, allowedOperations: ["prepare", "start", "input", "resize_pty", "pause", "resume", "graceful_stop", "force_stop", "reconcile"], allowedAdapters: [], approvalEnforcements: ["exact_command"], allowNever: true, allowUnrestrictedLaunch: true };
+    const devicePolicy = { revision: 1, policyDigest: devicePolicyDigest, previousPolicyDigest: null, publicSummary: devicePolicySummary, signature: await sign(devicePrivate, { deviceId, revision: 1, policyDigest: devicePolicyDigest, previousPolicyDigest: null, publicSummary: devicePolicySummary }) };
+    const bundleFor = async (installationId: string, revision: number, operations: string[]) => {
+      const root = {
+        policyVersion: 1, installationId, deviceId, uid: 1000, revision, enabled: true, origin: env.PUBLIC_ORIGIN, ticketKeyIds: ["pkey_testissuer0001"], allowedOperations: operations,
+        allowedAdapters: [], allowedLaunchProfiles: [], ceilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, allowNever: true,
+        allowUnrestrictedLaunch: false, allowPersistentSessions: false, allowOfflineControl: false, receiptRetentionSeconds: 86400,
+      };
+      const digest = await sha256Hex(canonicalJson(root));
+      const capability = { protocol: "conduit.privileged/1", helperVersion: "0.1.0", installationId, receiptKeyId: "hkey_privilegeflow01", policyRevision: revision, policyDigest: digest, enabled: true, observedAt: new Date().toISOString(), systemdSystemManager: true, socketPeerCredentials: true, transientUnits: true, cgroupV2: true, freeze: true, pidfd: true, openat2: true, execveat: true, pty: true, streamReplay: true, neverOptIn: true, unrestrictedLaunchOptIn: false, unavailableReason: null };
+      return { digest, bundle: { protocol: "conduit.privileged/1", installationId, deviceId, deviceKeyId, uid: 1000, origin: env.PUBLIC_ORIGIN, policyRevision: revision, policyDigest: digest, receiptPublicJwk: { ...helperPublicJwk, kid: "hkey_privilegeflow01" }, signedPolicyAttestation: { keyId: "hkey_privilegeflow01", claims: root, signature: await sign(helperPrivate, root) }, signedCapability: { keyId: "hkey_privilegeflow01", claims: capability, signature: await sign(helperPrivate, capability) } } };
+    };
+    try {
+      const reattestation = await bundleFor("phinst_privilegeflow01", 4, ["prepare"]);
+      const policySequence = String(sequence);
+      await sendFrame("privilege.installation_attestation", { requestId: "phreq_privbudgetpol1", registrationBundle: reattestation.bundle, devicePolicy, deviceKeyId }, "phreq_privbudgetpol1");
+      await receiveAck(policySequence);
+      assertInvocation();
+      expect(await env.DB.prepare("SELECT active_policy_revision,active_policy_digest FROM device_privilege_installations WHERE installation_id='phinst_privilegeflow01'").first()).toEqual({ active_policy_revision: 4, active_policy_digest: reattestation.digest });
+
+      const ticketRequestId = "ptreq_privbudget0001";
+      const ticketSequence = String(sequence);
+      await sendFrame("privilege.ticket_request", { requestId: ticketRequestId, idempotencyKey: "privilege-device-room-budget-0001", installationId: "phinst_privilegeflow01", deviceKeyId, operationId: "op_privilegeflow01", runId: "run_privilegeflow01", runtimeId: "rt_privilegeflow01", runtimeSpecDigest, launchPlanDigest, localExecutionPlanDigest: localPlanDigest, controlRequestDigest: null, runManifestDigest: manifestDigest, helperPolicyRevision: 4, helperPolicyDigest: reattestation.digest, devicePolicyRevision: 1, approvalReceiptDigest: null, approvalEnforcement: "exact_command", allowedOperation: "prepare", resourceCeilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, redactedSummary: { operation: "prepare" }, requestedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 120_000).toISOString() }, ticketRequestId);
+      const ticketFrames = [parseWireDocumentText(schemaIds.nodeV1, await next()), parseWireDocumentText(schemaIds.nodeV1, await next())];
+      const result = ticketFrames.find((frame) => frame.type === "privilege.ticket_result");
+      expect(ticketFrames.find((frame) => frame.type === "transport.ack")).toMatchObject({ payload: { throughSequence: ticketSequence } });
+      if (result?.type !== "privilege.ticket_result" || result.payload.status !== "issued") throw new Error("expected issued privilege ticket");
+      assertInvocation();
+      const ticket = result.payload.ticket as { claims: Record<string, unknown> };
+      const previousReceiptDigest = await sha256Hex(canonicalJson(durableReceipt));
+      const receiptClaims = { ...durableReceipt.claims, receiptId: "prcpt_privbudget0001", ticketId: ticket.claims.ticketId, ticketDigest: await sha256Hex(canonicalJson(result.payload.ticket)), policyRevision: 4, policyDigest: reattestation.digest, controllerEpoch: Number(accepted.connectionEpoch), stateRevision: 2, transition: "prepared", observedAt: new Date().toISOString(), previousReceiptDigest };
+      const receiptSequence = String(sequence);
+      await sendFrame("privilege.receipt", { receipt: { keyId: "hkey_privilegeflow01", claims: receiptClaims, signature: await sign(helperPrivate, receiptClaims) }, deviceKeyId }, "op_privilegeflow01");
+      await receiveAck(receiptSequence);
+      assertInvocation();
+      expect(await env.DB.prepare("SELECT transition FROM privilege_receipt_projections WHERE receipt_id='prcpt_privbudget0001'").first()).toEqual({ transition: "prepared" });
+    } finally {
+      if (originalEnv !== undefined) await runInDurableObject(room, (instance: DeviceRoom) => { Object.defineProperty(instance, "env", { value: originalEnv, configurable: true }); });
+      socket.close(1000, "privilege_budget_complete");
+    }
+  });
+
+  it("keeps a completely idle privilege room free of D1 writes, polling rows, and alarms", async () => {
+    const room = env.DEVICE_ROOMS.getByName("dev_privilege_idle_budget01");
+    const result = await runInDurableObject(room, async (instance: DeviceRoom, durable) => {
+      const holder = instance as unknown as { env: ControlPlaneEnv };
+      const original = holder.env;
+      const measured = instrumentD1(original.DB);
+      Object.defineProperty(instance, "env", { value: new Proxy(original, { get: (target, property, receiver) => property === "DB" ? measured.db : Reflect.get(target, property, receiver) }), configurable: true });
+      try { await instance.alarm(); } finally { Object.defineProperty(instance, "env", { value: original, configurable: true }); }
+      return {
+        usage: measured.snapshot(), alarm: await durable.storage.getAlarm(),
+        inbound: durable.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM inbound_frames").one().count,
+        outbound: durable.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_frames").one().count,
+        marker: durable.storage.sql.exec<{ pending: number; min_due_at: number | null }>("SELECT pending,min_due_at FROM room_work_marker WHERE singleton=1").one(),
+      };
+    });
+    expect(result).toEqual({ usage: { statements: 0, bindingCalls: 0, boundParameters: [], maxBoundParameters: 0, rowsRead: 0, rowsWritten: 0 }, alarm: null, inbound: 0, outbound: 0, marker: { pending: 0, min_due_at: null } });
+  });
+
+  it("converges denied ticket retention without deleting signed security evidence or storing sensitive summaries", async () => {
+    const old = "2026-01-01T00:00:00.000Z";
+    await env.DB.prepare(`
+      INSERT INTO privilege_ticket_requests(
+        request_id,device_id,device_key_id,connection_epoch,idempotency_key,idempotency_key_digest,installation_id,operation_id,assignment_id,run_id,runtime_id,
+        runtime_spec_digest,launch_plan_digest,local_execution_plan_digest,control_request_digest,operation_request_digest,run_manifest_digest,helper_policy_revision,
+        helper_policy_digest,device_policy_revision,connector_policy_id,connector_policy_revision,project_revision,project_agent_id,project_agent_revision,device_revision,
+        runtime_configuration_revision,approval_receipt_digest,approval_enforcement,allowed_operation,resource_ceilings_json,redacted_summary_json,request_digest,
+        device_signature,status,denial_code,requested_at,expires_at,terminal_at
+      ) SELECT
+        'ptreq_privretention1',device_id,device_key_id,connection_epoch,'privilege-retention-denied-0001',?1,installation_id,operation_id,assignment_id,run_id,runtime_id,
+        runtime_spec_digest,launch_plan_digest,local_execution_plan_digest,control_request_digest,operation_request_digest,run_manifest_digest,helper_policy_revision,
+        helper_policy_digest,device_policy_revision,connector_policy_id,connector_policy_revision,project_revision,project_agent_id,project_agent_revision,device_revision,
+        runtime_configuration_revision,approval_receipt_digest,approval_enforcement,allowed_operation,resource_ceilings_json,'{"operation":"prepare"}',?2,
+        device_signature,'denied','retention_test',?3,?3,?3
+      FROM privilege_ticket_requests WHERE request_id='ptreq_privilegeflow01'
+    `).bind("c".repeat(64), "d".repeat(64), old).run();
+    const measured = instrumentD1(env.DB);
+    const first = await cleanupHotData(new Proxy(env as ControlPlaneEnv, { get: (target, property, receiver) => property === "DB" ? measured.db : Reflect.get(target, property, receiver) }), { now: new Date("2026-09-03T00:00:00.000Z"), limit: 100 });
+    assertFreeD1Ceilings(measured.snapshot());
+    expect(first.deletedRows).toBeGreaterThanOrEqual(1);
+    expect(await env.DB.prepare("SELECT COUNT(*) AS count FROM privilege_ticket_requests WHERE request_id='ptreq_privretention1'").first()).toEqual({ count: 0 });
+    expect(await env.DB.prepare("SELECT COUNT(*) AS count FROM privilege_ticket_issuance WHERE request_id='ptreq_privilegeflow01'").first()).toEqual({ count: 1 });
+    expect(await env.DB.prepare("SELECT COUNT(*) AS count FROM privilege_receipt_projections WHERE receipt_id IN ('prcpt_privilegeflow01','prcpt_privbudget0001')").first()).toEqual({ count: 2 });
+    const persisted = await env.DB.prepare("SELECT redacted_summary_json FROM privilege_ticket_requests WHERE request_id='ptreq_privilegeflow01'").first<{ redacted_summary_json: string }>();
+    expect(persisted?.redacted_summary_json).not.toContain("/home/");
+    expect(persisted?.redacted_summary_json).not.toMatch(/secret|credential|token/i);
+    const replay = await cleanupHotData(env, { now: new Date("2026-09-03T00:00:01.000Z"), limit: 100 });
+    expect(replay.hasMore).toBe(false);
   });
 });

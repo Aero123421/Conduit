@@ -982,21 +982,55 @@ impl<M: SystemdManager> HelperEngine<M> {
             self.journal.mark_uncertain(&ticket.claims.ticket_id)?;
             return Err(e);
         }
-        let observation = self
-            .systemd
-            .inspect(&runtime.unit_name)
-            .unwrap_or(UnitObservation {
-                unit_name: runtime.unit_name.clone(),
-                invocation_id: runtime.invocation_id.clone(),
-                main_pid: runtime.main_pid,
-                active_state: "unknown".into(),
-                cgroup: None,
-                effective_uid: None,
-                effective_gid: None,
-                process_birth: None,
-                exit_code: None,
-                signal: None,
-            });
+        let stopping = matches!(
+            operation,
+            PrivilegedOperation::GracefulStop | PrivilegedOperation::ForceStop
+        );
+        let mut observation = None;
+        for _ in 0..if stopping { 100 } else { 1 } {
+            match self.systemd.inspect(&runtime.unit_name) {
+                Ok(value) => {
+                    let terminal =
+                        matches!(value.active_state.as_str(), "inactive" | "dead" | "failed");
+                    observation = Some(value);
+                    if !stopping || terminal {
+                        break;
+                    }
+                }
+                Err(_) if stopping => {
+                    // A successful exact StopUnit/KillUnit followed by the
+                    // disappearance of that same transient unit is terminal
+                    // evidence; systemd has released its process custody.
+                    observation = Some(UnitObservation {
+                        unit_name: runtime.unit_name.clone(),
+                        invocation_id: runtime.invocation_id.clone(),
+                        main_pid: None,
+                        active_state: "inactive".into(),
+                        cgroup: None,
+                        effective_uid: Some(0),
+                        effective_gid: Some(0),
+                        process_birth: None,
+                        exit_code: None,
+                        signal: None,
+                    });
+                    break;
+                }
+                Err(_) => break,
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let observation = observation.unwrap_or(UnitObservation {
+            unit_name: runtime.unit_name.clone(),
+            invocation_id: runtime.invocation_id.clone(),
+            main_pid: runtime.main_pid,
+            active_state: "unknown".into(),
+            cgroup: None,
+            effective_uid: None,
+            effective_gid: None,
+            process_birth: None,
+            exit_code: None,
+            signal: None,
+        });
         let transition = match operation {
             PrivilegedOperation::Pause => "paused",
             PrivilegedOperation::Resume => "resumed",

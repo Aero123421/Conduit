@@ -88,6 +88,7 @@ interface OperationAuthorityRow {
   current_project_status: string | null;
   current_agent_revision: number | null;
   current_agent_status: string | null;
+  agent_configuration_json: string | null;
   current_device_revision: number;
 }
 
@@ -223,6 +224,40 @@ function credentialProfileIds(value: unknown, label: string): string[] {
   return value as string[];
 }
 
+interface CredentialProjectionSummary { profileId: string; revision: number; }
+
+function credentialProjectionSummaries(value: unknown, label: string): CredentialProjectionSummary[] {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 16) throw new TypeError(`${label} is invalid`);
+  const profiles = value.map((item) => {
+    const projection = record(item, label);
+    exactKeys(projection, ["profileId", "revision"], label);
+    const profileId = idField(projection, "profileId");
+    if (!profileId.startsWith("cred_")) throw new TypeError(`${label} profileId is invalid`);
+    return { profileId, revision: positiveInteger(projection, "revision") };
+  });
+  if (new Set(profiles.map((profile) => profile.profileId)).size !== profiles.length) throw new TypeError(`${label} contains duplicate profile IDs`);
+  return profiles;
+}
+
+function operationCredentialProjections(value: unknown): Array<CredentialProjectionSummary & { targetName: string }> {
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 16) throw new TypeError("operation credentialProjections is invalid");
+  const targets = new Set<string>();
+  const projections = value.map((item) => {
+    const projection = record(item, "operation credential projection");
+    exactKeys(projection, ["profileId", "revision", "targetName"], "operation credential projection");
+    const summary = credentialProjectionSummaries([{ profileId: projection.profileId, revision: projection.revision }], "operation credential projection")[0]!;
+    const targetName = stringField(projection, "targetName", 256);
+    if (targetName.startsWith("/") || targetName.includes("\\") || targetName.split("/").some((part) => part.length === 0 || part === "." || part === ".." || !/^[A-Za-z0-9_.-]+$/.test(part)) || !targets.add(targetName)) {
+      throw new TypeError("operation credential targetName is invalid");
+    }
+    return { ...summary, targetName };
+  });
+  if (new Set(projections.map((profile) => profile.profileId)).size !== projections.length) throw new TypeError("operation credentialProjections contains duplicate profile IDs");
+  return projections;
+}
+
 function launchProfileExecutableDigests(value: unknown): Record<string, string> {
   if (value === undefined) return {};
   const digests = record(value, "root policy launchProfileExecutableDigests");
@@ -262,7 +297,7 @@ function safeRedactedSummary(value: unknown): Record<string, unknown> {
   safeLabel(summary.runtimeKind, "redactedSummary.runtimeKind");
   safeLabel(summary.resourceProfile, "redactedSummary.resourceProfile");
   if (summary.reasonCodes !== undefined && (!Array.isArray(summary.reasonCodes) || summary.reasonCodes.length > 16 || summary.reasonCodes.some((item) => typeof item !== "string" || !/^[a-z][a-z0-9_.-]{0,127}$/.test(item)))) throw new TypeError("redactedSummary.reasonCodes is not safe metadata");
-  credentialProfileIds(summary.credentialProfiles, "redactedSummary.credentialProfiles");
+  credentialProjectionSummaries(summary.credentialProfiles, "redactedSummary.credentialProfiles");
   if (new TextEncoder().encode(canonicalJson(summary)).byteLength > 2048) throw new TypeError("redacted summary is too large");
   return summary;
 }
@@ -502,7 +537,8 @@ async function operationAuthority(env: ControlPlaneEnv, operationId: string): Pr
            binding.runtime_provider_id AS binding_runtime_provider_id,binding.runtime_configuration_revision AS binding_runtime_configuration_revision,
            binding.access_scope AS binding_access_scope,binding.approval_mode AS binding_approval_mode,
            project.revision AS current_project_revision,project.status AS current_project_status,
-           agent.revision AS current_agent_revision,agent.status AS current_agent_status,device.revision AS current_device_revision
+           agent.revision AS current_agent_revision,agent.status AS current_agent_status,
+           agent.configuration_json AS agent_configuration_json,device.revision AS current_device_revision
     FROM operation_journal AS operation
     LEFT JOIN runs AS run ON run.id=operation.run_id
     LEFT JOIN assignment_run_bindings AS binding ON binding.assignment_id=operation.assignment_id
@@ -529,8 +565,7 @@ function summaryAllows(summaryJson: string, ticketRequest: Record<string, unknow
   const registeredExactProfile = typeof launchProfileId === "string" && typeof exactLaunchProfiles[launchProfileId] === "string";
   const unrestrictedProfile = typeof launchProfileId === "string" && policy.allowUnrestrictedLaunch === true && launchProfiles.includes(launchProfileId);
   if (adapterId !== null ? policy.allowUnrestrictedLaunch !== true : !registeredExactProfile && !unrestrictedProfile) throw new PublicError("privileged_helper_policy_mismatch", 409, "Root policy does not allow this launch profile");
-  const requestedCredentials = record(ticketRequest.redactedSummary, "redactedSummary").credentialProfiles;
-  const credentialProfiles = Array.isArray(requestedCredentials) ? requestedCredentials : [];
+  const credentialProfiles = credentialProjectionSummaries(record(ticketRequest.redactedSummary, "redactedSummary").credentialProfiles, "redactedSummary.credentialProfiles").map((profile) => profile.profileId);
   const allowedCredentialProfiles = Array.isArray(policy.allowedCredentialProfiles) ? policy.allowedCredentialProfiles : [];
   if (credentialProfiles.some((profile) => !allowedCredentialProfiles.includes(profile))) throw new PublicError("privileged_helper_policy_mismatch", 409, "Root policy does not allow a requested credential profile");
   // Exact commands bind the complete launch plan. Structured Agents may use
@@ -563,8 +598,7 @@ function devicePolicyAllows(summaryJson: string, request: Record<string, unknown
   if (typeof launchProfileId === "string" && !includes("launchProfiles", launchProfileId)) {
     throw new PublicError("privileged_helper_policy_mismatch", 409, "Device policy does not allow this launch profile");
   }
-  const requestedCredentials = record(ticketRequest.redactedSummary, "redactedSummary").credentialProfiles;
-  const credentialProfiles = Array.isArray(requestedCredentials) ? requestedCredentials : [];
+  const credentialProfiles = credentialProjectionSummaries(record(ticketRequest.redactedSummary, "redactedSummary").credentialProfiles, "redactedSummary.credentialProfiles").map((profile) => profile.profileId);
   const allowedCredentialProfiles = Array.isArray(policy.credentialProfiles) ? policy.credentialProfiles : [];
   if (credentialProfiles.some((profile) => !allowedCredentialProfiles.includes(profile))) throw new PublicError("privileged_helper_policy_mismatch", 409, "Device policy does not allow a requested credential profile");
   if (request.approvalMode === "never" && policy.allowFullAccessWithoutApproval !== true) {
@@ -773,6 +807,18 @@ async function issueTicket(env: ControlPlaneEnv, frame: PrivilegeTransportFrame)
   }
   const argumentsValue = request.arguments === null || typeof request.arguments !== "object" || Array.isArray(request.arguments) ? {} : request.arguments as Record<string, unknown>;
   const adapterId = typeof argumentsValue.adapterId === "string" ? argumentsValue.adapterId : authority.adapter_id;
+  const credentialProjections = operationCredentialProjections(argumentsValue.credentialProjections);
+  const credentialSummary = credentialProjectionSummaries(redactedSummary.credentialProfiles, "redactedSummary.credentialProfiles");
+  if (canonicalJson(credentialSummary) !== canonicalJson(credentialProjections.map(({ profileId, revision }) => ({ profileId, revision })))) {
+    throw new PublicError("privilege_ticket_invalid", 409, "Credential projection summary differs from the immutable operation");
+  }
+  if (credentialProjections.length !== 0) {
+    if (authority.assignment_id === null || authority.agent_configuration_json === null || adapterId === null) throw new PublicError("privilege_ticket_invalid", 409, "Credential projection requires exact Assignment and Adapter authority");
+    let agentConfiguration: Record<string, unknown>;
+    try { agentConfiguration = JSON.parse(authority.agent_configuration_json) as Record<string, unknown>; } catch { throw new PublicError("privilege_ticket_invalid", 409, "Project Agent credential authority is invalid"); }
+    const agentProjections = operationCredentialProjections(agentConfiguration.credentialProjections);
+    if (canonicalJson(agentProjections) !== canonicalJson(credentialProjections)) throw new PublicError("privilege_ticket_invalid", 409, "Credential projection exceeds the Project Agent Assignment authority");
+  }
   const runtimeConfigurationRevision = positiveInteger(runtime, "configurationRevision");
   if (authority.assignment_id !== null && (authority.project_agent_id === null || argumentsValue.projectAgentId !== authority.project_agent_id || argumentsValue.projectAgentRevision !== authority.project_agent_revision || adapterId !== authority.adapter_id || authority.current_agent_status !== "active" || authority.current_agent_revision !== authority.project_agent_revision || authority.current_project_status !== "active" || authority.current_project_revision !== authority.binding_project_revision || authority.binding_device_id !== frame.deviceId || authority.binding_device_revision !== authority.current_device_revision || authority.binding_runtime_kind !== "native" || authority.binding_runtime_provider_id !== "privileged-native" || authority.binding_runtime_configuration_revision !== runtimeConfigurationRevision || authority.binding_access_scope !== "full_device" || authority.binding_approval_mode !== request.approvalMode)) throw new PublicError("privilege_ticket_invalid", 409, "Assignment, Project Agent, Project, Device, or Runtime configuration revision binding differs");
   if (authority.assignment_id === null && typeof argumentsValue.projectAgentId === "string") throw new PublicError("privilege_ticket_invalid", 409, "Project Agent work requires an immutable Assignment binding");

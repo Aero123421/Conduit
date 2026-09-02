@@ -96,6 +96,26 @@ function parseJsonRecord(value: string, label: string): Record<string, unknown> 
   return parsed as Record<string, unknown>;
 }
 
+function projectAgentCredentialProjections(configuration: Record<string, unknown>): Array<{ profileId: string; revision: number; targetName: string }> {
+  const value = configuration.credentialProjections;
+  if (value === undefined) return [];
+  if (!Array.isArray(value) || value.length > 16) throw new PublicError("invalid_request", 409, "Project Agent credentialProjections is invalid");
+  const profiles = new Set<string>();
+  const targets = new Set<string>();
+  return value.map((item) => {
+    if (item === null || typeof item !== "object" || Array.isArray(item)) throw new PublicError("invalid_request", 409, "Project Agent credential projection is invalid");
+    const projection = item as Record<string, unknown>;
+    if (Object.keys(projection).some((key) => !["profileId", "revision", "targetName"].includes(key))) throw new PublicError("invalid_request", 409, "Project Agent credential projection contains an unknown field");
+    const profileId = projection.profileId;
+    const revision = projection.revision;
+    const targetName = projection.targetName;
+    if (typeof profileId !== "string" || !/^cred_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$/.test(profileId) || !Number.isSafeInteger(revision) || (revision as number) < 1 || typeof targetName !== "string" || targetName.length > 256 || targetName.startsWith("/") || targetName.includes("\\") || targetName.split("/").some((part) => part.length === 0 || part === "." || part === ".." || !/^[A-Za-z0-9_.-]+$/.test(part)) || !profiles.add(profileId) || !targets.add(targetName)) {
+      throw new PublicError("invalid_request", 409, "Project Agent credential projection is invalid");
+    }
+    return { profileId, revision: revision as number, targetName };
+  });
+}
+
 async function replayScheduledBoard(
   env: ControlPlaneEnv,
   actor: AuthActor,
@@ -209,6 +229,7 @@ export async function scheduleBoardAssignment(
   const snapshotId = newId("ctx");
   const createdAt = nowIso();
   const agentConfiguration = parseJsonRecord(agent.configuration_json, "Project Agent configuration");
+  const credentialProjections = projectAgentCredentialProjections(agentConfiguration);
   const runtime: StartOperationInput["runtime"] = {
     kind: schedule.runtime.kind,
     providerId: schedule.runtime.providerId,
@@ -297,6 +318,7 @@ export async function scheduleBoardAssignment(
       contextSnapshotContentDigest: compiledContentDigest, contextSnapshotBytes: new TextEncoder().encode(boardBody).byteLength,
       parentBaselineId: session.accepted_baseline_id, sourceBaselineRevisions,
       expectedNodeRevision: 0, verificationPolicy: schedule.verificationPolicy, settlementPolicy: "close_on_settle",
+      ...(credentialProjections.length === 0 ? {} : { credentialProjections }),
     },
     ...(schedule.expiresInSeconds === undefined ? {} : { expiresInSeconds: schedule.expiresInSeconds }),
   };

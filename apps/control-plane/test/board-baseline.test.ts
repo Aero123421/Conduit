@@ -25,7 +25,7 @@ describe.sequential("Board assignment to accepted Session Baseline", () => {
       env.DB.prepare("INSERT INTO devices(id,enrollment_id,display_label,os,arch,node_version,protocol_version,status,created_at,updated_at) VALUES ('dev_board_baseline','enroll_board_baseline','Linux','linux','x86_64','0.1.0','conduit.node/1','active',?1,?1)").bind(now),
       env.DB.prepare("INSERT INTO projects(id,name,created_at,updated_at) VALUES ('prj_board_baseline','Board Baseline',?1,?1)").bind(now),
       env.DB.prepare("INSERT INTO collaboration_sessions(id,project_id,title,created_at,updated_at) VALUES ('csess_board_baseline','prj_board_baseline','Session',?1,?1)").bind(now),
-      env.DB.prepare("INSERT INTO project_agents(id,project_id,name,adapter_id,role,configuration_json,status,created_at,updated_at) VALUES ('pagent_board_builder','prj_board_baseline','Builder','codex','implementer',?1,'active',?2,?2)").bind(JSON.stringify({ instructionRevision: 3, credentialProfileId: "cred_local" }), now),
+      env.DB.prepare("INSERT INTO project_agents(id,project_id,name,adapter_id,role,configuration_json,status,created_at,updated_at) VALUES ('pagent_board_builder','prj_board_baseline','Builder','codex','implementer',?1,'active',?2,?2)").bind(JSON.stringify({ instructionRevision: 3, credentialProjections: [{ profileId: "cred_board_local", revision: 2, targetName: ".codex/auth.json" }] }), now),
       env.DB.prepare("INSERT INTO sources(id,project_id,display_name,source_kind,repository_identity,created_at,updated_at) VALUES ('src_board_baseline','prj_board_baseline','Repository','git','repo-digest',?1,?1)").bind(now),
       env.DB.prepare("INSERT INTO locations(id,source_id,device_id,opaque_local_id,display_label,observed_state_json,status,created_at,updated_at) VALUES ('loc_board_baseline','src_board_baseline','dev_board_baseline','opaque-location-01','Checkout','{}','active',?1,?1)").bind(now),
     ]);
@@ -71,7 +71,7 @@ describe.sequential("Board assignment to accepted Session Baseline", () => {
     expect(String(persisted?.snapshot_digest)).toHaveLength(64);
     expect(["queued", "offered"]).toContain(persisted?.operation_state);
     expect(["pending", "offered"]).toContain(persisted?.outbox_state);
-    expect(JSON.parse(String(persisted?.request_json))).toMatchObject({ arguments: { parentBaselineId: null, sourceBaselineRevisions: {}, expectedNodeRevision: 0, verificationPolicy: { requiredChecks: ["workspace_clean"] }, settlementPolicy: "close_on_settle" } });
+    expect(JSON.parse(String(persisted?.request_json))).toMatchObject({ arguments: { parentBaselineId: null, sourceBaselineRevisions: {}, expectedNodeRevision: 0, verificationPolicy: { requiredChecks: ["workspace_clean"] }, settlementPolicy: "close_on_settle", credentialProjections: [{ profileId: "cred_board_local", revision: 2, targetName: ".codex/auth.json" }] } });
 
     const replay = await exports.default.fetch(new Request("https://conduit.example.com/api/v1/board/messages", { method: "POST", headers, body: JSON.stringify(body) }));
     expect(replay.status).toBe(200);

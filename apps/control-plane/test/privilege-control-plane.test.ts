@@ -132,7 +132,7 @@ describe.sequential("privileged helper Control Plane", () => {
       operationId: "op_privilegeflow01", runId: "run_privilegeflow01", runtimeId: "rt_privilegeflow01", runtimeSpecDigest, launchPlanDigest, localExecutionPlanDigest: localPlanDigest,
       controlRequestDigest: null, controlAuthority: null, runManifestDigest: manifestDigest, helperPolicyRevision: 1, helperPolicyDigest: rootPolicyDigest, devicePolicyRevision: 1,
       approvalReceiptDigest: null, approvalEnforcement: "exact_command", allowedOperation: "prepare",
-      resourceCeilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, redactedSummary: { adapter: null, operation: "prepare", credentialProfiles: ["cred_allowed01"] },
+      resourceCeilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, redactedSummary: { adapter: null, operation: "prepare", credentialProfiles: [] },
       requestedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 120_000).toISOString(),
     };
     const crossRun = await deviceSignedFrame("privilege.ticket_request", "nmsg_privcrossrun01", "2", {
@@ -144,17 +144,17 @@ describe.sequential("privileged helper Control Plane", () => {
     }, devicePrivate);
     await expect(projectPrivilegeFrame(env, sensitiveSummary)).rejects.toThrow(/unknown field cwd/);
     const secretSummary = await deviceSignedFrame("privilege.ticket_request", "nmsg_privredactbad2", "2", {
-      ...ticketPayload, requestId: "ptreq_privredactbad2", idempotencyKey: "privilege-redaction-denial-0002", redactedSummary: { operation: "prepare", credentialProfiles: ["sk_live_supersecret"] },
+      ...ticketPayload, requestId: "ptreq_privredactbad2", idempotencyKey: "privilege-redaction-denial-0002", redactedSummary: { operation: "prepare", credentialProfiles: [{ profileId: "sk_live_supersecret", revision: 1 }] },
     }, devicePrivate);
-    await expect(projectPrivilegeFrame(env, secretSummary)).rejects.toThrow(/credential profile IDs only/);
+    await expect(projectPrivilegeFrame(env, secretSummary)).rejects.toThrow(/profileId is invalid/);
     const rootDeniedCredential = await deviceSignedFrame("privilege.ticket_request", "nmsg_privcreddeny01", "2", {
-      ...ticketPayload, requestId: "ptreq_privcreddeny01", idempotencyKey: "privilege-root-credential-denial-1", redactedSummary: { operation: "prepare", credentialProfiles: ["cred_unlisted01"] },
+      ...ticketPayload, requestId: "ptreq_privcreddeny01", idempotencyKey: "privilege-root-credential-denial-1", redactedSummary: { operation: "prepare", credentialProfiles: [{ profileId: "cred_unlisted01", revision: 1 }] },
     }, devicePrivate);
-    await expect(projectPrivilegeFrame(env, rootDeniedCredential)).rejects.toMatchObject({ code: "privileged_helper_policy_mismatch" });
+    await expect(projectPrivilegeFrame(env, rootDeniedCredential)).rejects.toMatchObject({ code: "privilege_ticket_invalid" });
     const deviceDeniedCredential = await deviceSignedFrame("privilege.ticket_request", "nmsg_privcreddeny02", "2", {
-      ...ticketPayload, requestId: "ptreq_privcreddeny02", idempotencyKey: "privilege-device-credential-denial", redactedSummary: { operation: "prepare", credentialProfiles: ["cred_rootonly01"] },
+      ...ticketPayload, requestId: "ptreq_privcreddeny02", idempotencyKey: "privilege-device-credential-denial", redactedSummary: { operation: "prepare", credentialProfiles: [{ profileId: "cred_rootonly01", revision: 1 }] },
     }, devicePrivate);
-    await expect(projectPrivilegeFrame(env, deviceDeniedCredential)).rejects.toMatchObject({ code: "privileged_helper_policy_mismatch" });
+    await expect(projectPrivilegeFrame(env, deviceDeniedCredential)).rejects.toMatchObject({ code: "privilege_ticket_invalid" });
     const ticketFrame = await deviceSignedFrame("privilege.ticket_request", "nmsg_privticket001", "2", ticketPayload, devicePrivate);
     const measured = instrumentD1(env.DB);
     const measuredEnv = new Proxy(env as ControlPlaneEnv, { get: (target, property, receiver) => property === "DB" ? measured.db : Reflect.get(target, property, receiver) });
@@ -193,7 +193,7 @@ describe.sequential("privileged helper Control Plane", () => {
     ]);
     const initialAgentInput = await deviceSignedFrame("privilege.ticket_request", "nmsg_privinitialin1", "4", {
       ...ticketPayload, requestId: "ptreq_privinitialin1", idempotencyKey: "privilege-initial-agent-input-01", controlRequestDigest: "6".repeat(64),
-      controlAuthority: { kind: "initial_agent_input", agentStateRevision: "1" }, approvalEnforcement: "adapter_mediated", allowedOperation: "input", redactedSummary: { operation: "input", adapter: "codex", credentialProfiles: ["cred_allowed01"] },
+      controlAuthority: { kind: "initial_agent_input", agentStateRevision: "1" }, approvalEnforcement: "adapter_mediated", allowedOperation: "input", redactedSummary: { operation: "input", adapter: "codex", credentialProfiles: [] },
     }, devicePrivate);
     await expect(projectPrivilegeFrame(env, initialAgentInput)).resolves.toMatchObject({ status: "issued", ticket: { claims: { operationId: "op_privilegeflow01", allowedOperation: "input", controlDigest: "6".repeat(64) } } });
     const unauthorizedLifecycle = await deviceSignedFrame("privilege.ticket_request", "nmsg_privinternbad1", "4", {

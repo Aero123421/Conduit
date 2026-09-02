@@ -530,41 +530,23 @@ async function issueTicket(env: ControlPlaneEnv, frame: PrivilegeTransportFrame)
   const issuedAt = now.toISOString();
   const claims = {
     schemaVersion: 1, protocol: "conduit.privileged/1", ticketId, issuerKind: "control_plane", issuerKeyId: active.config.keyId,
-    issuer: env.OAUTH_ISSUER, audience: "conduit-privileged-helper", publicOrigin: env.PUBLIC_ORIGIN, origin: env.PUBLIC_ORIGIN,
-    helperInstallationId: installationId, installationId, helperKeyId: installation.active_key_id, helperPolicyRevision: installation.active_policy_revision, helperPolicyDigest: installation.active_policy_digest,
-    deviceId: frame.deviceId, deviceKeyId, devicePolicyRevision: installation.device_policy_revision, expectedUid: installation.expected_uid, uid: installation.expected_uid,
-    operationId, idempotencyKeyDigest, operationRequestDigest, requestDigest: operationRequestDigest, runManifestDigest, runId, runtimeId,
-    runtimeSpecDigest: digestField(payload, "runtimeSpecDigest")!, launchPlanDigest: digestField(payload, "launchPlanDigest")!, controlDigest, controlRequestDigest: controlDigest, localExecutionPlanDigest: digestField(payload, "localExecutionPlanDigest")!,
+    audience: "conduit-privileged-helper", publicOrigin: env.PUBLIC_ORIGIN,
+    helperInstallationId: installationId, helperKeyId: installation.active_key_id, helperPolicyRevision: installation.active_policy_revision, helperPolicyDigest: installation.active_policy_digest,
+    deviceId: frame.deviceId, deviceKeyId, devicePolicyRevision: installation.device_policy_revision, expectedUid: installation.expected_uid,
+    operationId, idempotencyKeyDigest, operationRequestDigest, runManifestDigest, runId, runtimeId,
+    runtimeSpecDigest: digestField(payload, "runtimeSpecDigest")!, launchPlanDigest: digestField(payload, "launchPlanDigest")!, controlDigest, localExecutionPlanDigest: digestField(payload, "localExecutionPlanDigest")!,
     controllerEpoch: Number(frame.connectionEpoch), connectorPolicyId: authority.connector_policy_id, connectorPolicyRevision: authority.connector_policy_revision,
     projectId: authority.project_id, projectRevision: authority.binding_project_revision, assignmentId: authority.assignment_id,
     projectAgentId: authority.project_agent_id, projectAgentRevision: authority.project_agent_revision,
     deviceRevision: authority.current_device_revision, runtimeConfigurationRevision,
     accessScope: "full_device", approvalMode, approvalReceiptDigest: approvalDigest, approvalEnforcement,
-    requiredApprovalRiskClasses: requiredRiskClasses, requiredRiskClasses,
+    requiredApprovalRiskClasses: requiredRiskClasses,
     allowedOperation, resourceCeilings,
-    issuedAt, notBefore: issuedAt, expiresAt: ticketExpiresAt, nonce: randomToken(), maxUseCount: 1,
+    issuedAt, expiresAt: ticketExpiresAt, nonce: randomToken(), maxUseCount: 1,
   };
   const signature = base64url(new Uint8Array(await crypto.subtle.sign("Ed25519", active.key, new TextEncoder().encode(canonicalJson(claims)))));
   const ticket = { keyId: active.config.keyId, claims, signature };
-  // The first parse validates the task-complete ticket when the regenerated
-  // schema is present. The second keeps this isolated Control Plane commit
-  // testable against the pre-integration schema; the coordinator removes it
-  // when merging the generated protocol commit.
-  try {
-    parseWireDocument(schemaIds.privilegedV1, ticket);
-  } catch {
-    parseWireDocument(schemaIds.privilegedV1, { keyId: ticket.keyId, signature: ticket.signature, claims: {
-      protocol: claims.protocol, ticketId: claims.ticketId, issuer: claims.issuer, audience: claims.audience, origin: claims.origin,
-      installationId: claims.installationId, helperKeyId: claims.helperKeyId, helperPolicyRevision: claims.helperPolicyRevision, helperPolicyDigest: claims.helperPolicyDigest,
-      deviceId: claims.deviceId, deviceKeyId: claims.deviceKeyId, devicePolicyRevision: claims.devicePolicyRevision, uid: claims.uid,
-      operationId: claims.operationId, idempotencyKeyDigest: claims.idempotencyKeyDigest, requestDigest: claims.requestDigest, runId: claims.runId, runtimeId: claims.runtimeId,
-      runtimeSpecDigest: claims.runtimeSpecDigest, launchPlanDigest: claims.launchPlanDigest, localExecutionPlanDigest: claims.localExecutionPlanDigest,
-      controllerEpoch: claims.controllerEpoch, connectorPolicyId: claims.connectorPolicyId, connectorPolicyRevision: claims.connectorPolicyRevision,
-      projectId: claims.projectId, assignmentId: claims.assignmentId, accessScope: claims.accessScope, approvalMode: claims.approvalMode,
-      approvalReceiptDigest: claims.approvalReceiptDigest, approvalEnforcement: claims.approvalEnforcement, requiredRiskClasses: claims.requiredRiskClasses,
-      allowedOperation: claims.allowedOperation, resourceCeilings: claims.resourceCeilings, notBefore: claims.notBefore, expiresAt: claims.expiresAt, nonce: claims.nonce,
-    } });
-  }
+  parseWireDocument(schemaIds.privilegedV1, ticket);
   const canonicalTicket = canonicalJson(ticket);
   const ticketDigest = await sha256Hex(canonicalTicket);
   const redactedSummary = safeRedactedSummary(payload.redactedSummary);

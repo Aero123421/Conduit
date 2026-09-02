@@ -40,56 +40,55 @@ export interface PrivilegeTicket {
   signature: Base64Url;
 }
 export interface PrivilegeTicketClaims {
+  schemaVersion: 1;
   protocol: Protocol;
   ticketId: Id;
-  issuer: string;
-  audience: string;
-  origin: string;
-  installationId: Id;
+  issuerKind: "control_plane";
+  issuerKeyId: Id;
+  audience: "conduit-privileged-helper";
+  publicOrigin: string;
+  helperInstallationId: Id;
   helperKeyId: Id;
   helperPolicyRevision: number;
   helperPolicyDigest: Sha256Hex;
   deviceId: Id;
   deviceKeyId: Id;
   devicePolicyRevision: number;
-  uid: number;
+  expectedUid: number;
   operationId: Id;
   idempotencyKeyDigest: Sha256Hex;
-  requestDigest: Sha256Hex;
+  operationRequestDigest: Sha256Hex;
+  runManifestDigest: Sha256Hex;
   runId: RunId;
   runtimeId: RuntimeId;
   runtimeSpecDigest: Sha256Hex;
   launchPlanDigest: Sha256Hex;
+  controlDigest: Sha256Hex | null;
   localExecutionPlanDigest: Sha256Hex;
   controllerEpoch: number;
   connectorPolicyId: Id;
   connectorPolicyRevision: number;
   projectId: Id | null;
+  projectRevision: number | null;
   assignmentId: Id | null;
+  projectAgentId: Id | null;
+  projectAgentRevision: number | null;
+  deviceRevision: number;
+  runtimeConfigurationRevision: number;
   accessScope: "full_device";
   approvalMode: "always" | "outside_scope" | "risk_classes" | "never";
   approvalReceiptDigest: Sha256Hex | null;
   approvalEnforcement: ApprovalEnforcement;
   /**
-   * @maxItems 10
+   * @maxItems 32
    */
-  requiredRiskClasses:
-    | []
-    | [string]
-    | [string, string]
-    | [string, string, string]
-    | [string, string, string, string]
-    | [string, string, string, string, string]
-    | [string, string, string, string, string, string]
-    | [string, string, string, string, string, string, string]
-    | [string, string, string, string, string, string, string, string]
-    | [string, string, string, string, string, string, string, string, string]
-    | [string, string, string, string, string, string, string, string, string, string];
+  requiredApprovalRiskClasses: string[];
   allowedOperation: PrivilegedOperation;
   resourceCeilings: ResourceCeilings;
-  notBefore: Timestamp;
+  issuedAt: Timestamp;
   expiresAt: Timestamp;
   nonce: Base64Url;
+  maxUseCount: 1;
 }
 export interface ResourceCeilings {
   cpuQuotaPerSecUsec: number | null;
@@ -310,6 +309,7 @@ export interface ReceiptClaims {
     | "paused"
     | "resumed"
     | "input_applied"
+    | "pty_resized"
     | "stopping"
     | "completed"
     | "failed"

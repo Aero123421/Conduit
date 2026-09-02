@@ -25,7 +25,14 @@ DESTDIR="$conduit_real_stage" CONDUIT_BUILD_DIR="$conduit_real_release" \
   "$conduit_root/installers/install-privileged.sh"
 for conduit_real_binary in conduit-privileged-helper conduit-privileged-exec; do
   test -x "$conduit_real_stage/usr/libexec/conduit/$conduit_real_binary"
-  test "$(stat -c '%a' "$conduit_real_stage/usr/libexec/conduit/$conduit_real_binary")" = 755
+  test "$(stat -c '%u:%g:%a' "$conduit_real_stage/usr/libexec/conduit/$conduit_real_binary")" = \
+    "$(id -u):$(id -g):755"
+done
+for conduit_real_unit in conduit-privileged-helper@.socket conduit-privileged-helper@.service; do
+  test -f "$conduit_real_stage/usr/lib/systemd/system/$conduit_real_unit"
+  test ! -L "$conduit_real_stage/usr/lib/systemd/system/$conduit_real_unit"
+  test "$(stat -c '%u:%g:%a' "$conduit_real_stage/usr/lib/systemd/system/$conduit_real_unit")" = \
+    "$(id -u):$(id -g):644"
 done
 if command -v systemd-analyze >/dev/null 2>&1; then
   # `--root` deliberately does not read host units. Supply only the minimal
@@ -87,11 +94,40 @@ conduit_helper="$conduit_stage/usr/libexec/conduit/conduit-privileged-helper"
 conduit_exec="$conduit_stage/usr/libexec/conduit/conduit-privileged-exec"
 conduit_socket="$conduit_stage/usr/lib/systemd/system/conduit-privileged-helper@.socket"
 conduit_service="$conduit_stage/usr/lib/systemd/system/conduit-privileged-helper@.service"
+conduit_package_targets=(
+  "$conduit_helper"
+  "$conduit_exec"
+  "$conduit_socket"
+  "$conduit_service"
+)
+conduit_assert_package_metadata() {
+  local conduit_expected_owner
+  conduit_expected_owner="$(id -u):$(id -g)"
+  test "$(stat -c '%u:%g:%a' "$conduit_helper")" = "$conduit_expected_owner:755"
+  test "$(stat -c '%u:%g:%a' "$conduit_exec")" = "$conduit_expected_owner:755"
+  test "$(stat -c '%u:%g:%a' "$conduit_socket")" = "$conduit_expected_owner:644"
+  test "$(stat -c '%u:%g:%a' "$conduit_service")" = "$conduit_expected_owner:644"
+}
+conduit_package_snapshot() {
+  sha256sum "${conduit_package_targets[@]}" | cut -d' ' -f1
+}
+conduit_assert_package_units() {
+  cmp -s \
+    <(sed 's|@LIBEXECDIR@|/usr/libexec/conduit|g' \
+      "$conduit_root/packaging/systemd/conduit-privileged-helper@.socket") \
+    "$conduit_socket"
+  cmp -s \
+    <(sed 's|@LIBEXECDIR@|/usr/libexec/conduit|g' \
+      "$conduit_root/packaging/systemd/conduit-privileged-helper@.service") \
+    "$conduit_service"
+}
 for conduit_binary in "$conduit_helper" "$conduit_exec"; do
   test -x "$conduit_binary"
   test ! -L "$conduit_binary"
   test "$(stat -c '%a' "$conduit_binary")" = 755
 done
+conduit_assert_package_metadata
+conduit_assert_package_units
 for conduit_unit in "$conduit_socket" "$conduit_service"; do
   test -f "$conduit_unit"
   test ! -L "$conduit_unit"
@@ -130,6 +166,10 @@ printf '0\n' > "$CONDUIT_TEST_PRIVILEGED_STATE/active-count"
 DESTDIR="$conduit_stage" CONDUIT_BUILD_DIR="$conduit_release_110" \
   "$conduit_root/installers/update-privileged.sh"
 test "$($conduit_helper --version)" = 'conduit-privileged-helper 1.1.0'
+cmp -s "$conduit_release_110/conduit-privileged-helper" "$conduit_helper"
+cmp -s "$conduit_release_110/conduit-privileged-exec" "$conduit_exec"
+conduit_assert_package_metadata
+conduit_assert_package_units
 
 # Installing a compatible package while a Runtime is active must not alter the
 # durable active count or invoke a service manager in DESTDIR mode.
@@ -138,7 +178,12 @@ DESTDIR="$conduit_stage" CONDUIT_BUILD_DIR="$conduit_release_120" \
   "$conduit_root/installers/update-privileged.sh"
 test "$($conduit_helper --version)" = 'conduit-privileged-helper 1.2.0'
 test "$(<"$CONDUIT_TEST_PRIVILEGED_STATE/active-count")" = 1
+cmp -s "$conduit_release_120/conduit-privileged-helper" "$conduit_helper"
+cmp -s "$conduit_release_120/conduit-privileged-exec" "$conduit_exec"
+conduit_assert_package_metadata
+conduit_assert_package_units
 
+conduit_pre_rollback_snapshot="$(conduit_package_snapshot)"
 if DESTDIR="$conduit_stage" CONDUIT_BUILD_DIR="$conduit_release_bad" \
   "$conduit_root/installers/update-privileged.sh"; then
   echo "a post-install compatibility failure unexpectedly committed" >&2
@@ -146,6 +191,14 @@ if DESTDIR="$conduit_stage" CONDUIT_BUILD_DIR="$conduit_release_bad" \
 fi
 test "$($conduit_helper --version)" = 'conduit-privileged-helper 1.2.0'
 test "$(<"$CONDUIT_TEST_PRIVILEGED_STATE/active-count")" = 1
+test "$(conduit_package_snapshot)" = "$conduit_pre_rollback_snapshot"
+cmp -s "$conduit_release_120/conduit-privileged-helper" "$conduit_helper"
+cmp -s "$conduit_release_120/conduit-privileged-exec" "$conduit_exec"
+conduit_assert_package_metadata
+conduit_assert_package_units
+test -n "$(find "$CONDUIT_TEST_PRIVILEGED_STATE/package-upgrades" \
+  -mindepth 2 -maxdepth 2 -type f -name result \
+  -exec grep -Flx rolled_back {} \; -print -quit)"
 
 if DESTDIR="$conduit_stage" CONDUIT_BUILD_DIR="$conduit_release_old" \
   "$conduit_root/installers/update-privileged.sh"; then
@@ -162,6 +215,8 @@ DESTDIR="$conduit_stage" \
   "$conduit_root/installers/uninstall-privileged.sh" --terminate-active
 test ! -e "$conduit_helper"
 test ! -e "$conduit_exec"
+test ! -e "$conduit_socket"
+test ! -e "$conduit_service"
 test -d "$CONDUIT_TEST_PRIVILEGED_STATE"
 test -d "$CONDUIT_TEST_PRIVILEGED_CONFIG"
 
@@ -172,6 +227,8 @@ if DESTDIR="$conduit_stage" CONDUIT_BUILD_DIR="$conduit_release_old" \
 fi
 DESTDIR="$conduit_stage" CONDUIT_BUILD_DIR="$conduit_release_120" \
   "$conduit_root/installers/install-privileged.sh"
+conduit_assert_package_metadata
+conduit_assert_package_units
 printf '0\n' > "$CONDUIT_TEST_PRIVILEGED_STATE/active-count"
 printf '' > "$CONDUIT_TEST_PRIVILEGED_STATE/authority.lock"
 chmod 0600 "$CONDUIT_TEST_PRIVILEGED_STATE/authority.lock"
@@ -183,6 +240,11 @@ fi
 DESTDIR="$conduit_stage" "$conduit_root/installers/uninstall-privileged.sh" \
   --purge --confirm-purge DELETE-CONDUIT-PRIVILEGED-STATE
 test ! -e "$conduit_helper"
+test ! -e "$conduit_exec"
+test ! -e "$conduit_socket"
+test ! -e "$conduit_service"
+test ! -e "$CONDUIT_TEST_PRIVILEGED_STATE/authority.lock"
+test ! -e "$CONDUIT_TEST_PRIVILEGED_STATE/package-upgrades"
 test ! -e "$CONDUIT_TEST_PRIVILEGED_STATE"
 test ! -e "$CONDUIT_TEST_PRIVILEGED_CONFIG"
 

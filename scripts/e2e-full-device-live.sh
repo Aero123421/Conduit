@@ -286,6 +286,39 @@ sudo -n env CONDUIT_BUILD_DIR="$conduit_package_root/bin" \
   "$conduit_package_root/installers/install-privileged.sh"
 
 conduit_helper=/usr/libexec/conduit/conduit-privileged-helper
+conduit_exec=/usr/libexec/conduit/conduit-privileged-exec
+conduit_socket_unit=/usr/lib/systemd/system/conduit-privileged-helper@.socket
+conduit_service_unit=/usr/lib/systemd/system/conduit-privileged-helper@.service
+conduit_package_targets=(
+  "$conduit_helper"
+  "$conduit_exec"
+  "$conduit_socket_unit"
+  "$conduit_service_unit"
+)
+conduit_live_package_snapshot() {
+  local conduit_target
+  for conduit_target in "${conduit_package_targets[@]}"; do
+    sudo -n sha256sum "$conduit_target" | cut -d' ' -f1
+  done
+}
+conduit_assert_live_package_metadata() {
+  test "$(sudo -n stat -c '%u:%g:%a' "$conduit_helper")" = 0:0:755
+  test "$(sudo -n stat -c '%u:%g:%a' "$conduit_exec")" = 0:0:755
+  test "$(sudo -n stat -c '%u:%g:%a' "$conduit_socket_unit")" = 0:0:644
+  test "$(sudo -n stat -c '%u:%g:%a' "$conduit_service_unit")" = 0:0:644
+}
+conduit_assert_live_package_content() {
+  sudo -n cmp -s "$conduit_package_root/bin/conduit-privileged-helper" "$conduit_helper"
+  sudo -n cmp -s "$conduit_package_root/bin/conduit-privileged-exec" "$conduit_exec"
+  test "$(sudo -n sed 's|@LIBEXECDIR@|/usr/libexec/conduit|g' \
+    "$conduit_package_root/packaging/systemd/conduit-privileged-helper@.socket" | sha256sum | cut -d' ' -f1)" = \
+    "$(sudo -n sha256sum "$conduit_socket_unit" | cut -d' ' -f1)"
+  test "$(sudo -n sed 's|@LIBEXECDIR@|/usr/libexec/conduit|g' \
+    "$conduit_package_root/packaging/systemd/conduit-privileged-helper@.service" | sha256sum | cut -d' ' -f1)" = \
+    "$(sudo -n sha256sum "$conduit_service_unit" | cut -d' ' -f1)"
+}
+conduit_assert_live_package_metadata
+conduit_assert_live_package_content
 export CONDUIT_FULL_DEVICE_E2E=1
 export CONDUIT_FULL_DEVICE_E2E_COMMIT="$conduit_commit"
 export CONDUIT_FULL_DEVICE_E2E_CONTROL_URL="$conduit_control_url"
@@ -635,6 +668,8 @@ grep -Eq '"activeRuntimeCount"[[:space:]]*:[[:space:]]*1' \
 sudo -n env CONDUIT_BUILD_DIR="$conduit_package_root/bin" \
   "$conduit_package_root/installers/update-privileged.sh" \
   > "$conduit_user_evidence/active-update.txt"
+conduit_assert_live_package_metadata
+conduit_assert_live_package_content
 sudo -n "$conduit_helper" admin package-status --uid "$(id -u)" --output json \
   > "$conduit_user_evidence/active-after-update.json"
 grep -Eq '"activeRuntimeCount"[[:space:]]*:[[:space:]]*1' \
@@ -645,7 +680,7 @@ grep -Eq '"activeRuntimeCount"[[:space:]]*:[[:space:]]*1' \
 
 # Force a post-replacement compatibility failure from a root-owned candidate.
 # The candidate succeeds only from its staging path, so the installed probe
-# fails after replacement and must restore every previous package inode.
+# fails after replacement and must restore every previous package file.
 conduit_rollback_candidate="$conduit_root_stage/rollback-candidate"
 sudo -n install -d -o root -g root -m 0700 "$conduit_rollback_candidate"
 conduit_rollback_helper="$conduit_user_evidence/rollback-helper"
@@ -664,7 +699,7 @@ sudo -n install -o root -g root -m 0755 \
 sudo -n install -o root -g root -m 0755 \
   "$conduit_package_root/bin/conduit-privileged-exec" \
   "$conduit_rollback_candidate/conduit-privileged-exec"
-conduit_helper_hash_before="$(sudo -n sha256sum /usr/libexec/conduit/conduit-privileged-helper | cut -d' ' -f1)"
+conduit_package_snapshot_before="$(conduit_live_package_snapshot)"
 set +e
 sudo -n env CONDUIT_BUILD_DIR="$conduit_rollback_candidate" \
   "$conduit_package_root/installers/update-privileged.sh" \
@@ -675,11 +710,12 @@ set -e
   echo "live injected update did not fail at the installed compatibility probe" >&2
   exit 4
 }
-conduit_helper_hash_after="$(sudo -n sha256sum /usr/libexec/conduit/conduit-privileged-helper | cut -d' ' -f1)"
-[[ "$conduit_helper_hash_before" = "$conduit_helper_hash_after" ]] || {
-  echo "live package rollback did not restore the helper binary" >&2
+conduit_package_snapshot_after="$(conduit_live_package_snapshot)"
+[[ "$conduit_package_snapshot_before" = "$conduit_package_snapshot_after" ]] || {
+  echo "live package rollback did not restore every replaced package file" >&2
   exit 4
 }
+conduit_assert_live_package_metadata
 sudo -n find /var/lib/conduit/privileged-helper/package-upgrades \
   -mindepth 2 -maxdepth 2 -type f -name result -exec grep -Fxq rolled_back {} \; -print \
   | grep -F /result >/dev/null || {
@@ -721,7 +757,7 @@ if grep -F "pid=$conduit_helper_pid," "$conduit_user_evidence/ip-sockets.local" 
   exit 4
 fi
 rm -f "$conduit_user_evidence/ip-sockets.local"
-printf '%s\n' '{"schemaVersion":1,"activeUpdate":{"passed":true,"custodyBefore":1,"custodyAfter":1,"activationRestarted":false},"rollback":{"passed":true,"postReplacementFailureInjected":true,"previousBinaryRestored":true,"activeCustodyPreserved":true},"activeUninstall":{"passed":true,"refused":true,"exitStatus":3},"helperServiceRestart":{"passed":true,"custodyBefore":1,"custodyAfter":1},"networkIsolation":{"passed":true,"helperIpSockets":0}}' \
+printf '%s\n' '{"schemaVersion":1,"activeUpdate":{"passed":true,"custodyBefore":1,"custodyAfter":1,"activationRestarted":false,"allPackageTargetsVerified":true},"rollback":{"passed":true,"postReplacementFailureInjected":true,"allPreviousPackageTargetsRestored":true,"ownershipAndModesRestored":true,"activeCustodyPreserved":true},"activeUninstall":{"passed":true,"refused":true,"exitStatus":3},"helperServiceRestart":{"passed":true,"custodyBefore":1,"custodyAfter":1},"networkIsolation":{"passed":true,"helperIpSockets":0}}' \
   > "$conduit_user_evidence/packaging-live-summary.json"
 chmod 0600 "$conduit_user_evidence/packaging-live-summary.json"
 
@@ -769,13 +805,26 @@ chmod 0600 "$conduit_user_evidence/security-summary.json"
 # Finish by exercising default state preservation followed by an explicit
 # destructive test purge. Transaction rollback is covered by the deterministic
 # package test; this live run uses only exact release artifacts from this head.
+# A package-level authority lock is distinct from per-UID helper state. Create
+# the fixed root-owned lock fixture after every Runtime is terminal so the live
+# uninstall proves default retention and confirmed-purge cleanup explicitly.
+sudo -n install -o root -g root -m 0600 /dev/null \
+  /var/lib/conduit/privileged-helper/authority.lock
 sudo -n "$conduit_package_root/installers/uninstall-privileged.sh"
+for conduit_removed_package_file in "${conduit_package_targets[@]}"; do
+  if sudo -n test -e "$conduit_removed_package_file" || sudo -n test -L "$conduit_removed_package_file"; then
+    echo "state-preserving uninstall left an installed package file" >&2
+    exit 4
+  fi
+done
 sudo -n test -d /var/lib/conduit/privileged-helper
 sudo -n test -d /etc/conduit/privileged-helper.d
+sudo -n test "$(sudo -n stat -c '%u:%a' /var/lib/conduit/privileged-helper/authority.lock)" = 0:600
 sudo -n env CONDUIT_BUILD_DIR="$conduit_package_root/bin" \
   "$conduit_package_root/installers/install-privileged.sh"
 sudo -n "$conduit_package_root/installers/uninstall-privileged.sh" \
   --purge --confirm-purge DELETE-CONDUIT-PRIVILEGED-STATE
+sudo -n test ! -e /var/lib/conduit/privileged-helper/authority.lock
 conduit_cleanup_started=0
 
 for conduit_removed in \

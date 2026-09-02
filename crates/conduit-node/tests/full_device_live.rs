@@ -4,7 +4,7 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use conduit_node::privileged::PrivilegedNodeRuntime;
 use conduit_node_store::DeviceIdentity;
-use conduit_privileged_helper::{HelperClient, capture_file_identity};
+use conduit_privileged_helper::capture_file_identity;
 use conduit_privileged_protocol::{
     ApprovalEnforcement, LocalExecutionPlan, PrivilegeTicket, PrivilegeTicketClaims,
     PrivilegedOperation, ResourceCeilings, SignedClaims, StdioMode, key_id,
@@ -338,21 +338,13 @@ fn root_exact_and_replay(
         .start_privileged(&prepared.runtime, start_ticket.clone(), &plan)
         .unwrap();
     assert_eq!(started.final_helper_receipt().claims.effective_uid, Some(0));
-    let identity = DeviceIdentity::load_or_create(evidence.join("device.ed25519")).unwrap();
-    let replay_client = HelperClient::connect_and_authenticate_with(
-        Path::new(&required("CONDUIT_FULL_DEVICE_E2E_SOCKET")),
-        &required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),
-        "full-device-live-lost-response",
-        |challenge| Ok(identity.sign_bytes(challenge)),
-    )
-    .unwrap();
-    let replay = replay_client
-        .start_chain(start_ticket, plan.digest().unwrap())
+    let replay = provider
+        .start_privileged(&prepared.runtime, start_ticket, &plan)
         .unwrap();
-    for receipt in &replay {
+    for receipt in &replay.helper_receipts {
         receipt.verify(runtime.receipt_key()).unwrap();
     }
-    let replay_final = replay.last().unwrap();
+    let replay_final = replay.final_helper_receipt();
     assert_eq!(
         replay_final.digest().unwrap(),
         started.final_helper_receipt().digest().unwrap()

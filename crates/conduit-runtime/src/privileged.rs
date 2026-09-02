@@ -218,11 +218,20 @@ impl PrivilegedNativeProvider {
                     .map_err(|e| RuntimeError::Record(e.to_string()))?,
             )
             .map_err(helper)?;
-        self.verify_chain(
-            &receipts,
-            Some(&entry.receipt),
-            &["unit_created", "running"],
-        )?;
+        let exact_replay = receipts.last() == Some(&entry.receipt);
+        if exact_replay {
+            self.verify_exact_replay_chain(
+                &receipts,
+                &entry.receipt,
+                &["unit_created", "running"],
+            )?;
+        } else {
+            self.verify_chain(
+                &receipts,
+                Some(&entry.receipt),
+                &["unit_created", "running"],
+            )?;
+        }
         let receipt = receipts
             .last()
             .expect("verified receipt chain is non-empty")
@@ -373,6 +382,54 @@ impl PrivilegedNativeProvider {
             self.verify(receipt)
         })
     }
+
+    fn verify_exact_replay_chain(
+        &self,
+        receipts: &[HelperReceipt],
+        current: &HelperReceipt,
+        expected_transitions: &[&str],
+    ) -> Result<(), RuntimeError> {
+        verify_exact_replay_chain(receipts, current, expected_transitions, |receipt| {
+            self.verify(receipt)
+        })
+    }
+}
+
+fn verify_exact_replay_chain(
+    receipts: &[HelperReceipt],
+    current: &HelperReceipt,
+    expected_transitions: &[&str],
+    verify: impl Fn(&HelperReceipt) -> Result<(), RuntimeError>,
+) -> Result<(), RuntimeError> {
+    if receipts.last() != Some(current)
+        || receipts.len() != expected_transitions.len()
+        || receipts
+            .iter()
+            .zip(expected_transitions)
+            .any(|(receipt, transition)| receipt.claims.transition != *transition)
+    {
+        return Err(RuntimeError::Uncertain(
+            "helper replay did not reproduce exact durable custody".into(),
+        ));
+    }
+    for receipt in receipts {
+        verify(receipt)?;
+    }
+    for pair in receipts.windows(2) {
+        let previous_digest = pair[0]
+            .digest()
+            .map_err(|error| RuntimeError::Record(error.to_string()))?;
+        if pair[1].claims.previous_receipt_digest.as_deref() != Some(previous_digest.as_str())
+            || pair[1].claims.state_revision != pair[0].claims.state_revision + 1
+            || pair[1].claims.runtime_id != pair[0].claims.runtime_id
+            || pair[1].claims.operation_id != pair[0].claims.operation_id
+        {
+            return Err(RuntimeError::Uncertain(
+                "helper replay receipt chain linkage is invalid".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 impl RuntimeProvider for PrivilegedNativeProvider {
@@ -880,6 +937,13 @@ mod tests {
         verify_receipt_chain(
             &started_chain,
             prepared_chain.last(),
+            &["unit_created", "running"],
+            |receipt| HelperClient::verify_receipt(receipt, &key.verifying_key()).map_err(helper),
+        )
+        .unwrap();
+        verify_exact_replay_chain(
+            &started_chain,
+            started_chain.last().unwrap(),
             &["unit_created", "running"],
             |receipt| HelperClient::verify_receipt(receipt, &key.verifying_key()).map_err(helper),
         )

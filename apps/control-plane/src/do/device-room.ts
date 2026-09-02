@@ -3,6 +3,8 @@ import { parseWireDocumentText, schemaIds, type NodeV1PostAuthFrame } from "@con
 import { canonicalJson, newId, nowIso, randomToken, sha256Hex, verifyEd25519 } from "../crypto.ts";
 import { ensureOperationConcurrencyReleased, type DeviceRoomOffer } from "../dispatch.ts";
 import type { DeviceRoomApproval } from "../approval-dispatch.ts";
+import { projectNodeState, type NodeProjectionEvent } from "../node-projection.ts";
+import { projectDeviceTerminalSubmission } from "../review-workflow.ts";
 import type { ControlPlaneEnv, QueueEventMessage } from "../types.ts";
 
 interface SocketAttachment {
@@ -64,6 +66,7 @@ const EFFECTFUL_CONTROL_TYPES = new Set<NodeV1PostAuthFrame["type"]>([
   "operation.offer",
   "operation.input",
   "operation.cancel",
+  "runtime.control",
   "operation.approval",
 ]);
 
@@ -168,7 +171,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     }
     const next: SocketAttachment = { ...attachment, stage: "authenticated", epoch: String(epoch), reconciling: true, reconciliationId };
     ws.serializeAttachment(next);
-    await this.env.DB.prepare("UPDATE devices SET connection_epoch=?1,last_observed_at=?2,updated_at=?2 WHERE id=?3 AND status='active'").bind(String(epoch), nowIso(), attachment.deviceId).run();
+    await this.env.DB.prepare("UPDATE devices SET connection_epoch=?1,node_boot_id=?2,last_observed_at=?3,updated_at=?3 WHERE id=?4 AND status='active'").bind(String(epoch), attachment.nodeBootId ?? null, nowIso(), attachment.deviceId).run();
     const positions = this.ctx.storage.sql.exec<{ direction: string; durable_sequence: number }>("SELECT direction,durable_sequence FROM transport_positions").toArray();
     const controlStored = positions.find((item) => item.direction === "control_to_node")?.durable_sequence ?? 0;
     const nodeStored = positions.find((item) => item.direction === "node_to_control")?.durable_sequence ?? 0;
@@ -352,6 +355,10 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
   }
 
   private async project(frame: NodeV1PostAuthFrame): Promise<void> {
+    if (frame.type === "operation.admission" || frame.type === "operation.status" || frame.type === "runtime.control_result" || frame.type === "device.health") {
+      const events = await projectNodeState(this.env, frame);
+      for (const event of events) await this.publishProjection(event);
+    }
     if (frame.type === "operation.approval_request") {
       const request = frame.payload;
       const issuedAt = Date.parse(request.issuedAt);
@@ -400,18 +407,38 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       if (stored === null || stored.commitment_digest !== request.operationDigest || stored.normalized_arguments_json !== normalized || stored.revisions_json !== revisions) throw new TypeError("approval id is bound to a different commitment");
     }
     if (frame.type === "operation.terminal") {
-      const operation = await this.env.DB.prepare("SELECT payload_digest,connector_grant_id,concurrency_class,state FROM operation_journal WHERE id=?1 LIMIT 1").bind(frame.payload.operationId).first<{ payload_digest: string; connector_grant_id: string | null; concurrency_class: "commands" | "agentRuns" | "runtimeStarts" | null; state: string }>();
+      const operation = await this.env.DB.prepare("SELECT payload_digest,connector_grant_id,concurrency_class,state,device_id,run_id,assignment_id,session_id,operation_kind FROM operation_journal WHERE id=?1 LIMIT 1").bind(frame.payload.operationId).first<{ payload_digest: string; connector_grant_id: string | null; concurrency_class: "commands" | "agentRuns" | "runtimeStarts" | null; state: string; device_id: string; run_id: string | null; assignment_id: string | null; session_id: string | null; operation_kind: string }>();
       if (operation === null) {
         await this.env.DB.prepare("INSERT INTO security_events(id,event_type,device_id,metadata_json,created_at) VALUES (?1,'device_terminal.unknown_operation',?2,?3,?4)").bind(newId("sevt"), frame.deviceId, JSON.stringify({ operationId: frame.payload.operationId, receiptDigest: frame.payload.receiptDigest }), nowIso()).run();
-      } else if (operation.payload_digest !== frame.payload.requestDigest) {
+      } else if (operation.device_id !== frame.deviceId || frame.correlationId !== frame.payload.operationId || operation.payload_digest !== frame.payload.requestDigest) {
         await this.env.DB.batch([
           this.env.DB.prepare("UPDATE operation_journal SET state='uncertain',result_json=?1,updated_at=?2 WHERE id=?3 AND state NOT IN ('completed','failed','cancelled','expired','rejected','uncertain')").bind(JSON.stringify({ denialCode: "request_digest_mismatch", terminal: frame.payload }), nowIso(), frame.payload.operationId),
           this.env.DB.prepare("INSERT INTO security_events(id,event_type,device_id,metadata_json,created_at) VALUES (?1,'device_terminal.request_digest_mismatch',?2,?3,?4)").bind(newId("sevt"), frame.deviceId, JSON.stringify({ operationId: frame.payload.operationId, expected: operation.payload_digest, received: frame.payload.requestDigest }), nowIso()),
         ]);
       } else {
         const projectedState = frame.payload.state === "completed" ? "completed" : frame.payload.state === "cancelled" ? "cancelled" : frame.payload.state === "rejected" || frame.payload.state === "expired" ? frame.payload.state : frame.payload.state === "uncertain" || frame.payload.state === "lost" || frame.payload.state === "recovery_required" ? "uncertain" : "failed";
-        await this.env.DB.prepare("UPDATE operation_journal SET state=?1,result_json=?2,updated_at=?3 WHERE id=?4 AND state NOT IN ('completed','failed','cancelled','expired','rejected','uncertain')").bind(projectedState, JSON.stringify(frame.payload), nowIso(), frame.payload.operationId).run();
+        const terminalAt = nowIso();
+        await this.env.DB.batch([
+          this.env.DB.prepare("UPDATE operation_journal SET state=?1,result_json=?2,updated_at=?3 WHERE id=?4 AND state NOT IN ('completed','failed','cancelled','expired','rejected','uncertain')").bind(projectedState, JSON.stringify(frame.payload), terminalAt, frame.payload.operationId),
+          this.env.DB.prepare("UPDATE idempotency_records SET state=?1,response_json=?2 WHERE operation_id=?3").bind(projectedState, JSON.stringify({ operationId: frame.payload.operationId, state: projectedState, terminal: frame.payload }), frame.payload.operationId),
+        ]);
+        if (operation.operation_kind === "start") {
+          const agentState = projectedState === "completed" ? "closed" : projectedState === "cancelled" ? "cancelled" : "failed";
+          await this.env.DB.batch([
+            this.env.DB.prepare("UPDATE agent_sessions SET state=?1,revision=revision+1,lease_expires_at=NULL,last_activity_at=?2,updated_at=?2 WHERE start_operation_id=?3 AND state IN ('starting','running','waiting_input','waiting_approval','closing')").bind(agentState, terminalAt, frame.payload.operationId),
+            this.env.DB.prepare("UPDATE runtime_custody SET state=?1,revision=revision+1,updated_at=?2 WHERE start_operation_id=?3 AND state NOT IN ('stopped','destroyed','failed','lost','uncertain','recovery_required')").bind(projectedState === "completed" || projectedState === "cancelled" ? "stopped" : "failed", terminalAt, frame.payload.operationId),
+          ]);
+        }
+        const summary = frame.payload.resultSummary as Record<string, unknown> | undefined;
+        if (operation.operation_kind === "start" && operation.run_id !== null && summary?.submission !== undefined) {
+          await projectDeviceTerminalSubmission(this.env, { operationId: frame.payload.operationId, runId: operation.run_id, deviceId: frame.deviceId, submission: summary.submission });
+        } else if (operation.operation_kind === "start" && operation.run_id !== null) {
+          const terminalRunState = projectedState === "completed" ? "completed" : projectedState === "cancelled" ? "cancelled" : "failed";
+          await this.env.DB.prepare("UPDATE runs SET state=?1,revision=revision+1,updated_at=?2 WHERE id=?3 AND state NOT IN ('ready_for_review','accepted','completed','cancelled','failed')").bind(terminalRunState, nowIso(), operation.run_id).run();
+          if (operation.assignment_id !== null) await this.env.DB.prepare("UPDATE assignments SET state=?1,revision=revision+1,updated_at=?2 WHERE id=?3 AND state IN ('queued','active','waiting_input','waiting_approval')").bind(terminalRunState === "completed" ? "ready_for_review" : terminalRunState, nowIso(), operation.assignment_id).run();
+        }
         if (operation.connector_grant_id !== null && operation.concurrency_class !== null) await ensureOperationConcurrencyReleased(this.env, frame.payload.operationId);
+        if (operation.session_id !== null && operation.run_id !== null) await this.publishProjection({ sessionId: operation.session_id, eventId: `bevt_${frame.messageId}`, type: `run.${projectedState}`, recordId: operation.run_id, revision: 1 });
       }
     }
     if (frame.type === "event.batch" && Array.isArray(frame.payload.events)) {
@@ -420,6 +447,14 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       }
     }
     this.ctx.storage.sql.exec("UPDATE inbound_frames SET projected=1 WHERE sequence=?", Number(frame.sequence));
+  }
+
+  private async publishProjection(event: NodeProjectionEvent): Promise<void> {
+    try {
+      await this.env.BOARD_ROOMS.getByName(event.sessionId).publish(event);
+    } catch (error) {
+      if (!(error instanceof Error) || !/UNIQUE|unique/i.test(error.message)) throw error;
+    }
   }
 
   private async projectApprovalOrDeadletter(frame: Extract<NodeV1PostAuthFrame, { type: "operation.approval_request" }>): Promise<void> {
@@ -434,7 +469,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     }
   }
 
-  private async enqueueControlFrame(type: NodeV1PostAuthFrame["type"], payload: Record<string, unknown>, correlationId: string | undefined, expiresAt: string, preferredSocket?: WebSocket, suppliedMessageId?: string): Promise<{ sequence: string; delivered: boolean }> {
+  private async enqueueControlFrame(type: NodeV1PostAuthFrame["type"], payload: Record<string, unknown>, correlationId: string | undefined, expiresAt: string, preferredSocket?: WebSocket, suppliedMessageId?: string, targetDeviceId?: string): Promise<{ sequence: string; delivered: boolean }> {
     const messageId = suppliedMessageId ?? newId("cmsg");
     const payloadDigest = await sha256Hex(canonicalJson(payload));
     const prior = suppliedMessageId === undefined ? undefined : this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE message_id=?", suppliedMessageId).toArray()[0];
@@ -462,7 +497,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     const payloadDeviceId = type === "operation.offer" && payload.operation !== null && typeof payload.operation === "object" && !Array.isArray(payload.operation) && typeof (payload.operation as Record<string, unknown>).deviceId === "string"
       ? String((payload.operation as Record<string, unknown>).deviceId)
       : undefined;
-    const wire = { protocol: "conduit.node/1", messageId, deviceId: state?.device_id ?? payloadDeviceId ?? "unconnected", connectionEpoch: String(state?.epoch ?? 0), direction: "control_to_node", sequence: String(sequence), type, ...(correlationId === undefined ? {} : { correlationId }), payloadDigest, payload };
+    const wire = { protocol: "conduit.node/1", messageId, deviceId: state?.device_id ?? payloadDeviceId ?? targetDeviceId ?? "unconnected", connectionEpoch: String(state?.epoch ?? 0), direction: "control_to_node", sequence: String(sequence), type, ...(correlationId === undefined ? {} : { correlationId }), payloadDigest, payload };
     parseWireDocumentText(schemaIds.nodeV1, JSON.stringify(wire));
     const createdAt = nowIso();
     this.ctx.storage.transactionSync(() => {
@@ -547,9 +582,11 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
 
   async offer(frame: DeviceRoomOffer): Promise<{ sequence: string; delivered: boolean }> {
     const computed = await sha256Hex(canonicalJson(frame.payload));
-    if (computed !== frame.payloadDigest) throw new TypeError("operation offer payload digest mismatch");
+    if (computed !== frame.payloadDigest) throw new TypeError("control payload digest mismatch");
+    const frameType = frame.frameType ?? "operation.offer";
     const operation = frame.payload.operation;
-    if (operation === null || typeof operation !== "object" || Array.isArray(operation) || (operation as Record<string, unknown>).deviceId !== frame.deviceId) throw new TypeError("operation offer device target mismatch");
+    if (frameType === "operation.offer" && (operation === null || typeof operation !== "object" || Array.isArray(operation) || (operation as Record<string, unknown>).deviceId !== frame.deviceId)) throw new TypeError("operation offer device target mismatch");
+    if (frameType !== "operation.offer" && frame.payload.operationId !== frame.correlationId) throw new TypeError("existing-target control correlation mismatch");
     const connection = this.ctx.storage.sql.exec<{ epoch: number; reconciliation_state: string }>("SELECT epoch,reconciliation_state FROM connection_state WHERE singleton=1").toArray()[0];
     const persistedDevice = this.ctx.storage.sql.exec<{ device_id: string }>("SELECT device_id FROM connection_state WHERE singleton=1").toArray()[0]?.device_id;
     if (persistedDevice !== undefined && persistedDevice !== frame.deviceId) throw new TypeError("operation offer device target conflicts with room identity");
@@ -557,7 +594,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       const item = candidate.deserializeAttachment() as SocketAttachment | null;
       return item?.stage === "authenticated" && connection?.reconciliation_state === "complete" && !item.reconciling && item.epoch === String(connection?.epoch);
     });
-    return this.enqueueControlFrame("operation.offer", frame.payload, frame.correlationId, frame.expiresAt, socket, frame.messageId);
+    return this.enqueueControlFrame(frameType, frame.payload, frame.correlationId, frame.expiresAt, socket, frame.messageId, frame.deviceId);
   }
 
   async deliverApproval(frame: DeviceRoomApproval): Promise<{ sequence: string; delivered: boolean }> {

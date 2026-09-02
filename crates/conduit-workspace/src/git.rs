@@ -142,6 +142,15 @@ pub struct DirectWorkspacePreflight {
     pub dirty_at_start: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct GitRevisionState {
+    pub commit: String,
+    /// SHA-256 commitment to the provider-native tree object identifier. This
+    /// remains a fixed-width Conduit digest for both SHA-1 and SHA-256 repos.
+    pub tree_digest: Sha256Digest,
+}
+
 impl GitRepository {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, GitError> {
         let path = fs::canonicalize(path)?;
@@ -281,6 +290,15 @@ impl GitRepository {
                 missing_objects,
                 alternates_present,
             },
+        })
+    }
+
+    pub fn revision_state(&self) -> Result<GitRevisionState, GitError> {
+        let commit = self.read_text("head-commit", &["rev-parse", "--verify", "HEAD"])?;
+        let tree = self.read_text("head-tree", &["rev-parse", "--verify", "HEAD^{tree}"])?;
+        Ok(GitRevisionState {
+            commit: commit.trim().to_owned(),
+            tree_digest: sha256_bytes(tree.trim().as_bytes()),
         })
     }
 

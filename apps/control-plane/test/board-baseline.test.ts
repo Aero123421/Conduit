@@ -86,18 +86,15 @@ describe.sequential("Board assignment to accepted Session Baseline", () => {
       env.DB.prepare("UPDATE assignments SET state='active',revision=2,updated_at=?1 WHERE id=?2").bind(now, assignmentId),
       env.DB.prepare("UPDATE runs SET state='finishing',revision=2,updated_at=?1 WHERE id=?2").bind(now, runId),
     ]);
-    const terminal = await exports.default.fetch(new Request(`https://conduit.example.com/api/v1/runs/${runId}/submissions`, {
-      method: "POST", headers: { ...authHeaders, "idempotency-key": "board-baseline-terminal-0001" },
-      body: JSON.stringify({ operationId, deviceId: "dev_board_baseline", submission: {
+    const projected = await projectDeviceTerminalSubmission(env, {
+      operationId, runId, deviceId: "dev_board_baseline", submission: {
         expectedNodeRevision: 0, terminalReceiptDigest: "2".repeat(64), parentBaselineId: null,
         sourceChanges: [{ sourceId: "src_board_baseline", sourceDigest, baseRevision: { kind: "git", commit: "1".repeat(40) }, resultRevision: { kind: "git", commit: "3".repeat(40), treeDigest: "4".repeat(64) }, state: "clean", custody: "healthy" }],
         unchangedSources: [], applicationOrder: ["src_board_baseline"], artifactCommitments: [{ artifactId: "art_test_report01", digest: "5".repeat(64) }],
         provenance: { adapterId: "codex" }, custody: { deviceRef: true, localArchive: true },
         verification: [{ checkId: "tests", status: "passed", evidenceRefs: ["evid_test_report01"], observedDigest: "6".repeat(64) }],
-      }}),
-    }));
-    expect(terminal.status).toBe(201);
-    const projected = await terminal.json() as { changeSetId: string; changeSetDigest: string };
+      },
+    }) as { changeSetId: string; changeSetDigest: string; state: string; runState: string; assignmentState: string };
     changeSetId = projected.changeSetId;
     changeSetDigest = projected.changeSetDigest;
     expect(projected).toMatchObject({ state: "proposed", runState: "ready_for_review", assignmentState: "ready_for_review" });

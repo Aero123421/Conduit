@@ -31,6 +31,11 @@ export class BoardRoom extends DurableObject<ControlPlaneEnv> {
 
   async publish(event: { eventId: string; sessionId: string; type: string; recordId: string; revision: number }): Promise<number> {
     const json = JSON.stringify(event);
+    const prior = this.ctx.storage.sql.exec<{ sequence: number; session_id: string; event_json: string }>("SELECT sequence,session_id,event_json FROM fanout_events WHERE event_id=?", event.eventId).toArray()[0];
+    if (prior !== undefined) {
+      if (prior.session_id !== event.sessionId || prior.event_json !== json) throw new TypeError("Board event ID is bound to another projection");
+      return prior.sequence;
+    }
     const row = this.ctx.storage.sql.exec<{ sequence: number }>("INSERT INTO fanout_events(event_id,session_id,event_json,created_at) VALUES (?,?,?,?) RETURNING sequence", event.eventId, event.sessionId, json, nowIso()).one();
     for (const ws of this.ctx.getWebSockets()) {
       const attachment = ws.deserializeAttachment() as BoardAttachment | null;

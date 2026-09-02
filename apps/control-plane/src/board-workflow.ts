@@ -244,7 +244,9 @@ export async function scheduleBoardAssignment(
     sourceRevisions,
     arguments: {
       projectAgentId: mention.targetId, projectAgentRevision: agent.revision, adapterId: agent.adapter_id, role: agent.role,
-      model: schedule.model, effort: schedule.effort, contextSnapshotId: snapshotId, contextSnapshotDigest: snapshotDigest,
+      model: schedule.model, effort: schedule.effort, prompt: boardBody,
+      contextSnapshotId: snapshotId, contextSnapshotDigest: snapshotDigest, contextCompilerVersion: "control-plane-board/v1",
+      contextSnapshotContentDigest: compiledContentDigest, contextSnapshotBytes: new TextEncoder().encode(boardBody).byteLength,
       parentBaselineId: session.accepted_baseline_id, sourceBaselineRevisions,
       expectedNodeRevision: 0, verificationPolicy: schedule.verificationPolicy, settlementPolicy: "close_on_settle",
     },

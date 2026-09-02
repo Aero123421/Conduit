@@ -73,6 +73,14 @@ paths:
       security: []
       requestBody: { $ref: "#/components/requestBodies/JsonBody" }
       responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "202": { description: Owner decision pending } }
+  /api/v1/device-enrollments/pending:
+    get:
+      operationId: inspectPendingDeviceEnrollment
+      tags: [devices]
+      description: Resolves a user code to bounded Node claims and the public-key fingerprint for browser confirmation.
+      parameters: [{ name: userCode, in: query, required: true, schema: { type: string, minLength: 8, maxLength: 32 } }]
+      security: [{ ownerSession: [] }]
+      responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "404": { description: Pending enrollment not found } }
   /api/v1/device-enrollments/{enrollmentId}/decision:
     post:
       operationId: decideDeviceEnrollment
@@ -182,15 +190,33 @@ paths:
       parameters: [{ $ref: "#/components/parameters/RunId" }]
       security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.read] }]
       responses: { "200": { $ref: "#/components/responses/PageSuccess" } }
-  /api/v1/runs/{runId}/submissions:
+  /api/v1/runs/{runId}/controls:
     post:
-      operationId: projectRunTerminalSubmission
-      tags: [domain]
-      description: Administrative projection of an already validated Device terminal receipt. Normal Node delivery calls the same custody-checked projection directly.
+      operationId: controlExistingRunTarget
+      tags: [operations]
+      description: Resolves the Run's current Agent Session or Runtime custody and durably sends an exact-target control without starting another process.
       parameters: [{ $ref: "#/components/parameters/RunId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
-      security: [{ ownerCli: [] }, { ownerSession: [] }]
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.run.control] }]
       requestBody: { $ref: "#/components/requestBodies/JsonBody" }
-      responses: { "201": { $ref: "#/components/responses/JsonSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+      responses: { "202": { $ref: "#/components/responses/JsonSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/assignments/{assignmentId}/controls:
+    post:
+      operationId: controlAssignmentAgentSession
+      tags: [operations]
+      parameters: [{ $ref: "#/components/parameters/AssignmentId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.run.control] }]
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "202": { $ref: "#/components/responses/JsonSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/runtimes/{runtimeId}/controls:
+    post:
+      operationId: controlExistingRuntime
+      tags: [operations]
+      parameters:
+        - { name: runtimeId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.runtime.manage] }]
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "202": { $ref: "#/components/responses/JsonSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
   /api/v1/change_sets/{changeSetId}:
     get:
       operationId: getChangeSet

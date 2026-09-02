@@ -9,6 +9,7 @@ export interface DeviceRoomOffer {
   correlationId: string;
   payloadDigest: string;
   payload: Record<string, unknown>;
+  frameType?: "operation.offer" | "operation.input" | "operation.cancel" | "runtime.control";
   expiresAt: string;
 }
 
@@ -34,6 +35,7 @@ interface DispatchRow {
   correlation_id: string;
   payload_digest: string;
   payload_json: string;
+  frame_type: "operation.offer" | "operation.input" | "operation.cancel" | "runtime.control";
   state: "pending" | "dispatching" | "offered" | "expired";
   attempt_count: number;
   next_attempt_at: string;
@@ -196,6 +198,7 @@ export async function attemptOperationDispatch(
       correlationId: row.correlation_id,
       payloadDigest: row.payload_digest,
       payload: parsePayload(row.payload_json),
+      frameType: row.frame_type,
       expiresAt: row.expires_at,
     });
     const response: DispatchAttemptResult = {

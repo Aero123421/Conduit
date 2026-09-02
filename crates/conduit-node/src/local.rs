@@ -1,7 +1,7 @@
 use conduit_domain::{AnyRunId, DeviceId, LocationId, RunId, Sha256Digest, SourceId};
 use conduit_observability::{
-    EventDraft, EvidenceLevel, RedactionPolicy, RetentionClass, RunManifest, RunManifestInput,
-    Sensitivity, TraceStore,
+    CatalogEntry, EventDraft, EvidenceLevel, RedactionPolicy, RetentionClass, RunManifest,
+    RunManifestInput, Sensitivity, TraceStore,
 };
 use conduit_runtime::WorkspaceAttachment;
 use conduit_workspace::{
@@ -87,6 +87,17 @@ pub struct PreparedSource {
     pub initial_state_digest: Sha256Digest,
     pub repository_identity_digest: Option<Sha256Digest>,
     pub display_path: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceCapture {
+    pub source_changes: Vec<Value>,
+    pub unchanged_sources: Vec<Value>,
+    pub application_order: Vec<String>,
+    pub custody: Value,
+    pub capture_digest: String,
+    pub all_clean: bool,
 }
 
 impl PreparedSource {
@@ -216,6 +227,141 @@ impl LocalServices {
         }
         state.device_id = Some(device_id);
         Ok(())
+    }
+
+    pub fn capture_workspace(
+        &self,
+        prepared: &[PreparedSource],
+        baseline_revisions: &BTreeMap<String, Value>,
+    ) -> Result<WorkspaceCapture, LocalServiceError> {
+        let mut source_changes = Vec::new();
+        let mut unchanged_sources = Vec::new();
+        let mut application_order = Vec::new();
+        let mut all_clean = true;
+        for source in prepared {
+            let source_id = source.source_id.to_string();
+            let fallback_base = if source.repository_identity_digest.is_some() {
+                serde_json::json!({ "kind": "git", "commit": source.base_revision })
+            } else {
+                serde_json::json!({
+                    "kind": "managed_folder",
+                    "snapshotId": source.base_revision,
+                    "manifestDigest": source.initial_state_digest,
+                })
+            };
+            let base_revision = baseline_revisions
+                .get(&source_id)
+                .cloned()
+                .unwrap_or(fallback_base);
+            let (result_revision, state, custody, changed) = if source
+                .repository_identity_digest
+                .is_some()
+            {
+                match GitRepository::open(&source.host_path).and_then(|repository| {
+                    Ok((repository.observe()?, repository.revision_state()?))
+                }) {
+                    Ok((observation, revision)) => {
+                        let state = if observation.diagnostics.conflicted {
+                            "conflicted"
+                        } else if observation.diagnostics.dirty {
+                            "draft"
+                        } else {
+                            "clean"
+                        };
+                        let result = serde_json::json!({
+                            "kind": "git",
+                            "repositoryIdentityDigest": observation.identity.digest,
+                            "commit": revision.commit,
+                            "treeDigest": revision.tree_digest,
+                        });
+                        let base_commit = base_revision.get("commit").and_then(Value::as_str);
+                        let changed = base_commit != result.get("commit").and_then(Value::as_str)
+                            || observation.diagnostics.dirty;
+                        (result, state, "healthy", changed)
+                    }
+                    Err(_) => (
+                        serde_json::json!({ "kind": "unavailable" }),
+                        "draft",
+                        "missing",
+                        true,
+                    ),
+                }
+            } else {
+                match snapshot_folder(
+                    source.source_id.clone(),
+                    &source.host_path,
+                    &SnapshotPolicy::default(),
+                ) {
+                    Ok(snapshot) => {
+                        let result = serde_json::json!({
+                            "kind": "managed_folder",
+                            "snapshotId": snapshot.snapshot_id,
+                            "manifestDigest": snapshot.manifest_digest,
+                        });
+                        let base_snapshot = base_revision.get("snapshotId").and_then(Value::as_str);
+                        let changed =
+                            base_snapshot != result.get("snapshotId").and_then(Value::as_str);
+                        (result, "clean", "healthy", changed)
+                    }
+                    Err(_) => (
+                        serde_json::json!({ "kind": "unavailable" }),
+                        "draft",
+                        "missing",
+                        true,
+                    ),
+                }
+            };
+            all_clean &= state == "clean" && custody == "healthy";
+            if changed {
+                let identity = serde_json::json!({
+                    "sourceId": source_id,
+                    "baseRevision": base_revision,
+                    "resultRevision": result_revision,
+                    "state": state,
+                    "custody": custody,
+                });
+                let source_digest = hex::encode(Sha256::digest(
+                    serde_jcs::to_vec(&identity)
+                        .map_err(|error| LocalServiceError::Invalid(error.to_string()))?,
+                ));
+                source_changes.push(serde_json::json!({
+                    "sourceId": source_id,
+                    "sourceDigest": source_digest,
+                    "baseRevision": identity["baseRevision"],
+                    "resultRevision": identity["resultRevision"],
+                    "state": state,
+                    "custody": custody,
+                }));
+                application_order.push(source_id);
+            } else {
+                unchanged_sources.push(serde_json::json!({
+                    "sourceId": source_id,
+                    "revision": result_revision,
+                }));
+            }
+        }
+        let material = serde_json::json!({
+            "sourceChanges": source_changes,
+            "unchangedSources": unchanged_sources,
+            "applicationOrder": application_order,
+            "allClean": all_clean,
+        });
+        let capture_digest = hex::encode(Sha256::digest(
+            serde_jcs::to_vec(&material)
+                .map_err(|error| LocalServiceError::Invalid(error.to_string()))?,
+        ));
+        Ok(WorkspaceCapture {
+            source_changes,
+            unchanged_sources,
+            application_order,
+            custody: serde_json::json!({
+                "deviceRef": true,
+                "localArchive": false,
+                "workspaceCaptureDigest": capture_digest,
+            }),
+            capture_digest,
+            all_clean,
+        })
     }
 
     pub fn locations(&self) -> Result<Vec<LocationRecord>, LocalServiceError> {
@@ -711,6 +857,36 @@ pub fn build_manifest(
         "{}:{}",
         operation.operation_id, operation.request_digest
     )));
+    let instruction_catalog = match (
+        operation.context_snapshot_id,
+        operation.context_content_digest,
+        operation.context_bytes,
+    ) {
+        (Some(item_id), Some(content_digest), Some(byte_count)) => vec![CatalogEntry {
+            item_id: item_id.to_owned(),
+            kind: "context_snapshot".into(),
+            content_digest: Sha256Digest::parse(content_digest)
+                .map_err(|error| LocalServiceError::Invalid(error.to_string()))?,
+            byte_count,
+            eligibility: "selected_by_control_plane_compiler".into(),
+            evidence_level: EvidenceLevel::Explicit,
+        }],
+        (None, None, None) => vec![],
+        _ => {
+            return Err(LocalServiceError::Invalid(
+                "Context Snapshot binding is incomplete".into(),
+            ));
+        }
+    };
+    let mut evaluation_tags = BTreeMap::new();
+    if let Some(id) = operation.context_snapshot_id {
+        evaluation_tags.insert("context_snapshot_id".into(), id.to_owned());
+    }
+    if let Some(snapshot_digest) = operation.context_snapshot_digest {
+        Sha256Digest::parse(snapshot_digest)
+            .map_err(|error| LocalServiceError::Invalid(error.to_string()))?;
+        evaluation_tags.insert("context_snapshot_digest".into(), snapshot_digest.to_owned());
+    }
     RunManifest::new(RunManifestInput {
         manifest_id: conduit_domain::ManifestId::parse(format!("rman_{}", &manifest_hash[..24]))
             .map_err(|error| LocalServiceError::Invalid(error.to_string()))?,
@@ -751,13 +927,16 @@ pub fn build_manifest(
         executable_digest: operation.executable_digest,
         model: operation.model.map(str::to_owned),
         effort: operation.effort.map(str::to_owned),
-        context_compiler_version: "none".into(),
-        instruction_catalog: vec![],
+        context_compiler_version: operation
+            .context_compiler_version
+            .unwrap_or("none")
+            .to_owned(),
+        instruction_catalog,
         skill_catalog: vec![],
         capture_policy_digest: digest(b"normalized-visible-events-only"),
         redaction_policy_digest: digest(b"default-secret-redaction"),
         retention_policy_digest: digest(b"R1"),
-        evaluation_tags: BTreeMap::new(),
+        evaluation_tags,
     })
     .map_err(|error| LocalServiceError::Invalid(error.to_string()))
 }

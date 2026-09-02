@@ -5,6 +5,7 @@ import { newId, nowIso, operationDigest } from "../crypto.ts";
 import { PublicError } from "../errors.ts";
 import { completeEffect, reserveEffect } from "../idempotency.ts";
 import { createOperation, type StartOperationInput } from "../operations.ts";
+import { createExistingTargetControl } from "../controls.ts";
 import { authorizeConnector } from "../policy.ts";
 import { DomainRepository, type ResourceName } from "../repositories/domain.ts";
 import { combineResourceAuthorities, resolveInputAuthority, resolveResourceAuthority, type ResourceAuthority } from "../repositories/resource-authority.ts";
@@ -136,8 +137,17 @@ export function createConduitMcpServer(env: ControlPlaneEnv, actor: AuthActor): 
   registerStart("run_start", "Start Assignment Run", "agent.run.start", "Start an allowed Assignment Run and return a durable operation handle immediately.");
   registerStart("quick_command_start", "Start Quick Command", "command.start", "Start a projectless or Project-bound Quick Command and return immediately.");
   registerStart("quick_agent_session_start", "Start Quick Agent Session", "agent.run.start", "Start a projectless or Project-bound Quick Agent Session and return immediately.");
-  registerStart("runtime_vm_lifecycle", "Control Runtime or VM", "runtime.create", "Create or control an allowed Runtime/VM through a typed durable operation.");
-  registerStart("run_control", "Control Run", "run.control", "Pause, resume, stop, or send typed input to one exact Run.");
+  registerStart("runtime_create", "Create Runtime or VM", "runtime.create", "Create one allowed Runtime/VM through a durable start operation.");
+  const controlFields = { idempotencyKey: requestKey, expectedState: z.string().min(1).max(64), expectedRevision: z.number().int().min(1), content: z.string().max(32768).optional(), snapshotName: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/).optional(), discardAuthorized: z.boolean().optional(), custodyComplete: z.boolean().optional() };
+  server.registerTool("run_control", { title: "Control existing Run", description: "Deliver input, steer, follow-up, close, cancel, pause, resume, or stop to exact existing Run/Runtime custody. This never starts another process.", inputSchema: z.strictObject({ runId: id, command: z.enum(["input", "steer", "follow_up", "close", "cancel", "pause", "resume", "stop"]), ...controlFields }), annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true } }, async ({ runId, idempotencyKey, ...body }) => {
+    try {
+      const targetKind = ["pause", "resume", "stop"].includes(body.command) ? "runtime" : "agent";
+      return result(await createExistingTargetControl(env, actor, { targetKind, targetId: runId, idempotencyKey, body }, "connector"));
+    } catch (error) { return toolFailure(error); }
+  });
+  server.registerTool("runtime_vm_lifecycle", { title: "Control existing Runtime or VM", description: "Pause, resume, stop, snapshot, restore, or destroy one exact existing Runtime handle. This never starts another process.", inputSchema: z.strictObject({ runtimeId: id, command: z.enum(["pause", "resume", "stop", "snapshot", "restore", "destroy"]), ...controlFields }), annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: true } }, async ({ runtimeId, idempotencyKey, ...body }) => {
+    try { return result(await createExistingTargetControl(env, actor, { targetKind: "runtime", targetId: runtimeId, idempotencyKey, body }, "connector")); } catch (error) { return toolFailure(error); }
+  });
 
   server.registerTool("approval_resolve", { title: "Resolve Approval", description: "Resolve one typed approval using its exact commitment digest.", inputSchema: z.object({ approvalId: id, commitmentDigest: z.string().regex(/^[a-f0-9]{64}$/), decision: z.enum(["approved", "denied"]), idempotencyKey: requestKey }), annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: true } }, async ({ approvalId, commitmentDigest, decision, idempotencyKey }) => {
     try {

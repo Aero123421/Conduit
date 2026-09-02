@@ -15,6 +15,21 @@ interface EnrollmentRow {
   expires_at: string;
 }
 
+async function pendingEnrollment(request: Request, env: ControlPlaneEnv): Promise<Response> {
+  await requireBrowserSession(request, env);
+  const supplied = boundedString(new URL(request.url).searchParams.get("userCode"), "userCode", 16).trim().toUpperCase();
+  if (!/^[A-Z0-9_-]{4,8}-[A-Z0-9_-]{3,8}$/.test(supplied)) throw new PublicError("invalid_request", 400, "User code is invalid");
+  const row = await env.DB.prepare("SELECT id,state,claims_json,requested_fingerprint,expires_at FROM device_enrollments WHERE user_code_hash=?1 LIMIT 1")
+    .bind(await keyedHash(env.TOKEN_PEPPER, supplied)).first<{ id: string; state: string; claims_json: string; requested_fingerprint: string; expires_at: string }>();
+  if (row === null) throw new PublicError("not_found", 404, "Enrollment not found");
+  if (row.state === "pending_owner" && Date.parse(row.expires_at) <= Date.now()) {
+    await env.DB.prepare("UPDATE device_enrollments SET state='expired',terminal_at=?1 WHERE id=?2 AND state='pending_owner'").bind(nowIso(), row.id).run();
+    throw new PublicError("invalid_request", 410, "Enrollment expired");
+  }
+  if (row.state !== "pending_owner") throw new PublicError("invalid_request", 409, `Enrollment is ${row.state}`);
+  return Response.json({ enrollmentId: row.id, state: row.state, userCode: supplied, fingerprint: row.requested_fingerprint, claims: JSON.parse(row.claims_json), expiresAt: row.expires_at }, { headers: { "cache-control": "no-store" } });
+}
+
 function enrollmentTranscript(claims: unknown, keyId: string, publicJwk: unknown, clientNonce: string): string {
   return `conduit.enrollment.v1\n${canonicalJson({ claims, keyId, publicJwk, clientNonce })}`;
 }
@@ -124,6 +139,8 @@ async function revokeDevice(request: Request, env: ControlPlaneEnv, deviceId: st
 }
 
 export async function handleDeviceIdentity(request: Request, env: ControlPlaneEnv, path: string): Promise<Response | null> {
+  if (request.method === "GET" && path === "/v1/device-enrollments/pending") return pendingEnrollment(request, env);
+  if (request.method === "GET" && path === "/v1/device-enrollments/browser.js") return deviceEnrollmentScript();
   if (request.method === "POST" && path === "/v1/device-enrollments") return createEnrollment(request, env);
   if (request.method === "POST" && path === "/v1/device-enrollments/poll") return pollEnrollment(request, env);
   const approve = path.match(/^\/v1\/device-enrollments\/([^/]+)\/decision$/);
@@ -135,4 +152,35 @@ export async function handleDeviceIdentity(request: Request, env: ControlPlaneEn
   const connect = path.match(/^\/v1\/devices\/([^/]+)\/connect$/);
   if (request.method === "GET" && connect?.[1] !== undefined && request.headers.get("upgrade")?.toLowerCase() === "websocket") return env.DEVICE_ROOMS.getByName(connect[1]).fetch(request);
   return null;
+}
+
+export async function renderDevicePage(): Promise<Response> {
+  return new Response(`<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Device enrollment</title><body><h1>Device enrollment</h1><p>Enter the code displayed by the Node. Verify the hostname, platform, and public-key fingerprint before approving.</p><form id=device-enrollment-lookup><label>User code <input id=device-user-code required autocomplete=one-time-code maxlength=16></label><button id=device-lookup-submit type=submit>Review device</button></form><section id=device-review hidden><dl><dt>Hostname</dt><dd id=device-hostname></dd><dt>Platform</dt><dd id=device-platform></dd><dt>Node version</dt><dd id=device-node-version></dd><dt>Public-key fingerprint</dt><dd><code id=device-fingerprint></code></dd><dt>Expires</dt><dd id=device-expires></dd></dl><button id=device-approve type=button>Verify passkey and approve</button><button id=device-deny type=button>Verify passkey and deny</button></section><p id=device-status role=status aria-live=polite></p><p><a href=/login?return_to=/device>Sign in with a passkey</a></p><script src=/api/v1/device-enrollments/browser.js defer></script></body></html>`, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; script-src 'self'; connect-src 'self'; style-src 'none'; frame-ancestors 'none'", "permissions-policy": "publickey-credentials-get=(self)" } });
+}
+
+const DEVICE_ENROLLMENT_SCRIPT = `(() => {
+  let pending;
+  const fromBase64url = (value) => Uint8Array.from(atob(value.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((value.length + 3) % 4)), (character) => character.charCodeAt(0));
+  const toBase64url = (value) => { if (value === null) return null; const bytes = new Uint8Array(value); let binary = ""; for (const byte of bytes) binary += String.fromCharCode(byte); return btoa(binary).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/g, ""); };
+  const csrf = () => document.cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith("__Host-conduit_csrf="))?.slice("__Host-conduit_csrf=".length) ?? "";
+  const json = async (path, init = {}) => { const response = await fetch(path, { credentials: "same-origin", ...init }); const value = response.status === 204 ? {} : await response.json(); if (!response.ok) throw new Error(value?.error?.message ?? "Device enrollment request failed"); return value; };
+  const stepUp = async () => {
+    const ceremony = await json("/api/v1/auth/step-up/options", { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf() }, body: "{}" });
+    const publicKey = { ...ceremony.options, challenge: fromBase64url(ceremony.options.challenge), allowCredentials: (ceremony.options.allowCredentials ?? []).map((item) => ({ ...item, id: fromBase64url(item.id) })) };
+    const credential = await navigator.credentials.get({ publicKey });
+    if (!(credential instanceof PublicKeyCredential)) throw new Error("The browser did not return a passkey credential");
+    const response = credential.response;
+    await json("/api/v1/auth/step-up/verify", { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf() }, body: JSON.stringify({ challengeId: ceremony.challengeId, challenge: ceremony.options.challenge, response: { id: credential.id, rawId: toBase64url(credential.rawId), type: credential.type, authenticatorAttachment: credential.authenticatorAttachment, clientExtensionResults: credential.getClientExtensionResults(), response: { clientDataJSON: toBase64url(response.clientDataJSON), authenticatorData: toBase64url(response.authenticatorData), signature: toBase64url(response.signature), userHandle: toBase64url(response.userHandle) } } }) });
+  };
+  document.querySelector("#device-enrollment-lookup")?.addEventListener("submit", async (event) => {
+    event.preventDefault(); const status = document.querySelector("#device-status");
+    try { const code = document.querySelector("#device-user-code")?.value.trim().toUpperCase() ?? ""; pending = await json("/api/v1/device-enrollments/pending?userCode=" + encodeURIComponent(code)); document.querySelector("#device-hostname").textContent = pending.claims.hostnameLabel; document.querySelector("#device-platform").textContent = pending.claims.os + " / " + pending.claims.arch; document.querySelector("#device-node-version").textContent = pending.claims.nodeVersion + " (" + pending.claims.protocolVersion + ")"; document.querySelector("#device-fingerprint").textContent = pending.fingerprint; document.querySelector("#device-expires").textContent = pending.expiresAt; document.querySelector("#device-review").hidden = false; if (status) status.textContent = "Compare every value with the Node before deciding."; } catch (error) { if (status) status.textContent = error instanceof Error ? error.message : "Lookup failed"; }
+  });
+  const decide = async (decision) => { const status = document.querySelector("#device-status"); if (!pending) return; try { if (status) status.textContent = "Waiting for passkey verification…"; await stepUp(); await json("/api/v1/device-enrollments/" + encodeURIComponent(pending.enrollmentId) + "/decision", { method: "POST", headers: { "content-type": "application/json", "x-csrf-token": csrf() }, body: JSON.stringify({ decision }) }); document.querySelector("#device-review").hidden = true; if (status) status.textContent = decision === "approve" ? "Device approved. Return to the Node." : "Device denied."; } catch (error) { if (status) status.textContent = error instanceof Error ? error.message : "Decision failed"; } };
+  document.querySelector("#device-approve")?.addEventListener("click", () => decide("approve"));
+  document.querySelector("#device-deny")?.addEventListener("click", () => decide("deny"));
+})();`;
+
+function deviceEnrollmentScript(): Response {
+  return new Response(DEVICE_ENROLLMENT_SCRIPT, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'" } });
 }

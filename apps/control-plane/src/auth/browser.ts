@@ -242,6 +242,18 @@ async function ownerCliLogout(request: Request, env: ControlPlaneEnv): Promise<R
   return responseJson(response);
 }
 
+async function browserLogout(request: Request, env: ControlPlaneEnv): Promise<Response> {
+  const { repo, session } = await requireBrowserSession(request, env, { csrf: true, allowRecovery: true });
+  const now = nowIso();
+  const updated = await env.DB.prepare("UPDATE owner_sessions SET status='revoked',revoked_at=?1 WHERE id=?2 AND status='active'").bind(now, session.id).run();
+  if (updated.meta.changes !== 1) throw new PublicError("authentication_required", 401, "Browser session is already inactive");
+  await repo.audit("browser_session.logout", { sessionId: session.id }, session.principal_id);
+  const headers = new Headers({ "cache-control": "no-store" });
+  headers.append("set-cookie", "__Host-conduit_session=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0");
+  headers.append("set-cookie", "__Host-conduit_csrf=; Path=/; Secure; SameSite=Lax; Max-Age=0");
+  return responseJson({ authenticated: false }, 200, headers);
+}
+
 async function recovery(request: Request, env: ControlPlaneEnv): Promise<Response> {
   assertSameOrigin(request, env);
   const body = record(await readJsonBounded(request));
@@ -266,7 +278,7 @@ async function revokePasskey(request: Request, env: ControlPlaneEnv, passkeyId: 
 export async function handleBrowserAuth(request: Request, env: ControlPlaneEnv, path: string): Promise<Response | null> {
   if (request.method === "GET" && path === "/v1/auth/browser.js") return browserAuthScript();
   if (request.method === "GET" && path === "/v1/auth/status") return ownerCliStatus(request, env);
-  if (request.method === "POST" && path === "/v1/auth/logout") return ownerCliLogout(request, env);
+  if (request.method === "POST" && path === "/v1/auth/logout") return request.headers.get("authorization")?.startsWith("Bearer conduit_owner_") === true ? ownerCliLogout(request, env) : browserLogout(request, env);
   if (request.method === "POST" && path === "/v1/auth/setup/options") return registrationOptions(request, env, "setup");
   if (request.method === "POST" && path === "/v1/auth/setup/verify") return registrationVerify(request, env, "setup");
   if (request.method === "POST" && path === "/v1/auth/login/options") return authenticationOptions(request, env, false);
@@ -302,9 +314,9 @@ export async function renderAuthPage(request: Request, env: ControlPlaneEnv): Pr
   const owner = await repo.owner();
   const returnPath = safeReturnPath(request);
   const body = owner === null
-    ? "<h1>Set up Conduit</h1><p>Use a WebAuthn-capable client to call the versioned setup ceremony endpoints.</p>"
+    ? `<h1>Set up Conduit</h1><p>Register the first owner passkey from this browser.</p><form id=passkey-setup><label>Owner name <input id=setup-display-name name=displayName required maxlength=128 value=Owner></label><label> Bootstrap secret <input id=setup-bootstrap-secret name=bootstrapSecret type=password required autocomplete=off maxlength=1024></label><label> Passkey label <input id=setup-passkey-label name=label maxlength=128 value="Owner passkey"></label><button id=passkey-setup-submit type=submit>Register owner passkey</button></form><p id=auth-status role=status aria-live=polite></p><script src=/api/v1/auth/browser.js defer></script>`
     : `<h1>Conduit sign in</h1><p>Authenticate with your passkey to continue.</p><button id=passkey-sign-in type=button data-return-to="${returnPath.replace(/[&<>"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[char] ?? char)}">Sign in with passkey</button><p id=auth-status role=status aria-live=polite></p><script src=/api/v1/auth/browser.js defer></script>`;
-  return new Response(`<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Conduit authentication</title><body>${body}</body></html>`, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; script-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'", "permissions-policy": "publickey-credentials-get=(self)" } });
+  return new Response(`<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Conduit authentication</title><body>${body}</body></html>`, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; script-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'", "permissions-policy": "publickey-credentials-create=(self), publickey-credentials-get=(self)" } });
 }
 
 const BROWSER_AUTH_SCRIPT = `(() => {
@@ -327,6 +339,13 @@ const BROWSER_AUTH_SCRIPT = `(() => {
     const response = credential.response;
     return { id: credential.id, rawId: toBase64url(credential.rawId), type: credential.type, authenticatorAttachment: credential.authenticatorAttachment, clientExtensionResults: credential.getClientExtensionResults(), response: { clientDataJSON: toBase64url(response.clientDataJSON), authenticatorData: toBase64url(response.authenticatorData), signature: toBase64url(response.signature), userHandle: toBase64url(response.userHandle) } };
   };
+  const registration = async (options) => {
+    const publicKey = { ...options, challenge: fromBase64url(options.challenge), user: { ...options.user, id: fromBase64url(options.user.id) }, excludeCredentials: (options.excludeCredentials ?? []).map((item) => ({ ...item, id: fromBase64url(item.id) })) };
+    const credential = await navigator.credentials.create({ publicKey });
+    if (!(credential instanceof PublicKeyCredential)) throw new Error("The browser did not return a passkey credential");
+    const response = credential.response;
+    return { id: credential.id, rawId: toBase64url(credential.rawId), type: credential.type, authenticatorAttachment: credential.authenticatorAttachment, clientExtensionResults: credential.getClientExtensionResults(), response: { clientDataJSON: toBase64url(response.clientDataJSON), attestationObject: toBase64url(response.attestationObject), transports: typeof response.getTransports === "function" ? response.getTransports() : [] } };
+  };
   const post = async (path, body, withCsrf) => {
     const response = await fetch(path, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json", ...(withCsrf ? { "x-csrf-token": csrf() } : {}) }, body: JSON.stringify(body) });
     const value = await response.json();
@@ -340,6 +359,26 @@ const BROWSER_AUTH_SCRIPT = `(() => {
     const response = await assertion(ceremony.options);
     await post(verifyPath, { challengeId: ceremony.challengeId, challenge: ceremony.options.challenge, response }, stepUp);
   };
+  document.querySelector("#passkey-setup")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = document.querySelector("#passkey-setup-submit");
+    const status = document.querySelector("#auth-status");
+    const displayName = document.querySelector("#setup-display-name")?.value ?? "Owner";
+    const bootstrapSecret = document.querySelector("#setup-bootstrap-secret")?.value ?? "";
+    const label = document.querySelector("#setup-passkey-label")?.value ?? "Owner passkey";
+    try {
+      button.disabled = true;
+      if (status) status.textContent = "Waiting for a new passkey…";
+      const ceremony = await post("/api/v1/auth/setup/options", { displayName, bootstrapSecret }, false);
+      const response = await registration(ceremony.options);
+      const transports = response.response.transports ?? [];
+      await post("/api/v1/auth/setup/verify", { challengeId: ceremony.challengeId, challenge: ceremony.options.challenge, response, displayName, bootstrapSecret, label, transports }, false);
+      location.assign("/");
+    } catch (error) {
+      button.disabled = false;
+      if (status) status.textContent = error instanceof Error ? error.message : "Passkey setup failed";
+    }
+  });
   document.querySelector("#passkey-sign-in")?.addEventListener("click", async (event) => {
     const button = event.currentTarget;
     const status = document.querySelector("#auth-status");

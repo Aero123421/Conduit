@@ -1,6 +1,6 @@
 use crate::{
     AdmissionReceipt, Node, NodeError, OperationOffer,
-    local::{LocalServices, SourceRevision, build_manifest},
+    local::{LocalServices, PreparedSource, SourceRevision, build_manifest},
     transport::{Envelope, TransportError, WssClient},
     verify_operation_commitment,
 };
@@ -325,6 +325,11 @@ pub struct ManifestOperation<'a> {
     pub executable_digest: Option<Sha256Digest>,
     pub model: Option<&'a str>,
     pub effort: Option<&'a str>,
+    pub context_compiler_version: Option<&'a str>,
+    pub context_snapshot_id: Option<&'a str>,
+    pub context_snapshot_digest: Option<&'a str>,
+    pub context_content_digest: Option<&'a str>,
+    pub context_bytes: Option<u64>,
 }
 struct Active {
     key: String,
@@ -362,6 +367,10 @@ struct AgentActive {
     session_state: AgentSessionState,
     idle_timeout_ms: u64,
     lease_expires_at_unix_ms: Option<u64>,
+    prepared_sources: Vec<PreparedSource>,
+    parent_baseline_id: Value,
+    source_baseline_revisions: BTreeMap<String, Value>,
+    verification_policy: Value,
 }
 
 #[derive(Clone)]
@@ -1207,6 +1216,37 @@ impl NodeService {
             .local
             .prepare_sources(&run_id, &op.source_revisions)
             .map_err(|error| ServiceError::Unavailable(source_reason(&error.to_string())))?;
+        let source_baseline_revisions = op
+            .arguments
+            .get("sourceBaselineRevisions")
+            .and_then(Value::as_object)
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let parent_baseline_id = op
+            .arguments
+            .get("parentBaselineId")
+            .cloned()
+            .unwrap_or(Value::Null);
+        if !parent_baseline_id.is_null() && !parent_baseline_id.is_string() {
+            return Err(ServiceError::Unavailable(
+                "parent_baseline_id_invalid".into(),
+            ));
+        }
+        let verification_policy = op
+            .arguments
+            .get("verificationPolicy")
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if !verification_policy.is_object() {
+            return Err(ServiceError::Unavailable(
+                "verification_policy_invalid".into(),
+            ));
+        }
         let runtime_kind = parse_kind(&op.runtime.kind)?;
         let workspaces = prepared_sources
             .iter()
@@ -1425,6 +1465,26 @@ impl NodeService {
                 executable_digest,
                 model: op.arguments.get("model").and_then(Value::as_str),
                 effort: op.arguments.get("effort").and_then(Value::as_str),
+                context_compiler_version: op
+                    .arguments
+                    .get("contextCompilerVersion")
+                    .and_then(Value::as_str),
+                context_snapshot_id: op
+                    .arguments
+                    .get("contextSnapshotId")
+                    .and_then(Value::as_str),
+                context_snapshot_digest: op
+                    .arguments
+                    .get("contextSnapshotDigest")
+                    .and_then(Value::as_str),
+                context_content_digest: op
+                    .arguments
+                    .get("contextSnapshotContentDigest")
+                    .and_then(Value::as_str),
+                context_bytes: op
+                    .arguments
+                    .get("contextSnapshotBytes")
+                    .and_then(Value::as_u64),
             },
             &prepared_sources,
         )
@@ -1571,6 +1631,10 @@ impl NodeService {
                             session_state: AgentSessionState::Running,
                             idle_timeout_ms,
                             lease_expires_at_unix_ms,
+                            prepared_sources: prepared_sources.clone(),
+                            parent_baseline_id: parent_baseline_id.clone(),
+                            source_baseline_revisions: source_baseline_revisions.clone(),
+                            verification_policy: verification_policy.clone(),
                         },
                     );
                     return Ok(());
@@ -1731,6 +1795,10 @@ impl NodeService {
                         session_state: AgentSessionState::Running,
                         idle_timeout_ms,
                         lease_expires_at_unix_ms,
+                        prepared_sources,
+                        parent_baseline_id,
+                        source_baseline_revisions,
+                        verification_policy,
                     },
                 );
                 return Ok(());
@@ -2691,6 +2759,43 @@ impl NodeService {
                         )?;
                         agent.revision = session.revision;
                         agent.session_state = AgentSessionState::ClosingCompleted;
+                        let handle_digest = runtime_handle_digest(&agent.handle)?;
+                        let target_digest = custody_target_digest(
+                            true,
+                            &agent.run_id,
+                            &agent.operation_id,
+                            &agent.request_digest,
+                            &agent.runtime_id,
+                            &handle_digest,
+                            agent.controller_epoch,
+                        )?;
+                        let runtime_target_digest = custody_target_digest(
+                            false,
+                            &agent.run_id,
+                            &agent.operation_id,
+                            &agent.request_digest,
+                            &agent.runtime_id,
+                            &handle_digest,
+                            agent.controller_epoch,
+                        )?;
+                        statuses.push(PendingStatus {
+                            operation_id: agent.operation_id.clone(),
+                            payload: json!({
+                                "operationId": agent.operation_id,
+                                "runId": agent.run_id,
+                                "requestDigest": agent.request_digest,
+                                "state": "finishing",
+                                "controllerEpoch": agent.controller_epoch.to_string(),
+                                "revision": agent.revision.to_string(),
+                                "phase": "workspace_capture",
+                                "targetRuntimeId": agent.runtime_id,
+                                "targetDigest": target_digest,
+                                "runtimeTargetDigest": runtime_target_digest,
+                                "selectedRuntimeProvider": agent.provider_id,
+                                "runtimeHandleDigest": handle_digest,
+                                "observedAt": now(),
+                            }),
+                        });
                         self.node.store().begin_agent_finalization(&agent.key)?;
                         agent
                             .child
@@ -3034,9 +3139,74 @@ impl NodeService {
             _ => "failed",
         };
         let mut payload = json!({"operationId":operation_id,"runId":run_id,"state":state,"requestDigest":request_digest,"lastRunEventSequence":last_sequence.to_string(),"observedAt":now()});
+        if terminal == OperationState::Completed && !agent.prepared_sources.is_empty() {
+            let capture = self
+                .local
+                .capture_workspace(&agent.prepared_sources, &agent.source_baseline_revisions)
+                .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+            let required_checks = agent
+                .verification_policy
+                .get("requiredChecks")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let checks = if required_checks.is_empty() {
+                vec!["workspace_capture".to_owned()]
+            } else {
+                required_checks
+            };
+            let verification = checks
+                .into_iter()
+                .map(|check_id| {
+                    let status = match check_id.as_str() {
+                        "workspace_capture" => "passed",
+                        "workspace_clean" if capture.all_clean => "passed",
+                        "workspace_clean" => "failed",
+                        _ => "unavailable",
+                    };
+                    let observed_digest = hex::encode(Sha256::digest(
+                        format!(
+                            "conduit.verification-observation.v1\n{}\n{}\n{}",
+                            check_id, status, capture.capture_digest
+                        )
+                        .as_bytes(),
+                    ));
+                    json!({
+                        "checkId": check_id,
+                        "status": status,
+                        "evidenceRefs": [],
+                        "observedDigest": observed_digest,
+                    })
+                })
+                .collect::<Vec<_>>();
+            payload["resultSummary"] = json!({
+                "submission": {
+                    "expectedNodeRevision": agent.revision,
+                    "terminalReceiptDigest": capture.capture_digest,
+                    "parentBaselineId": agent.parent_baseline_id,
+                    "sourceChanges": capture.source_changes,
+                    "unchangedSources": capture.unchanged_sources,
+                    "applicationOrder": capture.application_order,
+                    "artifactCommitments": [],
+                    "provenance": {
+                        "adapterId": agent.adapter_kind.as_str(),
+                        "evidenceLevel": "observed",
+                        "settlement": "protocol_completed",
+                    },
+                    "custody": capture.custody,
+                    "verification": verification,
+                }
+            });
+        }
         if let Some(reason) = reason {
             payload["reasonCode"] = Value::String(reason.into());
-            payload["resultSummary"] = json!({"adapterTerminal":reason});
+            payload["resultSummary"]["adapterTerminal"] = Value::String(reason.into());
         }
         let digest = hex::encode(Sha256::digest(
             serde_jcs::to_vec(&payload).map_err(|_| TransportError::Malformed)?,
@@ -3873,6 +4043,7 @@ fn agent_settlement_policy_name(policy: AgentSettlementPolicy) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use conduit_domain::{LocationId, SourceId};
     use conduit_node_store::NodeStore;
     use conduit_runtime::{
         CapabilityReceipt, CollectionReceipt, DestroyReceipt, ExpectedRuntime, PreparedRuntime,
@@ -4276,6 +4447,20 @@ mod tests {
             let operation_id = format!("op_settle_never_{index:08}");
             let key = format!("settle-never-idempotency-{index:08}");
             let request_digest = format!("{:02x}", index + 1).repeat(32);
+            let workspace = directory.path().join("captured-workspace");
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("result.txt"), format!("captured-{index}\n")).unwrap();
+            let captured_sources = vec![PreparedSource {
+                source_id: SourceId::parse("src_settle_capture01").unwrap(),
+                location_id: LocationId::parse("loc_settle_capture01").unwrap(),
+                location_revision: 1,
+                mode: crate::local::WorkspaceMode::ManagedCopy,
+                host_path: workspace,
+                base_revision: "snap_initial_settle_capture01".into(),
+                initial_state_digest: Sha256Digest::from_bytes([index as u8 + 1; 32]),
+                repository_identity_digest: None,
+                display_path: "captured-workspace".into(),
+            }];
             let driver = completed_long_lived_driver(kind, directory.path());
             let child_spec = conduit_adapters::LaunchSpec {
                 executable: PathBuf::from("/bin/sh"),
@@ -4401,6 +4586,10 @@ mod tests {
                     session_state: AgentSessionState::Running,
                     idle_timeout_ms: 0,
                     lease_expires_at_unix_ms: None,
+                    prepared_sources: captured_sources,
+                    parent_baseline_id: Value::Null,
+                    source_baseline_revisions: BTreeMap::new(),
+                    verification_policy: json!({"requiredChecks":["workspace_clean"]}),
                 },
             );
             let session =
@@ -4429,6 +4618,33 @@ mod tests {
                 RuntimeState::Stopped,
                 "{kind:?}",
             );
+            let outbound = store
+                .unacknowledged_outbound(1, 64)
+                .unwrap()
+                .into_iter()
+                .map(|row| serde_json::from_slice::<Envelope>(&row.frame).unwrap())
+                .collect::<Vec<_>>();
+            assert!(outbound.iter().any(|frame| {
+                frame.kind == "operation.status"
+                    && frame.payload["state"] == "finishing"
+                    && frame.payload["revision"] == "2"
+            }));
+            let terminal = outbound
+                .iter()
+                .find(|frame| frame.kind == "operation.terminal")
+                .unwrap();
+            assert_eq!(
+                terminal.payload["resultSummary"]["submission"]["expectedNodeRevision"],
+                2
+            );
+            assert_eq!(
+                terminal.payload["resultSummary"]["submission"]["verification"][0]["status"],
+                "passed"
+            );
+            assert_eq!(
+                terminal.payload["resultSummary"]["submission"]["sourceChanges"][0]["state"],
+                "clean"
+            );
         }
     }
 
@@ -4454,6 +4670,59 @@ mod tests {
             effective_approval_risk_classes(&["not_a_risk".into()], &[]),
             Err(ServiceError::Unavailable(reason)) if reason == "approval_risk_class_invalid"
         ));
+    }
+
+    #[test]
+    fn run_manifest_binds_control_plane_context_snapshot() {
+        let request_digest = "11".repeat(32);
+        let capability_digest = "22".repeat(32);
+        let snapshot_digest = "33".repeat(32);
+        let content_digest = "44".repeat(32);
+        let manifest = build_manifest(
+            &ManifestOperation {
+                operation_id: "op_context_manifest01",
+                idempotency_key: "context-manifest-idempotency-0001",
+                request_digest: &request_digest,
+                run_id: "run_context_manifest01",
+                assignment_id: None,
+                actor_id: "prin_context_manifest01",
+                client_id: "conduit.context-test",
+                device_id: "dev_context_manifest01",
+                boot_id: "node-boot-context-manifest01",
+                capability_digest: &capability_digest,
+                local_policy_revision: 1,
+                runtime_kind: "restricted_native",
+                runtime_provider: "restricted-native.linux",
+                runtime_config: b"{}",
+                access_scope: "project_full",
+                approval_mode: "always",
+                adapter_id: Some("codex"),
+                adapter_version: Some("fixture"),
+                executable_digest: None,
+                model: Some("gpt-5.6-codex"),
+                effort: Some("high"),
+                context_compiler_version: Some("control-plane-board/v1"),
+                context_snapshot_id: Some("ctx_context_manifest01"),
+                context_snapshot_digest: Some(&snapshot_digest),
+                context_content_digest: Some(&content_digest),
+                context_bytes: Some(128),
+            },
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            manifest.input.context_compiler_version,
+            "control-plane-board/v1"
+        );
+        assert_eq!(manifest.input.instruction_catalog.len(), 1);
+        assert_eq!(
+            manifest.input.instruction_catalog[0].item_id,
+            "ctx_context_manifest01"
+        );
+        assert_eq!(
+            manifest.input.evaluation_tags["context_snapshot_digest"],
+            snapshot_digest
+        );
     }
 
     #[test]
@@ -4839,6 +5108,11 @@ mod tests {
                 executable_digest: None,
                 model: None,
                 effort: None,
+                context_compiler_version: None,
+                context_snapshot_id: None,
+                context_snapshot_digest: None,
+                context_content_digest: None,
+                context_bytes: None,
             },
             &[],
         )
@@ -4905,6 +5179,10 @@ mod tests {
                 session_state: AgentSessionState::Running,
                 idle_timeout_ms: 0,
                 lease_expires_at_unix_ms: None,
+                prepared_sources: vec![],
+                parent_baseline_id: Value::Null,
+                source_baseline_revisions: BTreeMap::new(),
+                verification_policy: json!({}),
             },
         );
         let session =
@@ -5071,6 +5349,11 @@ mod tests {
                 executable_digest: None,
                 model: None,
                 effort: None,
+                context_compiler_version: None,
+                context_snapshot_id: None,
+                context_snapshot_digest: None,
+                context_content_digest: None,
+                context_bytes: None,
             },
             &[],
         )
@@ -5158,6 +5441,10 @@ mod tests {
                 session_state: AgentSessionState::Running,
                 idle_timeout_ms: 0,
                 lease_expires_at_unix_ms: None,
+                prepared_sources: vec![],
+                parent_baseline_id: Value::Null,
+                source_baseline_revisions: BTreeMap::new(),
+                verification_policy: json!({}),
             },
         );
 

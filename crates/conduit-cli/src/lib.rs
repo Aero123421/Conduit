@@ -130,6 +130,22 @@ fn finalize_effect(invocation: &mut command::Invocation) -> Result<(), CliError>
             .insert("idempotencyKey".to_owned(), Value::String(key.to_owned()));
         validate_operation_payload(invocation.body.as_ref().expect("operation body exists"))?;
     }
+    if invocation.route.ends_with("/controls") {
+        let body = invocation
+            .body
+            .as_ref()
+            .and_then(Value::as_object)
+            .ok_or_else(|| CliError::Usage("control payload must be a JSON object".to_owned()))?;
+        if body
+            .get("expectedState")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+        {
+            return Err(CliError::Usage(
+                "existing-target control requires expectedState in --data/--file".to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -590,6 +606,49 @@ mod tests {
             ]),
             Err(CliError::Usage(message)) if message.contains("cannot override")
         ));
+    }
+
+    #[test]
+    fn existing_target_control_requires_and_preserves_exact_state_and_revision() {
+        assert!(matches!(
+            prepare(&[
+                "conduit",
+                "run",
+                "pause",
+                "run_contract01",
+                "--revision",
+                "3",
+            ]),
+            Err(CliError::Usage(message)) if message.contains("expectedState")
+        ));
+
+        let invocation = prepare(&[
+            "conduit",
+            "run",
+            "pause",
+            "run_contract01",
+            "--revision",
+            "3",
+            "--data",
+            r#"{"expectedState":"running"}"#,
+            "--idempotency-key",
+            "control-key-0001",
+        ])
+        .unwrap();
+        assert_eq!(invocation.route, "/api/v1/runs/run_contract01/controls");
+        assert_eq!(invocation.revision, None);
+        assert_eq!(
+            invocation.idempotency_key.as_deref(),
+            Some("control-key-0001")
+        );
+        assert_eq!(
+            invocation.body,
+            Some(json!({
+                "command": "pause",
+                "expectedState": "running",
+                "expectedRevision": 3
+            }))
+        );
     }
 
     #[test]

@@ -26,7 +26,7 @@ const terminalSubmissionSchema = z.strictObject({
   terminalReceiptDigest: digest64,
   parentBaselineId: id.nullable(),
   supersedesChangeSetId: id.optional(),
-  sourceChanges: z.array(sourceChangeSchema).min(1).max(128),
+  sourceChanges: z.array(sourceChangeSchema).max(128),
   unchangedSources: z.array(unchangedSourceSchema).max(128),
   applicationOrder: z.array(id).max(128),
   artifactCommitments: z.array(z.record(z.string(), z.unknown())).max(256),

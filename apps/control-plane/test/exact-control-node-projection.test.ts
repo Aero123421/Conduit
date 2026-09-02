@@ -1,7 +1,8 @@
-import { env } from "cloudflare:workers";
+import { env, exports } from "cloudflare:workers";
 import type { NodeV1PostAuthFrame } from "@conduit/schema";
 import { beforeAll, describe, expect, it } from "vitest";
 import { createExistingTargetControl } from "../src/controls.ts";
+import { keyedHash } from "../src/crypto.ts";
 import { projectNodeState } from "../src/node-projection.ts";
 
 type ProjectedFrame = Extract<NodeV1PostAuthFrame, {
@@ -9,7 +10,8 @@ type ProjectedFrame = Extract<NodeV1PostAuthFrame, {
 }>;
 
 describe.sequential("exact existing-target controls and node projections", () => {
-  const actor = { principalId: "prin_exact_control", clientId: "conduit.test", scopes: ["owner"] };
+  const actor = { principalId: "prin_exact_control", clientId: "conduit.cli", scopes: ["owner"] };
+  const ownerToken = "conduit_owner_exact_control_route_token_01";
   const deviceId = "dev_exact_control";
   const runId = "run_exact_control";
   const assignmentId = "asg_exact_control";
@@ -26,6 +28,7 @@ describe.sequential("exact existing-target controls and node projections", () =>
     const now = new Date().toISOString();
     await env.DB.batch([
       env.DB.prepare("INSERT INTO owner_principals(id,display_name,status,created_at,updated_at) VALUES (?1,'Exact Control Owner','active',?2,?2)").bind(actor.principalId, now),
+      env.DB.prepare("INSERT INTO owner_api_tokens(id,principal_id,verifier_hash,label,status,created_at,expires_at) VALUES ('otk_exact_control',?1,?2,'exact-control-route','active',?3,?4)").bind(actor.principalId, await keyedHash("test-only-token-pepper-with-at-least-32-bytes", ownerToken), now, expiresAt),
       env.DB.prepare("INSERT INTO device_enrollments(id,state,device_code_hash,user_code_hash,claims_json,requested_key_id,requested_public_jwk_json,requested_fingerprint,possession_challenge,possession_signature,assigned_device_id,created_at,expires_at,terminal_at) VALUES ('enroll_exact_control','completed',?1,?2,'{}','dkey_exact_control','{}',?3,'challenge','signature',?4,?5,?6,?5)").bind("5".repeat(64), "6".repeat(64), "7".repeat(64), deviceId, now, expiresAt),
       env.DB.prepare("INSERT INTO devices(id,enrollment_id,display_label,os,arch,node_version,protocol_version,status,connection_epoch,created_at,updated_at) VALUES (?1,'enroll_exact_control','Exact Linux','linux','x86_64','0.1.0','conduit.node/1','active','7',?2,?2)").bind(deviceId, now),
       env.DB.prepare("INSERT INTO projects(id,name,created_at,updated_at) VALUES ('prj_exact_control','Exact Control',?1,?1)").bind(now),
@@ -39,14 +42,19 @@ describe.sequential("exact existing-target controls and node projections", () =>
     ]);
   });
 
+  async function routeControl(collection: "assignments" | "runtimes", targetId: string, idempotencyKey: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const response = await exports.default.fetch(new Request(`https://conduit.example.com/api/v1/${collection}/${targetId}/controls`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${ownerToken}`, "content-type": "application/json", "idempotency-key": idempotencyKey },
+      body: JSON.stringify(body),
+    }));
+    expect(response.status, await response.clone().text()).toBe(202);
+    return response.json<Record<string, unknown>>();
+  }
+
   it("queues agent input, steer, close, and cancel against the exact admitted session", async () => {
     for (const command of ["input", "steer", "close", "cancel"] as const) {
-      const result = await createExistingTargetControl(env, actor, {
-        targetKind: "agent",
-        targetId: assignmentId,
-        idempotencyKey: `exact-agent-${command}-key`,
-        body: { command, expectedState: "waiting_input", expectedRevision: 2, ...(command === "input" || command === "steer" ? { content: `${command} content` } : {}) },
-      }, "owner");
+      const result = await routeControl("assignments", assignmentId, `exact-agent-${command}-key`, { command, expectedState: "waiting_input", expectedRevision: 2, ...(command === "input" || command === "steer" ? { content: `${command} content` } : {}) });
       createdControls.set(`agent.${command}`, String(result.operationId));
     }
 
@@ -66,12 +74,7 @@ describe.sequential("exact existing-target controls and node projections", () =>
       restore: { snapshotName: "reviewed" }, destroy: { discardAuthorized: true, custodyComplete: true },
     } as const;
     for (const command of ["pause", "resume", "stop", "snapshot", "restore", "destroy"] as const) {
-      const result = await createExistingTargetControl(env, actor, {
-        targetKind: "runtime",
-        targetId: runtimeId,
-        idempotencyKey: `exact-runtime-${command}-key`,
-        body: { command, expectedState: "running", expectedRevision: 3, ...bodies[command] },
-      }, "owner");
+      const result = await routeControl("runtimes", runtimeId, `exact-runtime-${command}-key`, { command, expectedState: "running", expectedRevision: 3, ...bodies[command] });
       createdControls.set(`runtime.${command}`, String(result.operationId));
     }
 

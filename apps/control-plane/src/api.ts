@@ -12,7 +12,8 @@ import { resolveInputAuthority, resolveResourceAuthority, type ResourceAuthority
 import type { AuthActor, ControlPlaneEnv } from "./types.ts";
 import { approvalOutboxInsert, attemptApprovalDispatch, buildApprovalReceipt } from "./approval-dispatch.ts";
 import { scheduleBoardAssignment } from "./board-workflow.ts";
-import { acceptChangeSet, createReview, projectDeviceTerminalSubmission } from "./review-workflow.ts";
+import { acceptChangeSet, createReview } from "./review-workflow.ts";
+import { createExistingTargetControl } from "./controls.ts";
 
 const readPermissions: Partial<Record<ResourceName, string>> = {
   projects: "project.read", sources: "project.read", locations: "project.read", sessions: "session.read", messages: "board.read",
@@ -30,7 +31,8 @@ export const CLI_CONTROL_PLANE_ROUTE_MANIFEST = [
   ["POST", "/v1/project_agents"], ["GET", "/v1/project_agents"], ["GET", "/v1/project_agents/pagent_contract01"], ["PATCH", "/v1/project_agents/pagent_contract01"],
   ["POST", "/v1/assignments"], ["GET", "/v1/assignments/asg_contract01"], ["POST", "/v1/assignments/asg_contract01/transitions"],
   ["GET", "/v1/runs"], ["GET", "/v1/runs/run_contract01"], ["GET", "/v1/runs/run_contract01/events"], ["POST", "/v1/operations"],
-  ["POST", "/v1/runs/run_contract01/submissions"], ["GET", "/v1/change_sets/cset_contract01"], ["POST", "/v1/change_sets/cset_contract01/reviews"], ["POST", "/v1/sessions/csess_contract01/acceptances"],
+  ["POST", "/v1/runs/run_contract01/controls"], ["POST", "/v1/assignments/asg_contract01/controls"], ["POST", "/v1/runtimes/runtime_contract01/controls"],
+  ["GET", "/v1/change_sets/cset_contract01"], ["POST", "/v1/change_sets/cset_contract01/reviews"], ["POST", "/v1/sessions/csess_contract01/acceptances"],
   ["POST", "/v1/tasks"], ["GET", "/v1/tasks"], ["GET", "/v1/tasks/task_contract01"], ["PATCH", "/v1/tasks/task_contract01"], ["POST", "/v1/tasks/task_contract01/links"],
   ["GET", "/v1/evidence/evid_contract01"], ["GET", "/v1/evidence"],
   ["POST", "/v1/connector-policies"], ["PATCH", "/v1/connector-policies/cpol_contract01"], ["GET", "/v1/oauth/grants"], ["GET", "/v1/oauth/grants/grant_contract01"],
@@ -286,18 +288,21 @@ async function linkTask(request: Request, env: ControlPlaneEnv, rawTaskId: strin
 
 export async function handleApi(request: Request, env: ControlPlaneEnv, path: string): Promise<Response | null> {
   if (request.method === "POST" && path === "/v1/messages") return postBoardMessage(request, env);
-  const terminalSubmission = path.match(/^\/v1\/runs\/([^/]+)\/submissions$/);
-  if (request.method === "POST" && terminalSubmission?.[1] !== undefined) {
+  const exactControl = path.match(/^\/v1\/(runs|assignments|runtimes)\/([^/]+)\/controls$/);
+  if (request.method === "POST" && exactControl?.[1] !== undefined && exactControl[2] !== undefined) {
     const auth = await actorFor(request, env, true);
-    if (auth.connector) throw new PublicError("operation_not_allowed", 403, "Terminal projection is accepted from authenticated Device custody, not a Connector");
-    idempotencyKey(request);
     const body = record(await readJsonBounded(request));
-    return Response.json(await projectDeviceTerminalSubmission(env, {
-      operationId: boundedString(body.operationId, "operationId", 128),
-      runId: terminalSubmission[1],
-      deviceId: boundedString(body.deviceId, "deviceId", 128),
-      submission: body.submission,
-    }), { status: 201 });
+    const command = boundedString(body.command, "command", 64);
+    const targetKind = exactControl[1] === "runtimes" || (exactControl[1] === "runs" && ["pause", "resume", "stop", "snapshot", "restore", "destroy"].includes(command))
+      ? "runtime"
+      : "agent";
+    if (exactControl[1] === "assignments" && targetKind !== "agent") throw new PublicError("invalid_request", 400, "Assignment controls target its Agent Session");
+    return Response.json(await createExistingTargetControl(env, auth.actor, {
+      targetKind,
+      targetId: exactControl[2],
+      idempotencyKey: idempotencyKey(request),
+      body,
+    }, auth.connector ? "connector" : "owner"), { status: 202 });
   }
   const changeSetReview = path.match(/^\/v1\/change_sets\/([^/]+)\/reviews$/);
   if (request.method === "POST" && changeSetReview?.[1] !== undefined) {

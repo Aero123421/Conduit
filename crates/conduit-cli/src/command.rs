@@ -217,9 +217,12 @@ pub enum RunCommand {
     List,
     Show(IdArgs),
     Follow(IdArgs),
+    Input(MutationArgs),
+    Steer(MutationArgs),
     Pause(MutationArgs),
     Resume(MutationArgs),
     Cancel(MutationArgs),
+    Close(MutationArgs),
     Recover(MutationArgs),
 }
 
@@ -618,12 +621,8 @@ fn assignment(command: AssignmentCommand) -> Result<Invocation, CliError> {
             }));
             invocation.owner_bearer()
         }
-        AssignmentCommand::Input(args) => {
-            operation("run.input", args, OperationBinding::RequiredAssignment)?
-        }
-        AssignmentCommand::Steer(args) => {
-            operation("run.steer", args, OperationBinding::RequiredAssignment)?
-        }
+        AssignmentCommand::Input(args) => existing_target_control("assignments", "input", args)?,
+        AssignmentCommand::Steer(args) => existing_target_control("assignments", "steer", args)?,
     })
 }
 
@@ -634,10 +633,17 @@ fn run(command: RunCommand) -> Result<Invocation, CliError> {
         RunCommand::Follow(args) => {
             Invocation::get(format!("/api/v1/runs/{}/events", safe_id(&args.id)?))
         }
-        RunCommand::Pause(args) => operation("run.pause", args, OperationBinding::RequiredRun)?,
-        RunCommand::Resume(args) => operation("run.resume", args, OperationBinding::RequiredRun)?,
-        RunCommand::Cancel(args) => operation("run.cancel", args, OperationBinding::RequiredRun)?,
-        RunCommand::Recover(args) => operation("run.recover", args, OperationBinding::RequiredRun)?,
+        RunCommand::Input(args) => existing_target_control("runs", "input", args)?,
+        RunCommand::Steer(args) => existing_target_control("runs", "steer", args)?,
+        RunCommand::Pause(args) => existing_target_control("runs", "pause", args)?,
+        RunCommand::Resume(args) => existing_target_control("runs", "resume", args)?,
+        RunCommand::Cancel(args) => existing_target_control("runs", "cancel", args)?,
+        RunCommand::Close(args) => existing_target_control("runs", "close", args)?,
+        RunCommand::Recover(_) => {
+            return Err(CliError::Usage(
+                "run recovery requires an explicit runtime restore target".to_owned(),
+            ));
+        }
     })
 }
 
@@ -658,27 +664,17 @@ fn runtime(command: RuntimeCommand) -> Result<Invocation, CliError> {
         RuntimeCommand::Start(args) => {
             operation("runtime.create", args, OperationBinding::OptionalRun)?
         }
-        RuntimeCommand::Stop(args) => {
-            operation("runtime.stop", args, OperationBinding::RequiredRun)?
+        RuntimeCommand::Stop(args) => existing_target_control("runtimes", "stop", args)?,
+        RuntimeCommand::Pause(args) => existing_target_control("runtimes", "pause", args)?,
+        RuntimeCommand::Resume(args) => existing_target_control("runtimes", "resume", args)?,
+        RuntimeCommand::Snapshot(args) => existing_target_control("runtimes", "snapshot", args)?,
+        RuntimeCommand::Archive(_) => {
+            return Err(CliError::Usage(
+                "runtime archive is not an existing-target control; use snapshot".to_owned(),
+            ));
         }
-        RuntimeCommand::Pause(args) => {
-            operation("runtime.pause", args, OperationBinding::RequiredRun)?
-        }
-        RuntimeCommand::Resume(args) => {
-            operation("runtime.resume", args, OperationBinding::RequiredRun)?
-        }
-        RuntimeCommand::Snapshot(args) => {
-            operation("runtime.snapshot", args, OperationBinding::RequiredRun)?
-        }
-        RuntimeCommand::Archive(args) => {
-            operation("runtime.archive", args, OperationBinding::RequiredRun)?
-        }
-        RuntimeCommand::Restore(args) => {
-            operation("runtime.restore", args, OperationBinding::RequiredRun)?
-        }
-        RuntimeCommand::Destroy(args) => {
-            operation("runtime.destroy", args, OperationBinding::RequiredRun)?
-        }
+        RuntimeCommand::Restore(args) => existing_target_control("runtimes", "restore", args)?,
+        RuntimeCommand::Destroy(args) => existing_target_control("runtimes", "destroy", args)?,
     })
 }
 
@@ -813,8 +809,6 @@ fn backup(command: BackupCommand) -> Result<Invocation, CliError> {
 #[derive(Debug, Clone, Copy)]
 enum OperationBinding {
     None,
-    RequiredAssignment,
-    RequiredRun,
     OptionalRun,
 }
 
@@ -859,15 +853,6 @@ fn operation(
                 "this quick operation does not accept a positional target ID".to_owned(),
             ));
         }
-        OperationBinding::RequiredAssignment => {
-            protected.insert(
-                "assignmentId".to_owned(),
-                Value::String(required_id(id, "Assignment")?),
-            );
-        }
-        OperationBinding::RequiredRun => {
-            protected.insert("runId".to_owned(), Value::String(required_id(id, "Run")?));
-        }
         OperationBinding::OptionalRun => {
             if let Some(id) = id {
                 protected.insert("runId".to_owned(), Value::String(id));
@@ -878,6 +863,26 @@ fn operation(
     let mut invocation = Invocation::mutation(Method::Post, "/api/v1/operations", args)?;
     invocation.body = Some(Value::Object(protected));
     invocation.mirror_idempotency_in_body = true;
+    Ok(invocation)
+}
+
+fn existing_target_control(
+    collection: &str,
+    command: &str,
+    mut args: MutationArgs,
+) -> Result<Invocation, CliError> {
+    let target = required_id(args.id.take(), "control target")?;
+    validate_segment(&target)?;
+    let revision = args
+        .revision
+        .take()
+        .ok_or_else(|| CliError::Usage("existing-target control requires --revision".to_owned()))?;
+    let mut invocation = Invocation::mutation(
+        Method::Post,
+        format!("/api/v1/{collection}/{target}/controls"),
+        args,
+    )?;
+    invocation.body = Some(json!({ "command": command, "expectedRevision": revision }));
     Ok(invocation)
 }
 
@@ -1090,41 +1095,63 @@ mod tests {
     }
 
     #[test]
-    fn every_remote_effect_uses_one_typed_operation_contract() {
+    fn starts_and_existing_target_controls_use_separate_contracts() {
         let cases = [
-            (vec!["conduit", "quick", "command"], "command.start", None),
-            (vec!["conduit", "quick", "agent"], "agent.run.start", None),
-            (vec!["conduit", "quick", "vm"], "runtime.create", None),
-            (
-                vec!["conduit", "assignment", "input", "asg_contract01"],
-                "run.input",
-                Some(("assignmentId", "asg_contract01")),
-            ),
-            (
-                vec!["conduit", "assignment", "steer", "asg_contract01"],
-                "run.steer",
-                Some(("assignmentId", "asg_contract01")),
-            ),
-            (
-                vec!["conduit", "run", "pause", "run_contract01"],
-                "run.pause",
-                Some(("runId", "run_contract01")),
-            ),
-            (
-                vec!["conduit", "runtime", "destroy", "run_contract01"],
-                "runtime.destroy",
-                Some(("runId", "run_contract01")),
-            ),
+            (vec!["conduit", "quick", "command"], "command.start"),
+            (vec!["conduit", "quick", "agent"], "agent.run.start"),
+            (vec!["conduit", "quick", "vm"], "runtime.create"),
         ];
-        for (args, capability, binding) in cases {
+        for (args, capability) in cases {
             let invocation = invocation(&args);
             assert_eq!(invocation.route, "/api/v1/operations");
             assert_eq!(invocation.method, Method::Post);
             assert!(invocation.mirror_idempotency_in_body);
             assert_eq!(invocation.body.as_ref().unwrap()["capability"], capability);
-            if let Some((name, id)) = binding {
-                assert_eq!(invocation.body.as_ref().unwrap()[name], id);
-            }
+        }
+
+        for (args, route, command) in [
+            (
+                vec![
+                    "conduit",
+                    "assignment",
+                    "input",
+                    "asg_contract01",
+                    "--revision",
+                    "2",
+                ],
+                "/api/v1/assignments/asg_contract01/controls",
+                "input",
+            ),
+            (
+                vec![
+                    "conduit",
+                    "run",
+                    "pause",
+                    "run_contract01",
+                    "--revision",
+                    "3",
+                ],
+                "/api/v1/runs/run_contract01/controls",
+                "pause",
+            ),
+            (
+                vec![
+                    "conduit",
+                    "runtime",
+                    "destroy",
+                    "rt_contract01",
+                    "--revision",
+                    "4",
+                ],
+                "/api/v1/runtimes/rt_contract01/controls",
+                "destroy",
+            ),
+        ] {
+            let invocation = invocation(&args);
+            assert_eq!(invocation.route, route);
+            assert!(!invocation.mirror_idempotency_in_body);
+            assert_eq!(invocation.body.as_ref().unwrap()["command"], command);
+            assert!(invocation.body.as_ref().unwrap()["expectedRevision"].is_number());
         }
     }
 

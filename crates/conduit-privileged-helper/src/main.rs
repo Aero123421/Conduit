@@ -26,6 +26,10 @@ fn main() {
 }
 fn run() -> conduit_privileged_helper::Result<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
+    if args.as_slice() == ["--version"] {
+        println!("conduit-privileged-helper {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     match args.first().map(String::as_str) {
         Some("serve") => serve(&args[1..]),
         Some("exec-worker") => exec_worker(&args[1..]),
@@ -540,6 +544,30 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             output(registration_bundle(&state, &policy_path, &node_path)?);
             Ok(())
         }
+        "status" => {
+            require_root()?;
+            output(admin_status(
+                &state,
+                &policy_path,
+                &keys_path,
+                &node_path,
+                &journal,
+                false,
+            )?);
+            Ok(())
+        }
+        "doctor" => {
+            require_root()?;
+            output(admin_status(
+                &state,
+                &policy_path,
+                &keys_path,
+                &node_path,
+                &journal,
+                true,
+            )?);
+            Ok(())
+        }
         "package-status" => {
             require_root()?;
             let installation_id = fs::read_to_string(state.join("installation-id"))
@@ -646,6 +674,158 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             "unknown admin command".into(),
         )),
     }
+}
+
+fn admin_status(
+    state: &Path,
+    policy_path: &Path,
+    keys_path: &Path,
+    node_path: &Path,
+    journal_path: &Path,
+    doctor: bool,
+) -> conduit_privileged_helper::Result<serde_json::Value> {
+    let executable = env::current_exe()?;
+    let executable_custody = root_owned_regular(&executable, 0o022);
+    let policy_custody = root_owned_regular(policy_path, 0o077);
+    let key_custody = root_owned_regular(keys_path, 0o077);
+    let node_key_custody = root_owned_regular(node_path, 0o022);
+    let state_custody = root_owned_directory(state, 0o077);
+    let prepared = policy_custody
+        && node_key_custody
+        && state.join("installation-id").is_file()
+        && state.join("receipt.public").is_file();
+    if !prepared {
+        return Ok(json!({
+            "schemaVersion": 1,
+            "installed": executable_custody,
+            "prepared": false,
+            "enabled": false,
+            "effective": false,
+            "reasonCode": "privileged_helper_registration_missing",
+            "remediationCode": "run_privileged_prepare_as_root",
+            "custody": {
+                "helperBinary": executable_custody,
+                "stateDirectory": state_custody,
+                "rootPolicy": policy_custody,
+                "ticketKeys": key_custody,
+                "nodePublicKey": node_key_custody
+            },
+            "diagnosticLevel": if doctor { "doctor" } else { "status" }
+        }));
+    }
+
+    let policy: RootPolicy = serde_json::from_slice(&fs::read(policy_path)?)?;
+    let policy_digest = policy.digest()?;
+    let receipt_public = fs::read(state.join("receipt.public"))?;
+    let receipt_public: [u8; 32] = receipt_public.try_into().map_err(|_| {
+        conduit_privileged_helper::HelperError::Policy("receipt public key length".into())
+    })?;
+    VerifyingKey::from_bytes(&receipt_public).map_err(|_| {
+        conduit_privileged_helper::HelperError::Policy("receipt public key invalid".into())
+    })?;
+    let receipt_key_id = key_id("hkey", &receipt_public);
+    let receipt_fingerprint = hex::encode(Sha256::digest(receipt_public));
+    let active_runtime_count = if journal_path.exists() {
+        HelperJournal::open_root_owned(journal_path)?.active_runtime_count()?
+    } else {
+        0
+    };
+    let systemd_reachable = SystemdBackend::connect_system()
+        .and_then(|backend| backend.available())
+        .unwrap_or(false);
+    let capability = registration_bundle(state, policy_path, node_path)?
+        .pointer("/signedCapability/claims")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    let effective = policy.enabled
+        && policy_custody
+        && key_custody
+        && node_key_custody
+        && state_custody
+        && executable_custody
+        && systemd_reachable;
+    let reason_code = if !policy.enabled {
+        "privileged_helper_disabled"
+    } else if !key_custody || policy.ticket_key_ids.is_empty() {
+        "privileged_helper_registration_missing"
+    } else if !systemd_reachable {
+        "privileged_helper_unavailable"
+    } else if !effective {
+        "privileged_helper_policy_mismatch"
+    } else {
+        "ready"
+    };
+    let remediation_code = match reason_code {
+        "privileged_helper_disabled" => "pin_ticket_key_then_enable_locally",
+        "privileged_helper_registration_missing" => {
+            "complete_owner_registration_and_pin_ticket_key"
+        }
+        "privileged_helper_unavailable" => "repair_systemd_system_manager",
+        "privileged_helper_policy_mismatch" => "repair_root_owned_helper_custody",
+        _ => "none",
+    };
+    Ok(json!({
+        "schemaVersion": 1,
+        "installed": executable_custody,
+        "prepared": true,
+        "enabled": policy.enabled,
+        "effective": effective,
+        "reasonCode": reason_code,
+        "remediationCode": remediation_code,
+        "protocolVersion": conduit_privileged_protocol::PROTOCOL,
+        "helperVersion": env!("CARGO_PKG_VERSION"),
+        "installationId": policy.installation_id,
+        "deviceId": policy.device_id,
+        "uid": policy.uid,
+        "publicOrigin": policy.origin,
+        "policyRevision": policy.revision,
+        "policyDigest": policy_digest,
+        "receiptKeyId": receipt_key_id,
+        "receiptPublicKeyFingerprint": receipt_fingerprint,
+        "activeRuntimeCount": active_runtime_count,
+        "recoveryState": if active_runtime_count == 0 { "clean" } else { "active_custody_present" },
+        "controlPlaneRegistrationState": "not_observed_by_local_helper",
+        "capabilities": capability,
+        "custody": {
+            "helperBinary": executable_custody,
+            "stateDirectory": state_custody,
+            "rootPolicy": policy_custody,
+            "ticketKeys": key_custody,
+            "nodePublicKey": node_key_custody,
+            "journal": !journal_path.exists() || root_owned_regular(journal_path, 0o077)
+        },
+        "systemd": {
+            "systemManagerReachable": systemd_reachable,
+            "socketUnit": "/usr/lib/systemd/system/conduit-privileged-helper@.socket",
+            "serviceUnit": "/usr/lib/systemd/system/conduit-privileged-helper@.service"
+        },
+        "policy": {
+            "allowNever": policy.allow_never,
+            "allowUnrestrictedLaunch": policy.allow_unrestricted_launch,
+            "allowPersistentSessions": policy.allow_persistent_sessions,
+            "allowOfflineControl": policy.allow_offline_control,
+            "ticketKeyCount": policy.ticket_key_ids.len()
+        },
+        "diagnosticLevel": if doctor { "doctor" } else { "status" }
+    }))
+}
+
+fn root_owned_regular(path: &Path, forbidden_mode: u32) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.is_file()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == 0
+            && metadata.permissions().mode() & forbidden_mode == 0
+    })
+}
+
+fn root_owned_directory(path: &Path, forbidden_mode: u32) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|metadata| {
+        metadata.is_dir()
+            && !metadata.file_type().is_symlink()
+            && metadata.uid() == 0
+            && metadata.permissions().mode() & forbidden_mode == 0
+    })
 }
 
 fn send_response(

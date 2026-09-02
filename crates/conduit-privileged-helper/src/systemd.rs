@@ -24,6 +24,11 @@ pub struct UnitObservation {
     pub main_pid: Option<u32>,
     pub active_state: String,
     pub cgroup: Option<String>,
+    pub effective_uid: Option<u32>,
+    pub effective_gid: Option<u32>,
+    pub process_birth: Option<String>,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
 }
 
 pub trait SystemdManager: Send + Sync + 'static {
@@ -166,12 +171,38 @@ impl SystemdManager for SystemdBackend {
         .ok()
         .filter(|v| v.len() == 16)
         .map(hex::encode);
+        let (effective_uid, effective_gid, process_birth) = main_pid
+            .and_then(proc_identity)
+            .map(|v| (Some(v.0), Some(v.1), Some(v.2)))
+            .unwrap_or((None, None, None));
+        let main_code = i32::try_from(self.property(
+            &path,
+            "org.freedesktop.systemd1.Service",
+            "ExecMainCode",
+        )?)
+        .ok();
+        let main_status = i32::try_from(self.property(
+            &path,
+            "org.freedesktop.systemd1.Service",
+            "ExecMainStatus",
+        )?)
+        .ok();
+        let (exit_code, signal) = match (main_code, main_status) {
+            (Some(libc::CLD_EXITED), value) => (value, None),
+            (Some(_), value) => (None, value),
+            _ => (None, None),
+        };
         Ok(UnitObservation {
             unit_name: unit_name.into(),
             invocation_id: invocation,
             main_pid,
             active_state,
             cgroup,
+            effective_uid,
+            effective_gid,
+            process_birth,
+            exit_code,
+            signal,
         })
     }
 
@@ -248,6 +279,11 @@ impl SystemdManager for FakeSystemd {
             main_pid: Some(4242),
             active_state: "active".into(),
             cgroup: Some(format!("/system.slice/{}", spec.unit_name)),
+            effective_uid: Some(0),
+            effective_gid: Some(0),
+            process_birth: Some("fake:4242".into()),
+            exit_code: None,
+            signal: None,
         };
         self.inner
             .lock()
@@ -341,6 +377,27 @@ fn validate_unit_name(name: &str) -> Result<()> {
 
 fn bus_error(error: impl std::fmt::Display) -> HelperError {
     HelperError::Systemd(error.to_string())
+}
+fn proc_identity(pid: u32) -> Option<(u32, u32, String)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let uid = status
+        .lines()
+        .find(|v| v.starts_with("Uid:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    let gid = status
+        .lines()
+        .find(|v| v.starts_with("Gid:"))?
+        .split_whitespace()
+        .nth(1)?
+        .parse()
+        .ok()?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let end = stat.rfind(')')?;
+    let start = stat[end + 2..].split_whitespace().nth(19)?;
+    Some((uid, gid, format!("{pid}:{start}")))
 }
 
 #[cfg(test)]

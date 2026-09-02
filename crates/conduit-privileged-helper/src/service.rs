@@ -65,6 +65,7 @@ pub struct HelperConfig {
     pub helper_version: String,
     pub state_dir: PathBuf,
     pub worker_path: PathBuf,
+    pub device_key_id: String,
 }
 
 impl HelperConfig {
@@ -87,6 +88,16 @@ impl HelperConfig {
             ));
         }
         let policy: RootPolicy = serde_json::from_slice(&fs::read(path)?)?;
+        let node_key_path = path
+            .parent()
+            .ok_or_else(|| HelperError::Policy("policy parent".into()))?
+            .join("node-public.key");
+        validate_regular(&node_key_path, 0, 0o644)?;
+        let node_key: [u8; 32] = fs::read(node_key_path)?
+            .try_into()
+            .map_err(|_| HelperError::Policy("node public key length".into()))?;
+        VerifyingKey::from_bytes(&node_key)
+            .map_err(|_| HelperError::Policy("node public key invalid".into()))?;
         let digest = policy.digest()?;
         Ok(Self {
             policy,
@@ -95,6 +106,7 @@ impl HelperConfig {
             helper_version: env!("CARGO_PKG_VERSION").into(),
             state_dir,
             worker_path,
+            device_key_id: conduit_privileged_protocol::key_id("dkey", &node_key),
         })
     }
 }
@@ -193,27 +205,11 @@ impl<M: SystemdManager> HelperEngine<M> {
             .as_ref()
             .map(|v| matches!(v.active_state.as_str(), "inactive" | "failed" | "dead"))
             .unwrap_or(true);
-        let ticket = runtime.authority_ticket.clone();
-        let digest = hex::encode(Sha256::digest(serde_jcs::to_vec(request)?));
-        let receipt = self.receipt(
-            &ticket,
-            &digest,
-            receipt_transition(
-                observation
-                    .as_ref()
-                    .map(|v| v.active_state.as_str())
-                    .unwrap_or("missing"),
-            ),
-            observation.as_ref(),
-            runtime.state_revision,
-            None,
-        )?;
         Ok(crate::ManagedIoResponse::StreamChunk {
             data,
             next_cursor,
             eof: next_cursor >= length,
             terminal,
-            receipt,
         })
     }
     pub fn handle(
@@ -780,6 +776,11 @@ impl<M: SystemdManager> HelperEngine<M> {
                 main_pid: runtime.main_pid,
                 active_state: "unknown".into(),
                 cgroup: None,
+                effective_uid: None,
+                effective_gid: None,
+                process_birth: None,
+                exit_code: None,
+                signal: None,
             });
         let transition = match operation {
             PrivilegedOperation::Pause => "paused",
@@ -793,7 +794,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             transition,
             Some(&observation),
             runtime.state_revision + 1,
-            None,
+            Some(request.clone()),
         )?;
         self.journal.complete_effect(
             &ticket.claims.ticket_id,
@@ -852,11 +853,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             || runtime.invocation_id.as_deref() != Some(&target.invocation_id)
             || target.controller_epoch == 0
             || runtime.state_revision != target.expected_state_revision
-            || target.runtime_handle_digest.len() != 64
-            || !target
-                .runtime_handle_digest
-                .bytes()
-                .all(|v| v.is_ascii_hexdigit())
+            || target.runtime_handle_digest != control_target_digest(target)?
         {
             return Err(HelperError::Denied("exact_target_mismatch".into()));
         }
@@ -907,6 +904,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             || c.audience != "conduit-privileged-helper"
             || c.installation_id != self.config.policy.installation_id
             || c.device_id != self.config.policy.device_id
+            || c.device_key_id != self.config.device_key_id
             || c.uid != self.config.policy.uid
             || c.origin != self.config.policy.origin
             || c.helper_policy_revision != self.config.policy.revision
@@ -924,7 +922,10 @@ impl<M: SystemdManager> HelperEngine<M> {
             || (matches!(
                 c.approval_enforcement,
                 conduit_privileged_protocol::ApprovalEnforcement::ExactCommand
-            ) && c.approval_receipt_digest.is_none())
+            ) && c.approval_mode != "never"
+                && c.approval_receipt_digest.is_none())
+            || (c.approval_mode == "never"
+                && (!c.required_risk_classes.is_empty() || c.approval_receipt_digest.is_some()))
             || !within_ceilings(&c.resource_ceilings, &self.config.policy.ceilings)
         {
             return Err(HelperError::Denied("privilege_ticket_invalid".into()));
@@ -1004,13 +1005,13 @@ impl<M: SystemdManager> HelperEngine<M> {
             invocation_id: observation.and_then(|v| v.invocation_id.clone()),
             cgroup: observation.and_then(|v| v.cgroup.clone()),
             main_pid: observation.and_then(|v| v.main_pid),
-            process_birth: None,
-            effective_uid: Some(0),
-            effective_gid: Some(0),
+            process_birth: observation.and_then(|v| v.process_birth.clone()),
+            effective_uid: observation.and_then(|v| v.effective_uid),
+            effective_gid: observation.and_then(|v| v.effective_gid),
             stdout_cursor: runtime.as_ref().map_or(0, |v| v.stdout_cursor),
             stderr_cursor: runtime.as_ref().map_or(0, |v| v.stderr_cursor),
-            exit_code: None,
-            signal: None,
+            exit_code: observation.and_then(|v| v.exit_code),
+            signal: observation.and_then(|v| v.signal),
             observed_at,
             previous_receipt_digest: previous,
         };
@@ -1033,7 +1034,8 @@ fn within_ceilings(
     fn le<T: Ord>(requested: Option<T>, policy: Option<T>) -> bool {
         match (requested, policy) {
             (Some(a), Some(b)) => a <= b,
-            (Some(_), None) | (None, _) => true,
+            (Some(_), None) | (None, None) => true,
+            (None, Some(_)) => false,
         }
     }
     le(
@@ -1064,6 +1066,24 @@ fn receipt_transition(value: &str) -> &'static str {
 }
 fn request_digest(request: &HelperRequest) -> Result<String> {
     Ok(hex::encode(Sha256::digest(serde_jcs::to_vec(request)?)))
+}
+pub fn control_target_digest(target: &ControlTarget) -> Result<String> {
+    #[derive(serde::Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Binding<'a> {
+        runtime_id: &'a str,
+        unit_name: &'a str,
+        invocation_id: &'a str,
+        controller_epoch: u64,
+        expected_state_revision: u64,
+    }
+    Ok(hex::encode(Sha256::digest(serde_jcs::to_vec(&Binding {
+        runtime_id: &target.runtime_id,
+        unit_name: &target.unit_name,
+        invocation_id: &target.invocation_id,
+        controller_epoch: target.controller_epoch,
+        expected_state_revision: target.expected_state_revision,
+    })?)))
 }
 fn decode_receipt(value: Option<Vec<u8>>) -> Result<HelperResponse> {
     let value = value.ok_or_else(|| HelperError::RecoveryRequired("receipt missing".into()))?;
@@ -1140,6 +1160,7 @@ mod tests {
             helper_version: "test".into(),
             state_dir: directory.clone(),
             worker_path: "/usr/lib/conduit/conduit-privileged-helper".into(),
+            device_key_id: "dkey_test".into(),
         };
         let plan = LocalExecutionPlan {
             plan_version: 1,

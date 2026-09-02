@@ -14,7 +14,10 @@ mod worker;
 pub use journal::{
     EffectDisposition, HelperJournal, JOURNAL_SCHEMA_VERSION, JournalEffect, RuntimeRecord,
 };
-pub use service::{HelperConfig, HelperEngine, PinnedTicketKeys, load_receipt_key_root_owned};
+pub use service::{
+    HelperConfig, HelperEngine, PinnedTicketKeys, control_target_digest,
+    load_receipt_key_root_owned,
+};
 pub use systemd::{FakeSystemd, SystemdBackend, SystemdManager, UnitObservation, UnitSpec};
 pub use transport::{
     HelperClient, ManagedIoRequest, ManagedIoResponse, ManagedStream, Packet, PeerCredentials,

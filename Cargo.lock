@@ -670,7 +670,9 @@ dependencies = [
 name = "conduit-runtime"
 version = "0.1.0"
 dependencies = [
+ "conduit-privileged-helper",
  "conduit-privileged-protocol",
+ "ed25519-dalek",
  "hex",
  "libc",
  "serde",

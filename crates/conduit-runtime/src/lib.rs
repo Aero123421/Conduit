@@ -4,11 +4,16 @@
 mod container;
 mod incus;
 mod native;
+mod privileged;
 mod restricted;
 
 pub use container::{ContainerBackend, ContainerProvider};
 pub use incus::IncusProvider;
 pub use native::{NativeProvider, ProcessSupervisor};
+pub use privileged::{
+    PrivilegedManagedRuntime, PrivilegedNativeProvider, PrivilegedPreparedRuntime,
+    PrivilegedRuntimeReceipt, PrivilegedTicketSource,
+};
 pub use restricted::RestrictedNativeProvider;
 
 use conduit_privileged_protocol::{LocalExecutionPlan, PrivilegeTicket};

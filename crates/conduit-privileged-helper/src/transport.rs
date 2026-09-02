@@ -62,7 +62,6 @@ pub enum ManagedIoResponse {
         next_cursor: u64,
         eof: bool,
         terminal: bool,
-        receipt: HelperReceipt,
     },
     Error {
         code: String,

@@ -179,9 +179,28 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
                     "invalid device id".into(),
                 ));
             }
+            let node_source = required_path(args, "--node-public-key-file")?;
+            let node_metadata = fs::symlink_metadata(&node_source)?;
+            if !node_metadata.is_file()
+                || node_metadata.file_type().is_symlink()
+                || node_metadata.uid() != uid
+                || node_metadata.permissions().mode() & 0o022 != 0
+            {
+                return Err(conduit_privileged_helper::HelperError::Policy(
+                    "node public key ownership or mode invalid".into(),
+                ));
+            }
+            let node_public = fs::read(&node_source)?;
+            let node_raw: [u8; 32] = node_public.try_into().map_err(|_| {
+                conduit_privileged_helper::HelperError::Policy("node public key length".into())
+            })?;
+            VerifyingKey::from_bytes(&node_raw).map_err(|_| {
+                conduit_privileged_helper::HelperError::Policy("node public key invalid".into())
+            })?;
             fs::create_dir_all(&state)?;
             fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
             let installation_id = load_or_create_installation(&state)?;
+            atomic(&state.join("node-public.key"), &node_raw, 0o644)?;
             let secret = state.join("receipt.key");
             if !secret.exists() {
                 let mut seed = [0u8; 32];
@@ -227,7 +246,7 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
                 &json!({"installationId":installation_id,"policyDigest":policy.digest()?,"receiptKeyFingerprint":hex::encode(Sha256::digest(receipt_public))}),
             )?;
             output(
-                json!({"prepared":true,"enabled":false,"installationId":installation_id,"bundleDigest":hex::encode(Sha256::digest(bundle))}),
+                json!({"prepared":true,"enabled":false,"installationId":installation_id,"bundleDigest":hex::encode(Sha256::digest(bundle)),"deviceKeyId":key_id("dkey",&node_raw)}),
             );
             Ok(())
         }
@@ -567,6 +586,7 @@ fn validate_managed_state(state: &Path) -> conduit_privileged_helper::Result<()>
         "receipt.public",
         "privileged-policy.json",
         "ticket-keys.json",
+        "node-public.key",
         "helper.sqlite3",
         "helper.sqlite3-wal",
         "helper.sqlite3-shm",

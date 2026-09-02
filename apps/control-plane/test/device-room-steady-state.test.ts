@@ -223,6 +223,49 @@ describe.sequential("DeviceRoom steady-state custody", () => {
     connected.socket.close(1000, "steady_state_complete");
   });
 
+  it("routes a strict privilege request and replays one durable unacknowledged result", async () => {
+    const deviceId = "dev_room_priv_route01";
+    const keyId = "dkey_room_priv_route01";
+    const enrollmentId = "enroll_room_priv_route01";
+    const runId = "run_room_priv_route01";
+    const keyPair = await seedDevice(deviceId, keyId, enrollmentId, runId);
+    const room = env.DEVICE_ROOMS.getByName(deviceId);
+    const connected = await connectDevice(deviceId, keyId, keyPair, "node-boot-room-priv-route-01");
+    await completeReconciliation(connected, "node-boot-room-priv-route-01");
+    const requestId = "ptreq_roomprivroute01";
+    const unsigned = {
+      requestId, idempotencyKey: "privilege-route-replay-0001", installationId: "phinst_roomprivroute01", deviceKeyId: keyId,
+      operationId: "op_roomprivroute01", runId, runtimeId: "rt_roomprivroute01", runtimeSpecDigest: "1".repeat(64), launchPlanDigest: "2".repeat(64),
+      localExecutionPlanDigest: "3".repeat(64), controlRequestDigest: null, runManifestDigest: "4".repeat(64), helperPolicyRevision: 1,
+      helperPolicyDigest: "5".repeat(64), devicePolicyRevision: 1, approvalReceiptDigest: null, approvalEnforcement: "exact_command", allowedOperation: "prepare",
+      resourceCeilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, redactedSummary: { operation: "prepare" },
+      requestedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 120_000).toISOString(),
+    } satisfies Record<string, unknown>;
+    const transcript = canonicalJson({ domain: "conduit.privilege.ticket_request.v1", deviceId, connectionEpoch: connected.accepted.connectionEpoch, payload: unsigned });
+    const payload = { ...unsigned, deviceSignature: base64url(new Uint8Array(await crypto.subtle.sign("Ed25519", keyPair.privateKey, new TextEncoder().encode(transcript)))) };
+    const nextWithTimeout = (label: string) => Promise.race([connected.next(), new Promise<string>((_resolve, reject) => setTimeout(() => reject(new Error(`${label} timeout`)), 1_500))]);
+    const receiveResultAndAck = async (label: string, ackThrough: string) => {
+      const frames = [parseWireDocumentText(schemaIds.nodeV1, await nextWithTimeout(`${label}:first`)), parseWireDocumentText(schemaIds.nodeV1, await nextWithTimeout(`${label}:second`))];
+      const result = frames.find((frame) => frame.type === "privilege.ticket_result");
+      const ack = frames.find((frame) => frame.type === "transport.ack");
+      expect(result).toMatchObject({ type: "privilege.ticket_result", correlationId: requestId, payload: { requestId, status: "denied" } });
+      expect(ack).toMatchObject({ type: "transport.ack", payload: { direction: "node_to_control", throughSequence: ackThrough } });
+      return result;
+    };
+    await connected.send(4, "privilege.ticket_request", payload, requestId);
+    await expect.poll(async () => runInDurableObject(room, (_instance, state) => state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM inbound_frames WHERE sequence=4").one().count)).toBe(1);
+    const first = await receiveResultAndAck("initial privilege delivery", "4");
+    await connected.send(5, "transport.replay_required", { direction: "control_to_node", expectedSequence: "4", receivedSequence: "4" }, requestId);
+    const replay = await receiveResultAndAck("replayed privilege delivery", "5");
+    expect(replay).toEqual(first);
+    const durable = await runInDurableObject(room, (_instance, state) => ({
+      inbound: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM inbound_frames WHERE sequence=4 AND projected=1").one().count,
+      result: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_frames WHERE json_extract(frame_json,'$.type')='privilege.ticket_result'").one().count,
+    }));
+    expect(durable).toEqual({ inbound: 1, result: 1 });
+    connected.socket.close(1000, "privilege_route_replay_complete");
+  });
+
   it("treats an unchanged health checkpoint as an exact replay with bounded D1/DO/alarm cost", async () => {
     const deviceId = "dev_room_health_replay_01";
     const keyId = "dkey_room_health_replay_01";

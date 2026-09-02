@@ -193,7 +193,7 @@ CREATE TABLE privilege_receipt_projections (
   control_request_digest TEXT CHECK (control_request_digest IS NULL OR length(control_request_digest) = 64),
   controller_epoch INTEGER NOT NULL CHECK (controller_epoch >= 1),
   state_revision INTEGER NOT NULL CHECK (state_revision >= 1),
-  transition TEXT NOT NULL CHECK (transition IN ('admitted','prepared','unit_created','running','paused','resumed','input_applied','stopping','completed','failed','cancelled','timed_out','uncertain','recovery_required')),
+  transition TEXT NOT NULL CHECK (transition IN ('admitted','prepared','unit_created','running','paused','resumed','input_applied','pty_resized','stopping','completed','failed','cancelled','timed_out','uncertain','recovery_required')),
   previous_receipt_digest TEXT REFERENCES privilege_receipt_projections(receipt_digest) ON DELETE RESTRICT,
   unit_name TEXT NOT NULL,
   invocation_id TEXT,

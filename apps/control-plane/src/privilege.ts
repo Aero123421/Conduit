@@ -542,11 +542,30 @@ function receiptTransitionAllowed(previous: string | null, next: string): boolea
   if (previous === null) return next === "admitted";
   const allowed: Record<string, readonly string[]> = {
     admitted: ["prepared", "failed", "cancelled", "uncertain"], prepared: ["unit_created", "failed", "cancelled", "uncertain"],
-    unit_created: ["running", "failed", "cancelled", "uncertain", "recovery_required"], running: ["paused", "input_applied", "stopping", "completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"],
-    paused: ["resumed", "stopping", "failed", "cancelled", "uncertain", "recovery_required"], resumed: ["running", "paused", "input_applied", "stopping", "completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"],
-    input_applied: ["running", "paused", "stopping", "completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"], stopping: ["completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"],
+    unit_created: ["running", "failed", "cancelled", "uncertain", "recovery_required"], running: ["paused", "input_applied", "pty_resized", "stopping", "completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"],
+    paused: ["resumed", "input_applied", "pty_resized", "stopping", "failed", "cancelled", "uncertain", "recovery_required"], resumed: ["running", "paused", "input_applied", "pty_resized", "stopping", "completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"],
+    input_applied: ["running", "paused", "input_applied", "pty_resized", "stopping", "completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"],
+    pty_resized: ["running", "paused", "input_applied", "pty_resized", "stopping", "completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"],
+    stopping: ["completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"],
   };
   return allowed[previous]?.includes(next) === true;
+}
+
+function actionAllowsReceipt(allowedOperation: string, transition: string): boolean {
+  const terminal = ["completed", "failed", "cancelled", "timed_out", "uncertain", "recovery_required"];
+  const allowed: Record<string, readonly string[]> = {
+    prepare: ["admitted", "prepared"],
+    start: ["unit_created", "running", ...terminal],
+    input: ["input_applied"],
+    resize_pty: ["pty_resized"],
+    pause: ["paused"],
+    resume: ["resumed"],
+    graceful_stop: ["stopping", ...terminal],
+    force_stop: ["stopping", ...terminal],
+    inspect: ["prepared", "running", "paused", "stopping", ...terminal],
+    reconcile: ["prepared", "running", "paused", "stopping", ...terminal],
+  };
+  return allowed[allowedOperation]?.includes(transition) === true;
 }
 
 async function projectReceipt(env: ControlPlaneEnv, frame: PrivilegeTransportFrame): Promise<Record<string, unknown>> {
@@ -560,7 +579,8 @@ async function projectReceipt(env: ControlPlaneEnv, frame: PrivilegeTransportFra
   if (receipt.keyId !== helperKeyId || claims.protocol !== "conduit.privileged/1") throw new PublicError("privilege_ticket_invalid", 403, "Helper receipt key binding is invalid");
   const authority = await env.DB.prepare(`
     SELECT installation.device_id,installation.expected_uid,installation.status,
-           key.public_jwk_json,key.revoked_at,ticket.ticket_digest,ticket.canonical_ticket_json,request.operation_id,request.run_id,request.runtime_id,
+           key.public_jwk_json,key.revoked_at,ticket.ticket_digest,ticket.canonical_ticket_json,ticket.issuer_key_id,
+           request.operation_id,request.run_id,request.runtime_id,request.device_key_id,request.run_manifest_digest,request.device_policy_revision,request.allowed_operation,
            request.runtime_spec_digest,request.launch_plan_digest,request.local_execution_plan_digest,request.control_request_digest,request.operation_request_digest
            ,request.helper_policy_revision,request.helper_policy_digest
     FROM device_privilege_installations AS installation
@@ -568,7 +588,7 @@ async function projectReceipt(env: ControlPlaneEnv, frame: PrivilegeTransportFra
     JOIN privilege_ticket_issuance AS ticket ON ticket.ticket_id=?3
     JOIN privilege_ticket_requests AS request ON request.request_id=ticket.request_id
     WHERE installation.installation_id=?1 LIMIT 1
-  `).bind(installationId, helperKeyId, idField(claims, "ticketId")).first<{ device_id: string; expected_uid: number; status: string; public_jwk_json: string; revoked_at: string | null; ticket_digest: string; canonical_ticket_json: string; operation_id: string; run_id: string; runtime_id: string; runtime_spec_digest: string; launch_plan_digest: string; local_execution_plan_digest: string; control_request_digest: string | null; operation_request_digest: string; helper_policy_revision: number; helper_policy_digest: string }>();
+  `).bind(installationId, helperKeyId, idField(claims, "ticketId")).first<{ device_id: string; expected_uid: number; status: string; public_jwk_json: string; revoked_at: string | null; ticket_digest: string; canonical_ticket_json: string; issuer_key_id: string; operation_id: string; run_id: string; runtime_id: string; device_key_id: string; run_manifest_digest: string; device_policy_revision: number; allowed_operation: string; runtime_spec_digest: string; launch_plan_digest: string; local_execution_plan_digest: string; control_request_digest: string | null; operation_request_digest: string; helper_policy_revision: number; helper_policy_digest: string }>();
   if (authority === null || authority.device_id !== frame.deviceId) throw new PublicError("privileged_helper_registration_missing", 409, "Receipt helper installation is not registered");
   if (!await verifyEd25519(JSON.parse(authority.public_jwk_json) as JsonWebKey, receipt.signature, canonicalJson(claims))) throw new PublicError("privilege_ticket_invalid", 403, "Helper receipt signature is invalid");
   const receiptDigest = await sha256Hex(canonicalJson(payload.receipt));
@@ -578,8 +598,10 @@ async function projectReceipt(env: ControlPlaneEnv, frame: PrivilegeTransportFra
   const previousDigest = digestField(claims, "previousReceiptDigest", true);
   if (authority.revoked_at !== null && parseDate(claims.observedAt, "receipt observedAt") > Date.parse(authority.revoked_at)) throw new PublicError("privilege_ticket_invalid", 409, "Helper receipt was observed after key revocation");
   if (claims.ticketDigest !== authority.ticket_digest || claims.operationId !== authority.operation_id || claims.runId !== authority.run_id || claims.runtimeId !== authority.runtime_id || claims.requestDigest !== authority.operation_request_digest || claims.runtimeSpecDigest !== authority.runtime_spec_digest || claims.launchPlanDigest !== authority.launch_plan_digest || claims.localExecutionPlanDigest !== authority.local_execution_plan_digest || claims.controlRequestDigest !== authority.control_request_digest || claims.policyRevision !== authority.helper_policy_revision || claims.policyDigest !== authority.helper_policy_digest) throw new PublicError("privilege_ticket_invalid", 409, "Helper receipt exact authority binding differs");
-  const ticket = JSON.parse(authority.canonical_ticket_json) as { claims?: Record<string, unknown> };
-  if (ticket.claims?.controllerEpoch !== controllerEpoch || String(controllerEpoch) !== frame.connectionEpoch) throw new PublicError("privilege_ticket_invalid", 409, "Helper receipt controller epoch differs");
+  const ticket = JSON.parse(authority.canonical_ticket_json) as { keyId?: unknown; claims?: Record<string, unknown> };
+  const ticketClaims = ticket.claims ?? {};
+  if (ticket.keyId !== authority.issuer_key_id || ticketClaims.schemaVersion !== 1 || ticketClaims.issuerKind !== "control_plane" || ticketClaims.issuerKeyId !== authority.issuer_key_id || ticketClaims.audience !== "conduit-privileged-helper" || ticketClaims.publicOrigin !== env.PUBLIC_ORIGIN || ticketClaims.helperInstallationId !== installationId || ticketClaims.helperKeyId !== helperKeyId || ticketClaims.helperPolicyRevision !== authority.helper_policy_revision || ticketClaims.helperPolicyDigest !== authority.helper_policy_digest || ticketClaims.deviceId !== frame.deviceId || ticketClaims.deviceKeyId !== authority.device_key_id || ticketClaims.devicePolicyRevision !== authority.device_policy_revision || ticketClaims.expectedUid !== authority.expected_uid || ticketClaims.operationId !== authority.operation_id || ticketClaims.operationRequestDigest !== authority.operation_request_digest || ticketClaims.runManifestDigest !== authority.run_manifest_digest || ticketClaims.runId !== authority.run_id || ticketClaims.runtimeId !== authority.runtime_id || ticketClaims.runtimeSpecDigest !== authority.runtime_spec_digest || ticketClaims.launchPlanDigest !== authority.launch_plan_digest || ticketClaims.localExecutionPlanDigest !== authority.local_execution_plan_digest || ticketClaims.controlDigest !== authority.control_request_digest || ticketClaims.allowedOperation !== authority.allowed_operation || ticketClaims.maxUseCount !== 1 || ticketClaims.controllerEpoch !== controllerEpoch) throw new PublicError("privilege_ticket_invalid", 409, "Issued ticket claims differ from durable authority");
+  if (!actionAllowsReceipt(authority.allowed_operation, transition)) throw new PublicError("privilege_ticket_invalid", 409, "Helper receipt transition is not authorized by this action ticket");
   const previous = await env.DB.prepare("SELECT receipt_digest,transition,state_revision FROM privilege_receipt_projections WHERE runtime_id=?1 ORDER BY state_revision DESC LIMIT 1").bind(authority.runtime_id).first<{ receipt_digest: string; transition: string; state_revision: number }>();
   const duplicate = await env.DB.prepare("SELECT receipt_id FROM privilege_receipt_projections WHERE receipt_digest=?1 LIMIT 1").bind(receiptDigest).first<{ receipt_id: string }>();
   if (duplicate !== null) return { receiptDigest, status: "verified", replay: true };

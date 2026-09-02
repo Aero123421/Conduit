@@ -381,17 +381,33 @@ impl<M: SystemdManager> HelperEngine<M> {
             plan: plan.clone(),
         })?;
         let plan_digest = plan.digest()?;
-        match self
-            .journal
-            .admit_prepare(&ticket, &ticket_digest, &request, &plan_digest, &plan)?
-        {
+        let mut chain = match self.journal.admit_prepare(
+            &ticket,
+            &ticket_digest,
+            &request,
+            &plan_digest,
+            &plan,
+        )? {
             EffectDisposition::Replay(effect) => return decode_receipt(effect.receipt),
             EffectDisposition::Uncertain(_) => {
                 return Err(HelperError::RecoveryRequired(
                     "prepare outcome uncertain".into(),
                 ));
             }
-            EffectDisposition::Reserved(_) => {}
+            EffectDisposition::Reserved(_) => vec![],
+            EffectDisposition::InProgress(effect) => decode_receipt_chain(effect.receipt)?,
+        };
+        if chain.is_empty() {
+            let admitted = self.receipt(&ticket, &request, "admitted", None, 1, None)?;
+            self.journal.record_effect_boundary(
+                &ticket.claims.ticket_id,
+                &admitted,
+                "admitted",
+                None,
+                None,
+                false,
+            )?;
+            chain.push(admitted);
         }
         let runtime_dir = self
             .config
@@ -467,10 +483,11 @@ impl<M: SystemdManager> HelperEngine<M> {
             &self.receipt_key,
             unsafe { libc::geteuid() },
         )?;
-        let receipt = self.receipt(&ticket, &request, "prepared", None, 1, None)?;
+        let receipt = self.receipt(&ticket, &request, "prepared", None, 2, None)?;
         self.journal
             .complete_effect(&ticket.claims.ticket_id, &receipt, "prepared", None, None)?;
-        Ok(HelperResponse::Receipt(receipt))
+        chain.push(receipt);
+        Ok(HelperResponse::Receipts(chain))
     }
     fn start(&self, ticket: PrivilegeTicket, plan_digest: String) -> Result<HelperResponse> {
         self.validate_ticket(&ticket, PrivilegedOperation::Start, None)?;
@@ -489,7 +506,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             plan_digest,
         })?;
         let ticket_digest = ticket.digest()?;
-        match self.journal.reserve_effect(
+        let mut chain = match self.journal.reserve_effect(
             &ticket,
             &ticket_digest,
             &request,
@@ -502,8 +519,9 @@ impl<M: SystemdManager> HelperEngine<M> {
                     "start outcome uncertain".into(),
                 ));
             }
-            EffectDisposition::Reserved(_) => {}
-        }
+            EffectDisposition::Reserved(_) => vec![],
+            EffectDisposition::InProgress(effect) => decode_receipt_chain(effect.receipt)?,
+        };
         let runtime_dir = self
             .config
             .state_dir
@@ -520,21 +538,38 @@ impl<M: SystemdManager> HelperEngine<M> {
             stderr_path: runtime_dir.join("stderr.spool").to_string_lossy().into(),
             resources: runtime.plan.resources.clone(),
         };
-        let observation = match self.systemd.start_transient(&spec) {
-            Ok(v) => v,
-            Err(e) => {
-                self.journal.mark_uncertain(&ticket.claims.ticket_id)?;
-                return Err(e);
-            }
-        };
-        let receipt = self.receipt(
-            &ticket,
-            &request,
-            "started",
-            Some(&observation),
-            runtime.state_revision + 1,
-            None,
-        )?;
+        let observation =
+            if chain.last().map(|v| v.claims.transition.as_str()) == Some("unit_created") {
+                self.systemd.inspect(&runtime.unit_name)?
+            } else {
+                match self.systemd.start_transient(&spec) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        self.journal.mark_uncertain(&ticket.claims.ticket_id)?;
+                        return Err(e);
+                    }
+                }
+            };
+        if chain.is_empty() {
+            let created = self.receipt(
+                &ticket,
+                &request,
+                "unit_created",
+                Some(&observation),
+                3,
+                None,
+            )?;
+            self.journal.record_effect_boundary(
+                &ticket.claims.ticket_id,
+                &created,
+                "starting",
+                observation.invocation_id.as_deref(),
+                observation.main_pid,
+                false,
+            )?;
+            chain.push(created);
+        }
+        let receipt = self.receipt(&ticket, &request, "running", Some(&observation), 4, None)?;
         self.journal.complete_effect(
             &ticket.claims.ticket_id,
             &receipt,
@@ -542,7 +577,8 @@ impl<M: SystemdManager> HelperEngine<M> {
             observation.invocation_id.as_deref(),
             observation.main_pid,
         )?;
-        Ok(HelperResponse::Receipt(receipt))
+        chain.push(receipt);
+        Ok(HelperResponse::Receipts(chain))
     }
     fn inspect(&self, target: ControlTarget) -> Result<HelperResponse> {
         let runtime = self.exact_target(&target)?;
@@ -597,6 +633,11 @@ impl<M: SystemdManager> HelperEngine<M> {
                 ));
             }
             EffectDisposition::Reserved(_) => {}
+            EffectDisposition::InProgress(_) => {
+                return Err(HelperError::RecoveryRequired(
+                    "input boundary incomplete".into(),
+                ));
+            }
         }
         let source = File::from(descriptors.remove(0));
         let mut data = Vec::new();
@@ -689,6 +730,11 @@ impl<M: SystemdManager> HelperEngine<M> {
                 ));
             }
             EffectDisposition::Reserved(_) => {}
+            EffectDisposition::InProgress(_) => {
+                return Err(HelperError::RecoveryRequired(
+                    "resize boundary incomplete".into(),
+                ));
+            }
         }
         let client = crate::SeqpacketClient::connect(
             &self
@@ -755,6 +801,11 @@ impl<M: SystemdManager> HelperEngine<M> {
                 ));
             }
             EffectDisposition::Reserved(_) => {}
+            EffectDisposition::InProgress(_) => {
+                return Err(HelperError::RecoveryRequired(
+                    "control boundary incomplete".into(),
+                ));
+            }
         }
         let result = match operation {
             PrivilegedOperation::Pause => self.systemd.pause(&runtime.unit_name),
@@ -1087,7 +1138,20 @@ pub fn control_target_digest(target: &ControlTarget) -> Result<String> {
 }
 fn decode_receipt(value: Option<Vec<u8>>) -> Result<HelperResponse> {
     let value = value.ok_or_else(|| HelperError::RecoveryRequired("receipt missing".into()))?;
-    Ok(HelperResponse::Receipt(serde_json::from_slice(&value)?))
+    if let Ok(chain) = serde_json::from_slice::<Vec<HelperReceipt>>(&value) {
+        Ok(HelperResponse::Receipts(chain))
+    } else {
+        Ok(HelperResponse::Receipt(serde_json::from_slice(&value)?))
+    }
+}
+fn decode_receipt_chain(value: Option<Vec<u8>>) -> Result<Vec<HelperReceipt>> {
+    let value =
+        value.ok_or_else(|| HelperError::RecoveryRequired("receipt chain missing".into()))?;
+    if let Ok(chain) = serde_json::from_slice::<Vec<HelperReceipt>>(&value) {
+        Ok(chain)
+    } else {
+        Ok(vec![serde_json::from_slice(&value)?])
+    }
 }
 fn process_start(pid: u32) -> Result<String> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat"))?;
@@ -1264,10 +1328,19 @@ mod tests {
                 vec![],
             )
             .unwrap();
-        let HelperResponse::Receipt(prepared) = prepared else {
+        let HelperResponse::Receipts(prepared) = prepared else {
             panic!()
         };
-        prepared.verify(receipt_key.as_bytes()).unwrap();
+        assert_eq!(
+            prepared
+                .iter()
+                .map(|v| v.claims.transition.as_str())
+                .collect::<Vec<_>>(),
+            vec!["admitted", "prepared"]
+        );
+        for receipt in &prepared {
+            receipt.verify(receipt_key.as_bytes()).unwrap()
+        }
         let start = ticket(
             &engine,
             &issuer,
@@ -1276,12 +1349,21 @@ mod tests {
             "ptkt_start0001",
         );
         let response = engine.start(start.clone(), plan.digest().unwrap()).unwrap();
-        let HelperResponse::Receipt(started) = response else {
+        let HelperResponse::Receipts(started) = response else {
             panic!()
         };
-        started.verify(receipt_key.as_bytes()).unwrap();
+        assert_eq!(
+            started
+                .iter()
+                .map(|v| v.claims.transition.as_str())
+                .collect::<Vec<_>>(),
+            vec!["unit_created", "running"]
+        );
+        for receipt in &started {
+            receipt.verify(receipt_key.as_bytes()).unwrap()
+        }
         let replay = engine.start(start, plan.digest().unwrap()).unwrap();
-        assert_eq!(replay, HelperResponse::Receipt(started));
+        assert_eq!(replay, HelperResponse::Receipts(started));
     }
     #[test]
     fn systemd_failure_becomes_uncertain_and_is_not_repeated() {

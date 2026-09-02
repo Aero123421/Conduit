@@ -279,6 +279,9 @@ impl HelperClient {
     pub fn receipt(&self, request: &HelperRequest, descriptors: &[RawFd]) -> Result<HelperReceipt> {
         match self.call(request, descriptors)? {
             HelperResponse::Receipt(v) => Ok(v),
+            HelperResponse::Receipts(mut values) => values
+                .pop()
+                .ok_or_else(|| HelperError::RecoveryRequired("empty receipt chain".into())),
             HelperResponse::Error { code, .. } => Err(HelperError::Denied(code)),
             _ => Err(HelperError::Protocol(
                 conduit_privileged_protocol::ProtocolError::Invalid("receipt response".into()),

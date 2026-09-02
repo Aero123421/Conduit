@@ -25,6 +25,7 @@ pub struct JournalEffect {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EffectDisposition {
     Reserved(JournalEffect),
+    InProgress(JournalEffect),
     Replay(JournalEffect),
     Uncertain(JournalEffect),
 }
@@ -217,6 +218,24 @@ impl HelperJournal {
         invocation_id: Option<&str>,
         main_pid: Option<u32>,
     ) -> Result<()> {
+        self.record_effect_boundary(
+            ticket_id,
+            receipt,
+            runtime_state,
+            invocation_id,
+            main_pid,
+            true,
+        )
+    }
+    pub fn record_effect_boundary(
+        &self,
+        ticket_id: &str,
+        receipt: &HelperReceipt,
+        runtime_state: &str,
+        invocation_id: Option<&str>,
+        main_pid: Option<u32>,
+        final_boundary: bool,
+    ) -> Result<()> {
         let encoded = serde_jcs::to_vec(receipt)?;
         if encoded.len() > MAX_RECORD_BYTES {
             return Err(HelperError::Journal("receipt exceeds bound".into()));
@@ -230,10 +249,22 @@ impl HelperJournal {
             .ok_or_else(|| HelperError::Journal("effect admission missing".into()))?;
         match effect.state.as_str() {
             "reserved" => {
+                let mut chain = decode_chain(effect.receipt.as_deref())?;
+                if let Some(existing) = chain
+                    .iter()
+                    .find(|value| value.claims.state_revision == receipt.claims.state_revision)
+                {
+                    if existing == receipt {
+                        return Ok(());
+                    }
+                    return Err(HelperError::Denied("receipt_boundary_conflict".into()));
+                }
+                chain.push(receipt.clone());
+                let encoded_chain = serde_jcs::to_vec(&chain)?;
                 transaction
                     .execute(
-                        "UPDATE effects SET state='complete',receipt=?2,updated_at=unixepoch() WHERE ticket_id=?1 AND state='reserved'",
-                        params![ticket_id, encoded],
+                        "UPDATE effects SET state=?3,receipt=?2,updated_at=unixepoch() WHERE ticket_id=?1 AND state='reserved'",
+                        params![ticket_id, encoded_chain,if final_boundary{"complete"}else{"reserved"}],
                     )
                     .map_err(sql_error)?;
             }
@@ -443,7 +474,20 @@ fn verify_effect_identity(
 fn disposition(effect: JournalEffect) -> EffectDisposition {
     match effect.state.as_str() {
         "complete" => EffectDisposition::Replay(effect),
+        "reserved" if effect.receipt.is_some() => EffectDisposition::InProgress(effect),
         _ => EffectDisposition::Uncertain(effect),
+    }
+}
+fn decode_chain(bytes: Option<&[u8]>) -> Result<Vec<HelperReceipt>> {
+    match bytes {
+        None => Ok(vec![]),
+        Some(value) => {
+            if let Ok(chain) = serde_json::from_slice::<Vec<HelperReceipt>>(value) {
+                Ok(chain)
+            } else {
+                Ok(vec![serde_json::from_slice::<HelperReceipt>(value)?])
+            }
+        }
     }
 }
 

@@ -258,7 +258,7 @@ fn never_denied() {
     let (runtime, bundle, issuer) = connect("full-device-live-node-never-denied");
     let provider = runtime.provider();
     let (plan, request) = case_plan(
-        "never-denied",
+        "never_denied",
         existing(&["/usr/bin/sleep", "/bin/sleep"]),
         vec!["sleep".into(), "30".into()],
         StdioMode::Pipes,
@@ -320,7 +320,7 @@ fn never_allowed() {
     let (runtime, bundle, issuer) = connect("full-device-live-node-never-allowed");
     let provider = runtime.provider();
     let (plan, request) = case_plan(
-        "never-allowed",
+        "never_allowed",
         existing(&["/usr/bin/sleep", "/bin/sleep"]),
         vec!["sleep".into(), "30".into()],
         StdioMode::Pipes,

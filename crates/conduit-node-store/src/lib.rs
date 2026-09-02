@@ -1414,19 +1414,18 @@ impl NodeStore {
             .map_or(1, |receipt| receipt.state_revision + 1);
         let expected_previous = last.as_ref().map(|receipt| receipt.receipt_digest.as_str());
         if state_revision != expected_revision || previous_receipt_digest != expected_previous {
-            if let Some(existing) = query_privileged_receipt(&transaction, receipt_digest)? {
-                if existing.idempotency_key == idempotency_key
-                    && existing.ticket_id == ticket_id
-                    && existing.ticket_digest == ticket_digest
-                    && existing.runtime_id == runtime_id
-                    && existing.state_revision == state_revision
-                    && existing.transition == transition
-                    && existing.previous_receipt_digest.as_deref() == previous_receipt_digest
-                    && existing.signed_receipt == signed_receipt
-                {
-                    transaction.commit().map_err(map_sql)?;
-                    return Ok(existing);
-                }
+            if let Some(existing) = query_privileged_receipt(&transaction, receipt_digest)?
+                && existing.idempotency_key == idempotency_key
+                && existing.ticket_id == ticket_id
+                && existing.ticket_digest == ticket_digest
+                && existing.runtime_id == runtime_id
+                && existing.state_revision == state_revision
+                && existing.transition == transition
+                && existing.previous_receipt_digest.as_deref() == previous_receipt_digest
+                && existing.signed_receipt == signed_receipt
+            {
+                transaction.commit().map_err(map_sql)?;
+                return Ok(existing);
             }
             return Err(StoreError::SequenceConflict);
         }

@@ -4,19 +4,19 @@ use crate::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use conduit_privileged_protocol::{
-    CapabilityClaims, ChallengeClaims, ControlTarget, HelperReceipt, HelperRequest, HelperResponse,
-    LocalExecutionPlan, PROTOCOL, PrivilegeTicket, PrivilegedOperation, ReceiptClaims, RootPolicy,
-    SignedClaims,
+    CapabilityClaims, ChallengeClaims, ControlTarget, CredentialDescriptor, HelperReceipt,
+    HelperRequest, HelperResponse, LocalExecutionPlan, PROTOCOL, PrivilegeTicket,
+    PrivilegedOperation, ReceiptClaims, RootPolicy, SignedClaims,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::{
-        fd::OwnedFd,
+        fd::{AsRawFd, OwnedFd},
         unix::{
             ffi::OsStrExt,
             fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -26,6 +26,7 @@ use std::{
     sync::Mutex,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use zeroize::Zeroizing;
 
 #[derive(Clone)]
 pub struct PinnedTicketKeys(pub BTreeMap<String, [u8; 32]>);
@@ -525,8 +526,13 @@ impl<M: SystemdManager> HelperEngine<M> {
         descriptors: Vec<OwnedFd>,
     ) -> Result<HelperResponse> {
         self.validate_ticket(&ticket, PrivilegedOperation::Prepare, Some(&plan))?;
-        if descriptors.len() != plan.credentials.len() {
-            return Err(HelperError::Denied("credential_descriptor_count".into()));
+        let credential_payloads = validate_credential_descriptors(&plan, &descriptors)?;
+        for workspace in &plan.workspaces {
+            let identity =
+                crate::capture_file_identity(Path::new(&workspace.opaque_path_id), false)?;
+            if identity.sha256 != workspace.expected_identity_digest {
+                return Err(HelperError::Denied("workspace_identity_changed".into()));
+            }
         }
         let ticket_digest = ticket.digest()?;
         let request = request_digest(&HelperRequest::Prepare {
@@ -568,39 +574,11 @@ impl<M: SystemdManager> HelperEngine<M> {
             .join("runtimes")
             .join(&plan.runtime_id);
         fs::create_dir_all(&runtime_dir)?;
-        for workspace in &plan.workspaces {
-            let identity =
-                crate::capture_file_identity(Path::new(&workspace.opaque_path_id), false)?;
-            if identity.sha256 != workspace.expected_identity_digest {
-                return Err(HelperError::Denied("workspace_identity_changed".into()));
-            }
-        }
         if !plan.credentials.is_empty() {
             let credential_dir = runtime_dir.join("credentials");
             fs::create_dir_all(&credential_dir)?;
             fs::set_permissions(&credential_dir, fs::Permissions::from_mode(0o700))?;
-            for credential in &plan.credentials {
-                let index = credential.descriptor_index as usize;
-                if index >= descriptors.len()
-                    || credential.size > 1024 * 1024
-                    || credential.target_name.is_empty()
-                    || credential.target_name.len() > 128
-                    || !credential
-                        .target_name
-                        .bytes()
-                        .all(|v| v.is_ascii_alphanumeric() || matches!(v, b'_' | b'-' | b'.'))
-                {
-                    return Err(HelperError::Denied("credential_descriptor_invalid".into()));
-                }
-                let duplicate = descriptors[index].try_clone()?;
-                let source = File::from(duplicate);
-                let mut bytes = Vec::new();
-                source.take(credential.size + 1).read_to_end(&mut bytes)?;
-                if bytes.len() as u64 != credential.size
-                    || hex::encode(Sha256::digest(&bytes)) != credential.sha256
-                {
-                    return Err(HelperError::Denied("credential_projection_mismatch".into()));
-                }
+            for (credential, bytes) in &credential_payloads {
                 let path = credential_dir.join(&credential.target_name);
                 let mut file = OpenOptions::new()
                     .write(true)
@@ -609,7 +587,6 @@ impl<M: SystemdManager> HelperEngine<M> {
                     .open(path)?;
                 file.write_all(&bytes)?;
                 file.sync_all()?;
-                bytes.fill(0)
             }
         }
         for name in ["stdout.spool", "stderr.spool"] {
@@ -1120,9 +1097,26 @@ impl<M: SystemdManager> HelperEngine<M> {
         ticket: &PrivilegeTicket,
         runtime: &crate::RuntimeRecord,
     ) -> Result<()> {
-        if ticket.claims.runtime_id != runtime.runtime_id
-            || ticket.claims.run_id != runtime.run_id
-            || ticket.claims.local_execution_plan_digest != runtime.plan_digest
+        let current = &ticket.claims;
+        let admitted = &runtime.authority_ticket.claims;
+        if current.runtime_id != runtime.runtime_id
+            || current.run_id != runtime.run_id
+            || current.operation_id != runtime.operation_id
+            || current.local_execution_plan_digest != runtime.plan_digest
+            || current.operation_request_digest != admitted.operation_request_digest
+            || current.run_manifest_digest != admitted.run_manifest_digest
+            || current.runtime_spec_digest != admitted.runtime_spec_digest
+            || current.launch_plan_digest != admitted.launch_plan_digest
+            || current.device_policy_revision != admitted.device_policy_revision
+            || current.device_revision != admitted.device_revision
+            || current.connector_policy_id != admitted.connector_policy_id
+            || current.connector_policy_revision != admitted.connector_policy_revision
+            || current.project_id != admitted.project_id
+            || current.project_revision != admitted.project_revision
+            || current.assignment_id != admitted.assignment_id
+            || current.project_agent_id != admitted.project_agent_id
+            || current.project_agent_revision != admitted.project_agent_revision
+            || current.runtime_configuration_revision != admitted.runtime_configuration_revision
         {
             return Err(HelperError::Denied("ticket_runtime_mismatch".into()));
         }
@@ -1154,6 +1148,10 @@ impl<M: SystemdManager> HelperEngine<M> {
         ticket.verify(key)?;
         let c = &ticket.claims;
         c.validate(&ticket.key_id)?;
+        let ticket_digest = ticket.digest()?;
+        let already_admitted = self
+            .journal
+            .has_admitted_ticket(&c.ticket_id, &ticket_digest)?;
         let now = OffsetDateTime::now_utc();
         let not_before = parse_time(&c.issued_at)?;
         let expires_at = parse_time(&c.expires_at)?;
@@ -1180,8 +1178,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             || c.allowed_operation != operation
             || !self.config.policy.enabled
             || !self.config.policy.allowed_operations.contains(&operation)
-            || now < not_before
-            || now > expires_at
+            || ((now < not_before || now > expires_at) && !already_admitted)
             || expires_at - not_before > time::Duration::minutes(10)
             || c.access_scope != "full_device"
             || (c.approval_mode == "never" && !self.config.policy.allow_never)
@@ -1380,6 +1377,72 @@ fn within_ceilings(
         && le(requested.tasks_max, policy.tasks_max)
         && le(requested.io_weight, policy.io_weight)
         && le(requested.runtime_max_usec, policy.runtime_max_usec)
+}
+
+fn validate_credential_descriptors(
+    plan: &LocalExecutionPlan,
+    descriptors: &[OwnedFd],
+) -> Result<Vec<(CredentialDescriptor, Zeroizing<Vec<u8>>)>> {
+    if descriptors.len() != plan.credentials.len() {
+        return Err(HelperError::Denied("credential_descriptor_count".into()));
+    }
+    let mut indices = BTreeSet::new();
+    let mut target_names = BTreeSet::new();
+    let mut payloads = Vec::with_capacity(plan.credentials.len());
+    for credential in &plan.credentials {
+        let index = credential.descriptor_index as usize;
+        if index >= descriptors.len()
+            || !indices.insert(index)
+            || !target_names.insert(credential.target_name.clone())
+            || !credential.read_only
+            || credential.revision == 0
+            || credential.size > 1024 * 1024
+            || !valid_sha256(&credential.sha256)
+            || credential.target_name.is_empty()
+            || credential.target_name.len() > 128
+            || !credential
+                .target_name
+                .bytes()
+                .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-' | b'.'))
+            || matches!(credential.target_name.as_str(), "." | "..")
+        {
+            return Err(HelperError::Denied("credential_descriptor_invalid".into()));
+        }
+        let raw = descriptors[index].as_raw_fd();
+        let mut status = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe { libc::fstat(raw, status.as_mut_ptr()) } != 0 {
+            return Err(HelperError::Io(std::io::Error::last_os_error()));
+        }
+        let status = unsafe { status.assume_init() };
+        if status.st_mode & libc::S_IFMT != libc::S_IFREG
+            || status.st_size < 0
+            || status.st_size as u64 != credential.size
+            || unsafe { libc::fcntl(raw, libc::F_GETFD) } & libc::FD_CLOEXEC == 0
+            || unsafe { libc::lseek(raw, 0, libc::SEEK_CUR) } != 0
+        {
+            return Err(HelperError::Denied("credential_descriptor_invalid".into()));
+        }
+        let seals = unsafe { libc::fcntl(raw, libc::F_GET_SEALS) };
+        let required_seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        if seals < 0 || seals & required_seals != required_seals {
+            return Err(HelperError::Denied("credential_descriptor_unsealed".into()));
+        }
+        let duplicate = descriptors[index].try_clone()?;
+        let mut source = File::from(duplicate);
+        source.seek(SeekFrom::Start(0))?;
+        let mut bytes = Zeroizing::new(Vec::with_capacity(credential.size as usize));
+        source
+            .take(credential.size + 1)
+            .read_to_end(bytes.as_mut())?;
+        if bytes.len() as u64 != credential.size
+            || hex::encode(Sha256::digest(bytes.as_slice())) != credential.sha256
+        {
+            return Err(HelperError::Denied("credential_projection_mismatch".into()));
+        }
+        payloads.push((credential.clone(), bytes));
+    }
+    Ok(payloads)
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -1684,6 +1747,103 @@ mod tests {
         }
         let replay = engine.start(start, plan.digest().unwrap()).unwrap();
         assert_eq!(replay, HelperResponse::Receipts(started));
+    }
+
+    #[test]
+    fn expired_ticket_replays_only_after_exact_durable_admission() {
+        let (engine, _backend, plan, issuer, _receipt_key) = setup();
+        let base = ticket(
+            &engine,
+            &issuer,
+            &plan,
+            PrivilegedOperation::Prepare,
+            "ptkt_expired_replay",
+        );
+        let now = OffsetDateTime::now_utc();
+        let mut claims = base.claims;
+        claims.issued_at = (now - time::Duration::minutes(2)).format(&Rfc3339).unwrap();
+        claims.expires_at = (now - time::Duration::minutes(1)).format(&Rfc3339).unwrap();
+        let expired = SignedClaims::sign(base.key_id, claims, &issuer).unwrap();
+        assert!(matches!(
+            engine.prepare(expired.clone(), plan.clone(), vec![]),
+            Err(HelperError::Denied(reason)) if reason == "privilege_ticket_invalid"
+        ));
+
+        let request = request_digest(&HelperRequest::Prepare {
+            ticket: expired.clone(),
+            plan: plan.clone(),
+        })
+        .unwrap();
+        engine
+            .journal
+            .admit_prepare(
+                &expired,
+                &expired.digest().unwrap(),
+                &request,
+                &plan.digest().unwrap(),
+                &plan,
+            )
+            .unwrap();
+        let admitted = engine
+            .receipt(&expired, &request, "admitted", None, 1)
+            .unwrap();
+        engine
+            .journal
+            .record_effect_boundary(
+                &expired.claims.ticket_id,
+                &admitted,
+                "admitted",
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let replay = engine.prepare(expired, plan, vec![]).unwrap();
+        assert!(matches!(replay, HelperResponse::Receipts(ref values) if values.len() == 2));
+    }
+
+    #[test]
+    fn credential_projection_requires_exact_sealed_memfd() {
+        use std::os::fd::FromRawFd;
+
+        let (_engine, _backend, mut plan, _issuer, _receipt_key) = setup();
+        let secret = b"bounded-test-secret";
+        let name = std::ffi::CString::new("conduit-credential-test").unwrap();
+        let raw = unsafe {
+            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        };
+        assert!(raw >= 0);
+        let mut file = unsafe { File::from_raw_fd(raw) };
+        file.write_all(secret).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        plan.credentials = vec![CredentialDescriptor {
+            projection_id: "cred_test".into(),
+            revision: 1,
+            target_name: "token.json".into(),
+            descriptor_index: 0,
+            size: secret.len() as u64,
+            sha256: hex::encode(Sha256::digest(secret)),
+            read_only: true,
+        }];
+        assert!(matches!(
+            validate_credential_descriptors(&plan, &[file.try_clone().unwrap().into()]),
+            Err(HelperError::Denied(reason)) if reason == "credential_descriptor_unsealed"
+        ));
+        let seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        assert_eq!(
+            unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) },
+            0
+        );
+        let payloads =
+            validate_credential_descriptors(&plan, &[file.try_clone().unwrap().into()]).unwrap();
+        assert_eq!(payloads[0].1.as_slice(), secret);
+
+        file.seek(SeekFrom::End(0)).unwrap();
+        assert!(matches!(
+            validate_credential_descriptors(&plan, &[file.into()]),
+            Err(HelperError::Denied(reason)) if reason == "credential_descriptor_invalid"
+        ));
     }
     #[test]
     fn systemd_failure_becomes_uncertain_and_is_not_repeated() {

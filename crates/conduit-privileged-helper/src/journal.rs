@@ -97,6 +97,18 @@ impl HelperJournal {
         integrity(&connection)
     }
 
+    /// Returns true only when this exact signed ticket was already placed in
+    /// durable custody. This permits an identical retry to replay after the
+    /// ticket's wall-clock expiry without extending authority to a different
+    /// request (the effect identity is checked again by `reserve_effect`).
+    pub fn has_admitted_ticket(&self, ticket_id: &str, ticket_digest: &str) -> Result<bool> {
+        let connection = self.lock()?;
+        let existing = query_effect(&connection, ticket_id)?;
+        Ok(existing
+            .as_ref()
+            .is_some_and(|effect| effect.ticket_digest == ticket_digest))
+    }
+
     pub fn admit_prepare(
         &self,
         ticket: &PrivilegeTicket,

@@ -96,7 +96,11 @@ fn registration() {
     };
     let issuer_id = key_id("pkey", issuer.verifying_key().as_bytes());
     let fingerprint = hex::encode(Sha256::digest(issuer.verifying_key().as_bytes()));
-    let public_jwk = json!({"kty":"OKP","crv":"Ed25519","x":URL_SAFE_NO_PAD.encode(issuer.verifying_key().as_bytes())});
+    let public_jwk = json!({
+        "kty":"OKP","crv":"Ed25519",
+        "x":URL_SAFE_NO_PAD.encode(issuer.verifying_key().as_bytes()),
+        "kid":issuer_id
+    });
     write_json(&evidence.join("issuer-public-jwk.json"), &public_jwk);
     write_json(
         &evidence.join("issuer-public-key.json"),

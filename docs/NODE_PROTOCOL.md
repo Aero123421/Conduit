@@ -59,6 +59,8 @@ Limits:
 
 A frame above the limit is rejected before JSON decoding where the runtime permits it. Oversized or malformed frames never become public adapter text.
 
+The shared implementations enforce this boundary in Rust with `ValidatedDocument::<NodeProtocolV1>::from_slice` and in TypeScript with `parseWireDocumentText(schemaIds.nodeV1, textOrBytes)`. `parseWireDocument` operates on an already-decoded value and does not enforce encoded size.
+
 ## Protocol version
 
 The initial version is:

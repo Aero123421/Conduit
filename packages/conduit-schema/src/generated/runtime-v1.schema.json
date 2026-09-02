@@ -1,0 +1,700 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conduit.dev/spec/schemas/runtime-v1.schema.json",
+  "title": "Conduit Runtime Provider contract v1",
+  "description": "Runtime request, capabilities, preparation, state, snapshot, collection, destroy, and reconciliation receipts.",
+  "oneOf": [
+    { "$ref": "#/$defs/RuntimeRequest" },
+    { "$ref": "#/$defs/CapabilityReceipt" },
+    { "$ref": "#/$defs/PreparedRuntimeReceipt" },
+    { "$ref": "#/$defs/RuntimeStateReceipt" },
+    { "$ref": "#/$defs/SnapshotReceipt" },
+    { "$ref": "#/$defs/CollectionReceipt" },
+    { "$ref": "#/$defs/DestroyReceipt" },
+    { "$ref": "#/$defs/RuntimeReconciliationReceipt" }
+  ],
+  "$defs": {
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "U64Decimal": {
+      "type": "string",
+      "pattern": "^(0|[1-9][0-9]{0,19})$"
+    },
+    "Sha256Hex": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "RunId": {
+      "type": "string",
+      "pattern": "^(run|lrun)_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "RuntimeId": {
+      "type": "string",
+      "pattern": "^rt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "SourceId": {
+      "type": "string",
+      "pattern": "^src_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "LocationId": {
+      "type": "string",
+      "pattern": "^loc_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ArtifactId": {
+      "type": "string",
+      "pattern": "^art_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "CredentialProfileId": {
+      "type": "string",
+      "pattern": "^cred_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "SnapshotId": {
+      "type": "string",
+      "pattern": "^snap_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "CollectionId": {
+      "type": "string",
+      "pattern": "^collect_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "RuntimeKind": {
+      "type": "string",
+      "enum": ["native", "restricted_native", "container", "vm"]
+    },
+    "AccessScope": {
+      "type": "string",
+      "enum": ["read_only", "selected_sources", "project_full", "full_user", "full_device", "custom"]
+    },
+    "ApprovalMode": {
+      "type": "string",
+      "enum": ["always", "outside_scope", "risk_classes", "never"]
+    },
+    "RuntimeState": {
+      "type": "string",
+      "enum": [
+        "planned",
+        "preparing",
+        "prepared",
+        "starting",
+        "running",
+        "paused",
+        "stopping",
+        "stopped",
+        "failed",
+        "lost",
+        "uncertain",
+        "recovery_required",
+        "destroying",
+        "destroyed"
+      ]
+    },
+    "CapabilityState": {
+      "type": "string",
+      "enum": ["supported", "effective", "degraded", "unavailable"]
+    },
+    "EvidenceLevel": {
+      "type": "string",
+      "enum": ["explicit", "observed", "inferred", "unknown"]
+    },
+    "WorkspaceMode": {
+      "type": "string",
+      "enum": ["read_only", "direct", "worktree", "managed_copy"]
+    },
+    "NetworkMode": {
+      "type": "string",
+      "enum": ["open", "restricted", "offline", "lan_explicit"]
+    },
+    "CredentialProjectionType": {
+      "type": "string",
+      "enum": ["native_host", "read_only_file", "ephemeral_file", "environment", "agent_socket", "guest_volume", "login_required"]
+    },
+    "OpaquePathReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference", "displayPath"],
+      "properties": {
+        "reference": { "type": "string", "pattern": "^pathref_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "displayPath": { "type": "string", "minLength": 1, "maxLength": 512 }
+      }
+    },
+    "ResourceRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu", "memoryBytes", "pidLimit", "storageBytes", "gpuCount"],
+      "properties": {
+        "cpu": { "type": "number", "minimum": 0, "maximum": 1024 },
+        "memoryBytes": { "type": "integer", "minimum": 0 },
+        "pidLimit": { "type": "integer", "minimum": 0, "maximum": 1048576 },
+        "storageBytes": { "type": "integer", "minimum": 0 },
+        "gpuCount": { "type": "integer", "minimum": 0, "maximum": 64 },
+        "gpuSelectors": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "type": "string", "maxLength": 256 }
+        }
+      }
+    },
+    "ResourceValue": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requested", "state"],
+      "properties": {
+        "requested": { "type": "number", "minimum": 0 },
+        "reserved": { "type": "number", "minimum": 0 },
+        "hardLimit": { "type": "number", "minimum": 0 },
+        "softLimit": { "type": "number", "minimum": 0 },
+        "observed": { "type": "number", "minimum": 0 },
+        "unit": { "type": "string", "maxLength": 32 },
+        "state": { "enum": ["effective", "degraded", "unsupported", "unknown"] },
+        "reasonCode": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" }
+      }
+    },
+    "ResourceReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cpu", "memoryBytes", "pidLimit", "storageBytes", "gpuCount"],
+      "properties": {
+        "cpu": { "$ref": "#/$defs/ResourceValue" },
+        "memoryBytes": { "$ref": "#/$defs/ResourceValue" },
+        "pidLimit": { "$ref": "#/$defs/ResourceValue" },
+        "storageBytes": { "$ref": "#/$defs/ResourceValue" },
+        "gpuCount": { "$ref": "#/$defs/ResourceValue" }
+      }
+    },
+    "NetworkPolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode"],
+      "properties": {
+        "mode": { "$ref": "#/$defs/NetworkMode" },
+        "allowedDomains": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": { "type": "string", "maxLength": 253 }
+        },
+        "allowedCidrs": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": { "type": "string", "maxLength": 64 }
+        },
+        "allowedLanTargets": {
+          "type": "array",
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": { "type": "string", "maxLength": 256 }
+        },
+        "publishedPorts": {
+          "type": "array",
+          "maxItems": 128,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["guestPort", "protocol"],
+            "properties": {
+              "guestPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+              "hostPort": { "type": "integer", "minimum": 0, "maximum": 65535 },
+              "protocol": { "enum": ["tcp", "udp"] },
+              "bind": { "enum": ["loopback", "lan", "public"] }
+            }
+          }
+        }
+      }
+    },
+    "WorkspaceAttachment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceId",
+        "locationId",
+        "locationRevision",
+        "workspaceMode",
+        "hostPath",
+        "guestPath",
+        "access",
+        "contentDigest",
+        "cleanupPolicy"
+      ],
+      "properties": {
+        "sourceId": { "$ref": "#/$defs/SourceId" },
+        "locationId": { "$ref": "#/$defs/LocationId" },
+        "locationRevision": { "type": "integer", "minimum": 1 },
+        "workspaceMode": { "$ref": "#/$defs/WorkspaceMode" },
+        "hostPath": { "$ref": "#/$defs/OpaquePathReference" },
+        "guestPath": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "access": { "enum": ["read_only", "read_write"] },
+        "ownershipMode": { "enum": ["host", "mapped", "guest", "managed"] },
+        "contentDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "cleanupPolicy": { "enum": ["retain", "remove_on_terminal", "archive", "manual"] }
+      }
+    },
+    "WorkspaceAttachmentReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceId",
+        "locationId",
+        "workspaceMode",
+        "mechanism",
+        "access",
+        "effective",
+        "contentDigest"
+      ],
+      "properties": {
+        "sourceId": { "$ref": "#/$defs/SourceId" },
+        "locationId": { "$ref": "#/$defs/LocationId" },
+        "workspaceMode": { "$ref": "#/$defs/WorkspaceMode" },
+        "mechanism": { "enum": ["direct", "bind_mount", "virtiofs", "9p", "managed_volume", "copy", "sync"] },
+        "access": { "enum": ["read_only", "read_write"] },
+        "effective": { "type": "boolean" },
+        "contentDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "consistency": { "enum": ["live", "snapshot", "copy_in_copy_out", "unknown"] },
+        "reasonCode": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" }
+      }
+    },
+    "CredentialProjectionDescriptor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profileId",
+        "revision",
+        "adapterId",
+        "projectionType",
+        "targetReference",
+        "access",
+        "lifetime",
+        "persistChanges"
+      ],
+      "properties": {
+        "profileId": { "$ref": "#/$defs/CredentialProfileId" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "adapterId": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "projectionType": { "$ref": "#/$defs/CredentialProjectionType" },
+        "targetReference": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "access": { "enum": ["read_only", "read_write"] },
+        "lifetime": { "enum": ["operation", "run", "runtime", "project"] },
+        "persistChanges": { "type": "boolean" }
+      }
+    },
+    "CredentialProjectionReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "profileId",
+        "revision",
+        "adapterId",
+        "projectionType",
+        "targetReference",
+        "access",
+        "lifetime",
+        "persistChanges",
+        "state",
+        "evidenceLevel"
+      ],
+      "properties": {
+        "profileId": { "$ref": "#/$defs/CredentialProfileId" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "adapterId": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "projectionType": { "$ref": "#/$defs/CredentialProjectionType" },
+        "targetReference": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "access": { "enum": ["read_only", "read_write"] },
+        "lifetime": { "enum": ["operation", "run", "runtime", "project"] },
+        "persistChanges": { "type": "boolean" },
+        "state": { "enum": ["effective", "degraded", "unavailable", "login_required"] },
+        "evidenceLevel": { "$ref": "#/$defs/EvidenceLevel" },
+        "reasonCode": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" }
+      }
+    },
+    "LifecyclePolicy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["onTerminal", "archiveAfterSeconds", "destroyAfterSeconds"],
+      "properties": {
+        "onTerminal": { "enum": ["retain_running", "stop", "pause", "snapshot_and_stop", "destroy_after_collect"] },
+        "archiveAfterSeconds": { "type": "integer", "minimum": 0, "maximum": 31536000 },
+        "destroyAfterSeconds": { "type": "integer", "minimum": 0, "maximum": 315360000 },
+        "pinned": { "type": "boolean" }
+      }
+    },
+    "RequiredCapability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capabilityId", "requirement"],
+      "properties": {
+        "capabilityId": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "requirement": { "enum": ["required", "preferred", "optional"] }
+      }
+    },
+    "CapabilityEvidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capabilityId",
+        "state",
+        "evidenceLevel",
+        "evidenceSource",
+        "observedAt"
+      ],
+      "properties": {
+        "capabilityId": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "state": { "$ref": "#/$defs/CapabilityState" },
+        "evidenceLevel": { "$ref": "#/$defs/EvidenceLevel" },
+        "evidenceSource": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "observedAt": { "$ref": "#/$defs/Timestamp" },
+        "reasonCode": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "details": {
+          "type": "object",
+          "maxProperties": 32,
+          "additionalProperties": {
+            "type": ["string", "integer", "number", "boolean", "null"]
+          }
+        }
+      }
+    },
+    "CapabilityReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "providerId",
+        "providerVersion",
+        "runtimeKind",
+        "hostDigest",
+        "capabilities",
+        "receiptDigest",
+        "observedAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "runtime_capability_receipt" },
+        "providerId": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "providerVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "runtimeKind": { "$ref": "#/$defs/RuntimeKind" },
+        "hostDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "capabilities": {
+          "type": "array",
+          "maxItems": 512,
+          "items": { "$ref": "#/$defs/CapabilityEvidence" }
+        },
+        "receiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "observedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "LaunchPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["executableIdentityDigest", "argv", "workingDirectoryReference", "stdioMode", "identityClass", "launchDigest"],
+      "properties": {
+        "executableIdentityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "argv": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4096,
+          "items": { "type": "string", "maxLength": 32768 }
+        },
+        "workingDirectoryReference": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "environmentProjectionIds": {
+          "type": "array",
+          "maxItems": 256,
+          "uniqueItems": true,
+          "items": { "type": "string", "maxLength": 128 }
+        },
+        "stdioMode": { "enum": ["pipes", "pty", "detached"] },
+        "identityClass": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "adapterId": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "launchDigest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    },
+    "RuntimeRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "runtimeId",
+        "runId",
+        "runtimeKind",
+        "providerSelector",
+        "configurationRevision",
+        "requiredCapabilities",
+        "workspaceAttachments",
+        "credentialProjections",
+        "resources",
+        "network",
+        "environmentDigest",
+        "lifecycle",
+        "accessScope",
+        "approvalMode",
+        "requestDigest"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "runtime_request" },
+        "runtimeId": { "$ref": "#/$defs/RuntimeId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "runtimeKind": { "$ref": "#/$defs/RuntimeKind" },
+        "providerSelector": { "type": "string", "pattern": "^(auto|[a-z][a-z0-9_.-]{0,127})$" },
+        "configurationRevision": { "type": "integer", "minimum": 1 },
+        "requiredCapabilities": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/RequiredCapability" }
+        },
+        "workspaceAttachments": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/WorkspaceAttachment" }
+        },
+        "credentialProjections": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/CredentialProjectionDescriptor" }
+        },
+        "resources": { "$ref": "#/$defs/ResourceRequest" },
+        "network": { "$ref": "#/$defs/NetworkPolicy" },
+        "environmentDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "imageReference": { "type": "string", "maxLength": 512 },
+        "lifecycle": { "$ref": "#/$defs/LifecyclePolicy" },
+        "accessScope": { "$ref": "#/$defs/AccessScope" },
+        "approvalMode": { "$ref": "#/$defs/ApprovalMode" },
+        "providerOptions": {
+          "type": "object",
+          "maxProperties": 64
+        },
+        "requestDigest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    },
+    "PreparedRuntimeReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "runtimeId",
+        "runId",
+        "runtimeKind",
+        "providerId",
+        "providerVersion",
+        "specDigest",
+        "providerObjectId",
+        "providerObjectIdentityDigest",
+        "generation",
+        "state",
+        "capabilityReceiptDigest",
+        "workspaceAttachments",
+        "credentialProjections",
+        "resources",
+        "preparedStateDigest",
+        "preparedAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "prepared_runtime_receipt" },
+        "runtimeId": { "$ref": "#/$defs/RuntimeId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "runtimeKind": { "$ref": "#/$defs/RuntimeKind" },
+        "providerId": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "providerVersion": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "specDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "providerObjectId": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "providerObjectIdentityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "generation": { "$ref": "#/$defs/U64Decimal" },
+        "state": { "const": "prepared" },
+        "capabilityReceiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "workspaceAttachments": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/WorkspaceAttachmentReceipt" }
+        },
+        "credentialProjections": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "$ref": "#/$defs/CredentialProjectionReceipt" }
+        },
+        "resources": { "$ref": "#/$defs/ResourceReceipt" },
+        "warnings": {
+          "type": "array",
+          "maxItems": 128,
+          "items": { "type": "string", "maxLength": 256 }
+        },
+        "preparedStateDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "preparedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "RuntimeStateReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "runtimeId",
+        "runId",
+        "providerId",
+        "specDigest",
+        "generation",
+        "state",
+        "liveness",
+        "observedAt",
+        "receiptDigest"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "runtime_state_receipt" },
+        "runtimeId": { "$ref": "#/$defs/RuntimeId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "providerId": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "specDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "generation": { "$ref": "#/$defs/U64Decimal" },
+        "state": { "$ref": "#/$defs/RuntimeState" },
+        "liveness": { "enum": ["proven_live", "proven_stopped", "unknown"] },
+        "providerObjectIdentityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "processIdentityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "launchPlanDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "resources": { "$ref": "#/$defs/ResourceReceipt" },
+        "reasonCode": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "observedAt": { "$ref": "#/$defs/Timestamp" },
+        "receiptDigest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    },
+    "SnapshotReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "snapshotId",
+        "runtimeId",
+        "runId",
+        "providerId",
+        "runtimeSpecDigest",
+        "workspaceDigest",
+        "snapshotDigest",
+        "state",
+        "createdAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "snapshot_receipt" },
+        "snapshotId": { "$ref": "#/$defs/SnapshotId" },
+        "runtimeId": { "$ref": "#/$defs/RuntimeId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "providerId": { "type": "string", "maxLength": 128 },
+        "runtimeSpecDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "workspaceDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "snapshotDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "state": { "enum": ["created", "failed", "unsupported"] },
+        "storageClass": { "enum": ["hot", "archive", "backup"] },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "reasonCode": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "CollectionReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "collectionId",
+        "runtimeId",
+        "runId",
+        "state",
+        "workspaceCollected",
+        "traceFinalized",
+        "artifactIds",
+        "receiptDigest",
+        "collectedAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "collection_receipt" },
+        "collectionId": { "$ref": "#/$defs/CollectionId" },
+        "runtimeId": { "$ref": "#/$defs/RuntimeId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "state": { "enum": ["complete", "partial", "failed"] },
+        "workspaceCollected": { "type": "boolean" },
+        "traceFinalized": { "type": "boolean" },
+        "artifactIds": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ArtifactId" }
+        },
+        "uncollected": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "type": "string", "maxLength": 256 }
+        },
+        "receiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "collectedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "DestroyReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "runtimeId",
+        "runId",
+        "providerId",
+        "mode",
+        "previousState",
+        "state",
+        "providerObjectRemoved",
+        "receiptDigest",
+        "destroyedAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "destroy_receipt" },
+        "runtimeId": { "$ref": "#/$defs/RuntimeId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "providerId": { "type": "string", "maxLength": 128 },
+        "mode": { "enum": ["normal", "discard", "quarantine"] },
+        "previousState": { "$ref": "#/$defs/RuntimeState" },
+        "state": { "enum": ["destroyed", "quarantined", "blocked", "failed"] },
+        "providerObjectRemoved": { "type": "boolean" },
+        "reasonCode": { "type": "string", "maxLength": 128 },
+        "receiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "destroyedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "RuntimeReconciliationReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "runtimeId",
+        "runId",
+        "providerId",
+        "expectedSpecDigest",
+        "outcome",
+        "observedState",
+        "observedAt",
+        "receiptDigest"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "runtime_reconciliation_receipt" },
+        "runtimeId": { "$ref": "#/$defs/RuntimeId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "providerId": { "type": "string", "maxLength": 128 },
+        "expectedSpecDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "observedSpecDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "outcome": { "enum": ["running", "stopped", "lost", "uncertain", "recovery_required", "external"] },
+        "observedState": { "$ref": "#/$defs/RuntimeState" },
+        "providerObjectIdentityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "processIdentityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "reasonCode": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
+        "observedAt": { "$ref": "#/$defs/Timestamp" },
+        "receiptDigest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    }
+  }
+}

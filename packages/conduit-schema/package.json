@@ -1,0 +1,31 @@
+{
+  "name": "@conduit/schema",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": ["dist"],
+  "scripts": {
+    "generate:wire": "node scripts/generate-wire.mjs",
+    "check:wire": "node scripts/check-wire.mjs",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "ajv": "8.17.1",
+    "ajv-formats": "3.0.1",
+    "canonicalize": "2.1.0"
+  },
+  "devDependencies": {
+    "@types/node": "22.10.2",
+    "json-schema-to-typescript": "16.0.0",
+    "typescript": "5.7.2",
+    "vitest": "2.1.9"
+  }
+}

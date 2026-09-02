@@ -1,0 +1,17 @@
+{
+  "fixtureVersion": 1,
+  "schemaId": "https://conduit.dev/spec/schemas/node-protocol-v1.schema.json",
+  "validationLayer": "schema",
+  "validatorKind": "json_schema",
+  "instancePath": "/capabilityDigest",
+  "expectedInvalidReason": "invalid_digest",
+  "instance": {
+    "type": "device.hello",
+    "deviceId": "dev_fixture_node_01",
+    "keyId": "dkey_fixture_node_01",
+    "supportedProtocols": ["conduit.node/1"],
+    "capabilityDigest": "E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855",
+    "clientNonce": "fixture_nonce_01",
+    "nodeBootId": "boot-2026-09-01-fixture"
+  }
+}

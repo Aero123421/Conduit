@@ -1,0 +1,46 @@
+{
+  "fixtureVersion": 1,
+  "algorithm": "RFC 8785",
+  "digestAlgorithm": "SHA-256",
+  "cases": [
+    {
+      "name": "ordering-and-nesting",
+      "value": {
+        "z": 1,
+        "a": "first",
+        "nested": {
+          "trueValue": true,
+          "nullValue": null,
+          "array": [3, 2, 1]
+        }
+      },
+      "expectedCanonical": "{\"a\":\"first\",\"nested\":{\"array\":[3,2,1],\"nullValue\":null,\"trueValue\":true},\"z\":1}",
+      "expectedSha256": "590c11e1b5a8d931c7e84dcf987f73ce0ae1f9b8c2dd8daa5d07c07edd972d0d"
+    },
+    {
+      "name": "unicode-and-escaping",
+      "value": {
+        "😀": "astral",
+        "€": "euro",
+        "\r": "control",
+        "1": "ascii",
+        "": "control boundary",
+        "text": "雪 / café / \"quoted\" / \\ slash / \n line"
+      },
+      "expectedCanonical": "{\"\\r\":\"control\",\"1\":\"ascii\",\"text\":\"雪 / café / \\\"quoted\\\" / \\\\ slash / \\n line\",\"\":\"control boundary\",\"€\":\"euro\",\"😀\":\"astral\"}",
+      "expectedSha256": "448cc76d485d5fa176610dc28b6608fe89ab7a44ae4a5d1b48570c93a8f51e5a"
+    },
+    {
+      "name": "number-serialization",
+      "value": {
+        "negative": -42.5,
+        "small": 1e-7,
+        "large": 1e+21,
+        "fraction": 0.000001,
+        "zero": 0
+      },
+      "expectedCanonical": "{\"fraction\":0.000001,\"large\":1e+21,\"negative\":-42.5,\"small\":1e-7,\"zero\":0}",
+      "expectedSha256": "74b76dc886525aa138d13022123dd635b05cfaba3017e0a25a374cc431e30a34"
+    }
+  ]
+}

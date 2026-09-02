@@ -18,6 +18,32 @@ python -m pip install -r requirements-spec.txt
 python scripts/validate_spec.py
 ```
 
+## Wire schemas and domain types
+
+The JSON Schemas define versioned wire records. They check the JSON shape, required fields, bounded collections, string patterns, and JSON Schema formats accepted at a protocol boundary. Rust schema-marker documents and schema-generated TypeScript representations retain that accepted JSON shape; they are transport types, not trusted domain values. Schema validation does not replace construction of the hand-written values in `conduit-domain` and `@conduit/schema`.
+
+Code that admits an external record performs both steps in order:
+
+1. validate the complete record against the schema identified by its version;
+2. parse contract-sensitive fields into the corresponding domain types before using or persisting them.
+
+The distinction is observable for these v1 wire types:
+
+- an ID is a JSON string whose schema pattern checks its namespace and wire shape; the matching domain constructor prevents unvalidated strings from entering typed code;
+- `U64Decimal` is a canonical decimal JSON string so JavaScript does not lose integer precision. Its schema pattern bounds the wire shape to at most 20 digits, while the domain parser also rejects values above `18446744073709551615`;
+- `Timestamp` uses JSON Schema `date-time` for interoperable wire validation. The domain `UtcTimestamp` additionally requires a valid UTC form ending in uppercase `Z` and preserves the accepted wire text, including fractional-second precision and trailing zeros;
+- `Sha256Hex` is exactly 64 lowercase hexadecimal characters on the wire and becomes a digest domain value after parsing.
+
+This boundary is intentional. Tightening a released schema remains a schema change; stronger semantic parsing in a domain type does not silently change the accepted JSON Schema document.
+
+## Shared fixtures
+
+`fixtures/canonical-json-v1.json` is the Rust/TypeScript parity suite for RFC 8785 canonical JSON and lowercase SHA-256 output. Each case contains the input JSON value, exact canonical UTF-8 text, and digest. The cases cover recursive key ordering, arrays and nested values, Unicode key ordering and escaping, and ECMAScript-compatible number serialization.
+
+`fixtures/utc-timestamp-v1.json` is the Rust/TypeScript parity suite for accepted UTC RFC 3339 text. Both domain implementations preserve and reserialize the exact accepted wire text; the fixture covers `.000Z`, a fractional value with a trailing zero, and nine-digit fractional seconds.
+
+Files under `fixtures/invalid/` identify their `schemaId`, validation layer, validator kind, RFC 6901 instance path, and expected reason. A `schema` fixture must be rejected at the stated path by JSON Schema. A `domain` fixture must first pass the wire schema and then be rejected by the named hand-written-value validator. This prevents a semantic boundary test from being misreported as a schema constraint.
+
 ## Authentication v1
 
 `schemas/auth-v1.schema.json` contains:
@@ -44,6 +70,8 @@ The prose contract is `docs/AUTHORIZATION.md`.
 - bounded Device health and protocol errors
 
 Examples are under `examples/node-protocol/`.
+
+Untrusted encoded Node frames are limited to 65,536 UTF-8 bytes before JSON decoding. Rust callers use `ValidatedDocument::<NodeProtocolV1>::from_slice`; TypeScript callers use `parseWireDocumentText(schemaIds.nodeV1, textOrBytes)`. The TypeScript `parseWireDocument` API accepts an already-decoded value and therefore does not apply an encoded-byte limit.
 
 The prose contract is `docs/NODE_PROTOCOL.md`.
 

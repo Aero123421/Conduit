@@ -1,0 +1,18 @@
+{
+  "fixtureVersion": 1,
+  "schemaId": "https://conduit.dev/spec/schemas/node-protocol-v1.schema.json",
+  "validationLayer": "domain",
+  "validatorKind": "u64_decimal",
+  "instancePath": "/connectionEpoch",
+  "expectedInvalidReason": "u64_overflow",
+  "instance": {
+    "type": "transport.accepted",
+    "connectionId": "conn_transport_01",
+    "deviceId": "dev_fixture_node_01",
+    "connectionEpoch": "18446744073709551616",
+    "selectedProtocol": "conduit.node/1",
+    "controlNextSequence": "1",
+    "nodeStoredThroughSequence": "0",
+    "reconciliationRequired": false
+  }
+}

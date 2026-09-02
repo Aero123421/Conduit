@@ -1,0 +1,882 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://conduit.dev/spec/schemas/changeset-v1.schema.json",
+  "title": "Conduit Session baseline and Change Set contract v1",
+  "description": "Accepted Baseline vectors, Run Workspaces, immutable Change Sets, Reviews, acceptance preparation, and materialization receipts.",
+  "oneOf": [
+    { "$ref": "#/$defs/BaselineRevision" },
+    { "$ref": "#/$defs/RunWorkspace" },
+    { "$ref": "#/$defs/ChangeSet" },
+    { "$ref": "#/$defs/Review" },
+    { "$ref": "#/$defs/AcceptancePrepareReceipt" },
+    { "$ref": "#/$defs/AcceptanceReceipt" },
+    { "$ref": "#/$defs/MaterializationReceipt" }
+  ],
+  "$defs": {
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "Sha256Hex": {
+      "type": "string",
+      "pattern": "^[a-f0-9]{64}$"
+    },
+    "GitObjectId": {
+      "type": "string",
+      "pattern": "^[A-Fa-f0-9]{40}|[A-Fa-f0-9]{64}$"
+    },
+    "ProjectId": {
+      "type": "string",
+      "pattern": "^prj_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "SessionId": {
+      "type": "string",
+      "pattern": "^csess_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "BaselineId": {
+      "type": "string",
+      "pattern": "^bln_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ChangeSetId": {
+      "type": "string",
+      "pattern": "^chg_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ReviewId": {
+      "type": "string",
+      "pattern": "^revw_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "RunId": {
+      "type": "string",
+      "pattern": "^(run|lrun)_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "AssignmentId": {
+      "type": "string",
+      "pattern": "^asg_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "OperationId": {
+      "type": "string",
+      "pattern": "^op_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "DeviceId": {
+      "type": "string",
+      "pattern": "^dev_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "SourceId": {
+      "type": "string",
+      "pattern": "^src_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "LocationId": {
+      "type": "string",
+      "pattern": "^loc_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "RunWorkspaceId": {
+      "type": "string",
+      "pattern": "^rws_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "SnapshotId": {
+      "type": "string",
+      "pattern": "^snap_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ArtifactId": {
+      "type": "string",
+      "pattern": "^art_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "VerificationId": {
+      "type": "string",
+      "pattern": "^verify_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "PrincipalId": {
+      "type": "string",
+      "pattern": "^prin_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "ProjectAgentId": {
+      "type": "string",
+      "pattern": "^pagent_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$"
+    },
+    "OpaquePathReference": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["reference", "displayPath"],
+      "properties": {
+        "reference": { "type": "string", "pattern": "^pathref_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "displayPath": { "type": "string", "minLength": 1, "maxLength": 512 }
+      }
+    },
+    "WorkspaceMode": {
+      "type": "string",
+      "enum": ["read_only", "direct", "worktree", "managed_copy"]
+    },
+    "WorkspaceState": {
+      "type": "string",
+      "enum": ["preparing", "ready", "dirty", "diverged", "conflicted", "missing", "recovery_required", "released"]
+    },
+    "ChangeSetState": {
+      "type": "string",
+      "enum": [
+        "draft",
+        "proposed",
+        "under_review",
+        "changes_requested",
+        "approved",
+        "accepted",
+        "rejected",
+        "withdrawn",
+        "superseded",
+        "stale",
+        "conflicted"
+      ]
+    },
+    "CustodyClass": {
+      "type": "string",
+      "enum": ["device_ref", "device_archive", "remote_ref", "replicated_device", "r2_artifact"]
+    },
+    "CustodyState": {
+      "type": "string",
+      "enum": ["healthy", "degraded", "missing", "pending", "expired"]
+    },
+    "CustodyReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["custodyClass", "contentDigest", "state", "observedAt", "receiptDigest"],
+      "properties": {
+        "custodyClass": { "$ref": "#/$defs/CustodyClass" },
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "provider": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "reference": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "contentDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "state": { "$ref": "#/$defs/CustodyState" },
+        "bytes": { "type": "integer", "minimum": 0 },
+        "observedAt": { "$ref": "#/$defs/Timestamp" },
+        "expiresAt": { "$ref": "#/$defs/Timestamp" },
+        "receiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "reasonCode": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" }
+      }
+    },
+    "MaterializationState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["locationId", "state", "observedAt"],
+      "properties": {
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "locationId": { "$ref": "#/$defs/LocationId" },
+        "state": { "enum": ["materialized", "pending", "unavailable", "diverged", "conflicted", "unknown"] },
+        "observedDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "observedAt": { "$ref": "#/$defs/Timestamp" },
+        "reasonCode": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" }
+      }
+    },
+    "GitBaselineSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceType",
+        "sourceId",
+        "repositoryIdentityDigest",
+        "objectFormat",
+        "commit",
+        "treeDigest",
+        "stateDigest",
+        "custody",
+        "materializations"
+      ],
+      "properties": {
+        "sourceType": { "const": "git" },
+        "sourceId": { "$ref": "#/$defs/SourceId" },
+        "repositoryIdentityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "objectFormat": { "enum": ["sha1", "sha256"] },
+        "commit": { "$ref": "#/$defs/GitObjectId" },
+        "treeDigest": { "$ref": "#/$defs/GitObjectId" },
+        "stateDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "custody": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/CustodyReceipt" }
+        },
+        "materializations": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/MaterializationState" }
+        }
+      }
+    },
+    "ManagedBaselineSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceType",
+        "sourceId",
+        "snapshotId",
+        "manifestDigest",
+        "stateDigest",
+        "custody",
+        "materializations"
+      ],
+      "properties": {
+        "sourceType": { "const": "managed_folder" },
+        "sourceId": { "$ref": "#/$defs/SourceId" },
+        "snapshotId": { "$ref": "#/$defs/SnapshotId" },
+        "manifestDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "stateDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "custody": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/CustodyReceipt" }
+        },
+        "materializations": {
+          "type": "array",
+          "maxItems": 256,
+          "items": { "$ref": "#/$defs/MaterializationState" }
+        }
+      }
+    },
+    "BaselineSource": {
+      "oneOf": [
+        { "$ref": "#/$defs/GitBaselineSource" },
+        { "$ref": "#/$defs/ManagedBaselineSource" }
+      ]
+    },
+    "BaselineRevision": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "baselineId",
+        "projectId",
+        "sessionId",
+        "revision",
+        "state",
+        "sources",
+        "baselineDigest",
+        "createdAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "baseline_revision" },
+        "baselineId": { "$ref": "#/$defs/BaselineId" },
+        "projectId": { "$ref": "#/$defs/ProjectId" },
+        "sessionId": { "$ref": "#/$defs/SessionId" },
+        "revision": { "type": "integer", "minimum": 1 },
+        "predecessorBaselineId": { "$ref": "#/$defs/BaselineId" },
+        "state": { "enum": ["active", "superseded"] },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/BaselineSource" }
+        },
+        "acceptedChangeSetId": { "$ref": "#/$defs/ChangeSetId" },
+        "acceptanceOperationId": { "$ref": "#/$defs/OperationId" },
+        "acceptedByPrincipalId": { "$ref": "#/$defs/PrincipalId" },
+        "acceptedByClientId": { "type": "string", "maxLength": 2048 },
+        "baselineDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "createdAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "GitWorkspaceState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceType",
+        "sourceId",
+        "locationId",
+        "locationRevision",
+        "workspaceMode",
+        "path",
+        "repositoryIdentityDigest",
+        "baseCommit",
+        "branch",
+        "worktreeIdentityDigest",
+        "leaseMode",
+        "startStatusDigest",
+        "state"
+      ],
+      "properties": {
+        "sourceType": { "const": "git" },
+        "sourceId": { "$ref": "#/$defs/SourceId" },
+        "locationId": { "$ref": "#/$defs/LocationId" },
+        "locationRevision": { "type": "integer", "minimum": 1 },
+        "workspaceMode": { "$ref": "#/$defs/WorkspaceMode" },
+        "path": { "$ref": "#/$defs/OpaquePathReference" },
+        "repositoryIdentityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "baseCommit": { "$ref": "#/$defs/GitObjectId" },
+        "branch": { "type": "string", "minLength": 1, "maxLength": 512 },
+        "worktreeIdentityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "leaseMode": { "enum": ["exclusive_writer", "read_only"] },
+        "startStatusDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "state": { "$ref": "#/$defs/WorkspaceState" },
+        "lastStatusDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "divergenceReason": { "type": "string", "maxLength": 256 }
+      }
+    },
+    "ManagedWorkspaceState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceType",
+        "sourceId",
+        "locationId",
+        "locationRevision",
+        "workspaceMode",
+        "path",
+        "baseSnapshotId",
+        "baseManifestDigest",
+        "workspaceIdentityDigest",
+        "leaseMode",
+        "state"
+      ],
+      "properties": {
+        "sourceType": { "const": "managed_folder" },
+        "sourceId": { "$ref": "#/$defs/SourceId" },
+        "locationId": { "$ref": "#/$defs/LocationId" },
+        "locationRevision": { "type": "integer", "minimum": 1 },
+        "workspaceMode": { "$ref": "#/$defs/WorkspaceMode" },
+        "path": { "$ref": "#/$defs/OpaquePathReference" },
+        "baseSnapshotId": { "$ref": "#/$defs/SnapshotId" },
+        "baseManifestDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "workspaceIdentityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "leaseMode": { "enum": ["exclusive_writer", "read_only"] },
+        "state": { "$ref": "#/$defs/WorkspaceState" },
+        "lastManifestDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "divergenceReason": { "type": "string", "maxLength": 256 }
+      }
+    },
+    "WorkspaceSourceState": {
+      "oneOf": [
+        { "$ref": "#/$defs/GitWorkspaceState" },
+        { "$ref": "#/$defs/ManagedWorkspaceState" }
+      ]
+    },
+    "RunWorkspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "workspaceId",
+        "runId",
+        "deviceId",
+        "parentType",
+        "parentId",
+        "parentDigest",
+        "sources",
+        "state",
+        "workspaceDigest",
+        "createdAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "run_workspace" },
+        "workspaceId": { "$ref": "#/$defs/RunWorkspaceId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "parentType": { "enum": ["baseline", "change_set"] },
+        "parentId": { "type": "string", "maxLength": 128 },
+        "parentDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/WorkspaceSourceState" }
+        },
+        "state": { "$ref": "#/$defs/WorkspaceState" },
+        "workspaceDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "releasedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "ChangedPathSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["added", "modified", "deleted", "renamed", "typeChanged", "conflicted", "untracked", "truncated"],
+      "properties": {
+        "added": { "type": "integer", "minimum": 0 },
+        "modified": { "type": "integer", "minimum": 0 },
+        "deleted": { "type": "integer", "minimum": 0 },
+        "renamed": { "type": "integer", "minimum": 0 },
+        "typeChanged": { "type": "integer", "minimum": 0 },
+        "conflicted": { "type": "integer", "minimum": 0 },
+        "untracked": { "type": "integer", "minimum": 0 },
+        "truncated": { "type": "boolean" }
+      }
+    },
+    "GitFeatureState": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["submodules", "lfs", "sparseCheckout", "partialClone", "shallow"],
+      "properties": {
+        "submodules": { "enum": ["none", "recorded", "recursive_recorded", "unavailable"] },
+        "lfs": { "enum": ["not_used", "required", "pointer_only", "skip_smudge", "objects_missing"] },
+        "sparseCheckout": { "type": "boolean" },
+        "partialClone": { "type": "boolean" },
+        "shallow": { "type": "boolean" },
+        "stateDigest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    },
+    "GitSourceChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceType",
+        "sourceId",
+        "repositoryIdentityDigest",
+        "originDeviceId",
+        "originLocationId",
+        "baseCommit",
+        "baseTree",
+        "headCommit",
+        "headTree",
+        "mergeBase",
+        "commits",
+        "commitGraphDigest",
+        "diffDigest",
+        "changedPaths",
+        "gitFeatures",
+        "verificationIds",
+        "custody",
+        "sourceChangeDigest"
+      ],
+      "properties": {
+        "sourceType": { "const": "git" },
+        "sourceId": { "$ref": "#/$defs/SourceId" },
+        "repositoryIdentityDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "originDeviceId": { "$ref": "#/$defs/DeviceId" },
+        "originLocationId": { "$ref": "#/$defs/LocationId" },
+        "baseCommit": { "$ref": "#/$defs/GitObjectId" },
+        "baseTree": { "$ref": "#/$defs/GitObjectId" },
+        "headCommit": { "$ref": "#/$defs/GitObjectId" },
+        "headTree": { "$ref": "#/$defs/GitObjectId" },
+        "mergeBase": { "$ref": "#/$defs/GitObjectId" },
+        "commits": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 65536,
+          "items": { "$ref": "#/$defs/GitObjectId" }
+        },
+        "commitGraphDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "diffDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "patchArtifactId": { "$ref": "#/$defs/ArtifactId" },
+        "changedPaths": { "$ref": "#/$defs/ChangedPathSummary" },
+        "gitFeatures": { "$ref": "#/$defs/GitFeatureState" },
+        "verificationIds": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/VerificationId" }
+        },
+        "custody": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/CustodyReceipt" }
+        },
+        "sourceChangeDigest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    },
+    "FileOperation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operation", "pathReference", "afterType"],
+      "properties": {
+        "operation": { "enum": ["create", "modify", "delete", "rename", "type_change", "mode_change"] },
+        "pathReference": { "type": "string", "maxLength": 512 },
+        "fromPathReference": { "type": "string", "maxLength": 512 },
+        "beforeType": { "enum": ["missing", "file", "directory", "symlink", "other"] },
+        "afterType": { "enum": ["missing", "file", "directory", "symlink", "other"] },
+        "beforeDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "afterDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "beforeMode": { "type": "string", "maxLength": 32 },
+        "afterMode": { "type": "string", "maxLength": 32 },
+        "contentAvailable": { "type": "boolean" }
+      }
+    },
+    "ManagedSourceChange": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceType",
+        "sourceId",
+        "originDeviceId",
+        "originLocationId",
+        "baseSnapshotId",
+        "baseManifestDigest",
+        "resultSnapshotId",
+        "resultManifestDigest",
+        "operations",
+        "changedPaths",
+        "verificationIds",
+        "custody",
+        "sourceChangeDigest"
+      ],
+      "properties": {
+        "sourceType": { "const": "managed_folder" },
+        "sourceId": { "$ref": "#/$defs/SourceId" },
+        "originDeviceId": { "$ref": "#/$defs/DeviceId" },
+        "originLocationId": { "$ref": "#/$defs/LocationId" },
+        "baseSnapshotId": { "$ref": "#/$defs/SnapshotId" },
+        "baseManifestDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "resultSnapshotId": { "$ref": "#/$defs/SnapshotId" },
+        "resultManifestDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "operations": {
+          "type": "array",
+          "maxItems": 100000,
+          "items": { "$ref": "#/$defs/FileOperation" }
+        },
+        "changedPaths": { "$ref": "#/$defs/ChangedPathSummary" },
+        "verificationIds": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/VerificationId" }
+        },
+        "custody": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/CustodyReceipt" }
+        },
+        "sourceChangeDigest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    },
+    "SourceChange": {
+      "oneOf": [
+        { "$ref": "#/$defs/GitSourceChange" },
+        { "$ref": "#/$defs/ManagedSourceChange" }
+      ]
+    },
+    "UnchangedSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceId", "stateDigest"],
+      "properties": {
+        "sourceId": { "$ref": "#/$defs/SourceId" },
+        "stateDigest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    },
+    "ApplicationStep": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["order", "sourceId", "sourceChangeDigest"],
+      "properties": {
+        "order": { "type": "integer", "minimum": 1 },
+        "sourceId": { "$ref": "#/$defs/SourceId" },
+        "sourceChangeDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "dependsOn": {
+          "type": "array",
+          "maxItems": 1024,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/SourceId" }
+        },
+        "notes": { "type": "string", "maxLength": 1024 }
+      }
+    },
+    "ChangeSet": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "changeSetId",
+        "projectId",
+        "sessionId",
+        "producingRunId",
+        "producingAssignmentId",
+        "parentBaselineId",
+        "parentBaselineRevision",
+        "parentBaselineDigest",
+        "state",
+        "sourceChanges",
+        "unchangedSources",
+        "applicationOrder",
+        "requiredVerificationPolicyDigest",
+        "artifactIds",
+        "changeSetDigest",
+        "createdAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "change_set" },
+        "changeSetId": { "$ref": "#/$defs/ChangeSetId" },
+        "projectId": { "$ref": "#/$defs/ProjectId" },
+        "sessionId": { "$ref": "#/$defs/SessionId" },
+        "producingRunId": { "$ref": "#/$defs/RunId" },
+        "producingAssignmentId": { "$ref": "#/$defs/AssignmentId" },
+        "parentBaselineId": { "$ref": "#/$defs/BaselineId" },
+        "parentBaselineRevision": { "type": "integer", "minimum": 1 },
+        "parentBaselineDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "parentChangeSetIds": {
+          "type": "array",
+          "maxItems": 64,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ChangeSetId" }
+        },
+        "supersedesChangeSetId": { "$ref": "#/$defs/ChangeSetId" },
+        "state": { "$ref": "#/$defs/ChangeSetState" },
+        "sourceChanges": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/SourceChange" }
+        },
+        "unchangedSources": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/UnchangedSource" }
+        },
+        "applicationOrder": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/ApplicationStep" }
+        },
+        "requiredVerificationPolicyDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "verificationIds": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/VerificationId" }
+        },
+        "artifactIds": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ArtifactId" }
+        },
+        "changeSetDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "createdAt": { "$ref": "#/$defs/Timestamp" },
+        "proposedAt": { "$ref": "#/$defs/Timestamp" },
+        "terminalAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "ReviewFinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["findingId", "severity", "summary", "state"],
+      "properties": {
+        "findingId": { "type": "string", "pattern": "^finding_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "severity": { "enum": ["info", "low", "medium", "high", "critical"] },
+        "summary": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "sourceId": { "$ref": "#/$defs/SourceId" },
+        "pathReference": { "type": "string", "maxLength": 512 },
+        "lineStart": { "type": "integer", "minimum": 1 },
+        "lineEnd": { "type": "integer", "minimum": 1 },
+        "evidenceArtifactIds": {
+          "type": "array",
+          "maxItems": 128,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/ArtifactId" }
+        },
+        "state": { "enum": ["open", "resolved", "dismissed", "superseded"] }
+      }
+    },
+    "Review": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "reviewId",
+        "projectId",
+        "sessionId",
+        "changeSetId",
+        "changeSetDigest",
+        "reviewerType",
+        "verdict",
+        "findings",
+        "verificationIds",
+        "reviewDigest",
+        "createdAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "review" },
+        "reviewId": { "$ref": "#/$defs/ReviewId" },
+        "projectId": { "$ref": "#/$defs/ProjectId" },
+        "sessionId": { "$ref": "#/$defs/SessionId" },
+        "changeSetId": { "$ref": "#/$defs/ChangeSetId" },
+        "changeSetDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "reviewerType": { "enum": ["human", "project_agent"] },
+        "reviewerPrincipalId": { "$ref": "#/$defs/PrincipalId" },
+        "reviewerProjectAgentId": { "$ref": "#/$defs/ProjectAgentId" },
+        "reviewRunId": { "$ref": "#/$defs/RunId" },
+        "verdict": { "enum": ["approved", "changes_requested", "rejected", "unable_to_review"] },
+        "findings": {
+          "type": "array",
+          "maxItems": 4096,
+          "items": { "$ref": "#/$defs/ReviewFinding" }
+        },
+        "verificationIds": {
+          "type": "array",
+          "maxItems": 4096,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/VerificationId" }
+        },
+        "reviewDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "createdAt": { "$ref": "#/$defs/Timestamp" }
+      },
+      "oneOf": [
+        { "required": ["reviewerPrincipalId"] },
+        { "required": ["reviewerProjectAgentId"] }
+      ]
+    },
+    "PreparedSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceId", "sourceChangeDigest", "preparedReference", "targetStateDigest", "custody"],
+      "properties": {
+        "sourceId": { "$ref": "#/$defs/SourceId" },
+        "sourceChangeDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "preparedReference": { "type": "string", "minLength": 1, "maxLength": 1024 },
+        "targetStateDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "custody": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 64,
+          "items": { "$ref": "#/$defs/CustodyReceipt" }
+        }
+      }
+    },
+    "AcceptancePrepareReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "operationId",
+        "deviceId",
+        "sessionId",
+        "changeSetId",
+        "changeSetDigest",
+        "expectedBaselineId",
+        "expectedBaselineRevision",
+        "expectedBaselineDigest",
+        "state",
+        "preparedSources",
+        "receiptDigest",
+        "preparedAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "acceptance_prepare_receipt" },
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "sessionId": { "$ref": "#/$defs/SessionId" },
+        "changeSetId": { "$ref": "#/$defs/ChangeSetId" },
+        "changeSetDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "expectedBaselineId": { "$ref": "#/$defs/BaselineId" },
+        "expectedBaselineRevision": { "type": "integer", "minimum": 1 },
+        "expectedBaselineDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "state": { "enum": ["prepared", "aborted", "conflict", "failed"] },
+        "preparedSources": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/PreparedSource" }
+        },
+        "receiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "preparedAt": { "$ref": "#/$defs/Timestamp" },
+        "expiresAt": { "$ref": "#/$defs/Timestamp" },
+        "reasonCode": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "AcceptanceReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "operationId",
+        "projectId",
+        "sessionId",
+        "changeSetId",
+        "changeSetDigest",
+        "prepareReceiptDigest",
+        "previousBaselineId",
+        "previousBaselineRevision",
+        "newBaselineId",
+        "newBaselineRevision",
+        "newBaselineDigest",
+        "state",
+        "acceptedByPrincipalId",
+        "acceptedByClientId",
+        "receiptDigest",
+        "acceptedAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "acceptance_receipt" },
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "projectId": { "$ref": "#/$defs/ProjectId" },
+        "sessionId": { "$ref": "#/$defs/SessionId" },
+        "changeSetId": { "$ref": "#/$defs/ChangeSetId" },
+        "changeSetDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "prepareReceiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "previousBaselineId": { "$ref": "#/$defs/BaselineId" },
+        "previousBaselineRevision": { "type": "integer", "minimum": 1 },
+        "newBaselineId": { "$ref": "#/$defs/BaselineId" },
+        "newBaselineRevision": { "type": "integer", "minimum": 2 },
+        "newBaselineDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "state": { "enum": ["committed", "finalization_pending", "finalized", "failed"] },
+        "acceptedByPrincipalId": { "$ref": "#/$defs/PrincipalId" },
+        "acceptedByClientId": { "type": "string", "minLength": 1, "maxLength": 2048 },
+        "receiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "acceptedAt": { "$ref": "#/$defs/Timestamp" },
+        "finalizedAt": { "$ref": "#/$defs/Timestamp" },
+        "reasonCode": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "MaterializedSource": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["sourceId", "targetLocationId", "targetStateDigest", "state"],
+      "properties": {
+        "sourceId": { "$ref": "#/$defs/SourceId" },
+        "targetLocationId": { "$ref": "#/$defs/LocationId" },
+        "targetRef": { "type": "string", "maxLength": 1024 },
+        "expectedOldStateDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "targetStateDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "state": { "enum": ["materialized", "pending", "conflicted", "failed", "unavailable"] },
+        "reasonCode": { "type": "string", "maxLength": 128 }
+      }
+    },
+    "MaterializationReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schemaVersion",
+        "kind",
+        "operationId",
+        "deviceId",
+        "sessionId",
+        "baselineId",
+        "baselineRevision",
+        "baselineDigest",
+        "mode",
+        "sources",
+        "state",
+        "receiptDigest",
+        "observedAt"
+      ],
+      "properties": {
+        "schemaVersion": { "const": 1 },
+        "kind": { "const": "materialization_receipt" },
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "sessionId": { "$ref": "#/$defs/SessionId" },
+        "baselineId": { "$ref": "#/$defs/BaselineId" },
+        "baselineRevision": { "type": "integer", "minimum": 1 },
+        "baselineDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "mode": { "enum": ["session_ref", "create_branch", "fast_forward", "managed_folder_apply", "replicate"] },
+        "sources": {
+          "type": "array",
+          "maxItems": 1024,
+          "items": { "$ref": "#/$defs/MaterializedSource" }
+        },
+        "state": { "enum": ["complete", "partial", "conflicted", "failed"] },
+        "receiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "observedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    }
+  }
+}

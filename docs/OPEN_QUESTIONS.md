@@ -12,13 +12,17 @@ The first-release identity, owner bootstrap, passkey recovery, device enrollment
 
 Library selection, D1 migrations, endpoint implementation, and interoperability receipts remain implementation work. They must not change the identity separation or connector-ceiling contract without a new ADR.
 
+### Node transport and reconciliation
+
+The handshake, persistent sequence model, operation admission, device-local journal, event replay, offline behavior, cancellation, approval delivery, node restart, and reconciliation contracts are fixed in:
+
+- `docs/NODE_PROTOCOL.md`
+- `docs/adr/0007-durable-device-outbox-inbox-and-reconciliation.md`
+- `spec/schemas/node-protocol-v1.schema.json`
+
+The first implementation must still choose concrete SQLite table layouts, compaction limits, Rust types, canonical JSON encoding, and Cloudflare test harnesses. These implementation choices must preserve the distinction between transport custody, operation admission, runtime start, and terminal completion.
+
 ## Blocks the first executable vertical slice
-
-### Node transport and reconciliation protocol
-
-Define handshake message encoding, sequence numbers, operation admission, event replay, local journal format, and reconnect reconciliation.
-
-Device identity, enrollment, challenge authentication, connection epochs, key rotation, and revocation are already defined by the authorization contract. The transport work must cover control-plane disconnect, node restart, duplicate admission, late terminal result, and device clock skew.
 
 ### Collaboration-session baseline and change-set acceptance
 

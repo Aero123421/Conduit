@@ -1,0 +1,30 @@
+{
+  "protocol": "conduit.node/1",
+  "messageId": "nmsg_operation_terminal_01",
+  "deviceId": "dev_sahur_pc_01",
+  "connectionEpoch": "43",
+  "direction": "node_to_control",
+  "sequence": "920",
+  "type": "operation.terminal",
+  "correlationId": "op_assignment_start_01",
+  "payloadDigest": "a2f40ce0ee2f9afce5e3a4ed590f5c4f6b1efc3373e09b09cf2a1221787efd40",
+  "payload": {
+    "operationId": "op_assignment_start_01",
+    "runId": "run_codex_builder_01",
+    "state": "completed",
+    "requestDigest": "c5f3a151c4e62fa4566f322ec121874195e6af736dddb87ce6b5c2159a163c17",
+    "receiptDigest": "83ed4cdd4ed3d60d447c243d9777e23e25efda1c9ebdfcf2319a060d15c97f08",
+    "lastRunEventSequence": "112",
+    "resultSummary": {
+      "agentReportedComplete": true,
+      "verificationState": "tests_passed",
+      "changedFiles": 4,
+      "commits": 1
+    },
+    "artifactIds": [
+      "art_change_set_01",
+      "art_test_report_01"
+    ],
+    "observedAt": "2026-09-01T09:48:00Z"
+  }
+}

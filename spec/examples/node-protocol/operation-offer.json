@@ -1,0 +1,60 @@
+{
+  "protocol": "conduit.node/1",
+  "messageId": "cmsg_operation_offer_01",
+  "deviceId": "dev_sahur_pc_01",
+  "connectionEpoch": "42",
+  "direction": "control_to_node",
+  "sequence": "101",
+  "type": "operation.offer",
+  "correlationId": "op_assignment_start_01",
+  "payloadDigest": "4f2d8a0fc2e81867b869e4dcab7f90dfb4954e8316d3ecb9588f3d1768cb45ec",
+  "payload": {
+    "operation": {
+      "schemaVersion": 1,
+      "operationId": "op_assignment_start_01",
+      "idempotencyKey": "assignment-start-01-immutable",
+      "actorPrincipalId": "prin_owner_01",
+      "clientId": "https://client.example/dashboard/conduit",
+      "deviceId": "dev_sahur_pc_01",
+      "projectId": "prj_conduit_01",
+      "sessionId": "csess_runtime_design_01",
+      "assignmentId": "asg_codex_builder_01",
+      "runId": "run_codex_builder_01",
+      "capability": "agent.run.start",
+      "sourceRevisions": [
+        {
+          "sourceId": "src_conduit_repo_01",
+          "locationId": "loc_sahur_conduit_01",
+          "locationRevision": 3,
+          "mode": "worktree",
+          "baseCommit": "f34dda29e07aeb77a4581d4ef87a4951b2041b70"
+        }
+      ],
+      "runtime": {
+        "kind": "native",
+        "providerId": "native.linux",
+        "configurationRevision": 1,
+        "cpuLimit": 4,
+        "memoryBytes": 8589934592,
+        "storageBytes": 21474836480,
+        "gpuCount": 0,
+        "networkMode": "open"
+      },
+      "accessScope": "project_full",
+      "approvalMode": "never",
+      "connectorPolicyId": "cpol_dashboard_owner_01",
+      "connectorPolicyRevision": 4,
+      "arguments": {
+        "adapterId": "codex",
+        "projectAgentId": "pagent_codex_builder_01",
+        "model": "gpt-5.6",
+        "effort": "high",
+        "assignmentMessageId": "msg_assignment_01"
+      },
+      "payloadDigest": "c5f3a151c4e62fa4566f322ec121874195e6af736dddb87ce6b5c2159a163c17",
+      "issuedAt": "2026-09-01T09:00:00Z",
+      "expiresAt": "2026-09-01T09:10:00Z",
+      "validForMs": 600000
+    }
+  }
+}

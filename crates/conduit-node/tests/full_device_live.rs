@@ -694,7 +694,11 @@ fn structured_codex_agent(
     bundle: &Value,
     evidence: &Path,
 ) -> Value {
-    let python = existing(&["/usr/bin/python3", "/bin/python3"]);
+    let python = existing(&[
+        "/usr/bin/python3.12",
+        "/usr/bin/python3.11",
+        "/usr/bin/python3.10",
+    ]);
     let fixture = r#"import json,sys
 for line in sys.stdin:
     message=json.loads(line)

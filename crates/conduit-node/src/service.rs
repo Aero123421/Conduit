@@ -3005,7 +3005,10 @@ impl NodeService {
                     "full_device_capability_unavailable".into(),
                 ));
             }
-            if is_agent && profile_id != "codex" && op.approval_mode != "never" {
+            if is_agent
+                && op.approval_mode != "never"
+                && !full_device_adapter_approval_supported(profile_id)
+            {
                 return Err(ServiceError::Unavailable(
                     "full_device_approval_enforcement_unavailable".into(),
                 ));
@@ -6355,6 +6358,13 @@ fn privileged_operation_name(operation: &PrivilegedOperation) -> &'static str {
     }
 }
 
+fn full_device_adapter_approval_supported(adapter_id: &str) -> bool {
+    // These are the structured adapters whose correlated, pre-execution
+    // approval responses are exercised by the adapter protocol suites. Other
+    // adapters remain fail-closed for elevated interactive approval modes.
+    matches!(adapter_id, "codex" | "pi" | "opencode")
+}
+
 fn initial_frames_bytes(spec: &conduit_adapters::LaunchSpec) -> Result<Vec<u8>, ServiceError> {
     let mut input = Vec::new();
     for frame in &spec.initial_frames {
@@ -7355,6 +7365,16 @@ mod tests {
             policy(true).evaluate(&operation("full_device", "never", 1.0), "safe"),
             Err(ServiceError::Unavailable(reason)) if reason == "full_device_capability_unavailable"
         ));
+    }
+
+    #[test]
+    fn full_device_interactive_approval_only_names_proven_adapter_bridges() {
+        assert!(full_device_adapter_approval_supported("codex"));
+        assert!(full_device_adapter_approval_supported("pi"));
+        assert!(full_device_adapter_approval_supported("opencode"));
+        for unsupported in ["claude", "agy", "shell", "unknown"] {
+            assert!(!full_device_adapter_approval_supported(unsupported));
+        }
     }
 
     #[test]

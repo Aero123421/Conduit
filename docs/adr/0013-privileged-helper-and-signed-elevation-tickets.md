@@ -113,6 +113,12 @@ Owner Passkey approval; narrowing and revocation prevent new tickets
 immediately. Revocation cannot prove that an offline root process stopped. A
 separately signed stop action is required when connectivity returns.
 
+The initial disabled root policy may attest an empty ticket-key allowlist. This
+is the only bootstrap state in which no issuer key is pinned: it cannot accept
+a privilege ticket because the helper is disabled and there is no matching
+issuer. Pinning the first issuer and enabling the helper remain separate,
+explicit local-root mutations and produce a new signed policy revision.
+
 ### Installation and update
 
 Only explicit local root commands can install, enable, configure, rotate, stop,

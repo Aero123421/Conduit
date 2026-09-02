@@ -165,10 +165,9 @@ export interface RootPolicy {
   enabled: boolean;
   origin: string;
   /**
-   * @minItems 1
    * @maxItems 4
    */
-  ticketKeyIds: [Id] | [Id, Id] | [Id, Id, Id] | [Id, Id, Id, Id];
+  ticketKeyIds: [] | [Id] | [Id, Id] | [Id, Id, Id] | [Id, Id, Id, Id];
   /**
    * @maxItems 10
    */

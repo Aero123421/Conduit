@@ -1,10 +1,11 @@
 use crate::{
-    AdmissionReceipt, Node, NodeError, OperationOffer,
+    AdmissionReceipt, Node, NodeError, OperationOffer, VerifiedPrivilegedAdmission,
     batching::{
         AckAccumulator, BatchError, EVENT_BATCH_MAX_EVENTS, EventAccumulator, EventBatch,
         HealthState, HealthTracker, replay_batch,
     },
     local::{LocalServices, PreparedSource, SourceRevision, build_manifest},
+    privileged::PrivilegedNodeRuntime,
     transport::{Envelope, TransportError, WssClient},
     verify_operation_commitment,
 };
@@ -19,9 +20,11 @@ use conduit_node_store::{
     ControlEffectResult, DeviceIdentity, Direction, OperationState, ReceiveResult, StoreError,
 };
 use conduit_observability::RawRecord;
+use conduit_privileged_protocol::{PrivilegeTicket, PrivilegedOperation};
 use conduit_runtime::{
-    DestroyRequest, IoMode, LaunchPlan, NetworkMode, ProcessSupervisor, ResourceLimits,
-    RuntimeHandle, RuntimeKind, RuntimeRequest, RuntimeSignal, RuntimeState,
+    DestroyRequest, IoMode, LaunchPlan, ManagedProcessIo, NetworkMode, PreparedRuntime,
+    ProcessSupervisor, ResourceLimits, RuntimeHandle, RuntimeKind, RuntimeRequest, RuntimeSignal,
+    RuntimeState,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -52,7 +55,7 @@ pub enum ServiceError {
     Unavailable(String),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LaunchProfile {
     pub provider_id: String,
@@ -68,7 +71,7 @@ pub struct LaunchProfile {
 fn pipes() -> IoMode {
     IoMode::Pipes
 }
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct LocalPolicy {
     pub revision: u64,
@@ -101,6 +104,39 @@ impl LocalPolicy {
                 "full_device_capability_unavailable".into(),
             ));
         }
+        self.evaluate_common(operation, launch_profile)
+    }
+
+    fn evaluate_privileged(
+        &self,
+        operation: &WireOperation,
+        launch_profile: &str,
+        capability: &conduit_privileged_protocol::SignedCapability,
+    ) -> Result<(), ServiceError> {
+        let helper = &capability.claims;
+        if operation.access_scope != "full_device"
+            || !helper.enabled
+            || !helper.systemd_system_manager
+            || !helper.socket_peer_credentials
+            || !helper.transient_units
+        {
+            return Err(ServiceError::Unavailable(
+                "full_device_capability_unavailable".into(),
+            ));
+        }
+        if operation.approval_mode == "never" && !helper.never_opt_in {
+            return Err(ServiceError::Unavailable(
+                "full_device_never_local_opt_in_required".into(),
+            ));
+        }
+        self.evaluate_common(operation, launch_profile)
+    }
+
+    fn evaluate_common(
+        &self,
+        operation: &WireOperation,
+        launch_profile: &str,
+    ) -> Result<(), ServiceError> {
         let provider = normalize_provider(&operation.runtime.provider_id);
         if !self
             .capabilities
@@ -202,7 +238,7 @@ pub fn load_launch_profiles(path: &Path) -> Result<NodePolicyConfig, ServiceErro
     Ok(file)
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct WireRuntime {
     kind: String,
@@ -215,7 +251,7 @@ struct WireRuntime {
     _gpu_count: Option<u32>,
     network_mode: Option<String>,
 }
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WireOperation {
     schema_version: u32,
@@ -358,7 +394,7 @@ struct AgentActive {
     runtime_id: String,
     provider_id: String,
     handle: RuntimeHandle,
-    child: AdapterChild,
+    child: AgentProcess,
     driver: ProtocolDriver,
     adapter_kind: AdapterKind,
     actor_principal_id: String,
@@ -379,6 +415,140 @@ struct AgentActive {
     parent_baseline_id: Value,
     source_baseline_revisions: BTreeMap<String, Value>,
     verification_policy: Value,
+}
+
+/// Structured Adapter I/O is deliberately independent from process custody.
+/// Ordinary Runtimes own a local child; elevated Runtimes expose only the
+/// helper-managed bounded stream interface and can never be signalled by PID
+/// through this type.
+enum AgentProcess {
+    Local(AdapterChild),
+    Managed {
+        io: Box<dyn ManagedProcessIo>,
+        stdout_cursor: u64,
+        stdout_buffer: Vec<u8>,
+        stdout_eof: bool,
+    },
+}
+
+impl AgentProcess {
+    fn local(child: AdapterChild) -> Self {
+        Self::Local(child)
+    }
+
+    fn managed(io: Box<dyn ManagedProcessIo>) -> Self {
+        Self::Managed {
+            io,
+            stdout_cursor: 0,
+            stdout_buffer: Vec::new(),
+            stdout_eof: false,
+        }
+    }
+
+    fn initialize(&mut self, spec: &conduit_adapters::LaunchSpec) -> Result<(), String> {
+        match self {
+            Self::Local(child) => child.initialize(spec).map_err(|error| error.to_string()),
+            Self::Managed { io, .. } => {
+                let mut input = Vec::new();
+                for frame in &spec.initial_frames {
+                    if frame.0.is_empty()
+                        || frame.0.len() > 64 * 1024
+                        || !frame.0.ends_with(b"\n")
+                        || input.len().saturating_add(frame.0.len()) > 65_536
+                    {
+                        return Err("invalid privileged Adapter initialization frame".into());
+                    }
+                    input.extend_from_slice(&frame.0);
+                }
+                if input.is_empty() {
+                    return Err("privileged Adapter initialization is empty".into());
+                }
+                io.write_input(&input).map_err(|error| error.to_string())
+            }
+        }
+    }
+
+    fn write(&mut self, frame: &conduit_adapters::ProtocolFrame) -> Result<(), String> {
+        match self {
+            Self::Local(child) => child.write(frame).map_err(|error| error.to_string()),
+            Self::Managed { io, .. } => io.write_input(&frame.0).map_err(|error| error.to_string()),
+        }
+    }
+
+    fn try_read_record(&mut self) -> Result<Option<Vec<u8>>, String> {
+        match self {
+            Self::Local(child) => child.try_read_record().map_err(|error| error.to_string()),
+            Self::Managed {
+                io,
+                stdout_cursor,
+                stdout_buffer,
+                stdout_eof,
+            } => {
+                if let Some(end) = stdout_buffer.iter().position(|byte| *byte == b'\n') {
+                    return Ok(Some(stdout_buffer.drain(..=end).collect()));
+                }
+                if *stdout_eof {
+                    return if stdout_buffer.is_empty() {
+                        Ok(None)
+                    } else {
+                        Err("unterminated privileged Adapter record".into())
+                    };
+                }
+                let page = io
+                    .read_stdout(*stdout_cursor, 64 * 1024)
+                    .map_err(|error| error.to_string())?;
+                if page.next_cursor < *stdout_cursor
+                    || page.bytes.len() > 64 * 1024
+                    || page.next_cursor != stdout_cursor.saturating_add(page.bytes.len() as u64)
+                {
+                    return Err("invalid privileged Adapter stream cursor".into());
+                }
+                *stdout_cursor = page.next_cursor;
+                *stdout_eof = page.eof;
+                stdout_buffer.extend_from_slice(&page.bytes);
+                if stdout_buffer.len() > 64 * 1024 {
+                    return Err("privileged Adapter frame exceeds bound".into());
+                }
+                if let Some(end) = stdout_buffer.iter().position(|byte| *byte == b'\n') {
+                    Ok(Some(stdout_buffer.drain(..=end).collect()))
+                } else if *stdout_eof && !stdout_buffer.is_empty() {
+                    Err("unterminated privileged Adapter record".into())
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    fn terminate_local(&mut self) -> Result<(), String> {
+        match self {
+            Self::Local(child) => child
+                .terminate()
+                .map(|_| ())
+                .map_err(|error| error.to_string()),
+            Self::Managed { .. } => Err("privileged_control_ticket_required".into()),
+        }
+    }
+
+    fn terminate(&mut self) -> Result<std::process::ExitStatus, String> {
+        match self {
+            Self::Local(child) => child.terminate().map_err(|error| error.to_string()),
+            Self::Managed { .. } => Err("privileged_control_ticket_required".into()),
+        }
+    }
+
+    fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, String> {
+        match self {
+            Self::Local(child) => child.try_wait().map_err(|error| error.to_string()),
+            // A helper-managed process is observed through signed inspect and
+            // terminal receipts, never through a fabricated local Child.
+            Self::Managed { .. } => Ok(None),
+        }
+    }
+
+    fn is_managed(&self) -> bool {
+        matches!(self, Self::Managed { .. })
+    }
 }
 
 #[derive(Clone)]
@@ -463,6 +633,40 @@ pub struct NodeService {
     /// exact health envelope and avoid an ACK/health feedback allocation loop.
     health_frontier_dirty: bool,
     health_fault: Option<String>,
+    privileged: Option<Arc<PrivilegedNodeRuntime>>,
+    pending_privileged: HashMap<String, PendingPrivilegedStart>,
+    pending_privilege_requests: HashMap<String, PendingPrivilegeRequest>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrivilegedStartPhase {
+    PrepareTicket,
+    StartTicket,
+    InitialInputTicket,
+}
+
+struct PendingPrivilegeRequest {
+    operation_id: String,
+    phase: PrivilegedStartPhase,
+}
+
+struct PendingPrivilegedStart {
+    op: WireOperation,
+    offer: OperationOffer,
+    plan: conduit_privileged_protocol::LocalExecutionPlan,
+    run_manifest_digest: String,
+    prepared: Option<PreparedRuntime>,
+    managed_io: Option<Box<dyn ManagedProcessIo>>,
+    handle: Option<RuntimeHandle>,
+    agent_launch: Option<(conduit_adapters::LaunchSpec, ProtocolDriver, AdapterKind)>,
+    settlement_policy: AgentSettlementPolicy,
+    idle_timeout_ms: u64,
+    lease_expires_at_unix_ms: Option<u64>,
+    effective_required_approval_risk_classes: Vec<String>,
+    prepared_sources: Vec<PreparedSource>,
+    parent_baseline_id: Value,
+    source_baseline_revisions: BTreeMap<String, Value>,
+    verification_policy: Value,
 }
 impl NodeService {
     #[allow(clippy::too_many_arguments)]
@@ -581,7 +785,15 @@ impl NodeService {
             last_health: None,
             health_frontier_dirty: false,
             health_fault: None,
+            privileged: None,
+            pending_privileged: HashMap::new(),
+            pending_privilege_requests: HashMap::new(),
         })
+    }
+
+    pub fn with_privileged(mut self, privileged: Arc<PrivilegedNodeRuntime>) -> Self {
+        self.privileged = Some(privileged);
+        self
     }
     fn message_id(&mut self) -> String {
         self.message_counter = self.message_counter.saturating_add(1);
@@ -764,6 +976,7 @@ impl NodeService {
         // for a transient transport fault.  Any later local fault sets this
         // again before the connection is abandoned.
         self.health_fault = None;
+        self.queue_privilege_registration(&mut client)?;
         self.flush_all_event_batches(&mut client)?;
         self.flush_ack_if_due(&mut client, true)?;
         let positions = self.node.store().transport_positions()?;
@@ -967,6 +1180,28 @@ impl NodeService {
                     )?;
                 }
             }
+            "privilege.registration_result" => {
+                let privileged = self.privileged.as_ref().ok_or_else(|| {
+                    ServiceError::Unavailable("privileged_helper_not_installed".into())
+                })?;
+                privileged
+                    .activate_registration(&frame.payload)
+                    .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+            }
+            "privilege.ticket_result" => {
+                if let Err(error) = self.apply_privilege_ticket_result(client, &frame.payload) {
+                    let reason = bounded(error.to_string(), 192);
+                    let payload = json!({"code":"capability_unavailable","retryable":false,"details":{"messageType":frame.kind,"reason":reason}});
+                    let id = self.message_id();
+                    client.session.queue_outbound(
+                        &id,
+                        "transport.error",
+                        frame.correlation_id.clone(),
+                        payload,
+                        0,
+                    )?;
+                }
+            }
             _ => {
                 let payload = json!({"code":"capability_unavailable","retryable":false,"details":{"messageType":frame.kind}});
                 let id = self.message_id();
@@ -1127,6 +1362,558 @@ impl NodeService {
             .mark_agent_approval_applied_and_resume(&receipt.approval_id, &agent.key)?;
         Ok(())
     }
+
+    fn queue_privilege_registration(&mut self, client: &mut WssClient) -> Result<(), ServiceError> {
+        let Some(privileged) = self.privileged.as_ref() else {
+            return Ok(());
+        };
+        let request_id = format!(
+            "phreq_{}_{:08}",
+            &privileged.capability().claims.installation_id[privileged
+                .capability()
+                .claims
+                .installation_id
+                .len()
+                .saturating_sub(8)..],
+            privileged.capability().claims.policy_revision,
+        );
+        let summary =
+            serde_json::to_value(&self.local_policy).map_err(|_| TransportError::Malformed)?;
+        let payload = privileged
+            .registration_payload(
+                &request_id,
+                self.local_policy.revision,
+                summary,
+                &self.identity,
+            )
+            .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+        let id = self.message_id();
+        client.session.queue_outbound(
+            &id,
+            "privilege.installation_attestation",
+            Some(request_id),
+            payload,
+            0,
+        )?;
+        Ok(())
+    }
+
+    fn queue_privilege_ticket_request(
+        &mut self,
+        client: &mut WssClient,
+        operation_id: &str,
+        phase: PrivilegedStartPhase,
+        control_digest: Option<String>,
+    ) -> Result<(), ServiceError> {
+        let pending = self
+            .pending_privileged
+            .get(operation_id)
+            .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_required".into()))?;
+        let privileged = self
+            .privileged
+            .clone()
+            .ok_or_else(|| ServiceError::Unavailable("privileged_helper_not_installed".into()))?;
+        if !privileged.active() {
+            return Err(ServiceError::Unavailable(
+                "privileged_helper_registration_missing".into(),
+            ));
+        }
+        let allowed = match phase {
+            PrivilegedStartPhase::PrepareTicket => PrivilegedOperation::Prepare,
+            PrivilegedStartPhase::StartTicket => PrivilegedOperation::Start,
+            PrivilegedStartPhase::InitialInputTicket => PrivilegedOperation::Input,
+        };
+        if matches!(phase, PrivilegedStartPhase::InitialInputTicket) && control_digest.is_none() {
+            return Err(ServiceError::Unavailable("privilege_ticket_invalid".into()));
+        }
+        let action = privileged_operation_name(&allowed);
+        let request_seed = format!(
+            "{}:{}:{}:{}",
+            pending.offer.idempotency_key,
+            action,
+            client.session.epoch(),
+            control_digest.as_deref().unwrap_or("launch")
+        );
+        let seed_digest = hex::encode(Sha256::digest(request_seed.as_bytes()));
+        let request_id = format!("ptreq_{}", &seed_digest[..24]);
+        let ticket_idempotency_key = format!(
+            "{}:{}:{}",
+            pending.offer.idempotency_key,
+            action,
+            &seed_digest[..16]
+        );
+        let now = OffsetDateTime::now_utc();
+        let requested_at = now
+            .format(&Rfc3339)
+            .map_err(|_| TransportError::Malformed)?;
+        let expires_at = (now + time::Duration::minutes(2))
+            .format(&Rfc3339)
+            .map_err(|_| TransportError::Malformed)?;
+        let plan_digest = pending
+            .plan
+            .digest()
+            .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+        let launch_digest = hex::encode(Sha256::digest(
+            serde_jcs::to_vec(&pending.offer.launch).map_err(|_| TransportError::Malformed)?,
+        ));
+        let approval_enforcement = if pending.agent_launch.is_some() {
+            "adapter_mediated"
+        } else {
+            "exact_command"
+        };
+        let mut payload = json!({
+            "requestId": request_id,
+            "idempotencyKey": ticket_idempotency_key,
+            "installationId": privileged.capability().claims.installation_id,
+            "deviceKeyId": self.identity.key_id(),
+            "operationId": pending.offer.operation_id,
+            "runId": pending.offer.runtime.run_id,
+            "runtimeId": pending.offer.runtime.runtime_id,
+            "runtimeSpecDigest": pending.offer.runtime.spec_digest,
+            "launchPlanDigest": launch_digest,
+            "localExecutionPlanDigest": plan_digest,
+            "controlRequestDigest": control_digest,
+            "runManifestDigest": pending.run_manifest_digest,
+            "helperPolicyRevision": privileged.capability().claims.policy_revision,
+            "helperPolicyDigest": privileged.capability().claims.policy_digest,
+            "devicePolicyRevision": self.local_policy.revision,
+            "approvalReceiptDigest": pending.op.arguments.get("approvalReceiptDigest").cloned().unwrap_or(Value::Null),
+            "approvalEnforcement": approval_enforcement,
+            "allowedOperation": action,
+            "resourceCeilings": pending.plan.resources,
+            "redactedSummary": {
+                "capability": pending.op.capability,
+                "adapterId": pending.plan.adapter_id,
+                "runtimeKind": "native",
+                "providerId": "privileged-native"
+            },
+            "requestedAt": requested_at,
+            "expiresAt": expires_at,
+            "deviceSignature": "pending"
+        });
+        let mut unsigned = payload.clone();
+        unsigned
+            .as_object_mut()
+            .expect("ticket request payload")
+            .remove("deviceSignature");
+        payload["deviceSignature"] = Value::String(
+            self.identity
+                .sign(&serde_jcs::to_vec(&unsigned).map_err(|_| TransportError::Malformed)?),
+        );
+        let encoded = serde_jcs::to_vec(&payload).map_err(|_| TransportError::Malformed)?;
+        let digest = hex::encode(Sha256::digest(
+            serde_jcs::to_vec(&unsigned).map_err(|_| TransportError::Malformed)?,
+        ));
+        self.node.store().reserve_privilege_ticket_request(
+            &request_id,
+            &pending.offer.idempotency_key,
+            payload["idempotencyKey"]
+                .as_str()
+                .ok_or(TransportError::Malformed)?,
+            &digest,
+            &encoded,
+        )?;
+        self.pending_privilege_requests.insert(
+            request_id.clone(),
+            PendingPrivilegeRequest {
+                operation_id: operation_id.to_owned(),
+                phase,
+            },
+        );
+        let message_id = self.message_id();
+        client.session.queue_outbound(
+            &message_id,
+            "privilege.ticket_request",
+            Some(request_id),
+            payload,
+            0,
+        )?;
+        Ok(())
+    }
+
+    fn queue_privileged_receipt(
+        &mut self,
+        client: &mut WssClient,
+        receipt: &conduit_privileged_protocol::HelperReceipt,
+    ) -> Result<String, ServiceError> {
+        let digest = receipt
+            .digest()
+            .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+        let mut payload = json!({
+            "receipt": receipt,
+            "deviceKeyId": self.identity.key_id(),
+            "deviceSignature": "pending"
+        });
+        let mut unsigned = payload.clone();
+        unsigned
+            .as_object_mut()
+            .expect("receipt payload")
+            .remove("deviceSignature");
+        payload["deviceSignature"] = Value::String(
+            self.identity
+                .sign(&serde_jcs::to_vec(&unsigned).map_err(|_| TransportError::Malformed)?),
+        );
+        let message_id = self.message_id();
+        client.session.queue_outbound(
+            &message_id,
+            "privilege.receipt",
+            Some(receipt.claims.receipt_id.clone()),
+            payload,
+            0,
+        )?;
+        Ok(digest)
+    }
+
+    fn apply_privilege_ticket_result(
+        &mut self,
+        client: &mut WssClient,
+        payload: &Value,
+    ) -> Result<(), ServiceError> {
+        let request_id = payload
+            .get("requestId")
+            .and_then(Value::as_str)
+            .ok_or(TransportError::Malformed)?
+            .to_owned();
+        let request = self
+            .pending_privilege_requests
+            .remove(&request_id)
+            .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_replayed".into()))?;
+        if payload.get("status").and_then(Value::as_str) != Some("issued") {
+            let code = payload
+                .pointer("/error/code")
+                .and_then(Value::as_str)
+                .unwrap_or("privilege_ticket_invalid");
+            self.node
+                .store()
+                .complete_privilege_ticket_request(&request_id, None, Some(code))?;
+            return Err(ServiceError::Unavailable(code.into()));
+        }
+        let ticket: PrivilegeTicket = serde_json::from_value(
+            payload
+                .get("ticket")
+                .cloned()
+                .ok_or(TransportError::Malformed)?,
+        )
+        .map_err(|_| TransportError::Malformed)?;
+        let privileged = self
+            .privileged
+            .clone()
+            .ok_or_else(|| ServiceError::Unavailable("privileged_helper_not_installed".into()))?;
+        let issuer_key = privileged
+            .issuer_key(&ticket.key_id)
+            .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_invalid".into()))?;
+        let expected_operation = match request.phase {
+            PrivilegedStartPhase::PrepareTicket => PrivilegedOperation::Prepare,
+            PrivilegedStartPhase::StartTicket => PrivilegedOperation::Start,
+            PrivilegedStartPhase::InitialInputTicket => PrivilegedOperation::Input,
+        };
+        let (pending_offer, pending_approval_mode, pending_plan, pending_run_manifest_digest) = {
+            let pending = self
+                .pending_privileged
+                .get(&request.operation_id)
+                .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_required".into()))?;
+            (
+                pending.offer.clone(),
+                pending.op.approval_mode.clone(),
+                pending.plan.clone(),
+                pending.run_manifest_digest.clone(),
+            )
+        };
+        let expected_origin = ticket.claims.public_origin.clone();
+        let authority = VerifiedPrivilegedAdmission::verify_for_operation(
+            &pending_offer,
+            &pending_approval_mode,
+            &self.device_id,
+            &expected_origin,
+            &issuer_key,
+            privileged.receipt_key(),
+            expected_operation.clone(),
+            ticket,
+            pending_plan.clone(),
+            privileged.capability().clone(),
+        )?;
+        if authority.ticket().claims.run_manifest_digest != pending_run_manifest_digest
+            || authority.ticket().claims.max_use_count != 1
+        {
+            return Err(ServiceError::Unavailable("privilege_ticket_invalid".into()));
+        }
+        let signed_ticket =
+            serde_jcs::to_vec(authority.ticket()).map_err(|_| TransportError::Malformed)?;
+        let ticket_digest = authority
+            .ticket()
+            .digest()
+            .map_err(|_| TransportError::Malformed)?;
+        self.node.store().complete_privilege_ticket_request(
+            &request_id,
+            Some((
+                &authority.ticket().claims.ticket_id,
+                &ticket_digest,
+                &signed_ticket,
+            )),
+            None,
+        )?;
+
+        match request.phase {
+            PrivilegedStartPhase::PrepareTicket => {
+                self.node
+                    .bind_privileged_authority(&pending_offer, &authority)?;
+                let result = privileged
+                    .provider()
+                    .prepare_privileged(
+                        &pending_offer.runtime,
+                        authority.ticket().clone(),
+                        pending_plan,
+                    )
+                    .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                let offer = pending_offer;
+                let mut admission_receipt_digest = None;
+                for receipt in &result.helper_receipts {
+                    let digest = self.node.verify_and_record_privileged_receipt(
+                        &offer,
+                        receipt,
+                        privileged.receipt_key(),
+                        &issuer_key,
+                    )?;
+                    self.queue_privileged_receipt(client, receipt)?;
+                    if receipt.claims.transition == "admitted" {
+                        admission_receipt_digest = Some(digest);
+                    }
+                }
+                let admission_receipt_digest = admission_receipt_digest
+                    .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_invalid".into()))?;
+                let local_admission = self.node.admit_privileged_pending(
+                    &offer,
+                    "privileged-native",
+                    &pending_approval_mode,
+                    privileged.capability(),
+                    privileged.receipt_key(),
+                )?;
+                let mut admission = admission_payload(&local_admission, "admitted")?;
+                admission["privilegeReceiptDigest"] = Value::String(admission_receipt_digest);
+                let message_id = self.message_id();
+                client.session.queue_outbound(
+                    &message_id,
+                    "operation.admission",
+                    Some(offer.operation_id.clone()),
+                    admission,
+                    0,
+                )?;
+                self.node.store().transition_operation(
+                    &offer.idempotency_key,
+                    OperationState::Admitted,
+                    OperationState::Starting,
+                    Some(&offer.runtime.runtime_id),
+                    None,
+                    None,
+                )?;
+                self.pending_privileged
+                    .get_mut(&request.operation_id)
+                    .expect("pending privileged start")
+                    .prepared = Some(result.runtime);
+                self.queue_privilege_ticket_request(
+                    client,
+                    &request.operation_id,
+                    PrivilegedStartPhase::StartTicket,
+                    None,
+                )?;
+            }
+            PrivilegedStartPhase::StartTicket => {
+                let mut pending = self
+                    .pending_privileged
+                    .remove(&request.operation_id)
+                    .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_required".into()))?;
+                let prepared = pending
+                    .prepared
+                    .as_ref()
+                    .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_required".into()))?;
+                let (runtime_receipt, managed_io) = if pending.agent_launch.is_some() {
+                    let managed = privileged
+                        .provider()
+                        .start_managed_privileged(
+                            prepared,
+                            authority.ticket().clone(),
+                            &pending.plan,
+                        )
+                        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                    (managed.receipt, Some(managed.io))
+                } else {
+                    (
+                        privileged
+                            .provider()
+                            .start_privileged(prepared, authority.ticket().clone(), &pending.plan)
+                            .map_err(|error| ServiceError::Unavailable(error.to_string()))?,
+                        None,
+                    )
+                };
+                let mut running_digest = None;
+                for receipt in &runtime_receipt.helper_receipts {
+                    let digest = self.node.verify_and_record_privileged_receipt(
+                        &pending.offer,
+                        receipt,
+                        privileged.receipt_key(),
+                        &issuer_key,
+                    )?;
+                    self.queue_privileged_receipt(client, receipt)?;
+                    if receipt.claims.transition == "running" {
+                        running_digest = Some(digest);
+                    }
+                }
+                let running_digest = running_digest
+                    .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_invalid".into()))?;
+                let handle = runtime_receipt.runtime.handle.clone();
+                self.node.store().transition_operation(
+                    &pending.offer.idempotency_key,
+                    OperationState::Starting,
+                    OperationState::Running,
+                    Some(&pending.offer.runtime.runtime_id),
+                    handle.process_identity.as_deref(),
+                    None,
+                )?;
+                let mut status = running_status_payload(
+                    &pending.offer.operation_id,
+                    &pending.offer.runtime.run_id,
+                    &pending.offer.request_digest,
+                    &pending.offer.runtime.runtime_id,
+                    "privileged-native",
+                    &handle,
+                    authority.ticket().claims.controller_epoch,
+                    1,
+                    pending.agent_launch.is_some(),
+                    "root_liveness_proven",
+                )?;
+                status["privilegeReceiptDigest"] = Value::String(running_digest);
+                let message_id = self.message_id();
+                client.session.queue_outbound(
+                    &message_id,
+                    "operation.status",
+                    Some(pending.offer.operation_id.clone()),
+                    status,
+                    0,
+                )?;
+                self.runtime_custody.insert(
+                    pending.offer.runtime.runtime_id.clone(),
+                    RuntimeCustody {
+                        start_operation_id: pending.offer.operation_id.clone(),
+                        run_id: pending.offer.runtime.run_id.clone(),
+                        request_digest: pending.offer.request_digest.clone(),
+                        provider_id: "privileged-native".into(),
+                        handle: handle.clone(),
+                        state: RuntimeState::Running,
+                        controller_epoch: authority.ticket().claims.controller_epoch,
+                        revision: 1,
+                    },
+                );
+                if pending.agent_launch.is_none() {
+                    self.active.insert(
+                        pending.offer.operation_id.clone(),
+                        Active {
+                            key: pending.offer.idempotency_key,
+                            operation_id: pending.offer.operation_id,
+                            run_id: pending.offer.runtime.run_id,
+                            request_digest: pending.offer.request_digest,
+                            provider_id: "privileged-native".into(),
+                            handle,
+                            journal_state: OperationState::Running,
+                            controller_epoch: authority.ticket().claims.controller_epoch,
+                            revision: 1,
+                        },
+                    );
+                } else {
+                    let input = initial_frames_bytes(
+                        &pending.agent_launch.as_ref().expect("agent launch").0,
+                    )?;
+                    let control_digest = hex::encode(Sha256::digest(&input));
+                    pending.managed_io = managed_io;
+                    pending.handle = Some(handle);
+                    self.pending_privileged
+                        .insert(request.operation_id.clone(), pending);
+                    self.queue_privilege_ticket_request(
+                        client,
+                        &request.operation_id,
+                        PrivilegedStartPhase::InitialInputTicket,
+                        Some(control_digest),
+                    )?;
+                }
+            }
+            PrivilegedStartPhase::InitialInputTicket => {
+                let mut pending = self
+                    .pending_privileged
+                    .remove(&request.operation_id)
+                    .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_required".into()))?;
+                let handle = pending
+                    .handle
+                    .take()
+                    .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_required".into()))?;
+                let (spec, driver, kind) = pending
+                    .agent_launch
+                    .take()
+                    .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_invalid".into()))?;
+                let input = initial_frames_bytes(&spec)?;
+                let receipt = privileged
+                    .provider()
+                    .input_authorized(&handle, &input, authority.ticket().clone())
+                    .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                let helper_receipt = receipt.final_helper_receipt();
+                let digest = self.node.verify_and_record_privileged_receipt(
+                    &pending.offer,
+                    helper_receipt,
+                    privileged.receipt_key(),
+                    &issuer_key,
+                )?;
+                self.queue_privileged_receipt(client, helper_receipt)?;
+                if helper_receipt.claims.control_request_digest.as_deref()
+                    != authority.ticket().claims.control_digest.as_deref()
+                    || digest.is_empty()
+                {
+                    return Err(ServiceError::Unavailable("privilege_ticket_invalid".into()));
+                }
+                self.node.store().record_agent_session(
+                    &pending.offer.idempotency_key,
+                    agent_settlement_policy_name(pending.settlement_policy),
+                    authority.ticket().claims.controller_epoch,
+                    pending.lease_expires_at_unix_ms,
+                )?;
+                self.agents.insert(
+                    pending.offer.operation_id.clone(),
+                    AgentActive {
+                        key: pending.offer.idempotency_key,
+                        operation_id: pending.offer.operation_id,
+                        run_id: pending.offer.runtime.run_id,
+                        request_digest: pending.offer.request_digest,
+                        runtime_id: pending.offer.runtime.runtime_id,
+                        provider_id: "privileged-native".into(),
+                        handle,
+                        child: AgentProcess::managed(pending.managed_io.take().ok_or_else(
+                            || ServiceError::Unavailable("privilege_ticket_required".into()),
+                        )?),
+                        driver,
+                        adapter_kind: kind,
+                        actor_principal_id: pending.op.actor_principal_id,
+                        client_id: pending.op.client_id,
+                        access_scope: pending.op.access_scope,
+                        approval_mode: pending.op.approval_mode,
+                        effective_required_approval_risk_classes: pending
+                            .effective_required_approval_risk_classes,
+                        local_policy_revision: self.local_policy.revision,
+                        controller_epoch: authority.ticket().claims.controller_epoch,
+                        revision: 1,
+                        event_sequence: 0,
+                        raw_sequence: 0,
+                        settlement_policy: pending.settlement_policy,
+                        session_state: AgentSessionState::Running,
+                        idle_timeout_ms: pending.idle_timeout_ms,
+                        lease_expires_at_unix_ms: pending.lease_expires_at_unix_ms,
+                        prepared_sources: pending.prepared_sources,
+                        parent_baseline_id: pending.parent_baseline_id,
+                        source_baseline_revisions: pending.source_baseline_revisions,
+                        verification_policy: pending.verification_policy,
+                    },
+                );
+            }
+        }
+        Ok(())
+    }
+
     fn reject_offer(
         &mut self,
         client: &mut WssClient,
@@ -1417,8 +2204,31 @@ impl NodeService {
         // Device-local authority is evaluated before resolving Sources or
         // probing executables so a local deny cannot be bypassed or obscured by
         // a later availability failure.
-        self.local_policy.evaluate(&op, profile_id)?;
         let selected = normalize_provider(&op.runtime.provider_id);
+        if op.access_scope == "full_device" {
+            let privileged = self.privileged.as_ref().ok_or_else(|| {
+                ServiceError::Unavailable("privileged_helper_not_installed".into())
+            })?;
+            if !privileged.active() {
+                return Err(ServiceError::Unavailable(
+                    "privileged_helper_registration_missing".into(),
+                ));
+            }
+            if selected != "privileged-native" || op.runtime.kind != "native" {
+                return Err(ServiceError::Unavailable(
+                    "full_device_capability_unavailable".into(),
+                ));
+            }
+            if is_agent && profile_id != "codex" && op.approval_mode != "never" {
+                return Err(ServiceError::Unavailable(
+                    "full_device_approval_enforcement_unavailable".into(),
+                ));
+            }
+            self.local_policy
+                .evaluate_privileged(&op, profile_id, privileged.capability())?;
+        } else {
+            self.local_policy.evaluate(&op, profile_id)?;
+        }
         let manifest =
             serde_jcs::to_vec(&operation_value).map_err(|_| TransportError::Malformed)?;
         let run_id = op
@@ -1721,6 +2531,55 @@ impl NodeService {
             runtime,
             launch,
         };
+        if op.access_scope == "full_device" {
+            let run_manifest_digest = payload
+                .get("runManifestDigest")
+                .and_then(Value::as_str)
+                .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
+                .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_invalid".into()))?
+                .to_owned();
+            let plan =
+                privileged_local_plan(&offer, &prepared_sources, is_agent.then_some(profile_id))?;
+            let privileged = self.privileged.as_ref().ok_or_else(|| {
+                ServiceError::Unavailable("privileged_helper_not_installed".into())
+            })?;
+            self.node.admit_privileged_pending(
+                &offer,
+                "privileged-native",
+                &op.approval_mode,
+                privileged.capability(),
+                privileged.receipt_key(),
+            )?;
+            let operation_id = op.operation_id.clone();
+            self.pending_privileged.insert(
+                operation_id.clone(),
+                PendingPrivilegedStart {
+                    op,
+                    offer,
+                    plan,
+                    run_manifest_digest,
+                    prepared: None,
+                    managed_io: None,
+                    handle: None,
+                    agent_launch,
+                    settlement_policy,
+                    idle_timeout_ms,
+                    lease_expires_at_unix_ms,
+                    effective_required_approval_risk_classes,
+                    prepared_sources,
+                    parent_baseline_id,
+                    source_baseline_revisions,
+                    verification_policy,
+                },
+            );
+            self.queue_privilege_ticket_request(
+                client,
+                &operation_id,
+                PrivilegedStartPhase::PrepareTicket,
+                None,
+            )?;
+            return Ok(());
+        }
         let receipt = self
             .node
             .admit(&offer, selected, &op.access_scope, &op.approval_mode)?;
@@ -1834,7 +2693,7 @@ impl NodeService {
                             runtime_id,
                             provider_id: selected.to_owned(),
                             handle,
-                            child,
+                            child: AgentProcess::local(child),
                             driver,
                             adapter_kind: kind,
                             actor_principal_id: op.actor_principal_id,
@@ -2000,7 +2859,7 @@ impl NodeService {
                         runtime_id,
                         provider_id: "native".into(),
                         handle: custody.handle,
-                        child,
+                        child: AgentProcess::local(child),
                         driver,
                         adapter_kind: kind,
                         actor_principal_id: op.actor_principal_id,
@@ -2313,7 +3172,7 @@ impl NodeService {
         if command == "cancel" {
             cancelled = true;
             if prior_session_state == AgentSessionState::WaitingInput {
-                agent.child.terminate().map_err(|error| error.to_string())?;
+                agent.child.terminate_local()?;
             } else {
                 match agent.driver.command(AdapterOperation::Cancel, None) {
                     Ok(frames) => {
@@ -2325,11 +3184,11 @@ impl NodeService {
                         }
                     }
                     Err(conduit_adapters::AdapterError::UnsupportedOperation { .. }) => {
-                        agent.child.terminate().map_err(|error| error.to_string())?;
+                        agent.child.terminate_local()?;
                     }
                     Err(error) => return Err(error.to_string()),
                 }
-                agent.child.terminate().map_err(|error| error.to_string())?;
+                agent.child.terminate_local()?;
             }
         } else if command == "close" {
             let frames = agent
@@ -2342,7 +3201,7 @@ impl NodeService {
                     .write(&frame)
                     .map_err(|error| error.to_string())?;
             }
-            agent.child.terminate().map_err(|error| error.to_string())?;
+            agent.child.terminate_local()?;
             close = true;
         } else {
             let operation = match command {
@@ -2996,9 +3855,10 @@ impl NodeService {
                     AgentSettlementPolicy::CloseOnSettle => {
                         if let Ok(frames) = agent.driver.command(AdapterOperation::Close, None) {
                             for frame in frames {
-                                agent.child.write(&frame).map_err(|error| {
-                                    ServiceError::Unavailable(error.to_string())
-                                })?;
+                                agent
+                                    .child
+                                    .write(&frame)
+                                    .map_err(ServiceError::Unavailable)?;
                             }
                         }
                         let session = self.node.store().transition_agent_session(
@@ -4285,6 +5145,147 @@ fn running_status_payload(
     }))
 }
 
+fn privileged_local_plan(
+    offer: &OperationOffer,
+    prepared_sources: &[PreparedSource],
+    adapter_id: Option<&str>,
+) -> Result<conduit_privileged_protocol::LocalExecutionPlan, ServiceError> {
+    use conduit_privileged_protocol::{ResourceCeilings, StdioMode, WorkspaceBinding};
+    let executable =
+        conduit_privileged_helper::capture_file_identity(&offer.launch.executable, true)
+            .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+    let interpreter = approved_shebang_interpreter(&offer.launch.executable)?
+        .map(|path| conduit_privileged_helper::capture_file_identity(&path, true))
+        .transpose()
+        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+    let cwd = conduit_privileged_helper::capture_file_identity(&offer.launch.cwd, false)
+        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+    let workspaces = prepared_sources
+        .iter()
+        .map(|source| {
+            let identity =
+                conduit_privileged_helper::capture_file_identity(&source.host_path, false)
+                    .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+            Ok(WorkspaceBinding {
+                location_id: source.location_id.to_string(),
+                // Canonical paths remain confined to the Device/helper local
+                // protocol and are never copied to Cloudflare metadata.
+                opaque_path_id: source.host_path.to_string_lossy().into_owned(),
+                expected_identity_digest: identity.sha256,
+                read_only: matches!(source.mode, crate::local::WorkspaceMode::ReadOnly),
+            })
+        })
+        .collect::<Result<Vec<_>, ServiceError>>()?;
+    let environment_value_digests = offer
+        .launch
+        .environment
+        .iter()
+        .map(|(key, value)| (key.clone(), hex::encode(Sha256::digest(value.as_bytes()))))
+        .collect();
+    let resources = ResourceCeilings {
+        cpu_quota_per_sec_usec: offer
+            .runtime
+            .resources
+            .cpu
+            .map(|cpu| (cpu * 1_000_000.0).round() as u64),
+        memory_max_bytes: offer.runtime.resources.memory_bytes,
+        tasks_max: offer.runtime.resources.pid_limit,
+        io_weight: None,
+        runtime_max_usec: offer
+            .launch
+            .timeout_ms
+            .map(|value| value.saturating_mul(1_000)),
+    };
+    let plan = conduit_privileged_protocol::LocalExecutionPlan {
+        plan_version: 1,
+        runtime_id: offer.runtime.runtime_id.clone(),
+        run_id: offer.runtime.run_id.clone(),
+        operation_id: offer.operation_id.clone(),
+        executable,
+        interpreter,
+        argv: offer.launch.argv.clone(),
+        cwd,
+        systemd_unit: format!("conduit-elevated-{}.service", offer.runtime.runtime_id),
+        adapter_id: adapter_id.map(str::to_owned),
+        environment: offer.launch.environment.clone(),
+        environment_value_digests,
+        workspaces,
+        credentials: Vec::new(),
+        stdio: match offer.launch.io_mode {
+            IoMode::Pipes => StdioMode::Pipes,
+            IoMode::Pty => StdioMode::Pty,
+        },
+        resources,
+        helper_protocol: conduit_privileged_protocol::PROTOCOL.into(),
+        helper_min_version: "0.1.0".into(),
+    };
+    plan.validate()
+        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+    Ok(plan)
+}
+
+fn privileged_operation_name(operation: &PrivilegedOperation) -> &'static str {
+    match operation {
+        PrivilegedOperation::Prepare => "prepare",
+        PrivilegedOperation::Start => "start",
+        PrivilegedOperation::Inspect => "inspect",
+        PrivilegedOperation::Input => "input",
+        PrivilegedOperation::ResizePty => "resize_pty",
+        PrivilegedOperation::Pause => "pause",
+        PrivilegedOperation::Resume => "resume",
+        PrivilegedOperation::GracefulStop => "graceful_stop",
+        PrivilegedOperation::ForceStop => "force_stop",
+        PrivilegedOperation::Reconcile => "reconcile",
+    }
+}
+
+fn initial_frames_bytes(spec: &conduit_adapters::LaunchSpec) -> Result<Vec<u8>, ServiceError> {
+    let mut input = Vec::new();
+    for frame in &spec.initial_frames {
+        if frame.0.is_empty()
+            || !frame.0.ends_with(b"\n")
+            || frame.0.len() > 64 * 1024
+            || input.len().saturating_add(frame.0.len()) > 1024 * 1024
+        {
+            return Err(ServiceError::Unavailable(
+                "privileged_adapter_input_invalid".into(),
+            ));
+        }
+        input.extend_from_slice(&frame.0);
+    }
+    if input.is_empty() {
+        return Err(ServiceError::Unavailable(
+            "privileged_adapter_input_invalid".into(),
+        ));
+    }
+    Ok(input)
+}
+
+fn approved_shebang_interpreter(path: &Path) -> Result<Option<PathBuf>, ServiceError> {
+    use std::io::Read;
+    let mut file =
+        fs::File::open(path).map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+    let mut prefix = [0_u8; 512];
+    let count = file
+        .read(&mut prefix)
+        .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+    if count < 2 || &prefix[..2] != b"#!" {
+        return Ok(None);
+    }
+    let line = prefix[2..count]
+        .split(|byte| *byte == b'\n')
+        .next()
+        .ok_or_else(|| ServiceError::Unavailable("full_device_shebang_invalid".into()))?;
+    let text = std::str::from_utf8(line)
+        .map_err(|_| ServiceError::Unavailable("full_device_shebang_invalid".into()))?;
+    let interpreter = text
+        .split_ascii_whitespace()
+        .next()
+        .filter(|value| value.starts_with('/') && value.len() <= 256)
+        .ok_or_else(|| ServiceError::Unavailable("full_device_shebang_invalid".into()))?;
+    Ok(Some(PathBuf::from(interpreter)))
+}
+
 fn control_terminal_payload(
     operation_id: &str,
     run_id: &str,
@@ -5513,7 +6514,7 @@ mod tests {
                     runtime_id: runtime_id.clone(),
                     provider_id: "native".into(),
                     handle: custody.handle,
-                    child,
+                    child: AgentProcess::local(child),
                     driver,
                     adapter_kind: kind,
                     actor_principal_id: "prin_settle_never01".into(),
@@ -6118,7 +7119,7 @@ mod tests {
                 runtime_id: runtime_id.into(),
                 provider_id: "native".into(),
                 handle: custody.handle,
-                child,
+                child: AgentProcess::local(child),
                 driver,
                 adapter_kind: AdapterKind::Pi,
                 actor_principal_id: "prin_adapter_failure01".into(),
@@ -6381,7 +7382,7 @@ mod tests {
                 runtime_id: runtime_id.into(),
                 provider_id: "native".into(),
                 handle: custody.handle,
-                child,
+                child: AgentProcess::local(child),
                 driver,
                 adapter_kind: AdapterKind::Pi,
                 actor_principal_id: "prin_adapter_failure01".into(),

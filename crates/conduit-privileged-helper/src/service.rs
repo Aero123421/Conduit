@@ -978,6 +978,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             .ok_or_else(|| HelperError::Denied("ticket_key_unpinned".into()))?;
         ticket.verify(key)?;
         let c = &ticket.claims;
+        c.validate(&ticket.key_id)?;
         let now = OffsetDateTime::now_utc();
         let not_before = parse_time(&c.not_before)?;
         let expires_at = parse_time(&c.expires_at)?;
@@ -1301,11 +1302,16 @@ mod tests {
         SignedClaims::sign(
             engine.config.policy.ticket_key_ids[0].clone(),
             PrivilegeTicketClaims {
+                schema_version: 1,
                 protocol: PROTOCOL.into(),
                 ticket_id: id.into(),
-                issuer: "test".into(),
+                issuer_kind: "control_plane".into(),
+                issuer_key_id: engine.config.policy.ticket_key_ids[0].clone(),
+                issuer: "https://issuer.test".into(),
                 audience: "conduit-privileged-helper".into(),
+                public_origin: engine.config.policy.origin.clone(),
                 origin: engine.config.policy.origin.clone(),
+                helper_installation_id: engine.config.policy.installation_id.clone(),
                 installation_id: engine.config.policy.installation_id.clone(),
                 helper_key_id: engine.config.receipt_key_id.clone(),
                 helper_policy_revision: engine.config.policy.revision,
@@ -1313,30 +1319,49 @@ mod tests {
                 device_id: engine.config.policy.device_id.clone(),
                 device_key_id: "dkey_test".into(),
                 device_policy_revision: 1,
+                device_revision: 1,
+                expected_uid: engine.config.policy.uid,
                 uid: engine.config.policy.uid,
                 operation_id: plan.operation_id.clone(),
                 idempotency_key_digest: "11".repeat(32),
+                operation_request_digest: "22".repeat(32),
                 request_digest: "22".repeat(32),
+                run_manifest_digest: "66".repeat(32),
                 run_id: plan.run_id.clone(),
                 runtime_id: plan.runtime_id.clone(),
                 runtime_spec_digest: "33".repeat(32),
                 launch_plan_digest: "44".repeat(32),
+                control_digest: if matches!(
+                    operation,
+                    PrivilegedOperation::Prepare | PrivilegedOperation::Start
+                ) {
+                    None
+                } else {
+                    Some("77".repeat(32))
+                },
                 local_execution_plan_digest: plan.digest().unwrap(),
                 controller_epoch: 1,
-                connector_policy_id: "cpol_test".into(),
+                connector_policy_id: Some("cpol_test".into()),
                 connector_policy_revision: 1,
                 project_id: None,
+                project_revision: None,
                 assignment_id: None,
+                project_agent_id: None,
+                project_agent_revision: None,
+                runtime_configuration_revision: 1,
                 access_scope: "full_device".into(),
                 approval_mode: "always".into(),
                 approval_receipt_digest: Some("55".repeat(32)),
                 approval_enforcement: ApprovalEnforcement::ExactCommand,
+                required_approval_risk_classes: vec![],
                 required_risk_classes: vec![],
                 allowed_operation: operation,
                 resource_ceilings: resources(),
+                issued_at: (now - time::Duration::seconds(5)).format(&Rfc3339).unwrap(),
                 not_before: (now - time::Duration::seconds(5)).format(&Rfc3339).unwrap(),
                 expires_at: (now + time::Duration::minutes(5)).format(&Rfc3339).unwrap(),
                 nonce: "nonce".into(),
+                max_use_count: 1,
             },
             issuer,
         )

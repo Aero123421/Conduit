@@ -88,11 +88,16 @@ pub struct ResourceCeilings {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct PrivilegeTicketClaims {
+    pub schema_version: u16,
     pub protocol: String,
     pub ticket_id: String,
+    pub issuer_kind: String,
+    pub issuer_key_id: String,
     pub issuer: String,
     pub audience: String,
+    pub public_origin: String,
     pub origin: String,
+    pub helper_installation_id: String,
     pub installation_id: String,
     pub helper_key_id: String,
     pub helper_policy_revision: u64,
@@ -100,35 +105,87 @@ pub struct PrivilegeTicketClaims {
     pub device_id: String,
     pub device_key_id: String,
     pub device_policy_revision: u64,
+    pub device_revision: u64,
+    pub expected_uid: u32,
     pub uid: u32,
     pub operation_id: String,
     pub idempotency_key_digest: String,
+    pub operation_request_digest: String,
     pub request_digest: String,
+    pub run_manifest_digest: String,
     pub run_id: String,
     pub runtime_id: String,
     pub runtime_spec_digest: String,
     pub launch_plan_digest: String,
+    pub control_digest: Option<String>,
     pub local_execution_plan_digest: String,
     pub controller_epoch: u64,
-    pub connector_policy_id: String,
+    pub connector_policy_id: Option<String>,
     pub connector_policy_revision: u64,
     pub project_id: Option<String>,
+    pub project_revision: Option<u64>,
     pub assignment_id: Option<String>,
+    pub project_agent_id: Option<String>,
+    pub project_agent_revision: Option<u64>,
+    pub runtime_configuration_revision: u64,
     pub access_scope: String,
     pub approval_mode: String,
     pub approval_receipt_digest: Option<String>,
     pub approval_enforcement: ApprovalEnforcement,
+    pub required_approval_risk_classes: Vec<String>,
     pub required_risk_classes: Vec<String>,
     pub allowed_operation: PrivilegedOperation,
     pub resource_ceilings: ResourceCeilings,
+    pub issued_at: String,
     pub not_before: String,
     pub expires_at: String,
     pub nonce: String,
+    pub max_use_count: u16,
+}
+
+impl PrivilegeTicketClaims {
+    /// Enforce the canonical fields and their compatibility aliases before a
+    /// caller evaluates any action-specific authority.
+    pub fn validate(&self, envelope_key_id: &str) -> Result<(), ProtocolError> {
+        if self.schema_version != 1
+            || self.protocol != PROTOCOL
+            || self.issuer_kind != "control_plane"
+            || self.issuer_key_id != envelope_key_id
+            || self.public_origin != self.origin
+            || self.helper_installation_id != self.installation_id
+            || self.expected_uid != self.uid
+            || self.operation_request_digest != self.request_digest
+            || self.required_approval_risk_classes != self.required_risk_classes
+            || self.issued_at != self.not_before
+            || self.max_use_count != 1
+            || self.device_revision == 0
+            || self.device_policy_revision == 0
+            || self.runtime_configuration_revision == 0
+            || self.run_manifest_digest.len() != 64
+            || self
+                .control_digest
+                .as_ref()
+                .is_some_and(|value| value.len() != 64)
+        {
+            return Err(ProtocolError::Invalid(
+                "privilege ticket canonical binding".into(),
+            ));
+        }
+        let mut risks = self.required_approval_risk_classes.clone();
+        risks.sort();
+        risks.dedup();
+        if risks.len() != self.required_approval_risk_classes.len() {
+            return Err(ProtocolError::Invalid(
+                "duplicate approval risk class".into(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 pub type PrivilegeTicket = SignedClaims<PrivilegeTicketClaims>;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PrivilegedOperation {
     Prepare,

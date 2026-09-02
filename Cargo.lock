@@ -564,6 +564,7 @@ dependencies = [
  "conduit-domain",
  "conduit-node-store",
  "conduit-observability",
+ "conduit-privileged-helper",
  "conduit-privileged-protocol",
  "conduit-protocol",
  "conduit-runtime",

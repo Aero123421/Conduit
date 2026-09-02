@@ -5,6 +5,7 @@ pub mod batching;
 pub mod ipc;
 pub mod local;
 pub mod local_ipc;
+pub mod privileged;
 pub mod service;
 pub mod startup;
 pub mod transport;
@@ -136,6 +137,10 @@ impl VerifiedPrivilegedAdmission {
         ticket
             .verify(ticket_verification_key)
             .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
+        ticket
+            .claims
+            .validate(&ticket.key_id)
+            .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
         capability
             .verify(receipt_verification_key)
             .map_err(|_| NodeError::Rejected("privileged_helper_registration_missing".into()))?;
@@ -166,6 +171,7 @@ impl VerifiedPrivilegedAdmission {
             && helper.socket_peer_credentials
             && helper.transient_units
             && claims.origin == expected_origin
+            && claims.public_origin == expected_origin
             && claims.installation_id == helper.installation_id
             && claims.helper_key_id == helper.receipt_key_id
             && claims.helper_policy_revision == helper.policy_revision
@@ -175,6 +181,7 @@ impl VerifiedPrivilegedAdmission {
             && claims.operation_id == offer.operation_id
             && claims.idempotency_key_digest == idempotency_key_digest
             && claims.request_digest == offer.request_digest
+            && claims.operation_request_digest == offer.request_digest
             && claims.run_id == offer.runtime.run_id
             && claims.runtime_id == offer.runtime.runtime_id
             && claims.runtime_spec_digest == offer.runtime.spec_digest
@@ -352,6 +359,10 @@ impl Node {
         ticket
             .verify(ticket_verification_key)
             .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
+        ticket
+            .claims
+            .validate(&ticket.key_id)
+            .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
         let ticket_digest = ticket
             .digest()
             .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
@@ -407,7 +418,8 @@ impl Node {
             && claims.runtime_spec_digest == binding.runtime_spec_digest
             && claims.launch_plan_digest == binding.launch_plan_digest
             && claims.local_execution_plan_digest == binding.local_plan_digest
-            && claims.controller_epoch == binding.controller_epoch
+            && claims.controller_epoch == ticket.claims.controller_epoch
+            && claims.control_request_digest == ticket.claims.control_digest
             && ticket_operation_allows_transition
             && claims.unit_name.starts_with("conduit-elevated-")
             && claims.unit_name.ends_with(".service");
@@ -1215,11 +1227,16 @@ mod tests {
         let ticket = SignedClaims::sign(
             "pkey_test0001",
             PrivilegeTicketClaims {
+                schema_version: 1,
                 protocol: PROTOCOL.into(),
                 ticket_id: "ptkt_test0001".into(),
+                issuer_kind: "control_plane".into(),
+                issuer_key_id: "pkey_test0001".into(),
                 issuer: "https://control.invalid".into(),
                 audience: "conduit-privileged-helper".into(),
+                public_origin: "https://control.invalid".into(),
                 origin: "https://control.invalid".into(),
+                helper_installation_id: "phinst_test0001".into(),
                 installation_id: "phinst_test0001".into(),
                 helper_key_id: "hkey_test0001".into(),
                 helper_policy_revision: 3,
@@ -1227,29 +1244,42 @@ mod tests {
                 device_id: "dev_test0001".into(),
                 device_key_id: "dkey_test0001".into(),
                 device_policy_revision: request.local_policy_revision,
+                device_revision: 1,
+                expected_uid: unsafe { libc::geteuid() },
                 uid: unsafe { libc::geteuid() },
                 operation_id: request.operation_id.clone(),
                 idempotency_key_digest: hex::encode(Sha256::digest(
                     request.idempotency_key.as_bytes(),
                 )),
+                operation_request_digest: request.request_digest.clone(),
                 request_digest: request.request_digest.clone(),
+                run_manifest_digest: "99".repeat(32),
                 run_id: request.runtime.run_id.clone(),
                 runtime_id: request.runtime.runtime_id.clone(),
                 runtime_spec_digest: request.runtime.spec_digest.clone(),
                 launch_plan_digest: digest_jcs(&request.launch).unwrap(),
+                control_digest: None,
                 local_execution_plan_digest: plan.digest().unwrap(),
                 controller_epoch: 4,
-                connector_policy_id: "cpol_test0001".into(),
+                connector_policy_id: Some("cpol_test0001".into()),
                 connector_policy_revision: 2,
                 project_id: None,
+                project_revision: None,
                 assignment_id: None,
+                project_agent_id: None,
+                project_agent_revision: None,
+                runtime_configuration_revision: 1,
                 access_scope: "full_device".into(),
                 approval_mode: "never".into(),
                 approval_receipt_digest: None,
                 approval_enforcement: ApprovalEnforcement::ExactCommand,
+                required_approval_risk_classes: vec![],
                 required_risk_classes: vec![],
                 allowed_operation: PrivilegedOperation::Start,
                 resource_ceilings: resources,
+                issued_at: (observed - time::Duration::seconds(1))
+                    .format(&Rfc3339)
+                    .unwrap(),
                 not_before: (observed - time::Duration::seconds(1))
                     .format(&Rfc3339)
                     .unwrap(),
@@ -1257,6 +1287,7 @@ mod tests {
                     .format(&Rfc3339)
                     .unwrap(),
                 nonce: "ticket-nonce-test0001".into(),
+                max_use_count: 1,
             },
             &ticket_key,
         )

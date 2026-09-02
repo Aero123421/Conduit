@@ -14,8 +14,8 @@ prompt, or generated Device identifier.
 
 The accelerated idle test connects the real Rust `NodeService` and `WssClient`
 through the production Worker route to a SQLite-backed `DeviceRoom`. It runs
-all 36,000 100 ms service polls in the first hour, then advances the same live
-socket at each ten-minute checkpoint through 24 hours. The independent
+all 6,000 100 ms service polls in the first ten minutes, then advances the same
+live socket at each ten-minute checkpoint through 24 hours. The independent
 Node-only regression executes all 864,000 polls for 24 hours.
 
 | Connected idle evidence | Measured result |
@@ -25,7 +25,7 @@ Node-only regression executes all 864,000 polls for 24 hours.
 | DeviceRoom application receives | 144 |
 | D1 statements / binding calls / maximum parameters | 144 / 144 / 5 |
 | D1 rows read / written | 72 / 72 |
-| Durable Object SQL statements / rows read / rows written | 1,152 / 8,640 / 72 |
+| Durable Object SQL statements / rows read / rows written | 1,152 / 8,784 / 72 |
 | Retained inbound / cumulative ACK rows | 6 / 1 |
 | Alarm schedules / invocations / remaining alarm | 0 / 0 / none |
 | New Node outbox sequence during idle window | 0 |

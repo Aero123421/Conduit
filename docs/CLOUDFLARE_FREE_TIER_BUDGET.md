@@ -102,15 +102,15 @@ Free-profile Control Plane projection throttle (33 active projections).
 The accelerated integration probe connects the real Rust `NodeService` and
 `WssClient` through the production Worker route to `DeviceRoom`. After the
 authenticated reconciliation setup is complete, the connected probe exercises
-every 100 ms service poll for its first hour, then advances the same live
-socket at each ten-minute checkpoint through 24 hours. The Node-only regression
-separately executes all 864,000 service polls. The measured connected
+every 100 ms service poll for its first ten minutes, then advances the same
+live socket at each ten-minute checkpoint through 24 hours. The Node-only
+regression separately executes all 864,000 service polls. The measured connected
 steady-state window has 144 actual socket sends (6 in the first hour), 144
 DeviceRoom application receives, 72 D1 health
 row mutations, 72 Durable Object base-row mutations, one retained cumulative
 ACK row, six bounded inbound rows, and zero alarm scheduling or invocations.
 The corresponding aggregate counters are 144 D1 statements/binding calls,
-maximum 5 bound parameters, 1,152 Durable Object SQL statements, and 8,640
+maximum 5 bound parameters, 1,152 Durable Object SQL statements, and 8,784
 Durable Object rows read. The setup's fresh health frame is intentionally
 outside that reset measurement; the separate allocation test observes one
 fresh send plus 144 exact replays and only one Node outbox sequence.

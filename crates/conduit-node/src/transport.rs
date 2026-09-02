@@ -608,17 +608,22 @@ impl WssClient {
         result.map_err(|error| TransportError::WebSocket(error.to_string()))
     }
     #[cfg(test)]
-    pub(crate) fn await_idle_e2e_settled(&mut self) -> Result<(), TransportError> {
+    pub(crate) fn await_idle_e2e_settled(&mut self, count: usize) -> Result<(), TransportError> {
         self.set_poll_timeout(Duration::from_secs(15))?;
-        let result = self
-            .socket
-            .read()
-            .map_err(|error| TransportError::WebSocket(error.to_string()));
+        let result = (0..count).try_for_each(|_| {
+            match self
+                .socket
+                .read()
+                .map_err(|error| TransportError::WebSocket(error.to_string()))?
+            {
+                Message::Text(value) if value.as_str() == "{\"type\":\"idle_e2e.settled\"}" => {
+                    Ok(())
+                }
+                _ => Err(TransportError::Malformed),
+            }
+        });
         self.set_poll_timeout(SERVICE_POLL_TIMEOUT)?;
-        match result? {
-            Message::Text(value) if value.as_str() == "{\"type\":\"idle_e2e.settled\"}" => Ok(()),
-            _ => Err(TransportError::Malformed),
-        }
+        result
     }
     /// Send a WebSocket protocol ping.  This is deliberately separate from
     /// semantic `device.health`: a keepalive proves only that the socket peer

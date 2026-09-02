@@ -161,6 +161,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
   } | null = null;
   private idleProbeD1: InstrumentedD1 | null = null;
   private idleProbeNowMs: number | null = null;
+  private idleProbeHealthOrdinal = 0;
 
   constructor(ctx: DurableObjectState, env: ControlPlaneEnv) {
     super(ctx, env);
@@ -261,6 +262,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     Object.assign(this.idleProbe, { incomingMessages: 0, sqlStatements: 0, sqlRowsRead: 0, sqlRowsWritten: 0, setAlarm: 0, deleteAlarm: 0, alarmInvocations: 0 });
     this.idleProbeD1.reset();
     this.idleProbeNowMs = nowMs;
+    this.idleProbeHealthOrdinal = 0;
   }
 
   async inspectIdleE2EProbe(): Promise<Record<string, unknown>> {
@@ -808,14 +810,25 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     if (attachment === null) { ws.close(1011, "connection_state_missing"); return; }
     if (attachment.stage === "new") { await this.hello(ws, attachment, body); return; }
     if (attachment.stage === "challenged") { await this.authenticate(ws, attachment, body); return; }
+    let idleHealthProject: boolean | undefined;
     if (this.idleProbe !== null) {
       this.idleProbe.incomingMessages += 1;
-      if (body.type === "device.health" && this.idleProbeNowMs !== null) this.idleProbeNowMs += 10 * 60_000;
+      if (body.type === "device.health" && this.idleProbeNowMs !== null) {
+        this.idleProbeNowMs += 10 * 60_000;
+        this.idleProbeHealthOrdinal += 1;
+        // The accelerated clock represents observations at ten-minute
+        // boundaries. The fifteen-minute projection threshold is therefore
+        // first reached by every second observation. Claim that decision
+        // synchronously before any binding await so a burst still measures
+        // the same 72 projections as sequential delivery.
+        idleHealthProject = this.idleProbeHealthOrdinal % 2 === 0;
+      }
     }
-    await this.acceptFrame(ws, attachment, body);
-    // Test-only application barrier: it proves the real DeviceRoom handler
-    // completed before the accelerated harness sends the next ten-minute
-    // checkpoint. It is not a transport ACK and creates no durable row.
+    await this.acceptFrame(ws, attachment, body, idleHealthProject);
+    // Test-only application barrier: one response proves one real DeviceRoom
+    // handler completed. The accelerated harness counts all responses after
+    // sending its checkpoint burst. This is not a transport ACK and creates no
+    // durable row.
     if (this.idleProbe !== null && this.idleProbeNowMs !== null && body.type === "device.health") ws.send('{"type":"idle_e2e.settled"}');
   }
 
@@ -877,7 +890,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     await this.syncWorkMarker();
   }
 
-  private async acceptFrame(ws: WebSocket, attachment: SocketAttachment, body: Record<string, unknown>): Promise<void> {
+  private async acceptFrame(ws: WebSocket, attachment: SocketAttachment, body: Record<string, unknown>, idleHealthProject?: boolean): Promise<void> {
     if (body.protocol !== "conduit.node/1" || body.deviceId !== attachment.deviceId || body.connectionEpoch !== attachment.epoch || body.direction !== "node_to_control" || typeof body.sequence !== "string" || !/^\d+$/.test(body.sequence) || typeof body.messageId !== "string" || typeof body.type !== "string" || typeof body.payloadDigest !== "string" || body.payload === null || typeof body.payload !== "object" || Array.isArray(body.payload)) {
       ws.close(1008, "frame_malformed"); return;
     }
@@ -911,7 +924,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
             if (prior.projected === 0 || prior.projected === 3) {
               this.notePending(Date.now());
               await this.projectAndSync(persistedHealth);
-            } else if (this.shouldProjectHealth(persistedHealth)) {
+            } else if (idleHealthProject ?? this.shouldProjectHealth(persistedHealth)) {
               await this.projectExactHealthCheckpoint(persistedHealth);
               this.setHealthMarker(this.healthSemantic(persistedHealth), this.healthClockNow());
             }

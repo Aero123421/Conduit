@@ -52,11 +52,27 @@ Runtime providers expose an idempotent start boundary. Native processes are owne
 
 `DeviceRoom` stores a node frame in its durable inbox before acknowledging it. D1 and Queues projection happens after durable custody. Queue retries are deduplicated using Conduit event and receipt identity.
 
+### Durable control-plane dispatch handoff
+
+The operation journal, idempotency record, and a D1 dispatch-outbox row are committed together before the control plane invokes `DeviceRoom`. The dispatch row owns a stable message ID, operation correlation ID, payload digest, exact payload, target Device, and expiry.
+
+Dispatch uses a bounded lease. Same-key/same-digest retries and a scheduled reconciler reclaim pending or expired-lease rows and submit the identical offer. `DeviceRoom` persists the offer before returning and treats the same message ID, correlation ID, and digest as an idempotent replay that returns the original transport sequence. A conflicting replay is rejected.
+
+If the Worker fails after Durable Object custody but before the D1 offered transition, retry closes the ambiguous handoff without allocating another operation, message, or transport sequence. The offered or expired outbox transition and its operation-journal and idempotency projections commit in one D1 batch. The reconciler repairs terminal rows left with queued projections by an older deployment.
+
+Connector concurrency is a `ConnectorLimiter` Durable Object lease keyed by operation ID. Acquire and release are idempotent for that operation; release cannot decrement another operation's slot. The lease expires at the operation expiry so a failure after acquire but before the D1 creation batch cannot hold capacity indefinitely. D1 records a release-projection marker after terminal expiry or receipt handling. If the Worker fails between the Durable Object release and that marker, reconciliation repeats the same operation-bound release safely. The per-Device Durable Object uses one alarm for due WebSocket-send retry; its alarm handler is idempotent and derives all work from SQLite-backed storage after hibernation.
+
 ### Reconciliation before new work
 
 After authentication, a node sends a bounded reconciliation summary. The control plane responds with exact sequence and event ranges to replay, status requests, pending cancellations, and terminal-receipt confirmations.
 
 New remote operation offers wait until initial reconciliation completes.
+
+The public Worker forwards the WebSocket upgrade response without rebuilding away its `webSocket` endpoint. A reconnect summary whose control position is behind declares a control replay range. Node-origin `transport.replay_required` is accepted only for unacknowledged rows present in the Durable Object outbox. `DeviceRoom` validates one bounded contiguous chunk plus the high-sequence sentinel and commits a durable replay intent with request custody. Foreground, duplicate-request, and alarm paths resend the original sequence, message ID, correlation ID, payload, and digest on the current authenticated epoch. Repeated sentinel gaps advance ranges larger than one chunk. ACK compaction updates durable receipt tombstones, deletes covered replay intents, and removes live frames in one SQLite transaction. A received-but-unapplied replayed `operation.offer` is re-entered through the idempotent operation journal; this decision does not authorize automatic repetition of ambiguous `operation.input` or `operation.cancel` effects.
+
+The authenticated Node retains `controlNextSequence - 1` as the preexisting frontier. Until reconciliation completes, strict contiguous replay may apply effectful frames only through that frontier. New effectful frames fail closed. Received-but-unapplied `operation.offer` duplicates are reprojected through the idempotent operation journal after restart; applied duplicates are only acknowledged.
+
+While an authenticated socket is reconciling, new operation offers, input, cancellation, and approval effects remain in their producer outbox without a control transport sequence. Sequence allocation resumes after reconciliation completes. Offline delivery may allocate before the next handshake because that sequence is then included in the next authenticated frontier. The state check and new sequence allocation occur without an intervening asynchronous boundary inside the Durable Object turn.
 
 ### No automatic rerun from ambiguity
 
@@ -107,12 +123,16 @@ Rejected because stale shared state is not proof that a local runtime is unautho
 ## Consequences
 
 - `DeviceRoom` needs a bounded SQLite schema and compaction rules.
+- The control plane needs a D1 dispatch outbox and scheduled lease reconciler between operation commitment and `DeviceRoom` custody.
 - The node needs a local transactional journal and persistent run supervisor.
 - Control-plane read models are eventually updated from a durable per-device inbox.
 - UI states distinguish queued, delivered, admitted, started, and terminal.
 - Event replay can report an explicit gap when local retention has expired.
 - Runtime-provider design must expose deterministic runtime identity and reconciliation.
 - Transport tests require fake devices, fake Durable Object storage, and injected crash windows.
+- Dispatch tests inject response loss after Durable Object persistence, evict the object, run a fresh reconciler, and prove the stable message ID occupies one outbound sequence.
+- Projection tests reconstruct pre-invariant offered and expired crash images and prove reconciliation converges the outbox, journal, idempotency record, and concurrency-release marker.
+- Limiter tests prove duplicate operation-bound release cannot decrement another operation's slot and an orphaned acquire stops counting at operation expiry.
 
 ## Contract
 

@@ -7,7 +7,7 @@
   "sequence": "101",
   "type": "operation.offer",
   "correlationId": "op_assignment_start_01",
-  "payloadDigest": "4f2d8a0fc2e81867b869e4dcab7f90dfb4954e8316d3ecb9588f3d1768cb45ec",
+  "payloadDigest": "fb741798c9f8ba6e173e8b71be0a202f2bb3aef2d3e68bf33ac34e04770c50dd",
   "payload": {
     "operation": {
       "schemaVersion": 1,
@@ -42,6 +42,10 @@
       },
       "accessScope": "project_full",
       "approvalMode": "never",
+      "requiredApprovalRiskClasses": [
+        "production_deploy",
+        "secret_access"
+      ],
       "connectorPolicyId": "cpol_dashboard_owner_01",
       "connectorPolicyRevision": 4,
       "arguments": {
@@ -51,7 +55,7 @@
         "effort": "high",
         "assignmentMessageId": "msg_assignment_01"
       },
-      "payloadDigest": "c5f3a151c4e62fa4566f322ec121874195e6af736dddb87ce6b5c2159a163c17",
+      "payloadDigest": "78eb8adecf16ed5a921dc6bab9e1b9a78476fc2672aaa827ef38e49b63695e99",
       "issuedAt": "2026-09-01T09:00:00Z",
       "expiresAt": "2026-09-01T09:10:00Z",
       "validForMs": 600000

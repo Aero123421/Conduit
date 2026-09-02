@@ -37,11 +37,15 @@ export type PostAuthFrame = {
     | "operation.terminal"
     | "operation.input"
     | "operation.cancel"
+    | "runtime.control"
+    | "runtime.control_result"
     | "operation.approval"
+    | "operation.approval_request"
     | "event.batch"
     | "event.gap"
     | "device.health";
   correlationId?: string;
+  controlAppliedThrough?: U64Decimal;
   payloadDigest: Sha256Hex;
   payload: {
     [k: string]: unknown;

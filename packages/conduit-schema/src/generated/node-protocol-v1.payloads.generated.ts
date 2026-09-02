@@ -35,7 +35,33 @@ export type AssignmentId = string;
 export type RuntimeKind = "native" | "restricted_native" | "container" | "vm";
 export type AccessScope = "read_only" | "selected_sources" | "project_full" | "full_user" | "full_device" | "custom";
 export type ApprovalMode = "always" | "outside_scope" | "risk_classes" | "never";
+export type RiskClass =
+  | "external_publish"
+  | "secret_access"
+  | "destructive_delete"
+  | "elevation"
+  | "production_deploy"
+  | "device_admin"
+  | "raw_log_export"
+  | "lan_access"
+  | "credential_export"
+  | "runtime_management";
 export type Timestamp = string;
+export type OperationStatusPayload = {
+  operationId: OperationId;
+  runId?: RunId;
+  requestDigest: Sha256Hex;
+  state: OperationState;
+  controllerEpoch: U64Decimal;
+  revision: U64Decimal;
+  phase?: string;
+  targetRuntimeId?: string;
+  targetDigest?: Sha256Hex;
+  runtimeTargetDigest?: Sha256Hex;
+  selectedRuntimeProvider?: string;
+  runtimeHandleDigest?: Sha256Hex;
+  observedAt: Timestamp;
+};
 export type TerminalState =
   | "completed"
   | "failed"
@@ -47,6 +73,36 @@ export type TerminalState =
   | "rejected"
   | "expired";
 export type ArtifactId = string;
+export type RuntimeControlPayload = {
+  operationId: OperationId;
+  idempotencyKey: string;
+  targetRunId: RunId;
+  targetRuntimeId: string;
+  targetHandleDigest: Sha256Hex;
+  targetControllerEpoch: U64Decimal;
+  targetDigest: Sha256Hex;
+  expectedState:
+    | "planned"
+    | "preparing"
+    | "prepared"
+    | "starting"
+    | "running"
+    | "paused"
+    | "stopping"
+    | "stopped"
+    | "failed"
+    | "lost"
+    | "uncertain"
+    | "recovery_required"
+    | "destroying"
+    | "destroyed";
+  expectedRevision: U64Decimal;
+  control: "input" | "steer" | "pause" | "resume" | "cancel" | "stop" | "snapshot" | "restore" | "destroy";
+  content?: string;
+  snapshotName?: string;
+  discardAuthorized?: boolean;
+  custodyComplete?: boolean;
+};
 export type ApprovalId = string;
 
 export interface NodeProtocolPayloadCatalogV1 {
@@ -62,6 +118,9 @@ export interface NodeProtocolPayloadCatalogV1 {
   "operation.terminal": OperationTerminalPayload;
   "operation.input": OperationTargetPayload;
   "operation.cancel": OperationTargetPayload;
+  "runtime.control": RuntimeControlPayload;
+  "runtime.control_result": RuntimeControlResultPayload;
+  "operation.approval_request": OperationApprovalRequestPayload;
   "operation.approval": OperationApprovalPayload;
   "event.batch": EventBatchPayload;
   "event.gap": EventGapPayload;
@@ -90,6 +149,7 @@ export interface ReconcileSummaryPayload {
   journalGeneration: U64Decimal;
   capabilityDigest: Sha256Hex;
   lastControlSequenceApplied: U64Decimal;
+  controlAppliedThrough?: U64Decimal;
   lastNodeSequenceAcknowledged: U64Decimal;
   lastNodeSequenceRetained: U64Decimal;
   /**
@@ -162,6 +222,7 @@ export interface RunEventRangeRequest {
 export interface ReconcileCompletePayload {
   reconciliationId: string;
   lastControlSequenceApplied: U64Decimal;
+  controlAppliedThrough?: U64Decimal;
   lastNodeSequenceAcknowledged: U64Decimal;
   /**
    * @maxItems 256
@@ -190,6 +251,10 @@ export interface OperationEnvelope {
   runtime: RuntimeRequest;
   accessScope: AccessScope;
   approvalMode: ApprovalMode;
+  /**
+   * @maxItems 32
+   */
+  requiredApprovalRiskClasses: RiskClass[];
   connectorPolicyId: string;
   connectorPolicyRevision: number;
   arguments: {
@@ -231,14 +296,6 @@ export interface OperationAdmissionPayload {
   receiptDigest: Sha256Hex;
   reasonCode?: string;
 }
-export interface OperationStatusPayload {
-  operationId: OperationId;
-  runId?: RunId;
-  state: OperationState;
-  phase?: string;
-  runtimeHandleDigest?: Sha256Hex;
-  observedAt: Timestamp;
-}
 export interface OperationTerminalPayload {
   operationId: OperationId;
   runId?: RunId;
@@ -258,12 +315,88 @@ export interface OperationTerminalPayload {
 }
 export interface OperationTargetPayload {
   operationId: OperationId;
+  idempotencyKey: string;
   targetRunId: RunId;
   targetControllerEpoch: U64Decimal;
   expectedState: OperationState;
+  expectedRevision: U64Decimal;
   mode?: string;
   content?: string;
-  targetDigest?: Sha256Hex;
+  targetDigest: Sha256Hex;
+}
+export interface RuntimeControlResultPayload {
+  operationId: OperationId;
+  requestDigest: Sha256Hex;
+  targetRunId: RunId;
+  targetRuntimeId: string;
+  targetControllerEpoch: U64Decimal;
+  targetDigest: Sha256Hex;
+  expectedState:
+    | "planned"
+    | "preparing"
+    | "prepared"
+    | "starting"
+    | "running"
+    | "paused"
+    | "stopping"
+    | "stopped"
+    | "failed"
+    | "lost"
+    | "uncertain"
+    | "recovery_required"
+    | "destroying"
+    | "destroyed";
+  expectedRevision: U64Decimal;
+  control: "input" | "steer" | "pause" | "resume" | "cancel" | "stop" | "snapshot" | "restore" | "destroy";
+  state:
+    | "planned"
+    | "preparing"
+    | "prepared"
+    | "starting"
+    | "running"
+    | "paused"
+    | "stopping"
+    | "stopped"
+    | "failed"
+    | "lost"
+    | "uncertain"
+    | "recovery_required"
+    | "destroying"
+    | "destroyed";
+  revision: U64Decimal;
+  processCountDelta: 0;
+  result?: {
+    [k: string]: unknown;
+  };
+  receiptDigest: Sha256Hex;
+  observedAt: Timestamp;
+}
+export interface OperationApprovalRequestPayload {
+  approvalId: ApprovalId;
+  operationId: OperationId;
+  runId: RunId;
+  requesterPrincipalId: PrincipalId;
+  clientId: string;
+  deviceId: DeviceId;
+  operationDigest: Sha256Hex;
+  providerRequestId: string | number;
+  method: string;
+  parametersDigest: Sha256Hex;
+  argumentsSummary: {
+    [k: string]: unknown;
+  };
+  adapterId: string;
+  accessScope: AccessScope;
+  approvalMode: ApprovalMode;
+  /**
+   * @maxItems 32
+   */
+  effectiveRequiredApprovalRiskClasses: RiskClass[];
+  controllerEpoch: U64Decimal;
+  localPolicyRevision: number;
+  issuedAt: Timestamp;
+  expiresAt: Timestamp;
+  validForMs: number;
 }
 export interface OperationApprovalPayload {
   approvalId: ApprovalId;
@@ -282,10 +415,12 @@ export interface EventBatchPayload {
   runId: RunId;
   fromSequence: U64Decimal;
   throughSequence: U64Decimal;
+  sourceSequenceRange: SequenceRange;
+  sourceRangeDigest: Sha256Hex;
   traceSchema: "conduit.trace/1";
   /**
    * @minItems 1
-   * @maxItems 128
+   * @maxItems 32
    */
   events: [NormalizedEvent, ...NormalizedEvent[]];
 }
@@ -341,6 +476,7 @@ export interface DeviceHealthPayload {
   nodeState: "ready" | "busy" | "degraded" | "reconciling" | "protocol_incompatible";
   journalState: "healthy" | "degraded" | "read_only" | "corrupt";
   storageState: "healthy" | "low" | "exhausted" | "unavailable";
+  controlAppliedThrough?: U64Decimal;
   activeCommands?: number;
   activeAgentRuns?: number;
   activeRuntimes?: number;

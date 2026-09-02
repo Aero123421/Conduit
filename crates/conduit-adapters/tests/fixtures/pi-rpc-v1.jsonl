@@ -1,0 +1,13 @@
+{"id":"conduit-1","type":"response","command":"prompt","success":true}
+{"type":"agent_start"}
+{"type":"extension_ui_request","id":"pi-dialog-fixture","method":"confirm","title":"Continue fixture?"}
+{"type":"message_update","assistantMessageEvent":{"type":"text_delta","contentIndex":0,"delta":"visible fixture response"}}
+{"type":"tool_execution_start","toolCallId":"pi-tool-fixture","toolName":"read","args":{}}
+{"type":"tool_execution_end","toolCallId":"pi-tool-fixture","toolName":"read","result":{"content":[{"type":"text","text":"fixture tool error"}]},"isError":true}
+{"type":"queue_update","steering":[],"followUp":["summarize after retry"]}
+{"type":"agent_end","messages":[],"willRetry":true}
+{"type":"auto_retry_start","attempt":1,"maxAttempts":3,"delayMs":1,"errorMessage":"transient fixture failure"}
+{"type":"auto_retry_end","success":true,"attempt":1}
+{"type":"agent_start"}
+{"type":"agent_end","messages":[],"willRetry":false}
+{"type":"agent_settled"}

@@ -251,6 +251,10 @@ The MCP endpoint publishes OAuth Protected Resource Metadata. The authorization 
 
 The supported authorization flow is Authorization Code with PKCE S256. The implicit grant and resource-owner password grant are not supported.
 
+The authorization request contains only standard OAuth and protected-resource parameters. It does not contain a `connector_policy_id` or another Conduit authority selector. After browser sign-in, Conduit lists the active Connector Policies already bound to the requesting client and owner. The owner selects one during consent, and the resulting grant stores its exact ID and revision.
+
+The consent surface is usable in a normal WebAuthn-capable browser. A missing owner session redirects to browser passkey sign-in. A session older than the fresh-authentication window performs Passkey step-up in the same origin before enabling approval. Consent is submitted as an ordinary HTML form with a same-origin, session-bound CSRF value; it does not depend on a custom request header that a form cannot send.
+
 Access tokens are short-lived. Refresh tokens rotate on use, and reuse of an old refresh token revokes the token family. The authorization server exposes token revocation. Lowering or revoking a grant takes effect independently of access-token expiry because each effectful call resolves the current server-side grant revision.
 
 DPoP may be enabled for clients that support it. It is not required globally until ChatGPT, Claude, Perplexity, and other supported clients can all use it reliably.
@@ -296,6 +300,8 @@ Initial scopes:
 
 A token scope does not imply access to every device or project.
 
+Read authentication does not create an unbounded activity log. Browser and owner-CLI session activity is touched no more than once per ten minutes, and OAuth grant use no more than once per hour. Every request still checks current status, expiry, token family, audience, scope, policy revision, and revocation. Mutation and fresh-passkey requirements are evaluated immediately; throttled timestamps never broaden authority.
+
 ## OAuth grants and connector ceilings
 
 An OAuth grant joins:
@@ -316,10 +322,13 @@ The connector policy limits:
 - runtime providers
 - maximum access scope
 - most permissive approval policy
+- required approval risk classes
 - raw log and raw content access
 - artifact upload and export
 - rate-limit profile
 - maximum run and command duration
+
+Connector limiting keeps rate and weighted/byte budget state in one compact Durable Object row. An all-zero byte charge and an allowed read-only call create no idempotency row. Effectful operations use the D1 operation journal as durable idempotency authority and acquire admission plus concurrency in one Durable Object transaction. Expired windows and released leases are pruned in bounded pages. These storage optimizations do not change policy ceilings, local-deny precedence, idempotency conflicts, or concurrency enforcement.
 
 Access scopes are ordered:
 
@@ -341,6 +350,10 @@ never
 ```
 
 A run may choose a narrower access scope or a more restrictive approval mode than its connector ceiling. It cannot choose a broader or more permissive value.
+
+For every admitted Connector operation, the Control Plane reads `required_risk_classes_json` from the exact Connector Policy ID and revision bound to the OAuth grant. It validates the value against the ten `RiskClass` values, rejects malformed or duplicate policy state, and copies it to the immutable operation envelope as `requiredApprovalRiskClasses`. The field is not part of the OAuth authorization request, MCP tool input, or operation-intent API input. It is bound into the operation digest, D1 custody record, and durable Device outbox payload.
+
+A non-empty Connector list remains authoritative when the requested approval mode is `never`; the client cannot use that mode to erase required classes. When `risk_classes` is selected and the authoritative list is empty, the operation snapshots all defined risk classes. Owner first-party operations snapshot an empty list for other modes. Later policy revisions do not mutate an operation already in custody.
 
 `custom` access policies are admitted only after the server proves that each requested capability is a subset of the connector, project, and device policies. They are not ranked by name.
 
@@ -379,6 +392,10 @@ The effective authority for an operation is the intersection of:
 10. typed approval receipt, when required
 
 The authorization decision binds the exact target and revision. A later request cannot reuse an approval after the source location, runtime, arguments, operation digest, or controller epoch changes.
+
+For MCP object operations, the control plane derives Project and Device authority from stored relationships before applying the Connector Policy. It does not accept a caller-supplied `projectId` as proof of ownership. The binding follows the stored graph, including Session to Project, Location to Source to Project, and Assignment, Run, Task, Artifact, trace, evidence, and operation references to their actual Project. Multiple denormalized references must resolve to the same Project and Device or the request fails closed.
+
+MCP create operations resolve every referenced parent before policy admission. A supplied Project that disagrees with a Session, Assignment, Run, Source Location, or Project Agent is rejected before the record or operation is persisted. When an Agent Run names a Project Agent, its adapter and role are replaced with the stored Project Agent values. A stored `reviewer` role forces `read_only` access; a caller cannot promote or demote the role in request arguments.
 
 Board text is never parsed as an approval receipt.
 

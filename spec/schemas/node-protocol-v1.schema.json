@@ -88,6 +88,21 @@
       "type": "string",
       "enum": ["always", "outside_scope", "risk_classes", "never"]
     },
+    "RiskClass": {
+      "type": "string",
+      "enum": [
+        "external_publish",
+        "secret_access",
+        "destructive_delete",
+        "elevation",
+        "production_deploy",
+        "device_admin",
+        "raw_log_export",
+        "lan_access",
+        "credential_export",
+        "runtime_management"
+      ]
+    },
     "OperationState": {
       "type": "string",
       "enum": [
@@ -264,6 +279,7 @@
         "runtime",
         "accessScope",
         "approvalMode",
+        "requiredApprovalRiskClasses",
         "connectorPolicyId",
         "connectorPolicyRevision",
         "arguments",
@@ -292,6 +308,12 @@
         "runtime": { "$ref": "#/$defs/RuntimeRequest" },
         "accessScope": { "$ref": "#/$defs/AccessScope" },
         "approvalMode": { "$ref": "#/$defs/ApprovalMode" },
+        "requiredApprovalRiskClasses": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/RiskClass" }
+        },
         "connectorPolicyId": { "type": "string", "pattern": "^cpol_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
         "connectorPolicyRevision": { "type": "integer", "minimum": 1 },
         "arguments": { "type": "object", "maxProperties": 128 },
@@ -338,15 +360,26 @@
     "OperationStatusPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["operationId", "state", "observedAt"],
+      "required": ["operationId", "requestDigest", "state", "controllerEpoch", "revision", "observedAt"],
       "properties": {
         "operationId": { "$ref": "#/$defs/OperationId" },
         "runId": { "$ref": "#/$defs/RunId" },
+        "requestDigest": { "$ref": "#/$defs/Sha256Hex" },
         "state": { "$ref": "#/$defs/OperationState" },
+        "controllerEpoch": { "$ref": "#/$defs/U64Decimal" },
+        "revision": { "$ref": "#/$defs/U64Decimal" },
         "phase": { "type": "string", "maxLength": 128 },
+        "targetRuntimeId": { "type": "string", "pattern": "^rt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "targetDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "runtimeTargetDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "selectedRuntimeProvider": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
         "runtimeHandleDigest": { "$ref": "#/$defs/Sha256Hex" },
         "observedAt": { "$ref": "#/$defs/Timestamp" }
-      }
+      },
+      "allOf": [{
+        "if": { "properties": { "state": { "const": "running" } }, "required": ["state"] },
+        "then": { "required": ["runId", "targetRuntimeId", "targetDigest", "runtimeTargetDigest", "selectedRuntimeProvider", "runtimeHandleDigest"] }
+      }]
     },
     "OperationTerminalPayload": {
       "type": "object",
@@ -373,15 +406,122 @@
     "OperationTargetPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["operationId", "targetRunId", "targetControllerEpoch", "expectedState"],
+      "required": ["operationId", "idempotencyKey", "targetRunId", "targetControllerEpoch", "targetDigest", "expectedState", "expectedRevision"],
       "properties": {
         "operationId": { "$ref": "#/$defs/OperationId" },
+        "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 256 },
         "targetRunId": { "$ref": "#/$defs/RunId" },
         "targetControllerEpoch": { "$ref": "#/$defs/U64Decimal" },
         "expectedState": { "$ref": "#/$defs/OperationState" },
+        "expectedRevision": { "$ref": "#/$defs/U64Decimal" },
         "mode": { "type": "string", "maxLength": 64 },
         "content": { "type": "string", "maxLength": 32768 },
         "targetDigest": { "$ref": "#/$defs/Sha256Hex" }
+      }
+    },
+    "RuntimeControlPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "idempotencyKey", "targetRunId", "targetRuntimeId", "targetHandleDigest", "targetControllerEpoch", "targetDigest", "expectedState", "expectedRevision", "control"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 256 },
+        "targetRunId": { "$ref": "#/$defs/RunId" },
+        "targetRuntimeId": { "type": "string", "pattern": "^rt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "targetHandleDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "targetControllerEpoch": { "$ref": "#/$defs/U64Decimal" },
+        "targetDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "expectedState": { "enum": ["planned", "preparing", "prepared", "starting", "running", "paused", "stopping", "stopped", "failed", "lost", "uncertain", "recovery_required", "destroying", "destroyed"] },
+        "expectedRevision": { "$ref": "#/$defs/U64Decimal" },
+        "control": { "enum": ["input", "steer", "pause", "resume", "cancel", "stop", "snapshot", "restore", "destroy"] },
+        "content": { "type": "string", "maxLength": 32768 },
+        "snapshotName": { "type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$" },
+        "discardAuthorized": { "type": "boolean" },
+        "custodyComplete": { "type": "boolean" }
+      },
+      "allOf": [{
+        "if": { "properties": { "control": { "enum": ["snapshot", "restore"] } }, "required": ["control"] },
+        "then": { "required": ["snapshotName"] }
+      }]
+    },
+    "RuntimeControlResultPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["operationId", "requestDigest", "targetRunId", "targetRuntimeId", "targetControllerEpoch", "targetDigest", "expectedState", "expectedRevision", "control", "state", "revision", "processCountDelta", "receiptDigest", "observedAt"],
+      "properties": {
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "requestDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "targetRunId": { "$ref": "#/$defs/RunId" },
+        "targetRuntimeId": { "type": "string", "pattern": "^rt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "targetControllerEpoch": { "$ref": "#/$defs/U64Decimal" },
+        "targetDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "expectedState": { "enum": ["planned", "preparing", "prepared", "starting", "running", "paused", "stopping", "stopped", "failed", "lost", "uncertain", "recovery_required", "destroying", "destroyed"] },
+        "expectedRevision": { "$ref": "#/$defs/U64Decimal" },
+        "control": { "enum": ["input", "steer", "pause", "resume", "cancel", "stop", "snapshot", "restore", "destroy"] },
+        "state": { "enum": ["planned", "preparing", "prepared", "starting", "running", "paused", "stopping", "stopped", "failed", "lost", "uncertain", "recovery_required", "destroying", "destroyed"] },
+        "revision": { "$ref": "#/$defs/U64Decimal" },
+        "processCountDelta": { "const": 0 },
+        "result": { "type": "object", "maxProperties": 32 },
+        "receiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "observedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "OperationApprovalRequestPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "approvalId",
+        "operationId",
+        "runId",
+        "requesterPrincipalId",
+        "clientId",
+        "deviceId",
+        "operationDigest",
+        "providerRequestId",
+        "method",
+        "parametersDigest",
+        "argumentsSummary",
+        "adapterId",
+        "accessScope",
+        "approvalMode",
+        "effectiveRequiredApprovalRiskClasses",
+        "controllerEpoch",
+        "localPolicyRevision",
+        "issuedAt",
+        "expiresAt",
+        "validForMs"
+      ],
+      "properties": {
+        "approvalId": { "$ref": "#/$defs/ApprovalId" },
+        "operationId": { "$ref": "#/$defs/OperationId" },
+        "runId": { "$ref": "#/$defs/RunId" },
+        "requesterPrincipalId": { "$ref": "#/$defs/PrincipalId" },
+        "clientId": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "deviceId": { "$ref": "#/$defs/DeviceId" },
+        "operationDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "providerRequestId": {
+          "oneOf": [
+            { "type": "string", "minLength": 1, "maxLength": 128 },
+            { "type": "integer", "minimum": -9007199254740991, "maximum": 9007199254740991 }
+          ]
+        },
+        "method": { "type": "string", "minLength": 1, "maxLength": 128 },
+        "parametersDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "argumentsSummary": { "type": "object", "maxProperties": 64 },
+        "adapterId": { "type": "string", "minLength": 1, "maxLength": 64 },
+        "accessScope": { "$ref": "#/$defs/AccessScope" },
+        "approvalMode": { "$ref": "#/$defs/ApprovalMode" },
+        "effectiveRequiredApprovalRiskClasses": {
+          "type": "array",
+          "maxItems": 32,
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/RiskClass" }
+        },
+        "controllerEpoch": { "$ref": "#/$defs/U64Decimal" },
+        "localPolicyRevision": { "type": "integer", "minimum": 1 },
+        "issuedAt": { "$ref": "#/$defs/Timestamp" },
+        "expiresAt": { "$ref": "#/$defs/Timestamp" },
+        "validForMs": { "type": "integer", "minimum": 1, "maximum": 3600000 }
       }
     },
     "OperationApprovalPayload": {
@@ -416,16 +556,18 @@
     "EventBatchPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["runId", "fromSequence", "throughSequence", "traceSchema", "events"],
+      "required": ["runId", "fromSequence", "throughSequence", "sourceSequenceRange", "sourceRangeDigest", "traceSchema", "events"],
       "properties": {
         "runId": { "$ref": "#/$defs/RunId" },
         "fromSequence": { "$ref": "#/$defs/U64Decimal" },
         "throughSequence": { "$ref": "#/$defs/U64Decimal" },
+        "sourceSequenceRange": { "$ref": "#/$defs/SequenceRange" },
+        "sourceRangeDigest": { "$ref": "#/$defs/Sha256Hex" },
         "traceSchema": { "const": "conduit.trace/1" },
         "events": {
           "type": "array",
           "minItems": 1,
-          "maxItems": 128,
+          "maxItems": 32,
           "items": { "$ref": "trace-v1.schema.json#/$defs/NormalizedEvent" }
         }
       }
@@ -491,6 +633,7 @@
         "journalGeneration": { "$ref": "#/$defs/U64Decimal" },
         "capabilityDigest": { "$ref": "#/$defs/Sha256Hex" },
         "lastControlSequenceApplied": { "$ref": "#/$defs/U64Decimal" },
+        "controlAppliedThrough": { "$ref": "#/$defs/U64Decimal" },
         "lastNodeSequenceAcknowledged": { "$ref": "#/$defs/U64Decimal" },
         "lastNodeSequenceRetained": { "$ref": "#/$defs/U64Decimal" },
         "runs": {
@@ -582,6 +725,7 @@
       "properties": {
         "reconciliationId": { "type": "string", "pattern": "^rec_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
         "lastControlSequenceApplied": { "$ref": "#/$defs/U64Decimal" },
+        "controlAppliedThrough": { "$ref": "#/$defs/U64Decimal" },
         "lastNodeSequenceAcknowledged": { "$ref": "#/$defs/U64Decimal" },
         "unresolvedRunIds": {
           "type": "array",
@@ -600,6 +744,7 @@
         "nodeState": { "enum": ["ready", "busy", "degraded", "reconciling", "protocol_incompatible"] },
         "journalState": { "enum": ["healthy", "degraded", "read_only", "corrupt"] },
         "storageState": { "enum": ["healthy", "low", "exhausted", "unavailable"] },
+        "controlAppliedThrough": { "$ref": "#/$defs/U64Decimal" },
         "activeCommands": { "type": "integer", "minimum": 0 },
         "activeAgentRuns": { "type": "integer", "minimum": 0 },
         "activeRuntimes": { "type": "integer", "minimum": 0 }
@@ -630,13 +775,17 @@
             "operation.terminal",
             "operation.input",
             "operation.cancel",
+            "runtime.control",
+            "runtime.control_result",
             "operation.approval",
+            "operation.approval_request",
             "event.batch",
             "event.gap",
             "device.health"
           ]
         },
         "correlationId": { "type": "string", "maxLength": 128 },
+        "controlAppliedThrough": { "$ref": "#/$defs/U64Decimal" },
         "payloadDigest": { "$ref": "#/$defs/Sha256Hex" },
         "payload": { "type": "object" }
       },
@@ -684,6 +833,18 @@
         {
           "if": { "properties": { "type": { "enum": ["operation.input", "operation.cancel"] } }, "required": ["type"] },
           "then": { "properties": { "payload": { "$ref": "#/$defs/OperationTargetPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "runtime.control" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/RuntimeControlPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "runtime.control_result" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/RuntimeControlResultPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "operation.approval_request" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/OperationApprovalRequestPayload" } } }
         },
         {
           "if": { "properties": { "type": { "const": "operation.approval" } }, "required": ["type"] },

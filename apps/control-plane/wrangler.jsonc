@@ -1,0 +1,77 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "conduit-control-plane",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "assets": {
+    "directory": "./assets",
+    "binding": "ASSETS"
+  },
+  "vars": {
+    "PUBLIC_ORIGIN": "https://conduit.example.com",
+    "OAUTH_ISSUER": "https://conduit.example.com",
+    "WEBAUTHN_RP_ID": "conduit.example.com",
+    "WEBAUTHN_RP_NAME": "Conduit",
+    "DCR_MODE": "owner_confirmed",
+    "CLOUDFLARE_USAGE_PROFILE": "free"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "conduit-control-plane",
+      "database_id": "00000000-0000-0000-0000-000000000001",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ARTIFACTS",
+      "bucket_name": "conduit-artifacts"
+    }
+  ],
+  "queues": {
+    "producers": [
+      {
+        "binding": "EVENT_INGESTION",
+        "queue": "conduit-event-ingestion"
+      }
+    ],
+    "consumers": [
+      {
+        "queue": "conduit-event-ingestion",
+        "max_batch_size": 6,
+        "max_batch_timeout": 5,
+        "max_retries": 5,
+        "dead_letter_queue": "conduit-event-ingestion-dead-letter"
+      }
+    ]
+  },
+  "triggers": {
+    "crons": ["*/5 * * * *"]
+  },
+  "durable_objects": {
+    "bindings": [
+      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+      { "name": "BOARD_ROOMS", "class_name": "BoardRoom" },
+      { "name": "CONNECTOR_LIMITERS", "class_name": "ConnectorLimiter" },
+      { "name": "RETRY_SCHEDULER", "class_name": "RetryScheduler" }
+    ]
+  },
+  "migrations": [
+    {
+      "tag": "v1",
+      "new_sqlite_classes": ["DeviceRoom", "BoardRoom", "ConnectorLimiter"]
+    },
+    {
+      "tag": "v2",
+      "new_sqlite_classes": ["RetryScheduler"]
+    }
+  ],
+  "observability": {
+    "enabled": true,
+    "logs": { "enabled": true, "head_sampling_rate": 0.2 },
+    "traces": { "enabled": true, "head_sampling_rate": 0.01 }
+  },
+  "upload_source_maps": true
+}

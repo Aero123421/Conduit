@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -eq 1 && "$1" == "--version" ]]; then
+  echo "conduit @VERSION@"
+  exit 0
+fi
+
+conduit_arguments=" $* "
+if [[ "$conduit_arguments" == *" backup create "* ]]; then
+  conduit_backup_directory="${XDG_DATA_HOME:?}/conduit/storage/backup/backup_packaging_smoke"
+  install -d -m 0700 "$conduit_backup_directory"
+  printf '%s\n' '{"backupId":"backup_packaging_smoke"}' > "$conduit_backup_directory/manifest.json"
+  chmod 0600 "$conduit_backup_directory/manifest.json"
+  printf '{"backupId":"backup_packaging_smoke","manifestPath":"%s","schemaVersion":1}\n' "$conduit_backup_directory/manifest.json"
+  echo create >> "${CONDUIT_TEST_BACKUP_LOG:?}"
+  exit 0
+fi
+if [[ "$conduit_arguments" == *" backup verify "* ]]; then
+  echo verify >> "${CONDUIT_TEST_BACKUP_LOG:?}"
+  if [[ "${CONDUIT_TEST_INVALID_BACKUP:-0}" == 1 ]]; then
+    printf '{"backupId":"backup_packaging_smoke","manifestPath":"%s","schemaVersion":1,"verified":false}\n' "${XDG_DATA_HOME:?}/conduit/storage/backup/backup_packaging_smoke/manifest.json"
+    exit 0
+  fi
+  printf '{"backupId":"backup_packaging_smoke","manifestPath":"%s","schemaVersion":1,"verified":true}\n' "${XDG_DATA_HOME:?}/conduit/storage/backup/backup_packaging_smoke/manifest.json"
+  exit 0
+fi
+
+exec "@REAL_CONDUIT@" "$@"

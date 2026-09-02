@@ -117,6 +117,7 @@ DOMAIN_VALIDATORS = {
 }
 
 SCHEMA_INVALID_REASONS = {
+    "duplicate_item": "uniqueItems",
     "invalid_digest": "pattern",
     "malformed_id": "pattern",
     "unknown_schema_version": "const",

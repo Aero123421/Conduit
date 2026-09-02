@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+[[ "${1:-}" == "--user" ]] || exit 2
+shift
+conduit_command="${1:-}"
+shift || true
+
+conduit_pid_file="${CONDUIT_TEST_SERVICE_PID:?}"
+conduit_enabled_file="${CONDUIT_TEST_SERVICE_ENABLED:?}"
+conduit_log="${CONDUIT_TEST_SERVICE_LOG:?}"
+
+conduit_is_active() {
+  [[ -f "$conduit_pid_file" ]] || return 3
+  conduit_pid="$(<"$conduit_pid_file")"
+  kill -0 "$conduit_pid" 2>/dev/null || return 3
+}
+
+conduit_stop() {
+  if conduit_is_active; then
+    conduit_pid="$(<"$conduit_pid_file")"
+    kill -TERM "$conduit_pid"
+    for _ in $(seq 1 100); do
+      kill -0 "$conduit_pid" 2>/dev/null || break
+      sleep 0.02
+    done
+  fi
+  rm -f -- "$conduit_pid_file"
+}
+
+conduit_start() {
+  conduit_stop
+  install -d -m 0700 \
+    "$XDG_RUNTIME_DIR" \
+    "$XDG_DATA_HOME/conduit" \
+    "$XDG_CONFIG_HOME/conduit"
+  "$CONDUIT_TEST_BINDIR/conduit-node" serve \
+    --data-dir "$XDG_DATA_HOME/conduit" \
+    --socket "$XDG_RUNTIME_DIR/conduit/node.sock" \
+    --launch-profiles "$XDG_CONFIG_HOME/conduit/launch-profiles.json" \
+    >> "$conduit_log" 2>&1 &
+  echo "$!" > "$conduit_pid_file"
+}
+
+echo "$conduit_command $*" >> "${CONDUIT_TEST_SYSTEMCTL_LOG:?}"
+case "$conduit_command" in
+  daemon-reload)
+    ;;
+  is-active)
+    conduit_is_active
+    ;;
+  is-enabled)
+    [[ -f "$conduit_enabled_file" ]] || exit 1
+    ;;
+  enable)
+    : > "$conduit_enabled_file"
+    if [[ " $* " == *" --now "* ]]; then
+      conduit_start
+    fi
+    ;;
+  disable)
+    if [[ " $* " == *" --now "* ]]; then
+      conduit_stop
+    fi
+    rm -f -- "$conduit_enabled_file"
+    ;;
+  start)
+    conduit_start
+    ;;
+  stop)
+    conduit_stop
+    ;;
+  restart)
+    conduit_stop
+    conduit_start
+    ;;
+  *)
+    echo "unsupported mock systemctl command: $conduit_command" >&2
+    exit 2
+    ;;
+esac

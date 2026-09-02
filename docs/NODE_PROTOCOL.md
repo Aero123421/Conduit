@@ -54,7 +54,7 @@ Limits:
 - one JSON object per frame
 - maximum encoded frame size: 65,536 bytes
 - maximum string field: 32,768 UTF-8 bytes unless a smaller field limit is defined
-- maximum event batch: 128 events and 60,000 encoded bytes
+- maximum event batch: 32 events and 60,000 encoded payload bytes (the complete frame remains below 65,536 bytes)
 - binary files, raw logs, large command output, and artifacts use content references or separate bounded upload paths
 
 A frame above the limit is rejected before JSON decoding where the runtime permits it. Oversized or malformed frames never become public adapter text.
@@ -129,6 +129,7 @@ Every post-authentication frame uses this envelope:
   "sequence": "918",
   "type": "operation.terminal",
   "correlationId": "op_...",
+  "controlAppliedThrough": "917",
   "payloadDigest": "sha256-hex",
   "payload": {}
 }
@@ -146,11 +147,19 @@ Required fields:
 - SHA-256 digest of canonical payload
 - bounded payload
 
+Optional fields:
+
+- cumulative control sequence applied by the Device when this frame was built (`controlAppliedThrough`)
+
 `correlationId` is required for an operation, run, approval, input, or reconciliation exchange. Transport acknowledgements may omit it.
 
 A sequence replay is accepted only when message ID and payload digest match the stored record. The same sequence with another message or digest is `sequence_conflict` and closes the connection.
 
 A higher-than-expected sequence is not applied. The receiver returns `transport.replay_required` with the expected sequence. It does not skip an effectful message to process later frames.
+
+A node-origin `transport.replay_required` may request only `control_to_node` sequences that are above the cumulative acknowledged position and no later than the Durable Object's stored control position. `expectedSequence` is the first requested sequence and `receivedSequence`, when present, is the inclusive end. `DeviceRoom` validates a bounded contiguous chunk and the original high-sequence sentinel, persists a replay intent in the same SQLite transaction as inbound custody, then resends the stored frames with their original sequence, message ID, correlation ID, payload, and payload digest. Only the connection epoch is rebound to the authenticated replacement connection. The sentinel induces the next bounded gap request until the range converges. An acknowledged, missing, conflicting, or expired row fails closed.
+
+The replay intent remains alarm-driven until cumulative acknowledgement covers its requested end. A crash after request custody but before socket send, Durable Object eviction, and an exact duplicate request all redrive the same intent. The alarm and foreground path use the same durable rows and one per-object alarm.
 
 ## Cumulative acknowledgement
 
@@ -174,6 +183,13 @@ An acknowledgement means:
 
 It does not mean that an offered operation was admitted, started, completed, or projected into every read model.
 
+The node may coalesce acknowledgements for up to 100ms or 32 control frames. The
+coalesced frame carries the highest contiguous applied sequence, and every
+ordinary node-origin frame carries the same applied-control watermark in
+`controlAppliedThrough`. A sent ACK row is eligible for bounded compaction only
+after the peer's cumulative receipt is durable; a missing or conflicting
+tombstone fails closed and triggers reconciliation.
+
 ## Control-to-node delivery
 
 A side-effecting remote request is created in this order:
@@ -181,12 +197,19 @@ A side-effecting remote request is created in this order:
 1. authorize actor, client, connector policy, project, device, runtime, access scope, and approval policy
 2. allocate operation ID and idempotency key
 3. canonicalize the exact request and calculate its digest
-4. store intended operation state in D1
-5. submit the exact operation to `DeviceRoom`
-6. store an outbound transport row in Durable Object storage
-7. send it over the current WebSocket if the device is connected
+4. atomically store intended operation state and a dispatch-outbox row in D1
+5. claim the dispatch row with a bounded lease and submit the exact operation to `DeviceRoom`
+6. store an outbound transport row in Durable Object storage using the dispatch row's stable message ID
+7. atomically project the D1 dispatch row, operation journal, and idempotency record to offered only after `DeviceRoom` confirms durable custody
+8. send the stored frame over the current WebSocket if the device is connected
 
-The outbound row is persisted before the frame is sent.
+Both custody boundaries persist before sending or acknowledging. A timeout or Worker failure between `DeviceRoom` custody and the D1 offered transition leaves the dispatch row retryable. An explicit same-key/same-digest request and the scheduled reconciler reuse the original operation ID, message ID, correlation ID, and payload digest. `DeviceRoom` returns the original transport sequence for that exact identity; a conflicting digest is rejected.
+
+Dispatch attempts use expiring leases. An abandoned lease is reclaimable after Worker restart. The offered or expired outbox transition and its journal and idempotency projections execute in one D1 batch, so a Worker failure cannot commit a terminal outbox row while leaving the operation queued. The reconciler also repairs terminal rows written by deployments that predate this invariant.
+
+Connector concurrency is represented by a Durable Object lease keyed by operation ID, class, and operation expiry. Acquire is idempotent for the same operation and release changes only that operation's active lease. D1 records `concurrency_released_at` as the release projection. A failure after Durable Object release but before that marker is safe because retry performs the same operation-bound release. A failure after acquire but before the D1 operation batch leaves an orphan lease that stops counting at operation expiry. Deterministic bounded backoff schedules ordinary retry, and operation expiry releases its lease exactly once without decrementing a different operation's slot. A dispatch failure never authorizes a new operation or a new message identity.
+
+The Durable Object outbound row is persisted before any WebSocket send. A failed send remains queued in SQLite-backed storage. A single Durable Object alarm retries due rows idempotently; reconnect and hibernation reconstruct behavior from storage rather than isolate memory.
 
 An offline device keeps queued messages in the Durable Object outbox until expiry, cancellation, or device revocation. A run is not shown as working merely because an offer was queued or transport-acknowledged.
 
@@ -337,6 +360,28 @@ At-least-once queue delivery is deduplicated by Conduit event ID, run ID, and ru
 
 Each run has a persistent event sequence independent of transport connections.
 
+The node records each normalized event and its local raw provider record before
+cloud delivery. A short per-run accumulator then emits one `event.batch` when
+the first of these conditions is met:
+
+- 100ms has elapsed since the first buffered event
+- 32 events are buffered
+- the canonical encoded event payload would reach 60,000 bytes
+
+Approval requests, terminal receipts, errors, tool start/end, commands, file
+effects, Change Set, and verification events are priority events and flush the
+accumulator immediately. Adjacent assistant text deltas are coalesced only at
+the transport boundary: each normalized event, source sequence, and digest is
+retained, so concatenating visible text reconstructs the exact local bytes.
+The Device-local raw stream is independent of this cloud batching and remains
+lossless under its own capture permission and retention policy.
+
+Every cloud batch contains both the existing `fromSequence`/
+`throughSequence` range and the explicit `sourceSequenceRange` object, plus a
+`sourceRangeDigest` committing the Run ID, range, and each event digest. The
+control plane treats a batch as one durable ingestion unit; it must not split a
+single `event.batch` into one Queue message per event.
+
 A normalized event contains:
 
 - run ID
@@ -352,7 +397,10 @@ A normalized event contains:
 - bounded payload or content reference
 - content digest
 
-The event contract is defined by the trace schema. The node can batch consecutive events in `event.batch`.
+The event contract is defined by the trace schema. The node batches consecutive
+events in `event.batch` using the bounded accumulator above. A batch is accepted
+only when its source range and range digest agree with its normalized event
+records.
 
 The control plane applies a batch only when:
 
@@ -399,6 +447,12 @@ The summary contains:
 When the device has more records than fit in one summary, it sends counts and cursors. It does not truncate without declaring truncation.
 
 The control plane compares the summary with D1 intended state and `DeviceRoom` transport state, then sends `reconcile.plan`.
+
+When `lastControlSequenceApplied` is behind the Durable Object position, the plan declares the inclusive control replay range. `transport.accepted.controlNextSequence - 1` is the authenticated preexisting control frontier for that connection. While reconciliation is incomplete, the node may apply only strict contiguous effectful replays at or below that frontier; newly allocated effectful frames remain denied. A high-sequence plan acts as the replay sentinel, is not applied across a gap, and becomes processable after all preceding chunks converge. A received-but-not-applied `operation.offer` inbox row returns `DuplicatePending` after restart and re-enters the idempotent operation journal; only an applied duplicate is acknowledged without reapplication. This does not claim automatic crash-safe repetition for `operation.input` or `operation.cancel`, whose ambiguous external effects remain fail-closed until they gain their own effect journal.
+
+After `transport.accepted` fixes that frontier, an online reconciling connection does not allocate transport sequences for new `operation.offer`, `operation.input`, `operation.cancel`, or `operation.approval` effects. Their durable producer outbox remains pending and retries after reconciliation completes. An offline Device may still accept durable control custody because the next authenticated frontier will include every sequence allocated before that handshake. This keeps the reconciliation plan and all replayed effects on one strict sequence frontier.
+
+The Durable Object serves requested chunks directly from SQLite-backed `outbound_frames`. A Worker restart, Durable Object eviction, WebSocket replacement, or lost pre-disconnect acknowledgement does not allocate new transport identities. Cumulative acknowledgement compacts the live outbox rows and replay intents only after durable receipt tombstones have been updated.
 
 The plan can request:
 
@@ -450,6 +504,8 @@ The node cannot determine whether an external effect started or completed. Examp
 
 The observed state conflicts with a durable terminal or authority record. Examples include a runtime still running after a terminal journal state, a different runtime digest under the same run ID, or an unresolvable controller transition.
 
+An Agent subprocess cannot be resumed merely because its PID is still live. Resume requires an attachable provider I/O channel plus durable Adapter protocol phase, native session identity, active turn correlation, and event cursor. If any of those are unavailable after Node restart, the Node fences the exact recorded process identity and commits a schema-complete `recovery_required` terminal receipt. The receipt binds the original request digest and last durable event sequence and states that automatic replay did not occur.
+
 `lost`, `uncertain`, and `recovery_required` require an explicit recovery action. None automatically create a replacement run.
 
 ## Disconnect behavior
@@ -484,6 +540,42 @@ Input targets:
 
 A stale or terminal target rejects the input. Text posted to the board is not automatically injected into a running agent unless a structured input operation is created.
 
+Every input or cancellation also carries an expected Device-local revision and
+an Agent target digest. The digest is SHA-256 over canonical JSON containing
+`domain=conduit.agent-session-target.v1`, the Run ID, start Operation ID, start
+request digest, Runtime ID, Runtime-handle digest, and controller epoch. A
+running Agent status publishes that digest plus a separate Runtime custody
+digest using `domain=conduit.runtime-custody-target.v1`. The latter authorizes
+only typed Runtime controls; neither digest authorizes starting a replacement
+process.
+
+Input and cancellation effects are reserved in the Device control-effect
+journal before adapter I/O. A completed retry replays both the target Run status
+and the control Operation terminal receipt. A crash leaving an effect pending is
+reported uncertain rather than repeated.
+
+Long-lived Codex, Pi, and ACP processes use an explicit settlement policy.
+`close_on_settle` is the default: protocol settlement closes or archives the
+session, terminates the supervised process, terminalizes the Run, and releases
+Runtime custody. `persistent` moves the Run to durable `waiting_input` under a
+bounded session lease and idle deadline. A follow-up performs a revision-CAS
+transition back to `running`. Explicit close, cancel, or idle expiry finalizes
+the Run and releases the process even when the provider would otherwise never
+exit.
+
+## Existing Runtime controls
+
+`runtime.control` never enters `operation.offer`. It binds the control Operation
+ID and idempotency key to an existing Run, Runtime ID, exact handle digest,
+Runtime custody digest, controller epoch, expected Runtime state, and expected
+Device revision. The typed controls are input, steer, pause, resume, cancel,
+stop, snapshot, restore, and destroy. A result records the resulting state and
+`processCountDelta=0`; pause, resume, stop, snapshot, and destroy call only the
+existing Provider handle. Restore names an existing snapshot on that same
+handle; Providers without an in-place restore primitive fail closed. Archive
+restore that creates a different Runtime remains a start operation and cannot
+be smuggled through this control frame.
+
 ## Approval delivery
 
 The node emits an approval request containing an exact operation commitment. The control plane resolves it according to `docs/AUTHORIZATION.md` and sends `operation.approval`.
@@ -500,9 +592,98 @@ The approval message binds:
 - server expiry
 - bounded validity duration
 
-The node journals the approval receipt before applying it. A receipt for another digest, revision, or controller epoch is rejected.
+The Node journals the approval request commitment and the transition to
+`waiting_approval` in one local SQLite transaction before queueing
+`operation.approval_request`. The request frame uses a deterministic message ID,
+so an unqueued journal row is re-driven without allocating a second logical
+message. The Control Plane persists and projects that request before sending its
+transport ACK. Invalid or stale requests are recorded as security deadletters
+and terminalized for projection so one poison frame cannot block the alarm.
 
-If the connection is lost before the receipt is received, the run remains `waiting_approval` unless a prior approval already covers the exact operation.
+Browser and MCP resolution commit the approval decision, idempotency completion,
+and a D1 dispatch outbox row atomically. Delivery retries until expiry. The
+outbox state `offered` means the frame is durably held by DeviceRoom; it is not
+evidence that the Node wrote the response to the provider.
+
+The Node verifies the receipt commitment and deadline, journals the exact
+provider response and the authoritative Cloud receipt digest before child I/O,
+and marks it applied only after a successful write. A failed write is retried
+from that same journal binding; replay cannot replace the receipt digest with a
+local marker. A duplicate or late receipt with another decision or digest is
+rejected both before and after provider application. A receipt for another digest,
+revision, deadline, or controller epoch is rejected. The controller epoch is an
+Agent-controller generation and is independent of the WebSocket connection
+epoch; reconnect alone does not invalidate a pending approval. The current
+non-attachable restart path creates a new operation/run rather than replacing a
+same-run controller. A future attach implementation must durably increment this
+generation before accepting receipts for the replacement controller.
+
+The local approval journal has one durable row per operation/provider-request
+ID pair. A different approval commitment cannot create a second row for an ID
+that was already pending, resolved, or applied.
+
+Agent finalization is also one local transaction: every outstanding
+`pending`, `requested`, or `resolved` approval becomes `abandoned` while a
+`running` or `waiting_approval` operation moves to `finishing`. Late approval
+receipts cannot resolve or apply an abandoned row. An approval first observed in
+the same poll that terminalizes its Agent is not projected to the Control Plane.
+
+The approval request commitment includes the sorted effective required-risk set
+computed by the Device. DeviceRoom verifies that it contains the immutable
+operation snapshot. This permits a Connector-bound risk minimum to require a
+prompt even when the requested approval mode is `never`, without allowing the
+Device or caller to remove a Cloud minimum.
+
+If the connection is lost before the receipt is received, the run remains
+`waiting_approval` unless a prior approval already covers the exact operation.
+Only one Codex approval is pending per Agent. An exact outstanding duplicate is
+ignored while the original commitment remains pending. Reusing that ID with a
+changed method or parameters terminally fails the Adapter and invalidates the
+pending provider response. After settlement, the
+Adapter retains a bounded, non-evicting process-lifetime tombstone keyed by the
+normalized provider request ID, method, and canonical parameters digest. An
+exact duplicate replays the identical recorded response bytes; a changed
+commitment receives no second terminal JSON-RPC response and terminally fails
+the Adapter with a visible error. Exhausting the tombstone bound terminally
+fails the Adapter instead of evicting an ID or leaving the operation running.
+When the deadline expires, the Node durably journals and writes one same-ID
+decline, resumes the operation, and rejects late receipts without sending a
+second provider response.
+
+## Agent server-request correlation
+
+An Agent Adapter must answer every provider-initiated request that carries an ID. A supported approval request is bridged to the typed approval flow or receives a correlated explicit decline. A request for an unadvertised capability, including host-managed authentication refresh, client attestation, dynamic tools, or user input, receives a correlated fail-closed protocol error. Unknown request methods receive a correlated method-not-found error and a bounded visible Adapter error event. No provider request is left pending merely because Conduit does not implement it.
+
+Codex client requests are held in a bounded request-ID map that also records the
+method and expected response shape. Wrong IDs, duplicate responses, malformed
+exact-ID responses, notification-before-response ordering, and stale turn
+notifications cannot consume or resurrect another turn. If `turn/started` and
+`turn/completed` arrive before the matching `turn/start` response, the pending
+request retains the completed turn ID: an exact delayed response is consumed
+without resurrection, while a different turn ID terminally fails correlation.
+The test fixture is
+derived from the locally generated Codex app-server `ServerRequest` union,
+including `currentTime/read`, so adding a union member without a response fails
+conformance.
+
+ACP permission responses preserve the JSON-RPC request ID and use the
+versioned nested outcome shape. A request for another session, or a request
+without its tool-call identity, is cancelled. A missing typed bridge returns
+`{ "outcome": { "outcome": "cancelled" } }`; effective `never` may select an
+offered `allow_once` option but not a reusable option. A typed pending request is
+bound to method, session, tool call, canonical parameters digest, and expiry.
+`session/load` cannot replace the requested native session ID, and every
+`session/update` must carry that exact active session ID before its tool or text
+event is attributed to the run.
+Pi extension dialog requests preserve their request ID in
+`extension_ui_response`; without a typed bridge they are cancelled. ACP and Pi
+share the same process-lifetime terminal tombstone rule as Codex. Exact
+duplicates replay identical response bytes; changed commitments do not receive
+a contradictory second response and terminally fail the Adapter so the provider
+cannot remain waiting.
+Pi `agent_end` remains nonterminal even when `willRetry` is false;
+`agent_settled` is the terminal event after retries and queued follow-ups are
+drained.
 
 ## Cancellation
 
@@ -528,7 +709,21 @@ If graceful cancellation fails, a separate force-stop operation may be offered a
 
 WebSocket presence is an observation, not device authority.
 
-`DeviceRoom` uses hibernatable WebSocket auto-response for bounded ping/pong where possible. It does not use a permanent timer that prevents hibernation merely to update presence.
+`DeviceRoom` uses hibernatable WebSocket auto-response for bounded ping/pong where possible. The node sends a WebSocket protocol `Ping` roughly every 30 seconds and answers peer `Ping` frames with `Pong`; these control frames are not Conduit envelopes and do not emit `device.health`. It does not use a permanent timer that prevents hibernation merely to update presence.
+
+`device.health` is semantic state, not a keepalive. The node emits it immediately
+after authenticated connection/reconciliation completion, when node/journal/
+storage state or active-run counts change, and on fault/recovery. An unchanged
+state has a ten-minute checkpoint by default (the upper end of the
+five-to-ten-minute policy window). At that checkpoint an unchanged state replays
+the exact durable health envelope, preserving its message ID, sequence, digest,
+and observed timestamp; state changes, faults, recovery, and reconnects allocate
+a fresh sequence. Health payloads include `controlAppliedThrough`, matching the
+watermark on ordinary and reconciliation frames. Control ACKs may advance the
+applied frontier without changing semantic health; they do not invalidate the
+saved health envelope or create a health/ACK feedback loop. The next fresh
+semantic observation (or ordinary/reconciliation frame) carries the current
+frontier, while a non-ACK control application requests a health rebase.
 
 The UI distinguishes:
 

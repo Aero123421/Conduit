@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Set up Conduit</title>
+<body>
+  <h1>Set up Conduit</h1>
+  <p>Register the first owner passkey from this browser.</p>
+  <form id="passkey-setup">
+    <label>Owner name <input id="setup-display-name" name="displayName" required maxlength="128" value="Owner"></label>
+    <label>Bootstrap secret <input id="setup-bootstrap-secret" name="bootstrapSecret" type="password" required autocomplete="off" maxlength="1024"></label>
+    <label>Passkey label <input id="setup-passkey-label" name="label" maxlength="128" value="Owner passkey"></label>
+    <button id="passkey-setup-submit" type="submit">Register owner passkey</button>
+  </form>
+  <p id="auth-status" role="status" aria-live="polite"></p>
+  <script src="/static/auth-browser.js" defer></script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+[package]
+name = "conduit-node-store"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+
+[dependencies]
+base64 = "=0.22.1"
+chacha20poly1305 = "=0.10.1"
+ed25519-dalek = { version = "=2.2.0", features = ["rand_core"] }
+getrandom = "=0.3.4"
+hex = "=0.4.3"
+libc = "=0.2.189"
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+thiserror = "=2.0.20"
+zeroize = { version = "=1.8.2", features = ["derive"] }
+
+[dev-dependencies]
+tempfile = "=3.23.0"

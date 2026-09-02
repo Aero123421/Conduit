@@ -34,12 +34,15 @@ The control plane owns:
 Expected components:
 
 - Workers for HTTP APIs, dashboard backend, OAuth/MCP, and admission checks
+- Workers Static Assets for Setup, Login, Device, and Dashboard shells; asset-first routing keeps those requests out of Worker execution
 - D1 for durable collaboration and configuration records
-- Durable Objects for live device routing, presence, and realtime session fan-out
-- Queues for asynchronous event ingestion and indexing
+- Durable Objects for live device routing, presence, realtime session fan-out, compact Connector budgets, and the singleton minimum-due retry alarm
+- the DeviceRoom durable inbox for Free-profile normalized-event custody; Queue mode keeps one complete Node batch per asynchronous Queue message
 - R2 only for explicitly uploaded artifacts, compressed log chunks, exports, or backups
 
 Durable Object memory is never authoritative. Important state must survive hibernation and eviction in D1 or Durable Object storage. Per-connection metadata required after hibernation is attached to the WebSocket.
+
+`CLOUDFLARE_USAGE_PROFILE` selects `free` or `standard` batching, unchanged-health checkpoints, ingestion transport, retention page sizes, sampling, and Cron backstop intervals. The profile does not change authorization, approval, stale-epoch fencing, idempotency conflicts, exact-target control, or evidence retention. Unknown profile values fail closed. The deployment template defaults to Free and its measured release gates are defined in `docs/CLOUDFLARE_FREE_TIER_BUDGET.md`.
 
 References:
 

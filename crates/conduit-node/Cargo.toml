@@ -1,0 +1,30 @@
+[package]
+name = "conduit-node"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.92"
+license = "Apache-2.0"
+
+[dependencies]
+base64 = "=0.22.1"
+conduit-adapters = { path = "../conduit-adapters" }
+conduit-domain = { path = "../conduit-domain" }
+conduit-node-store = { path = "../conduit-node-store" }
+conduit-observability = { path = "../conduit-observability" }
+conduit-protocol = { path = "../conduit-protocol" }
+conduit-runtime = { path = "../conduit-runtime" }
+conduit-workspace = { path = "../conduit-workspace" }
+hex = "=0.4.3"
+libc = "=0.2.189"
+serde = { version = "=1.0.229", features = ["derive"] }
+serde_jcs = "=0.2.0"
+serde_json = "=1.0.151"
+sha2 = "=0.10.9"
+thiserror = "=2.0.20"
+time = { version = "=0.3.55", features = ["formatting", "parsing"] }
+tungstenite = { version = "=0.28.0", features = ["rustls-tls-native-roots"] }
+url = "=2.5.7"
+
+[dev-dependencies]
+rusqlite = { version = "=0.37.0", features = ["bundled"] }
+tempfile = "=3.23.0"

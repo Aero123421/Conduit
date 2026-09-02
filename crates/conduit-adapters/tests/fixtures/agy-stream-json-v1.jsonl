@@ -1,0 +1,4 @@
+{"event":"init","conversation_id":"agy-session-fixture","init":{"cwd":"/tmp/conduit-fixture-workspace","tools":["run_command"],"permission_mode":"request-review"}}
+{"event":"step_update","step_update":{"conversation_id":"agy-session-fixture","step_index":2,"state":"ACTIVE","step_type":"agent_response","text_delta":"visible fixture response"}}
+{"event":"step_update","step_update":{"conversation_id":"agy-session-fixture","step_index":3,"state":"DONE","step_type":"tool","tool_name":"run_command","tool_info":{"name":"run_command","parameters":{"CommandLine":"redacted fixture"},"output":"bounded result"}}}
+{"event":"result","result":{"conversation_id":"agy-session-fixture","status":"SUCCESS","response":"visible fixture response","duration_seconds":1.0,"num_turns":1,"usage":{"input_tokens":1,"output_tokens":1,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":2}}}

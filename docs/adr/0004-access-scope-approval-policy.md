@@ -11,6 +11,14 @@ Access presets include read only, selected sources, project full access, full us
 
 Full user or full device access with `never` approval is a supported explicit configuration. The effective authority remains bounded by actor/client authorization, connector ceiling, device policy, runtime capability, and operating-system permissions.
 
+Every immutable operation envelope carries `requiredApprovalRiskClasses`. For an OAuth Connector, the Control Plane copies this bounded, unique list from the exact Connector Policy revision bound to the grant. An API or MCP caller cannot provide or override the field. The list is included in the operation commitment, durable operation journal, and Device delivery payload.
+
+The owner first-party policy snapshots an empty list for approval modes other than `risk_classes`. If `risk_classes` is selected and the authoritative list is empty, the Control Plane snapshots all defined risk classes; an empty configuration must not silently turn that mode into `never`. A Connector's non-empty required list is retained for every approval mode, including `never`, because a requested mode cannot remove a grant-bound minimum approval requirement.
+
+At Agent launch the Device validates the immutable snapshot, rejects unknown or duplicate classes, and unions it with any Device-local required classes. That effective set is passed to the Adapter and included in the commitment-bound `operation.approval_request`. The Control Plane requires the request set to contain every immutable class before creating an Approval row. `never` may therefore create an approval request only when the effective required set is non-empty; an empty-set `never` run remains explicitly pre-authorized.
+
+The current Codex classifier identifies file-change/apply-patch requests as `destructive_delete`. Command requests are intentionally unclassified and therefore prompt when any effective required class exists. A known request whose classification is disjoint from the effective set may be pre-authorized. This is a conservative enforcement floor, not a claim that every provider effect has complete semantic classification.
+
 ## Reasons
 
 - a VM can safely grant root inside the guest without granting host access
@@ -27,6 +35,9 @@ Full user or full device access with `never` approval is a supported explicit co
 - there is no undocumented product-wide denial after full access and no approvals are explicitly configured
 - unavailable elevation or provider capability is reported as unavailable, not silently simulated
 - approval receipts bind one exact operation or explicit bounded reuse scope
+- operation retries retain the exact policy revision and required-risk snapshot that was committed at admission
+- Device-local required classes can tighten but never remove the immutable Connector minimum
+- changing a Connector Policy affects newly authorized operations and requires grant reauthorization; it does not rewrite existing operation envelopes
 
 ## Rejected alternatives
 

@@ -1,0 +1,35 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "conduit-idle-e2e",
+  "main": "test/fixtures/idle-e2e-worker.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "PUBLIC_ORIGIN": "http://127.0.0.1:8787",
+    "OAUTH_ISSUER": "http://127.0.0.1:8787",
+    "WEBAUTHN_RP_ID": "127.0.0.1",
+    "WEBAUTHN_RP_NAME": "Conduit idle E2E",
+    "DCR_MODE": "owner_confirmed",
+    "CLOUDFLARE_USAGE_PROFILE": "free",
+    "CLOUDFLARE_IDLE_E2E_PROBE": "enabled",
+    "IDLE_E2E_PROBE_TOKEN": "local-synthetic-idle-e2e-token"
+  },
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "conduit-idle-e2e",
+    "database_id": "00000000-0000-0000-0000-000000000019",
+    "migrations_dir": "migrations"
+  }],
+  "durable_objects": {
+    "bindings": [
+      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+      { "name": "BOARD_ROOMS", "class_name": "BoardRoom" },
+      { "name": "CONNECTOR_LIMITERS", "class_name": "ConnectorLimiter" },
+      { "name": "RETRY_SCHEDULER", "class_name": "RetryScheduler" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["DeviceRoom", "BoardRoom", "ConnectorLimiter"] },
+    { "tag": "v2", "new_sqlite_classes": ["RetryScheduler"] }
+  ]
+}

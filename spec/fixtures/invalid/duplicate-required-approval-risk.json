@@ -1,0 +1,46 @@
+{
+  "fixtureVersion": 1,
+  "schemaId": "https://conduit.dev/spec/schemas/node-protocol-v1.schema.json",
+  "validationLayer": "schema",
+  "validatorKind": "json_schema",
+  "instancePath": "/payload/operation/requiredApprovalRiskClasses",
+  "expectedInvalidReason": "duplicate_item",
+  "instance": {
+    "protocol": "conduit.node/1",
+    "messageId": "cmsg_risk_duplicate_01",
+    "deviceId": "dev_fixture_node_01",
+    "connectionEpoch": "1",
+    "direction": "control_to_node",
+    "sequence": "1",
+    "type": "operation.offer",
+    "correlationId": "op_risk_duplicate_01",
+    "payloadDigest": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "payload": {
+      "operation": {
+        "schemaVersion": 1,
+        "operationId": "op_risk_duplicate_01",
+        "idempotencyKey": "risk-duplicate-fixture-0001",
+        "actorPrincipalId": "prin_fixture_owner_01",
+        "clientId": "https://client.example/fixture",
+        "deviceId": "dev_fixture_node_01",
+        "capability": "command.start",
+        "sourceRevisions": [],
+        "runtime": {
+          "kind": "native",
+          "providerId": "native.linux",
+          "configurationRevision": 1
+        },
+        "accessScope": "full_user",
+        "approvalMode": "never",
+        "requiredApprovalRiskClasses": ["secret_access", "secret_access"],
+        "connectorPolicyId": "cpol_fixture_policy_01",
+        "connectorPolicyRevision": 1,
+        "arguments": {},
+        "payloadDigest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "issuedAt": "2026-09-01T00:00:00Z",
+        "expiresAt": "2026-09-01T00:10:00Z",
+        "validForMs": 600000
+      }
+    }
+  }
+}

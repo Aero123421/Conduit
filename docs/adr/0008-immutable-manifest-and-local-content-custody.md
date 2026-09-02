@@ -66,6 +66,89 @@ Secret plaintext is not written to normalized events. Raw local streams are sepa
 
 Provider-private reasoning is neither requested nor normalized into public messages. A provider event can be suppressed with metadata-only evidence.
 
+### Adapter request custody and restart
+
+Every provider-initiated request with a correlation ID is completed by the Adapter. Approval requests are either bridged to a durable typed Conduit approval or explicitly declined; unadvertised and unknown requests receive correlated fail-closed errors. A Node restart may reattach an Agent only when provider I/O, protocol phase, native session, active turn, and cursor custody are all durable. Otherwise the exact process identity is fenced and a durable `recovery_required` terminal receipt is committed without automatic replay.
+
+The Adapter receives the effective Approval Policy separately from Access
+Scope and an explicit indication of whether the typed approval bridge owns
+provider requests. ACP `session/request_permission` requests are cancelled
+immediately when that bridge is unavailable. Under effective `never`, the
+Adapter may select only an `allow_once` option already offered by the ACP
+server; it never selects `allow_always` because that would broaden reuse
+authority. Pi `select`, `confirm`, `input`, and `editor` extension dialogs are
+never inferred from `never`: an unavailable bridge receives a correlated
+cancel response. Only `agent_settled`, not the lower-level `agent_end`, is a Pi
+terminal receipt because retry, compaction, or queued input may still follow.
+
+Codex app-server client requests are tracked in a bounded map keyed by the
+exact JSON-RPC request ID. Each entry also records the method and expected
+response shape. A wrong, duplicate, stale, or out-of-order response cannot
+consume another request. Turn notifications are accepted only for the active
+turn ID. Every method in the locally generated `ServerRequest` union receives
+either its typed response or a correlated fail-closed response; unknown methods
+receive a same-ID method-not-found response.
+
+A notification may complete a Codex turn before the correlated `turn/start`
+response arrives. The pending request retains that completed turn ID until the
+response is consumed. An exact delayed response is observational only and
+cannot resurrect the turn; a mismatched response terminally fails correlation.
+
+Provider request IDs are process-scoped across approval and fail-closed request
+categories. After a terminal response, the Adapter retains a bounded,
+non-evicting tombstone containing the normalized ID, method, canonical
+parameters digest, and exact response bytes. Exact duplicate requests replay
+those bytes. Reusing a settled ID with another commitment produces a visible
+Adapter error and terminally fails the Adapter without a contradictory second
+response. Capacity exhaustion terminally fails the Adapter rather than evicting
+an ID.
+
+The effective Access Scope is translated into an explicit Codex sandbox policy
+at thread and turn start. Read-only becomes `readOnly`; Restricted Native,
+Container, and VM use `externalSandbox` because the Node enforces the boundary;
+selected/workspace Native access uses `workspaceWrite`; and configured Full
+User or Full Device Native access uses `dangerFullAccess`. Approval Policy is a
+separate parameter. Empty-risk `never` is pre-authorized, `always` uses Codex
+`untrusted`, and outside-scope or risk-class modes conservatively use
+`on-request`. A non-empty immutable or Device-local required-risk set forces
+provider callbacks to remain observable. The current conservative classifier
+can pre-authorize only a known effect whose class is disjoint from that set;
+unknown effects prompt.
+
+Only one interactive Codex approval may be pending for an Agent. An exact
+duplicate pending ID does not receive a second terminal response; changed reuse
+of that ID invalidates the pending response and terminally fails the Adapter.
+Another fresh ID is declined and tombstoned. The Node transactionally
+journals the request commitment and `waiting_approval` transition before it can
+queue the transport frame. The frame has a deterministic message ID; re-queue
+after a crash is idempotent. Resolution is journaled as the exact provider
+response before child I/O, then marked applied after the write succeeds. A
+write failure is retried from the journal. Expiry produces one same-ID decline;
+a late receipt cannot create a second response. The local approval journal
+enforces one durable row per operation/provider-request ID pair.
+
+If the Agent exits or its protocol terminally fails while approval custody is
+outstanding, the Node atomically marks pending, requested, and resolved approval
+rows `abandoned` and advances either `running` or `waiting_approval` to
+`finishing`. Only then is the durable operation terminal written and the Agent
+removed from memory. Same-poll approval observations for a terminalizing Agent
+are never projected, and late receipts for abandoned rows fail closed.
+
+The approval controller epoch is the generation of the Agent controller, not
+the Device WebSocket connection epoch. Ordinary reconnect increments only the
+transport epoch and does not invalidate a pending approval. Replacing the Agent
+controller requires a new operation/run in the current non-attachable
+implementation, so its generation remains `1`. A future same-run attach path
+must persist and increment this generation before it may claim receipt fencing.
+
+The control plane takes durable custody of `operation.approval_request` before
+acknowledging the Node sequence and projects it idempotently into D1. Invalid or
+stale requests are security-event deadletters so they cannot poison replay;
+the Node-side deadline still settles the provider request. Browser or MCP
+resolution commits the decision, approval dispatch outbox row, and idempotency
+effect completion in one D1 batch. A dispatch state of `offered` proves only
+DeviceRoom durable custody, not Node application or provider settlement.
+
 ### Local storage
 
 Normalized events and sequence advancement commit transactionally in SQLite. Inline event payloads are bounded. Larger content uses immutable references.
@@ -115,6 +198,8 @@ Rejected because comparison would no longer identify the exact start conditions.
 - Node startup requires a local trace database and Content Object directory.
 - Runtime start depends on successful Manifest persistence.
 - Adapters emit evidence without claiming more certainty than their protocol supports.
+- Provider-initiated requests never remain pending without a correlated response.
+- Non-attachable Agent processes become durable `recovery_required` outcomes after restart and are never silently rerun.
 - Instruction and Skill reports require catalog identities and content digests.
 - The Node protocol Event Batch references `trace-v1.schema.json`.
 - Device storage settings need retention and capacity controls before long-running use.

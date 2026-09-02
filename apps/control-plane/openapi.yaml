@@ -1,0 +1,562 @@
+openapi: 3.1.0
+info:
+  title: Conduit Control Plane
+  version: 0.1.0
+  description: |
+    Canonical non-visual Linux API. `/api/v1/*` is the public prefix. All
+    effectful requests are idempotent, revisioned resources use quoted integer
+    ETags, and a Cloudflare allow decision never overrides a Device-local deny.
+servers:
+  - url: https://conduit.example.com
+tags:
+  - { name: auth, description: Owner passkey and recovery ceremonies }
+  - { name: devices, description: Device identity and outbound connectivity }
+  - { name: domain, description: Shared product records }
+  - { name: operations, description: Typed execution admission }
+  - { name: connectors, description: OAuth and connector policy }
+  - { name: mcp, description: Modern MCP Streamable HTTP }
+paths:
+  /healthz:
+    get:
+      operationId: health
+      security: []
+      responses: { "200": { $ref: "#/components/responses/JsonSuccess" } }
+  /api/v1/auth/setup/options:
+    post: { operationId: ownerSetupOptions, tags: [auth], security: [], responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /api/v1/auth/setup/verify:
+    post: { operationId: ownerSetupVerify, tags: [auth], security: [], requestBody: { $ref: "#/components/requestBodies/JsonBody" }, responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /api/v1/auth/login/options:
+    post: { operationId: ownerLoginOptions, tags: [auth], security: [], responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /api/v1/auth/login/verify:
+    post: { operationId: ownerLoginVerify, tags: [auth], security: [], requestBody: { $ref: "#/components/requestBodies/JsonBody" }, responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /api/v1/auth/status:
+    get: { operationId: ownerCliStatus, tags: [auth], security: [{ ownerCli: [] }], responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "401": { $ref: "#/components/responses/AuthRequired" } } }
+  /api/v1/auth/logout:
+    post:
+      operationId: ownerCliLogout
+      tags: [auth]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      security: [{ ownerCli: [] }]
+      responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "401": { $ref: "#/components/responses/AuthRequired" } }
+  /api/v1/auth/step-up/options:
+    post: { operationId: ownerStepUpOptions, tags: [auth], security: [{ ownerSession: [] }], responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /api/v1/auth/step-up/verify:
+    post: { operationId: ownerStepUpVerify, tags: [auth], security: [{ ownerSession: [] }], requestBody: { $ref: "#/components/requestBodies/JsonBody" }, responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /api/v1/auth/passkeys/options:
+    post: { operationId: addPasskeyOptions, tags: [auth], security: [{ ownerSession: [] }], responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /api/v1/auth/passkeys/verify:
+    post: { operationId: addPasskeyVerify, tags: [auth], security: [{ ownerSession: [] }], requestBody: { $ref: "#/components/requestBodies/JsonBody" }, responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /api/v1/auth/passkeys/{passkeyId}/revoke:
+    post:
+      operationId: revokePasskey
+      tags: [auth]
+      parameters: [{ $ref: "#/components/parameters/PasskeyId" }, { $ref: "#/components/parameters/CsrfToken" }]
+      security: [{ ownerSession: [] }]
+      responses: { "204": { description: Passkey revoked }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/auth/recovery:
+    post: { operationId: consumeRecoveryCode, tags: [auth], security: [], requestBody: { $ref: "#/components/requestBodies/JsonBody" }, responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /api/v1/auth/recovery/passkeys/options:
+    post: { operationId: recoveryPasskeyOptions, tags: [auth], security: [{ ownerSession: [] }], responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /api/v1/auth/recovery/passkeys/verify:
+    post: { operationId: recoveryPasskeyVerify, tags: [auth], security: [{ ownerSession: [] }], requestBody: { $ref: "#/components/requestBodies/JsonBody" }, responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /api/v1/device-enrollments:
+    post:
+      operationId: createDeviceEnrollment
+      tags: [devices]
+      security: []
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "201": { $ref: "#/components/responses/JsonSuccess" } }
+  /api/v1/device-enrollments/poll:
+    post:
+      operationId: pollDeviceEnrollment
+      tags: [devices]
+      security: []
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "202": { description: Owner decision pending } }
+  /api/v1/device-enrollments/pending:
+    get:
+      operationId: inspectPendingDeviceEnrollment
+      tags: [devices]
+      description: Resolves a user code to bounded Node claims and the public-key fingerprint for browser confirmation.
+      parameters: [{ name: userCode, in: query, required: true, schema: { type: string, minLength: 8, maxLength: 32 } }]
+      security: [{ ownerSession: [] }]
+      responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "404": { description: Pending enrollment not found } }
+  /api/v1/device-enrollments/{enrollmentId}/decision:
+    post:
+      operationId: decideDeviceEnrollment
+      tags: [devices]
+      parameters: [{ $ref: "#/components/parameters/EnrollmentId" }, { $ref: "#/components/parameters/CsrfToken" }]
+      security: [{ ownerSession: [] }]
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/devices/{deviceId}/keys/rotate:
+    post:
+      operationId: rotateDeviceKey
+      tags: [devices]
+      parameters: [{ $ref: "#/components/parameters/DeviceId" }]
+      security: [{ deviceProof: [] }]
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "403": { $ref: "#/components/responses/Forbidden" } }
+  /api/v1/devices/{deviceId}/revoke:
+    post:
+      operationId: revokeDevice
+      tags: [devices]
+      parameters: [{ $ref: "#/components/parameters/DeviceId" }, { $ref: "#/components/parameters/CsrfToken" }]
+      security: [{ ownerSession: [] }]
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "204": { description: Device and keys revoked } }
+  /api/v1/devices/{deviceId}/connect:
+    get:
+      operationId: connectDeviceWebSocket
+      tags: [devices]
+      description: Outbound-only Device WebSocket with signed challenge and connection-epoch fencing.
+      parameters: [{ $ref: "#/components/parameters/DeviceId" }]
+      security: [{ deviceProof: [] }]
+      responses: { "101": { description: WebSocket upgraded }, "403": { $ref: "#/components/responses/Forbidden" } }
+  /api/v1/projects: { $ref: "#/components/pathItems/MutableCollection" }
+  /api/v1/projects/{id}: { $ref: "#/components/pathItems/MutableItem" }
+  /api/v1/sources: { $ref: "#/components/pathItems/MutableCollection" }
+  /api/v1/sources/{id}: { $ref: "#/components/pathItems/MutableItem" }
+  /api/v1/locations: { $ref: "#/components/pathItems/MutableCollection" }
+  /api/v1/locations/{id}: { $ref: "#/components/pathItems/MutableItem" }
+  /api/v1/sessions: { $ref: "#/components/pathItems/MutableCollection" }
+  /api/v1/sessions/{id}: { $ref: "#/components/pathItems/MutableItem" }
+  /api/v1/messages: { $ref: "#/components/pathItems/MutableCollection" }
+  /api/v1/messages/{id}: { $ref: "#/components/pathItems/MutableItem" }
+  /api/v1/project_agents: { $ref: "#/components/pathItems/MutableCollection" }
+  /api/v1/project_agents/{id}: { $ref: "#/components/pathItems/MutableItem" }
+  /api/v1/assignments: { $ref: "#/components/pathItems/MutableCollection" }
+  /api/v1/assignments/{id}: { $ref: "#/components/pathItems/MutableItem" }
+  /api/v1/runs: { $ref: "#/components/pathItems/MutableCollection" }
+  /api/v1/runs/{id}: { $ref: "#/components/pathItems/MutableItem" }
+  /api/v1/tasks: { $ref: "#/components/pathItems/MutableCollection" }
+  /api/v1/tasks/{id}: { $ref: "#/components/pathItems/MutableItem" }
+  /api/v1/tasks/{taskId}/links:
+    post:
+      operationId: linkTask
+      tags: [domain]
+      parameters:
+        - { name: taskId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+        - { $ref: "#/components/parameters/IfMatch" }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.board.write] }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - { type: object, additionalProperties: false, required: [dependsOnTaskId], properties: { dependsOnTaskId: { $ref: "#/components/schemas/Id" } } }
+                - { type: object, additionalProperties: false, required: [linkKind, targetId], properties: { linkKind: { type: string, enum: [message, assignment, run, change_set, artifact] }, targetId: { $ref: "#/components/schemas/Id" } } }
+      responses: { "200": { $ref: "#/components/responses/RevisionedSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/approvals: { $ref: "#/components/pathItems/ReadCollection" }
+  /api/v1/approvals/{id}: { $ref: "#/components/pathItems/ReadItem" }
+  /api/v1/artifacts: { $ref: "#/components/pathItems/MutableCollection" }
+  /api/v1/artifacts/{id}: { $ref: "#/components/pathItems/ReadItem" }
+  /api/v1/devices: { $ref: "#/components/pathItems/ReadCollection" }
+  /api/v1/devices/{id}: { $ref: "#/components/pathItems/ReadItem" }
+  /api/v1/traces: { $ref: "#/components/pathItems/ReadCollection" }
+  /api/v1/traces/{id}: { $ref: "#/components/pathItems/ReadItem" }
+  /api/v1/evidence: { $ref: "#/components/pathItems/ReadCollection" }
+  /api/v1/evidence/{id}: { $ref: "#/components/pathItems/ReadItem" }
+  /api/v1/operations/{id}: { $ref: "#/components/pathItems/ReadItem" }
+  /api/v1/sessions/{sessionId}/stream:
+    get:
+      operationId: streamSessionBoard
+      tags: [domain]
+      parameters: [{ $ref: "#/components/parameters/SessionId" }]
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.read] }]
+      responses: { "101": { description: Durable Board WebSocket upgraded } }
+  /api/v1/assignments/{assignmentId}/transitions:
+    post:
+      operationId: transitionAssignment
+      tags: [domain]
+      parameters: [{ $ref: "#/components/parameters/AssignmentId" }, { $ref: "#/components/parameters/IfMatch" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      security: [{ ownerCli: [] }, { ownerSession: [] }]
+      requestBody: { $ref: "#/components/requestBodies/Transition" }
+      responses: { "200": { $ref: "#/components/responses/RevisionedSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/runs/{runId}/transitions:
+    post:
+      operationId: transitionRun
+      tags: [domain]
+      parameters: [{ $ref: "#/components/parameters/RunId" }, { $ref: "#/components/parameters/IfMatch" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      security: [{ ownerCli: [] }, { ownerSession: [] }]
+      requestBody: { $ref: "#/components/requestBodies/Transition" }
+      responses: { "200": { $ref: "#/components/responses/RevisionedSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/runs/{runId}/events:
+    get:
+      operationId: listRunEvents
+      tags: [domain]
+      parameters: [{ $ref: "#/components/parameters/RunId" }]
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.read] }]
+      responses: { "200": { $ref: "#/components/responses/PageSuccess" } }
+  /api/v1/runs/{runId}/controls:
+    post:
+      operationId: controlExistingRunTarget
+      tags: [operations]
+      description: Resolves the Run's current Agent Session or Runtime custody and durably sends an exact-target control without starting another process.
+      parameters: [{ $ref: "#/components/parameters/RunId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.run.control] }]
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "202": { $ref: "#/components/responses/JsonSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/assignments/{assignmentId}/controls:
+    post:
+      operationId: controlAssignmentAgentSession
+      tags: [operations]
+      parameters: [{ $ref: "#/components/parameters/AssignmentId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.run.control] }]
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "202": { $ref: "#/components/responses/JsonSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/runtimes/{runtimeId}/controls:
+    post:
+      operationId: controlExistingRuntime
+      tags: [operations]
+      parameters:
+        - { name: runtimeId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.runtime.manage] }]
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "202": { $ref: "#/components/responses/JsonSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/change_sets/{changeSetId}:
+    get:
+      operationId: getChangeSet
+      tags: [domain]
+      parameters: [{ name: changeSetId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }]
+      security: [{ ownerCli: [] }, { ownerSession: [] }]
+      responses: { "200": { $ref: "#/components/responses/RevisionedSuccess" } }
+  /api/v1/change_sets/{changeSetId}/reviews:
+    post:
+      operationId: reviewChangeSet
+      tags: [domain]
+      parameters:
+        - { name: changeSetId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+        - { $ref: "#/components/parameters/IfMatch" }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      security: [{ ownerCli: [] }, { ownerSession: [] }]
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "201": { $ref: "#/components/responses/RevisionedSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/sessions/{sessionId}/acceptances:
+    post:
+      operationId: acceptChangeSetBaseline
+      tags: [domain]
+      description: Advances the immutable Session Baseline vector using exact Session-revision and expected-Baseline compare-and-swap inputs.
+      parameters:
+        - { $ref: "#/components/parameters/SessionId" }
+        - { $ref: "#/components/parameters/IfMatch" }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      security: [{ ownerCli: [] }, { ownerSession: [] }]
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "201": { $ref: "#/components/responses/RevisionedSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/approvals/{approvalId}/resolve:
+    post:
+      operationId: resolveApproval
+      tags: [operations]
+      parameters: [{ $ref: "#/components/parameters/ApprovalId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      security: [{ ownerSession: [] }, { oauthConnector: [conduit.approval.resolve] }]
+      requestBody: { $ref: "#/components/requestBodies/ApprovalDecision" }
+      responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/artifacts/{artifactId}/content:
+    put:
+      operationId: uploadArtifactContent
+      tags: [domain]
+      parameters: [{ $ref: "#/components/parameters/ArtifactId" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.run.start] }]
+      requestBody: { required: true, content: { application/octet-stream: { schema: { type: string, format: binary } } } }
+      responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "413": { description: Upload exceeds admitted bound } }
+  /api/v1/operations:
+    get:
+      operationId: listOperations
+      tags: [operations]
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.read] }]
+      responses: { "200": { $ref: "#/components/responses/PageSuccess" } }
+    post:
+      operationId: createOperation
+      tags: [operations]
+      parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+      security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.run.start] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/OperationIntent" } } } }
+      responses: { "202": { description: Intent durably admitted or awaiting an exact approval, content: { application/json: { schema: { $ref: "#/components/schemas/OperationReceipt" } } } }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/rate-limit-profiles:
+    post:
+      operationId: createRateLimitProfile
+      tags: [connectors]
+      parameters: [{ $ref: "#/components/parameters/CsrfToken" }]
+      security: [{ ownerSession: [] }]
+      requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+      responses: { "201": { $ref: "#/components/responses/JsonSuccess" } }
+  /api/v1/connector-policies:
+    post:
+      operationId: createConnectorPolicy
+      tags: [connectors]
+      parameters: [{ $ref: "#/components/parameters/CsrfToken" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+      security: [{ ownerSession: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/ConnectorPolicyInput" } } } }
+      responses: { "201": { $ref: "#/components/responses/RevisionedSuccess" } }
+  /api/v1/connector-policies/{policyId}:
+    patch:
+      operationId: updateConnectorPolicy
+      tags: [connectors]
+      parameters: [{ $ref: "#/components/parameters/PolicyId" }, { $ref: "#/components/parameters/IfMatch" }, { $ref: "#/components/parameters/IdempotencyKey" }, { $ref: "#/components/parameters/CsrfToken" }]
+      security: [{ ownerSession: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/ConnectorPolicyInput" } } } }
+      responses: { "200": { $ref: "#/components/responses/RevisionedSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /api/v1/oauth/clients:
+    post: { operationId: registerFirstPartyOAuthClient, tags: [connectors], parameters: [{ $ref: "#/components/parameters/CsrfToken" }], security: [{ ownerSession: [] }], requestBody: { $ref: "#/components/requestBodies/JsonBody" }, responses: { "201": { $ref: "#/components/responses/JsonSuccess" } } }
+  /api/v1/oauth/clients/{clientId}/approve:
+    post: { operationId: approveOAuthClient, tags: [connectors], parameters: [{ $ref: "#/components/parameters/ClientId" }, { $ref: "#/components/parameters/CsrfToken" }], security: [{ ownerSession: [] }], responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /api/v1/oauth/grants:
+    get:
+      operationId: listOAuthGrants
+      tags: [connectors]
+      parameters: [{ $ref: "#/components/parameters/PageLimit" }, { $ref: "#/components/parameters/PageCursor" }]
+      security: [{ ownerSession: [] }]
+      responses: { "200": { $ref: "#/components/responses/PageSuccess" } }
+  /api/v1/oauth/grants/{grantId}:
+    get:
+      operationId: getOAuthGrant
+      tags: [connectors]
+      parameters: [{ $ref: "#/components/parameters/GrantId" }]
+      security: [{ ownerSession: [] }]
+      responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "404": { description: Grant not found } }
+  /api/v1/oauth/grants/{grantId}/{action}:
+    post:
+      operationId: changeOAuthGrantState
+      tags: [connectors]
+      description: Resume requires a fresh passkey session; recovery can only revoke or force reauthorization.
+      parameters:
+        - { $ref: "#/components/parameters/GrantId" }
+        - { name: action, in: path, required: true, schema: { type: string, enum: [pause, resume, revoke, reauthorize] } }
+        - { $ref: "#/components/parameters/CsrfToken" }
+        - { $ref: "#/components/parameters/IdempotencyKey" }
+      security: [{ ownerSession: [] }]
+      responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  /.well-known/oauth-protected-resource:
+    get: { operationId: oauthProtectedResourceMetadata, tags: [connectors], security: [], responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /.well-known/oauth-authorization-server:
+    get: { operationId: oauthAuthorizationServerMetadata, tags: [connectors], security: [], responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /oauth/register:
+    post: { operationId: registerOAuthClient, tags: [connectors], security: [], requestBody: { $ref: "#/components/requestBodies/JsonBody" }, responses: { "201": { $ref: "#/components/responses/JsonSuccess" } } }
+  /authorize:
+    get: { operationId: beginOAuthAuthorization, tags: [connectors], description: Accepts standard Authorization Code + PKCE parameters. The Owner selects an active Connector Policy in the browser; clients do not supply a policy identifier., security: [{ ownerSession: [] }, {}], responses: { "200": { description: Browser consent and optional Passkey step-up document }, "303": { description: Browser sign-in redirect } } }
+    post: { operationId: completeOAuthAuthorization, tags: [connectors], description: Same-origin HTML form submission with a session-bound form CSRF token., security: [{ ownerSession: [] }], requestBody: { $ref: "#/components/requestBodies/FormBody" }, responses: { "303": { description: Exact registered redirect } } }
+  /oauth/token:
+    post: { operationId: issueOAuthToken, tags: [connectors], security: [], requestBody: { $ref: "#/components/requestBodies/FormBody" }, responses: { "200": { $ref: "#/components/responses/JsonSuccess" } } }
+  /oauth/revoke:
+    post: { operationId: revokeOAuthToken, tags: [connectors], security: [], requestBody: { $ref: "#/components/requestBodies/FormBody" }, responses: { "200": { description: Revocation accepted } } }
+  /mcp:
+    post:
+      operationId: modernMcp
+      tags: [mcp]
+      description: MCP 2026-07-28 only. Every request carries a matching protocol envelope and standard headers; legacy initialize traffic is rejected.
+      parameters:
+        - { name: MCP-Protocol-Version, in: header, required: true, schema: { type: string, const: "2026-07-28" } }
+        - { name: Mcp-Method, in: header, required: true, schema: { type: string, maxLength: 128 } }
+        - { name: Mcp-Name, in: header, required: false, schema: { type: string, maxLength: 256 }, description: Required for tools/call and must match params.name. }
+      security: [{ oauthConnector: [] }]
+      requestBody: { required: true, content: { application/json: { schema: { $ref: "#/components/schemas/JsonRpcRequest" } } } }
+      responses: { "200": { description: JSON or SSE-framed MCP result }, "400": { $ref: "#/components/responses/BadRequest" }, "401": { $ref: "#/components/responses/AuthRequired" }, "403": { $ref: "#/components/responses/Forbidden" } }
+components:
+  pathItems:
+    ReadCollection:
+      get:
+        tags: [domain]
+        parameters: [{ $ref: "#/components/parameters/PageLimit" }, { $ref: "#/components/parameters/PageCursor" }]
+        security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.read] }]
+        responses: { "200": { $ref: "#/components/responses/PageSuccess" }, "401": { $ref: "#/components/responses/AuthRequired" } }
+    MutableCollection:
+      get:
+        tags: [domain]
+        parameters: [{ $ref: "#/components/parameters/PageLimit" }, { $ref: "#/components/parameters/PageCursor" }]
+        security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.read] }]
+        responses: { "200": { $ref: "#/components/responses/PageSuccess" } }
+      post:
+        tags: [domain]
+        description: The connector grant must carry the scope mapped to this resource's exact policy operation (for example config, Board, Run, or artifact admission).
+        parameters: [{ $ref: "#/components/parameters/IdempotencyKey" }]
+        security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [] }]
+        requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+        responses: { "201": { $ref: "#/components/responses/RevisionedSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+    ReadItem:
+      parameters: [{ $ref: "#/components/parameters/ResourceId" }]
+      get:
+        tags: [domain]
+        security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.read] }]
+        responses: { "200": { $ref: "#/components/responses/JsonSuccess" }, "404": { description: Record not found } }
+    MutableItem:
+      parameters: [{ $ref: "#/components/parameters/ResourceId" }]
+      get:
+        tags: [domain]
+        security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [conduit.read] }]
+        responses: { "200": { $ref: "#/components/responses/RevisionedSuccess" } }
+      patch:
+        tags: [domain]
+        description: The connector grant must carry the scope mapped to this resource's exact policy operation; the immutable policy revision is checked on every call.
+        parameters: [{ $ref: "#/components/parameters/IfMatch" }, { $ref: "#/components/parameters/IdempotencyKey" }]
+        security: [{ ownerCli: [] }, { ownerSession: [] }, { oauthConnector: [] }]
+        requestBody: { $ref: "#/components/requestBodies/JsonBody" }
+        responses: { "200": { $ref: "#/components/responses/RevisionedSuccess" }, "409": { $ref: "#/components/responses/Conflict" } }
+  parameters:
+    ResourceId: { name: id, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+    PasskeyId: { name: passkeyId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+    EnrollmentId: { name: enrollmentId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+    DeviceId: { name: deviceId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+    SessionId: { name: sessionId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+    AssignmentId: { name: assignmentId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+    RunId: { name: runId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+    ApprovalId: { name: approvalId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+    ArtifactId: { name: artifactId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+    PolicyId: { name: policyId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+    GrantId: { name: grantId, in: path, required: true, schema: { $ref: "#/components/schemas/Id" } }
+    ClientId: { name: clientId, in: path, required: true, schema: { type: string, minLength: 1, maxLength: 2048 } }
+    PageLimit: { name: limit, in: query, required: false, schema: { type: integer, minimum: 1, maximum: 500, default: 100 } }
+    PageCursor: { name: cursor, in: query, required: false, schema: { type: string, maxLength: 256 } }
+    IdempotencyKey: { name: Idempotency-Key, in: header, required: true, schema: { type: string, minLength: 16, maxLength: 256 } }
+    IfMatch: { name: If-Match, in: header, required: true, schema: { type: string, pattern: '^"[1-9][0-9]*"$' } }
+    CsrfToken: { name: X-CSRF-Token, in: header, required: true, schema: { type: string, minLength: 32, maxLength: 512 } }
+  securitySchemes:
+    ownerCli: { type: http, scheme: bearer, bearerFormat: conduit_owner, description: Passkey-issued owner token; never accepted at MCP. }
+    ownerSession: { type: apiKey, in: cookie, name: __Host-conduit_session }
+    deviceProof: { type: http, scheme: bearer, bearerFormat: ConduitDeviceProof, description: Ed25519 Device proof and connection epoch. }
+    oauthConnector:
+      type: oauth2
+      flows:
+        authorizationCode:
+          authorizationUrl: /authorize
+          tokenUrl: /oauth/token
+          refreshUrl: /oauth/token
+          scopes:
+            conduit.read: Read policy-filtered metadata.
+            conduit.config.write: Change policy-filtered shared configuration.
+            conduit.board.write: Write policy-filtered Board messages.
+            conduit.run.start: Request typed execution admission.
+            conduit.approval.resolve: Resolve an exact bound approval.
+  requestBodies:
+    JsonBody: { required: true, content: { application/json: { schema: { type: object, maxProperties: 128, additionalProperties: true } } } }
+    FormBody: { required: true, content: { application/x-www-form-urlencoded: { schema: { type: object, maxProperties: 32, additionalProperties: { type: string, maxLength: 4096 } } } } }
+    Transition:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [toState]
+            properties:
+              toState: { type: string, maxLength: 64 }
+              receiptKind: { type: string, maxLength: 128 }
+              reasonCode: { type: string, maxLength: 128 }
+              evidenceRef: { type: [string, "null"], maxLength: 512 }
+              receiptDigest: { type: [string, "null"], pattern: '^[0-9a-f]{64}$' }
+    ApprovalDecision:
+      required: true
+      content:
+        application/json:
+          schema:
+            type: object
+            additionalProperties: false
+            required: [decision, commitmentDigest]
+            properties:
+              decision: { type: string, enum: [approved, denied] }
+              commitmentDigest: { type: string, pattern: '^[0-9a-f]{64}$' }
+  schemas:
+    Id: { type: string, minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9_-]+$' }
+    RevisionedRecord:
+      type: object
+      required: [id, revision]
+      properties:
+        id: { $ref: "#/components/schemas/Id" }
+        revision: { type: integer, minimum: 1 }
+        created_at: { type: string, format: date-time }
+        updated_at: { type: string, format: date-time }
+      additionalProperties: true
+    OperationIntent:
+      type: object
+      additionalProperties: false
+      required: [deviceId, capability, runtime, accessScope, approvalMode, sourceRevisions, arguments]
+      properties:
+        capability: { type: string, pattern: '^[a-z][a-z0-9_.-]{0,127}$' }
+        deviceId: { $ref: "#/components/schemas/Id" }
+        projectId: { type: [string, "null"], maxLength: 128 }
+        sessionId: { type: [string, "null"], maxLength: 128 }
+        assignmentId: { type: [string, "null"], maxLength: 128 }
+        runId: { type: [string, "null"], maxLength: 128 }
+        sourceRevisions: { type: array, maxItems: 64, items: { type: object, maxProperties: 16 } }
+        runtime:
+          type: object
+          additionalProperties: false
+          required: [kind, providerId, configurationRevision]
+          properties:
+            kind: { type: string, enum: [native, restricted_native, container, vm] }
+            providerId: { type: string, pattern: '^[a-z][a-z0-9_.-]{0,127}$' }
+            configurationRevision: { type: integer, minimum: 1 }
+            cpuLimit: { type: number, exclusiveMinimum: 0, maximum: 1024 }
+            memoryBytes: { type: integer, minimum: 0 }
+            storageBytes: { type: integer, minimum: 0 }
+            gpuCount: { type: integer, minimum: 0, maximum: 64 }
+            networkMode: { type: string, enum: [open, restricted, offline, lan_explicit] }
+        accessScope: { type: string, enum: [read_only, selected_sources, project_full, full_user, full_device, custom] }
+        approvalMode: { type: string, enum: [always, outside_scope, risk_classes, never] }
+        arguments: { type: object, maxProperties: 128 }
+        expiresInSeconds: { type: integer, minimum: 30, maximum: 3600 }
+        idempotencyKey: { type: string, minLength: 16, maxLength: 256 }
+    OperationReceipt:
+      type: object
+      required: [operationId, state, commitmentDigest]
+      properties:
+        operationId: { $ref: "#/components/schemas/Id" }
+        state: { type: string, enum: [pending_approval, admitted, offered, claimed, running, completed, failed, cancelled, lost, uncertain, rejected] }
+        commitmentDigest: { type: string, pattern: '^[0-9a-f]{64}$' }
+        approvalId: { type: [string, "null"], maxLength: 128 }
+    ConnectorPolicyInput:
+      type: object
+      maxProperties: 32
+      properties:
+        deviceSelector: { type: object, maxProperties: 16 }
+        projectSelector: { type: object, maxProperties: 16 }
+        allowedOperations: { type: array, maxItems: 128, items: { type: string, maxLength: 128 } }
+        allowedRuntimes: { type: array, maxItems: 4, uniqueItems: true, items: { type: string, enum: [native, restricted_native, container, vm] } }
+        maxAccessScope: { type: string, enum: [read_only, selected_sources, project_full, full_user, full_device, custom] }
+        mostPermissiveApprovalMode: { type: string, enum: [always, outside_scope, risk_classes, never] }
+        requiredApprovalRiskClasses:
+          type: array
+          maxItems: 32
+          uniqueItems: true
+          items: { type: string, enum: [external_publish, secret_access, destructive_delete, elevation, production_deploy, device_admin, raw_log_export, lan_access, credential_export, runtime_management] }
+        allowRawContent: { type: boolean }
+        allowArtifactUpload: { type: boolean }
+    JsonRpcRequest:
+      type: object
+      additionalProperties: false
+      required: [jsonrpc, id, method, params]
+      properties:
+        jsonrpc: { type: string, const: "2.0" }
+        id: { oneOf: [{ type: string, maxLength: 128 }, { type: integer }] }
+        method: { type: string, maxLength: 128 }
+        params:
+          type: object
+          required: [_meta]
+          properties:
+            _meta:
+              type: object
+              required: [io.modelcontextprotocol/protocolVersion]
+              properties:
+                io.modelcontextprotocol/protocolVersion: { type: string, const: "2026-07-28" }
+                io.modelcontextprotocol/clientInfo: { type: object }
+                io.modelcontextprotocol/clientCapabilities: { type: object }
+          additionalProperties: true
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties: { code: { type: string, maxLength: 128 }, message: { type: string, maxLength: 4096 }, requestId: { type: string, maxLength: 128 } }
+  responses:
+    JsonSuccess: { description: Bounded JSON response, content: { application/json: { schema: { type: object, additionalProperties: true } } } }
+    PageSuccess: { description: Bounded cursor page, content: { application/json: { schema: { type: object, required: [items], properties: { items: { type: array, maxItems: 500, items: { type: object } } } } } } }
+    RevisionedSuccess: { description: Revision committed, headers: { ETag: { schema: { type: string, pattern: '^"[1-9][0-9]*"$' } } }, content: { application/json: { schema: { $ref: "#/components/schemas/RevisionedRecord" } } } }
+    AuthRequired: { description: Authentication required, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    Forbidden: { description: Outside the exact policy boundary, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    BadRequest: { description: Invalid or unsupported bounded request, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }
+    Conflict: { description: Revision, commitment, digest, state, or idempotency conflict, content: { application/json: { schema: { $ref: "#/components/schemas/Error" } } } }

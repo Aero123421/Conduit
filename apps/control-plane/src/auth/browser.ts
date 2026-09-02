@@ -1,0 +1,403 @@
+import {
+  generateAuthenticationOptions,
+  generateRegistrationOptions,
+  verifyAuthenticationResponse,
+  verifyRegistrationResponse,
+  type AuthenticationResponseJSON,
+  type RegistrationResponseJSON,
+} from "@simplewebauthn/server";
+import { boundedString, boundedStringArray, readJsonBounded, record } from "../bounds.ts";
+import { fromBase64url, keyedHash, newId, nowIso, operationDigest, randomToken, sha256Hex } from "../crypto.ts";
+import { PublicError } from "../errors.ts";
+import { completeEffect, reserveEffect } from "../idempotency.ts";
+import type { ControlPlaneEnv } from "../types.ts";
+import { AuthRepository, readCookie, sessionCookieHeaders, type SessionRow } from "../repositories/auth.ts";
+import { requestSourceHash } from "../abuse.ts";
+
+function equalFixed(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i += 1) mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  return mismatch === 0;
+}
+
+function responseJson(value: unknown, status = 200, headers?: HeadersInit): Response {
+  const responseHeaders = new Headers(headers);
+  if (!responseHeaders.has("cache-control")) responseHeaders.set("cache-control", "no-store");
+  return Response.json(value, { status, headers: responseHeaders });
+}
+
+function assertSameOrigin(request: Request, env: ControlPlaneEnv): void {
+  const origin = request.headers.get("origin");
+  if (origin !== env.PUBLIC_ORIGIN) throw new PublicError("csrf_failed", 403, "Request origin is not allowed");
+}
+
+export async function requireBrowserSession(request: Request, env: ControlPlaneEnv, options: { csrf?: boolean; fresh?: boolean; allowRecovery?: boolean } = {}): Promise<{ repo: AuthRepository; session: SessionRow }> {
+  const repo = new AuthRepository(env.DB, env.TOKEN_PEPPER);
+  const token = readCookie(request, "__Host-conduit_session");
+  if (token === null) throw new PublicError("authentication_required", 401, "Browser session is required");
+  const session = await repo.session(token);
+  if (!options.allowRecovery && session.kind === "recovery") throw new PublicError("scope_insufficient", 403, "Recovery sessions cannot access this API");
+  if (options.csrf) {
+    assertSameOrigin(request, env);
+    await repo.verifyCsrf(session, boundedString(request.headers.get("x-csrf-token"), "X-CSRF-Token", 128));
+  }
+  if (options.fresh) repo.requireFresh(session);
+  return { repo, session };
+}
+
+export async function requireBrowserFormSession(request: Request, env: ControlPlaneEnv, csrfToken: string, options: { fresh?: boolean } = {}): Promise<{ repo: AuthRepository; session: SessionRow }> {
+  assertSameOrigin(request, env);
+  const auth = await requireBrowserSession(request, env);
+  await auth.repo.verifyCsrf(auth.session, boundedString(csrfToken, "csrf_token", 128));
+  if (options.fresh) auth.repo.requireFresh(auth.session);
+  return auth;
+}
+
+async function registrationOptions(request: Request, env: ControlPlaneEnv, mode: "setup" | "add" | "recovery"): Promise<Response> {
+  const body = record(await readJsonBounded(request));
+  let principalId: string | undefined;
+  let sessionId: string | undefined;
+  let displayName = boundedString(body.displayName ?? "Owner", "displayName", 128);
+  const repo = new AuthRepository(env.DB, env.TOKEN_PEPPER);
+  if (mode === "setup") {
+    if (await repo.owner() !== null) throw new PublicError("invalid_request", 409, "Owner already exists");
+    const supplied = await sha256Hex(boundedString(body.bootstrapSecret, "bootstrapSecret", 1024));
+    if (!equalFixed(supplied, env.BOOTSTRAP_VERIFIER)) throw new PublicError("authentication_required", 401, "Bootstrap verification failed");
+  } else {
+    const auth = await requireBrowserSession(request, env, { csrf: true, fresh: mode === "add", allowRecovery: mode === "recovery" });
+    if ((mode === "recovery") !== (auth.session.kind === "recovery")) throw new PublicError("scope_insufficient", 403, "Wrong session type for registration");
+    principalId = auth.session.principal_id;
+    sessionId = auth.session.id;
+    const owner = await repo.owner();
+    displayName = owner?.display_name ?? "Owner";
+  }
+  const registrationInput = {
+    rpName: env.WEBAUTHN_RP_NAME,
+    rpID: env.WEBAUTHN_RP_ID,
+    userName: displayName,
+    ...(principalId === undefined ? {} : { userID: Uint8Array.from(new TextEncoder().encode(principalId)) }),
+    attestationType: "none" as const,
+    authenticatorSelection: { residentKey: "preferred" as const, userVerification: "required" as const },
+    timeout: 300_000,
+  };
+  const options = await generateRegistrationOptions(registrationInput);
+  const challengeId = await repo.createChallenge({ kind: mode === "recovery" ? "recovery_registration" : "registration", ...(principalId === undefined ? {} : { principalId }), ...(sessionId === undefined ? {} : { sessionId }), challenge: options.challenge, origin: env.PUBLIC_ORIGIN, rpId: env.WEBAUTHN_RP_ID, state: { mode, displayName }, sourceHash: await requestSourceHash(request, env) });
+  return responseJson({ challengeId, options });
+}
+
+async function registrationVerify(request: Request, env: ControlPlaneEnv, mode: "setup" | "add" | "recovery"): Promise<Response> {
+  const body = record(await readJsonBounded(request));
+  const repo = new AuthRepository(env.DB, env.TOKEN_PEPPER);
+  if (mode === "setup") {
+    const supplied = await sha256Hex(boundedString(body.bootstrapSecret, "bootstrapSecret", 1024));
+    if (!equalFixed(supplied, env.BOOTSTRAP_VERIFIER)) throw new PublicError("authentication_required", 401, "Bootstrap verification failed");
+  } else {
+    await requireBrowserSession(request, env, { csrf: true, fresh: mode === "add", allowRecovery: mode === "recovery" });
+  }
+  const challenge = boundedString(body.challenge, "challenge", 512);
+  const stored = await repo.consumeChallenge(boundedString(body.challengeId, "challengeId", 128), challenge, mode === "recovery" ? "recovery_registration" : "registration");
+  const verification = await verifyRegistrationResponse({
+    response: body.response as RegistrationResponseJSON,
+    expectedChallenge: challenge,
+    expectedOrigin: stored.expected_origin,
+    expectedRPID: stored.expected_rp_id,
+    requireUserVerification: true,
+  });
+  if (!verification.verified) throw new PublicError("authentication_required", 401, "Passkey registration verification failed");
+  const credential = verification.registrationInfo.credential;
+  const label = body.label === undefined ? undefined : boundedString(body.label, "label", 128);
+  const transports = body.transports === undefined ? [] : boundedStringArray(body.transports, "transports", 16, 32);
+  let principalId = stored.principal_id;
+  if (mode === "setup") {
+    principalId = await repo.createOwnerAndPasskey({ displayName: boundedString(body.displayName, "displayName", 128), credentialId: credential.id, publicKey: credential.publicKey, rpId: stored.expected_rp_id, ...(label === undefined ? {} : { label }), transports, signCount: credential.counter });
+  } else {
+    if (principalId === null) throw new PublicError("authentication_required", 401, "Challenge is not bound to an owner");
+    await env.DB.prepare("INSERT INTO passkeys(id,principal_id,credential_id,public_key,relying_party_id,label,transports_json,sign_count,status,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'active',?9)")
+      .bind(`pkey_${crypto.randomUUID().replaceAll("-", "")}`, principalId, credential.id, credential.publicKey, stored.expected_rp_id, label ?? null, JSON.stringify(transports), credential.counter, new Date().toISOString()).run();
+    await repo.audit("passkey.registered", { credentialIdDigest: await sha256Hex(credential.id), mode }, principalId);
+  }
+  if (principalId === null) throw new PublicError("authentication_required", 401, "Owner bootstrap did not complete");
+  const session = await repo.createSession(principalId, "owner", true);
+  let recoveryCodes: string[] | undefined;
+  if (mode === "setup" || mode === "recovery") {
+    if (mode === "recovery") {
+      const now = new Date().toISOString();
+      await env.DB.batch([
+        env.DB.prepare("UPDATE owner_sessions SET status='revoked',revoked_at=?1 WHERE principal_id=?2 AND id<>?3 AND status='active'").bind(now, principalId, session.id),
+        env.DB.prepare("UPDATE oauth_grants SET status='reauthorization_required' WHERE principal_id=?1 AND status IN ('active','paused')").bind(principalId),
+        env.DB.prepare("UPDATE oauth_tokens SET revoked_at=?1 WHERE grant_id IN (SELECT id FROM oauth_grants WHERE principal_id=?2) AND revoked_at IS NULL").bind(now, principalId),
+        env.DB.prepare("UPDATE recovery_codes SET revoked_at=?1 WHERE principal_id=?2 AND consumed_at IS NULL AND revoked_at IS NULL").bind(now, principalId),
+      ]);
+    }
+    recoveryCodes = await repo.generateRecoveryCodes(principalId);
+  }
+  return responseJson({ principalId, csrfToken: session.csrf, recoveryCodes }, 201, sessionCookieHeaders(session.token, session.csrf, session.expiresAt));
+}
+
+async function authenticationOptions(request: Request, env: ControlPlaneEnv, stepUp: boolean): Promise<Response> {
+  const repo = new AuthRepository(env.DB, env.TOKEN_PEPPER);
+  let principalId: string | undefined;
+  let sessionId: string | undefined;
+  if (stepUp) {
+    const auth = await requireBrowserSession(request, env, { csrf: true });
+    principalId = auth.session.principal_id;
+    sessionId = auth.session.id;
+  }
+  const passkeys = await repo.passkeys(principalId);
+  if (passkeys.length === 0) throw new PublicError("authentication_required", 401, "No active passkey is registered");
+  const options = await generateAuthenticationOptions({
+    rpID: env.WEBAUTHN_RP_ID,
+    userVerification: "required",
+    timeout: 300_000,
+    allowCredentials: passkeys.map((passkey) => ({ id: passkey.credential_id, transports: JSON.parse(passkey.transports_json) as [] })),
+  });
+  const challengeId = await repo.createChallenge({ kind: stepUp ? "step_up" : "authentication", ...(principalId === undefined ? {} : { principalId }), ...(sessionId === undefined ? {} : { sessionId }), challenge: options.challenge, origin: env.PUBLIC_ORIGIN, rpId: env.WEBAUTHN_RP_ID, sourceHash: await requestSourceHash(request, env) });
+  return responseJson({ challengeId, options });
+}
+
+async function authenticationVerify(request: Request, env: ControlPlaneEnv, stepUp: boolean): Promise<Response> {
+  const body = record(await readJsonBounded(request));
+  if (stepUp) await requireBrowserSession(request, env, { csrf: true });
+  const repo = new AuthRepository(env.DB, env.TOKEN_PEPPER);
+  const challenge = boundedString(body.challenge, "challenge", 512);
+  const stored = await repo.consumeChallenge(boundedString(body.challengeId, "challengeId", 128), challenge, stepUp ? "step_up" : "authentication");
+  const response = body.response as AuthenticationResponseJSON;
+  const passkey = await repo.passkeyByCredential(boundedString(response.id, "response.id", 8192));
+  if (stored.principal_id !== null && passkey.principal_id !== stored.principal_id) throw new PublicError("authentication_required", 401, "Passkey does not match challenge owner");
+  const verification = await verifyAuthenticationResponse({
+    response,
+    expectedChallenge: challenge,
+    expectedOrigin: stored.expected_origin,
+    expectedRPID: stored.expected_rp_id,
+    credential: { id: passkey.credential_id, publicKey: new Uint8Array(passkey.public_key), counter: passkey.sign_count, transports: JSON.parse(passkey.transports_json) as [] },
+    requireUserVerification: true,
+  });
+  if (!verification.verified || !verification.authenticationInfo.userVerified) throw new PublicError("authentication_required", 401, "Passkey authentication failed");
+  await repo.notePasskeyUse(passkey.id, verification.authenticationInfo.newCounter);
+  const session = await repo.createSession(passkey.principal_id, "owner", true);
+  if (stepUp && stored.session_id !== null) {
+    await env.DB.prepare("UPDATE owner_sessions SET status='revoked',revoked_at=?1 WHERE id=?2").bind(new Date().toISOString(), stored.session_id).run();
+  }
+  await repo.audit(stepUp ? "passkey.step_up" : "passkey.authentication", { passkeyId: passkey.id }, passkey.principal_id);
+  let ownerAccessToken: string | undefined;
+  let ownerAccessTokenExpiresAt: string | undefined;
+  if (!stepUp && body.issueCliToken === true) {
+    ownerAccessToken = `conduit_owner_${randomToken(32)}`;
+    ownerAccessTokenExpiresAt = new Date(Date.now() + 8 * 60 * 60_000).toISOString();
+    await env.DB.prepare("INSERT INTO owner_api_tokens(id,principal_id,verifier_hash,label,status,issued_from_session_id,created_at,expires_at) VALUES (?1,?2,?3,?4,'active',?5,?6,?7)")
+      .bind(newId("otk"), passkey.principal_id, await keyedHash(env.TOKEN_PEPPER, ownerAccessToken), body.cliTokenLabel === undefined ? "Conduit CLI" : boundedString(body.cliTokenLabel, "cliTokenLabel", 128), session.id, new Date().toISOString(), ownerAccessTokenExpiresAt).run();
+    await repo.audit("owner_api_token.issued", { expiresAt: ownerAccessTokenExpiresAt }, passkey.principal_id);
+  }
+  return responseJson({ principalId: passkey.principal_id, csrfToken: session.csrf, fresh: true, ...(ownerAccessToken === undefined ? {} : { ownerAccessToken, ownerAccessTokenExpiresAt }) }, 200, sessionCookieHeaders(session.token, session.csrf, session.expiresAt));
+}
+
+interface OwnerCliToken {
+  id: string;
+  principal_id: string;
+  label: string;
+  status: string;
+  expires_at: string;
+  last_used_at: string | null;
+}
+
+async function ownerCliToken(request: Request, env: ControlPlaneEnv): Promise<OwnerCliToken> {
+  const authorization = request.headers.get("authorization");
+  if (authorization === null || !authorization.startsWith("Bearer conduit_owner_")) throw new PublicError("authentication_required", 401, "Owner CLI bearer token is required");
+  const token = boundedString(authorization.slice(7), "owner bearer token", 512);
+  const row = await env.DB.prepare("SELECT id,principal_id,label,status,expires_at,last_used_at FROM owner_api_tokens WHERE verifier_hash=?1 AND expires_at>?2 LIMIT 1").bind(await keyedHash(env.TOKEN_PEPPER, token), new Date().toISOString()).first<OwnerCliToken>();
+  if (row === null) throw new PublicError("authentication_required", 401, "Owner CLI bearer token is invalid or expired");
+  return row;
+}
+
+export async function authenticateOwnerCli(request: Request, env: ControlPlaneEnv): Promise<{ principalId: string; clientId: string; scopes: string[]; tokenId: string }> {
+  const row = await ownerCliToken(request, env);
+  if (row.status !== "active") throw new PublicError("authentication_required", 401, "Owner CLI bearer token is invalid or expired");
+  if (row.last_used_at === null || Date.parse(row.last_used_at) <= Date.now() - 10 * 60_000) {
+    const now = new Date().toISOString();
+    await env.DB.prepare("UPDATE owner_api_tokens SET last_used_at=?1 WHERE id=?2 AND (last_used_at IS NULL OR last_used_at<?3)").bind(now, row.id, new Date(Date.now() - 10 * 60_000).toISOString()).run();
+  }
+  return { principalId: row.principal_id, clientId: "conduit.cli", scopes: ["conduit.admin"], tokenId: row.id };
+}
+
+async function ownerCliStatus(request: Request, env: ControlPlaneEnv): Promise<Response> {
+  const actor = await authenticateOwnerCli(request, env);
+  const row = await env.DB.prepare("SELECT label,status,created_at,last_used_at,expires_at FROM owner_api_tokens WHERE id=?1 AND principal_id=?2 LIMIT 1").bind(actor.tokenId, actor.principalId).first<Record<string, unknown>>();
+  if (row === null) throw new PublicError("authentication_required", 401, "Owner CLI bearer token is invalid");
+  return responseJson({ authenticated: true, principalId: actor.principalId, tokenId: actor.tokenId, ...row });
+}
+
+async function ownerCliLogout(request: Request, env: ControlPlaneEnv): Promise<Response> {
+  const row = await ownerCliToken(request, env);
+  const key = boundedString(request.headers.get("idempotency-key"), "Idempotency-Key", 256, 16);
+  const digest = await operationDigest({ action: "owner_cli.logout", tokenId: row.id });
+  if (row.status !== "active") {
+    const prior = await env.DB.prepare("SELECT payload_digest,state,response_json FROM effect_idempotency_records WHERE scope=?1 AND idempotency_key=?2 LIMIT 1").bind(`owner-cli-token:${row.id}`, key).first<{ payload_digest: string; state: string; response_json: string | null }>();
+    if (prior?.payload_digest === digest && prior.state === "completed" && prior.response_json !== null) return responseJson({ ...(JSON.parse(prior.response_json) as Record<string, unknown>), replay: true });
+    throw new PublicError("authentication_required", 401, "Owner CLI bearer token is already inactive");
+  }
+  const reserved = await reserveEffect(env.DB, `owner-cli-token:${row.id}`, key, digest);
+  if (reserved.replay !== undefined) return responseJson(reserved.replay);
+  const now = nowIso();
+  const result = await env.DB.prepare("UPDATE owner_api_tokens SET status='revoked',revoked_at=?1 WHERE id=?2 AND status='active'").bind(now, row.id).run();
+  if (result.meta.changes !== 1) throw new PublicError("authentication_required", 401, "Owner CLI bearer token changed before logout");
+  const response = { authenticated: false, tokenId: row.id, revokedAt: now };
+  await env.DB.prepare("INSERT INTO security_events(id,event_type,principal_id,client_id,metadata_json,created_at) VALUES (?1,'owner_api_token.revoked',?2,'conduit.cli',?3,?4)").bind(newId("sevt"), row.principal_id, JSON.stringify({ tokenId: row.id }), now).run();
+  await completeEffect(env.DB, reserved.reservation!, response);
+  return responseJson(response);
+}
+
+async function browserLogout(request: Request, env: ControlPlaneEnv): Promise<Response> {
+  const { repo, session } = await requireBrowserSession(request, env, { csrf: true, allowRecovery: true });
+  const now = nowIso();
+  const updated = await env.DB.prepare("UPDATE owner_sessions SET status='revoked',revoked_at=?1 WHERE id=?2 AND status='active'").bind(now, session.id).run();
+  if (updated.meta.changes !== 1) throw new PublicError("authentication_required", 401, "Browser session is already inactive");
+  await repo.audit("browser_session.logout", { sessionId: session.id }, session.principal_id);
+  const headers = new Headers({ "cache-control": "no-store" });
+  headers.append("set-cookie", "__Host-conduit_session=; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=0");
+  headers.append("set-cookie", "__Host-conduit_csrf=; Path=/; Secure; SameSite=Lax; Max-Age=0");
+  return responseJson({ authenticated: false }, 200, headers);
+}
+
+async function recovery(request: Request, env: ControlPlaneEnv): Promise<Response> {
+  assertSameOrigin(request, env);
+  const body = record(await readJsonBounded(request));
+  const repo = new AuthRepository(env.DB, env.TOKEN_PEPPER);
+  const principalId = await repo.consumeRecoveryCode(boundedString(body.recoveryCode, "recoveryCode", 256));
+  const session = await repo.createSession(principalId, "recovery", false);
+  await repo.audit("recovery_code.used", {}, principalId);
+  return responseJson({ principalId, csrfToken: session.csrf, allowedActions: ["passkey.register", "sessions.revoke", "grants.reauthorize", "recovery.replace", "devices.revoke"] }, 200, sessionCookieHeaders(session.token, session.csrf, session.expiresAt));
+}
+
+async function revokePasskey(request: Request, env: ControlPlaneEnv, passkeyId: string): Promise<Response> {
+  const { repo, session } = await requireBrowserSession(request, env, { csrf: true, fresh: true });
+  const count = await env.DB.prepare("SELECT COUNT(*) AS count FROM passkeys WHERE principal_id=?1 AND status='active'").bind(session.principal_id).first<{ count: number }>();
+  if ((count?.count ?? 0) <= 1) throw new PublicError("invalid_request", 409, "The final active passkey cannot be revoked");
+  const now = new Date().toISOString();
+  const result = await env.DB.prepare("UPDATE passkeys SET status='revoked',revoked_at=?1 WHERE id=?2 AND principal_id=?3 AND status='active'").bind(now, passkeyId, session.principal_id).run();
+  if (result.meta.changes !== 1) throw new PublicError("not_found", 404, "Active passkey not found");
+  await repo.audit("passkey.revoked", { passkeyId }, session.principal_id);
+  return new Response(null, { status: 204 });
+}
+
+export async function handleBrowserAuth(request: Request, env: ControlPlaneEnv, path: string): Promise<Response | null> {
+  if (request.method === "GET" && path === "/v1/auth/browser.js") return browserAuthScript();
+  if (request.method === "GET" && path === "/v1/auth/status") return ownerCliStatus(request, env);
+  if (request.method === "POST" && path === "/v1/auth/logout") return request.headers.get("authorization")?.startsWith("Bearer conduit_owner_") === true ? ownerCliLogout(request, env) : browserLogout(request, env);
+  if (request.method === "POST" && path === "/v1/auth/setup/options") return registrationOptions(request, env, "setup");
+  if (request.method === "POST" && path === "/v1/auth/setup/verify") return registrationVerify(request, env, "setup");
+  if (request.method === "POST" && path === "/v1/auth/login/options") return authenticationOptions(request, env, false);
+  if (request.method === "POST" && path === "/v1/auth/login/verify") return authenticationVerify(request, env, false);
+  if (request.method === "POST" && path === "/v1/auth/login") return authenticationVerify(request, env, false);
+  if (request.method === "POST" && path === "/v1/auth/step-up/options") return authenticationOptions(request, env, true);
+  if (request.method === "POST" && path === "/v1/auth/step-up/verify") return authenticationVerify(request, env, true);
+  if (request.method === "POST" && path === "/v1/auth/passkeys/options") return registrationOptions(request, env, "add");
+  if (request.method === "POST" && path === "/v1/auth/passkeys/verify") return registrationVerify(request, env, "add");
+  if (request.method === "POST" && path === "/v1/auth/passkeys/register") return registrationVerify(request, env, (await new AuthRepository(env.DB, env.TOKEN_PEPPER).owner()) === null ? "setup" : "add");
+  if (request.method === "POST" && path === "/v1/auth/recovery") return recovery(request, env);
+  if (request.method === "POST" && path === "/v1/auth/recovery/passkeys/options") return registrationOptions(request, env, "recovery");
+  if (request.method === "POST" && path === "/v1/auth/recovery/passkeys/verify") return registrationVerify(request, env, "recovery");
+  const revoke = path.match(/^\/v1\/auth\/passkeys\/([^/]+)\/revoke$/);
+  if (request.method === "POST" && revoke?.[1] !== undefined) return revokePasskey(request, env, revoke[1]);
+  return null;
+}
+
+function safeReturnPath(request: Request): string {
+  const candidate = new URL(request.url).searchParams.get("return_to");
+  if (candidate === null) return "/";
+  try {
+    const parsed = new URL(candidate, request.url);
+    if (parsed.origin === new URL(request.url).origin && parsed.pathname === "/authorize") return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    // Invalid return paths fall back to the control-plane root.
+  }
+  return "/";
+}
+
+export async function renderAuthPage(request: Request, env: ControlPlaneEnv): Promise<Response> {
+  const repo = new AuthRepository(env.DB, env.TOKEN_PEPPER);
+  const owner = await repo.owner();
+  const returnPath = safeReturnPath(request);
+  const body = owner === null
+    ? `<h1>Set up Conduit</h1><p>Register the first owner passkey from this browser.</p><form id=passkey-setup><label>Owner name <input id=setup-display-name name=displayName required maxlength=128 value=Owner></label><label> Bootstrap secret <input id=setup-bootstrap-secret name=bootstrapSecret type=password required autocomplete=off maxlength=1024></label><label> Passkey label <input id=setup-passkey-label name=label maxlength=128 value="Owner passkey"></label><button id=passkey-setup-submit type=submit>Register owner passkey</button></form><p id=auth-status role=status aria-live=polite></p><script src=/api/v1/auth/browser.js defer></script>`
+    : `<h1>Conduit sign in</h1><p>Authenticate with your passkey to continue.</p><button id=passkey-sign-in type=button data-return-to="${returnPath.replace(/[&<>"]/g, (char) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[char] ?? char)}">Sign in with passkey</button><p id=auth-status role=status aria-live=polite></p><script src=/api/v1/auth/browser.js defer></script>`;
+  return new Response(`<!doctype html><html lang=en><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1"><title>Conduit authentication</title><body>${body}</body></html>`, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'; script-src 'self'; connect-src 'self'; form-action 'self'; frame-ancestors 'none'", "permissions-policy": "publickey-credentials-create=(self), publickey-credentials-get=(self)" } });
+}
+
+const BROWSER_AUTH_SCRIPT = `(() => {
+  const fromBase64url = (value) => {
+    const padded = value.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((value.length + 3) % 4);
+    return Uint8Array.from(atob(padded), (character) => character.charCodeAt(0));
+  };
+  const toBase64url = (value) => {
+    if (value === null) return null;
+    const bytes = new Uint8Array(value);
+    let binary = "";
+    for (const byte of bytes) binary += String.fromCharCode(byte);
+    return btoa(binary).replace(/\\+/g, "-").replace(/\\//g, "_").replace(/=+$/g, "");
+  };
+  const csrf = () => document.cookie.split(";").map((part) => part.trim()).find((part) => part.startsWith("__Host-conduit_csrf="))?.slice("__Host-conduit_csrf=".length) ?? "";
+  const assertion = async (options) => {
+    const publicKey = { ...options, challenge: fromBase64url(options.challenge), allowCredentials: (options.allowCredentials ?? []).map((item) => ({ ...item, id: fromBase64url(item.id) })) };
+    const credential = await navigator.credentials.get({ publicKey });
+    if (!(credential instanceof PublicKeyCredential)) throw new Error("The browser did not return a passkey credential");
+    const response = credential.response;
+    return { id: credential.id, rawId: toBase64url(credential.rawId), type: credential.type, authenticatorAttachment: credential.authenticatorAttachment, clientExtensionResults: credential.getClientExtensionResults(), response: { clientDataJSON: toBase64url(response.clientDataJSON), authenticatorData: toBase64url(response.authenticatorData), signature: toBase64url(response.signature), userHandle: toBase64url(response.userHandle) } };
+  };
+  const registration = async (options) => {
+    const publicKey = { ...options, challenge: fromBase64url(options.challenge), user: { ...options.user, id: fromBase64url(options.user.id) }, excludeCredentials: (options.excludeCredentials ?? []).map((item) => ({ ...item, id: fromBase64url(item.id) })) };
+    const credential = await navigator.credentials.create({ publicKey });
+    if (!(credential instanceof PublicKeyCredential)) throw new Error("The browser did not return a passkey credential");
+    const response = credential.response;
+    return { id: credential.id, rawId: toBase64url(credential.rawId), type: credential.type, authenticatorAttachment: credential.authenticatorAttachment, clientExtensionResults: credential.getClientExtensionResults(), response: { clientDataJSON: toBase64url(response.clientDataJSON), attestationObject: toBase64url(response.attestationObject), transports: typeof response.getTransports === "function" ? response.getTransports() : [] } };
+  };
+  const post = async (path, body, withCsrf) => {
+    const response = await fetch(path, { method: "POST", credentials: "same-origin", headers: { "content-type": "application/json", ...(withCsrf ? { "x-csrf-token": csrf() } : {}) }, body: JSON.stringify(body) });
+    const value = await response.json();
+    if (!response.ok) throw new Error(value?.error?.message ?? "Passkey request failed");
+    return value;
+  };
+  const run = async (stepUp) => {
+    const optionsPath = stepUp ? "/api/v1/auth/step-up/options" : "/api/v1/auth/login/options";
+    const verifyPath = stepUp ? "/api/v1/auth/step-up/verify" : "/api/v1/auth/login/verify";
+    const ceremony = await post(optionsPath, {}, stepUp);
+    const response = await assertion(ceremony.options);
+    await post(verifyPath, { challengeId: ceremony.challengeId, challenge: ceremony.options.challenge, response }, stepUp);
+  };
+  document.querySelector("#passkey-setup")?.addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const button = document.querySelector("#passkey-setup-submit");
+    const status = document.querySelector("#auth-status");
+    const displayName = document.querySelector("#setup-display-name")?.value ?? "Owner";
+    const bootstrapSecret = document.querySelector("#setup-bootstrap-secret")?.value ?? "";
+    const label = document.querySelector("#setup-passkey-label")?.value ?? "Owner passkey";
+    try {
+      button.disabled = true;
+      if (status) status.textContent = "Waiting for a new passkey…";
+      const ceremony = await post("/api/v1/auth/setup/options", { displayName, bootstrapSecret }, false);
+      const response = await registration(ceremony.options);
+      const transports = response.response.transports ?? [];
+      await post("/api/v1/auth/setup/verify", { challengeId: ceremony.challengeId, challenge: ceremony.options.challenge, response, displayName, bootstrapSecret, label, transports }, false);
+      location.assign("/");
+    } catch (error) {
+      button.disabled = false;
+      if (status) status.textContent = error instanceof Error ? error.message : "Passkey setup failed";
+    }
+  });
+  document.querySelector("#passkey-sign-in")?.addEventListener("click", async (event) => {
+    const button = event.currentTarget;
+    const status = document.querySelector("#auth-status");
+    try { button.disabled = true; if (status) status.textContent = "Waiting for passkey…"; await run(false); location.assign(button.dataset.returnTo || "/"); }
+    catch (error) { button.disabled = false; if (status) status.textContent = error instanceof Error ? error.message : "Passkey sign-in failed"; }
+  });
+  document.querySelector("#oauth-step-up")?.addEventListener("click", async () => {
+    const button = document.querySelector("#oauth-step-up");
+    const status = document.querySelector("#oauth-status");
+    try { button.disabled = true; if (status) status.textContent = "Waiting for passkey…"; await run(true); location.reload(); }
+    catch (error) { button.disabled = false; if (status) status.textContent = error instanceof Error ? error.message : "Passkey verification failed"; }
+  });
+})();`;
+
+export function browserAuthScript(): Response {
+  return new Response(BROWSER_AUTH_SCRIPT, { headers: { "content-type": "text/javascript; charset=utf-8", "cache-control": "no-store", "content-security-policy": "default-src 'none'" } });
+}

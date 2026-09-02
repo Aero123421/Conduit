@@ -1,0 +1,38 @@
+{
+  "name": "@conduit/control-plane",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check": "npm run types:check && npm run typecheck && npm test && npm run deploy:check",
+    "predeploy:check": "node ../../node_modules/typescript/bin/tsc -p ../../packages/conduit-schema/tsconfig.json",
+    "deploy:check": "node scripts/check-deployment-profile.mjs && wrangler deploy --dry-run --outdir .wrangler/dry-run",
+    "predev": "node ../../node_modules/typescript/bin/tsc -p ../../packages/conduit-schema/tsconfig.json",
+    "dev": "wrangler dev --local",
+    "migrate:local": "wrangler d1 migrations apply conduit-control-plane --local",
+    "pretest": "node ../../node_modules/typescript/bin/tsc -p ../../packages/conduit-schema/tsconfig.json",
+    "test": "vitest run",
+    "pretest:e2e": "node ../../node_modules/typescript/bin/tsc -p ../../packages/conduit-schema/tsconfig.json",
+    "test:e2e": "vitest run test/core.test.ts",
+    "pretypecheck": "node ../../node_modules/typescript/bin/tsc -p ../../packages/conduit-schema/tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "types": "wrangler types worker-configuration.d.ts",
+    "types:check": "wrangler types worker-configuration.d.ts --check"
+  },
+  "dependencies": {
+    "@conduit/schema": "workspace:*",
+    "@modelcontextprotocol/server": "2.0.0",
+    "@simplewebauthn/server": "13.3.3",
+    "agents": "0.22.0",
+    "zod": "4.5.4"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-plugin": "1.1.2",
+    "@cloudflare/workers-types": "5.20260901.1",
+    "@types/node": "26.4.0",
+    "typescript": "7.0.2",
+    "vite": "8.2.2",
+    "vitest": "4.1.11",
+    "wrangler": "4.127.1"
+  }
+}

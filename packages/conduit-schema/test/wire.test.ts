@@ -64,6 +64,15 @@ describe("schema-derived wire documents", () => {
     }
   });
 
+  it("keeps the Node approval risk vocabulary identical to Auth v1", async () => {
+    const [auth, node] = await Promise.all([
+      readJson(`${repositoryRoot}/spec/schemas/auth-v1.schema.json`),
+      readJson(`${repositoryRoot}/spec/schemas/node-protocol-v1.schema.json`),
+    ]) as Array<{ $defs: Record<string, { enum?: unknown[] }> }>;
+    expect(node!.$defs.RiskClass?.enum).toEqual(auth!.$defs.RiskClass?.enum);
+    expect(node!.$defs.RiskClass?.enum).toHaveLength(10);
+  });
+
   it("preserves node frame type and payload discrimination", () => {
     type OfferFrame = Extract<
       NodeV1WireDocument,
@@ -100,6 +109,24 @@ describe("schema-derived wire documents", () => {
     expectTypeOf<
       Extract<NodeV1WireDocument, { type: "unknown.frame" }>
     >().toEqualTypeOf<never>();
+  });
+
+  it("requires the bounded source range commitment on event batches", async () => {
+    const fixture = await readJson(
+      `${repositoryRoot}/spec/examples/node-protocol/event-batch.json`,
+    ) as Record<string, any>;
+    expect(validateWireDocument(schemaIds.nodeV1, fixture)).toBe(true);
+
+    const missingCommitment = structuredClone(fixture);
+    delete missingCommitment.payload.sourceRangeDigest;
+    expect(validateWireDocument(schemaIds.nodeV1, missingCommitment)).toBe(false);
+
+    const oversized = structuredClone(fixture);
+    oversized.payload.events = Array.from(
+      { length: 33 },
+      () => structuredClone(fixture.payload.events[0]),
+    );
+    expect(validateWireDocument(schemaIds.nodeV1, oversized)).toBe(false);
   });
 
   it("decodes Node text only after enforcing its UTF-8 byte limit", async () => {
@@ -177,6 +204,7 @@ interface InvalidFixture {
 }
 
 const validationReason = {
+  duplicate_item: "uniqueItems",
   invalid_digest: "pattern",
   malformed_id: "pattern",
   unknown_schema_version: "const",
@@ -191,7 +219,7 @@ describe("invalid wire fixtures", () => {
       .filter((fileName) => fileName.endsWith(".json"))
       .sort();
 
-    expect(fileNames).toHaveLength(5);
+    expect(fileNames).toHaveLength(6);
     for (const fileName of fileNames) {
       const fixture = (await readJson(
         `${directory}/${fileName}`,

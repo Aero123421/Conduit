@@ -7,11 +7,16 @@
   "sequence": "921",
   "type": "event.batch",
   "correlationId": "run_conduit_codex_01",
-  "payloadDigest": "cb811ac5501aacbaa276185530de3cae63e6a3439755463dc2d8ad7068027c6c",
+  "payloadDigest": "0e8549d5c489e02168b86630ac4d134f7b03daff28afd40455456ac014c874a7",
   "payload": {
     "runId": "run_conduit_codex_01",
     "fromSequence": "27",
     "throughSequence": "27",
+    "sourceSequenceRange": {
+      "from": "27",
+      "through": "27"
+    },
+    "sourceRangeDigest": "ee84cc58c5f8499e323e6edb0f2764570266f851bb64c5c2618c3a6f82930a28",
     "traceSchema": "conduit.trace/1",
     "events": [
       {

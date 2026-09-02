@@ -73,10 +73,13 @@ async function callMcp(
   params: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
   const protocolVersion = "2026-07-28";
+  const publicUrl = new URL(env.PUBLIC_ORIGIN);
   const headers: Record<string, string> = {
     authorization: `Bearer ${token}`,
     accept: "application/json, text/event-stream",
     "content-type": "application/json",
+    host: publicUrl.host,
+    origin: publicUrl.origin,
     "MCP-Protocol-Version": protocolVersion,
     "Mcp-Method": method,
   };

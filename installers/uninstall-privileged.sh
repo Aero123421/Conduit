@@ -156,6 +156,58 @@ if ((conduit_purge)); then
       }
     done
   fi
+
+  # Package update transactions contain only a fixed set of rollback files,
+  # but live outside per-UID helper state. Purge them without a recursive or
+  # caller-selected deletion target after every Runtime has reached terminal
+  # custody and every per-UID journal has been purged above.
+  conduit_upgrade_root="$(conduit_privileged_target "$conduit_privileged_state_dir")/package-upgrades"
+  if [[ -e "$conduit_upgrade_root" || -L "$conduit_upgrade_root" ]]; then
+    [[ -d "$conduit_upgrade_root" && ! -L "$conduit_upgrade_root" ]] || {
+      echo "unsafe privileged update evidence root" >&2
+      exit 4
+    }
+    conduit_upgrade_owner=0
+    [[ -z "$conduit_privileged_destdir" ]] || conduit_upgrade_owner="$(id -u)"
+    test "$(stat -c '%u' "$conduit_upgrade_root")" = "$conduit_upgrade_owner" || {
+      echo "privileged update evidence owner mismatch" >&2
+      exit 4
+    }
+    (( (8#$(stat -c '%a' "$conduit_upgrade_root") & 8#077) == 0 )) || {
+      echo "privileged update evidence permissions are too broad" >&2
+      exit 4
+    }
+    shopt -s nullglob
+    conduit_upgrade_transactions=("$conduit_upgrade_root"/*)
+    shopt -u nullglob
+    for conduit_transaction in "${conduit_upgrade_transactions[@]}"; do
+      conduit_transaction_name="$(basename "$conduit_transaction")"
+      [[ "$conduit_transaction_name" =~ ^[0-9]{8}T[0-9]{6}Z-[0-9]+$ && \
+          -d "$conduit_transaction" && ! -L "$conduit_transaction" && \
+          "$(stat -c '%u' "$conduit_transaction")" = "$conduit_upgrade_owner" ]] || {
+        echo "unsafe privileged update transaction during purge" >&2
+        exit 4
+      }
+      shopt -s nullglob
+      conduit_transaction_entries=("$conduit_transaction"/*)
+      shopt -u nullglob
+      for conduit_entry in "${conduit_transaction_entries[@]}"; do
+        conduit_entry_name="$(basename "$conduit_entry")"
+        case "$conduit_entry_name" in
+          candidate.socket|candidate.service|previous-helper|previous-exec|previous-socket|previous-service|pre-update-status.json|result) ;;
+          *) echo "unknown privileged update evidence during purge" >&2; exit 4 ;;
+        esac
+        [[ -f "$conduit_entry" && ! -L "$conduit_entry" && \
+            "$(stat -c '%u' "$conduit_entry")" = "$conduit_upgrade_owner" ]] || {
+          echo "unsafe privileged update evidence during purge" >&2
+          exit 4
+        }
+        rm -f -- "$conduit_entry"
+      done
+      rmdir -- "$conduit_transaction"
+    done
+    rmdir -- "$conduit_upgrade_root"
+  fi
 fi
 
 for conduit_target in \

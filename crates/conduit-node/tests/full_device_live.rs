@@ -262,7 +262,7 @@ fn recover() {
             "schemaVersion":2,"isolatedCryptographicControlPlane":true,
             "registrationActivated":runtime.active(),"ordinaryFullUser":full_user,"cases":cases,
             "packageLifecycle":packaging,
-            "nodeRestart":{"newNodeBootIdentity":true,"durableAttach":true,"duplicateStart":false,"invocationPreserved":true},
+        "nodeRestart":{"newNodeEpoch":true,"durableAttach":true,"duplicateStart":false,"invocationPreserved":true},
             "helperRestart":{"durableAttach":true,"processCustodyPreserved":true,"invocationPreserved":true},
             "terminalState":"stopped","recoveredTerminalReceiptDigest":stopped.final_helper_receipt().digest().unwrap()
         }),

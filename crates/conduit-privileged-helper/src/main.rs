@@ -86,14 +86,21 @@ fn serve(args: &[String]) -> conduit_privileged_helper::Result<()> {
     let pinned = PinnedTicketKeys::load_root_owned(&keys)?;
     let journal = HelperJournal::open_root_owned(&journal_path)?;
     let node = load_public(&node_key)?;
-    let engine = HelperEngine::new(
+    let engine = std::sync::Arc::new(HelperEngine::new(
         config,
         pinned,
         signing,
         journal,
         SystemdBackend::connect_system()?,
-    )?;
+    )?);
     let _startup_reconciliation = engine.recover_nonterminal()?;
+    let watcher = engine.clone();
+    std::thread::spawn(move || {
+        loop {
+            let _ = watcher.converge_terminal();
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+    });
     let activated = env::var("LISTEN_PID").ok().as_deref() == Some(&std::process::id().to_string())
         && env::var("LISTEN_FDS").ok().as_deref() == Some("1");
     let server = if activated {
@@ -187,7 +194,20 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
     let command = args.first().ok_or_else(|| {
         conduit_privileged_helper::HelperError::Policy("admin command missing".into())
     })?;
-    let state = path_arg(args, "--installed-state", "/var/lib/conduit/privileged");
+    let uid_hint = value_arg(args, "--uid");
+    let state = value_arg(args, "--installed-state")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            uid_hint
+                .as_ref()
+                .map(|uid| PathBuf::from("/var/lib/conduit/privileged-helper").join(uid))
+                .unwrap_or_else(|| PathBuf::from("/var/lib/conduit/privileged-helper"))
+        });
+    let config_base = path_arg(args, "--config-dir", "/etc/conduit/privileged-helper.d");
+    let suffix = uid_hint.clone().unwrap_or_else(|| "unknown".into());
+    let policy_path = config_base.join(format!("{suffix}.json"));
+    let keys_path = config_base.join(format!("{suffix}.ticket-keys.json"));
+    let node_path = config_base.join(format!("{suffix}.node-public.key"));
     let journal = state.join("helper.sqlite3");
     match command.as_str() {
         "prepare" => {
@@ -224,8 +244,10 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             })?;
             fs::create_dir_all(&state)?;
             fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
+            fs::create_dir_all(&config_base)?;
+            fs::set_permissions(&config_base, fs::Permissions::from_mode(0o700))?;
             let installation_id = load_or_create_installation(&state)?;
-            atomic(&state.join("node-public.key"), &node_raw, 0o644)?;
+            atomic(&node_path, &node_raw, 0o644)?;
             let secret = state.join("receipt.key");
             if !secret.exists() {
                 let mut seed = [0u8; 32];
@@ -265,8 +287,8 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
                 receipt_retention_seconds: 604800,
             };
             let policy_bytes = serde_jcs::to_vec(&policy)?;
-            atomic(&state.join("privileged-policy.json"), &policy_bytes, 0o600)?;
-            let registration = registration_bundle(&state)?;
+            atomic(&policy_path, &policy_bytes, 0o600)?;
+            let registration = registration_bundle(&state, &policy_path, &node_path)?;
             let bundle_digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&registration)?));
             output(
                 json!({"prepared":true,"enabled":false,"installationId":installation_id,"bundleDigest":bundle_digest,"deviceKeyId":key_id("dkey",&node_raw),"registrationBundle":registration}),
@@ -306,7 +328,6 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
                 ));
             }
             let id = key_id("pkey", &raw);
-            let policy_path = state.join("privileged-policy.json");
             let mut policy: RootPolicy = serde_json::from_slice(&fs::read(&policy_path)?)?;
             if policy.uid != uid || policy.enabled {
                 return Err(conduit_privileged_helper::HelperError::Policy(
@@ -321,7 +342,6 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
                 })?;
             }
             let mut keys = BTreeMap::new();
-            let keys_path = state.join("ticket-keys.json");
             if keys_path.exists() {
                 #[derive(serde::Deserialize)]
                 struct Existing {
@@ -350,7 +370,7 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
         "enable" => {
             require_root()?;
             let uid = parse_uid(args)?;
-            let path = state.join("privileged-policy.json");
+            let path = policy_path.clone();
             let mut policy: RootPolicy = serde_json::from_slice(&fs::read(&path)?)?;
             if policy.uid != uid {
                 return Err(conduit_privileged_helper::HelperError::Policy(
@@ -368,14 +388,14 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             })?;
             atomic(&path, &serde_jcs::to_vec(&policy)?, 0o600)?;
             output(
-                json!({"enabled":true,"policyRevision":policy.revision,"policyDigest":policy.digest()?,"installationId":policy.installation_id,"registrationBundle":registration_bundle(&state)?}),
+                json!({"enabled":true,"policyRevision":policy.revision,"policyDigest":policy.digest()?,"installationId":policy.installation_id,"registrationBundle":registration_bundle(&state,&policy_path,&node_path)?}),
             );
             Ok(())
         }
         "policy" => {
             require_root()?;
             let uid = parse_uid(args)?;
-            let path = state.join("privileged-policy.json");
+            let path = policy_path.clone();
             let mut policy: RootPolicy = serde_json::from_slice(&fs::read(&path)?)?;
             if policy.uid != uid {
                 return Err(conduit_privileged_helper::HelperError::Policy(
@@ -406,13 +426,13 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             let digest = policy.digest()?;
             atomic(&path, &serde_jcs::to_vec(&policy)?, 0o600)?;
             output(
-                json!({"updated":true,"policyRevision":policy.revision,"policyDigest":digest,"allowNever":policy.allow_never,"allowUnrestrictedLaunch":policy.allow_unrestricted_launch,"allowedAdapters":policy.allowed_adapters,"allowedLaunchProfiles":policy.allowed_launch_profiles,"registrationBundle":registration_bundle(&state)?}),
+                json!({"updated":true,"policyRevision":policy.revision,"policyDigest":digest,"allowNever":policy.allow_never,"allowUnrestrictedLaunch":policy.allow_unrestricted_launch,"allowedAdapters":policy.allowed_adapters,"allowedLaunchProfiles":policy.allowed_launch_profiles,"registrationBundle":registration_bundle(&state,&policy_path,&node_path)?}),
             );
             Ok(())
         }
         "registration-bundle" => {
             require_root()?;
-            output(registration_bundle(&state)?);
+            output(registration_bundle(&state, &policy_path, &node_path)?);
             Ok(())
         }
         "package-status" => {
@@ -479,14 +499,14 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             }
             let signing = load_receipt_key_root_owned(&state.join("receipt.key"))?;
             let config = HelperConfig::load_policy_root_owned(
-                &state.join("privileged-policy.json"),
+                &policy_path,
                 key_id("hkey", signing.verifying_key().as_bytes()),
                 state.clone(),
                 env::current_exe()?,
             )?;
             let engine = HelperEngine::new(
                 config,
-                PinnedTicketKeys::load_root_owned(&state.join("ticket-keys.json"))?,
+                PinnedTicketKeys::load_root_owned(&keys_path)?,
                 signing,
                 helper,
                 SystemdBackend::connect_system()?,
@@ -507,6 +527,12 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             drop(helper);
             validate_managed_state(&state)?;
             fs::remove_dir_all(&state)?;
+            for path in [&policy_path, &keys_path, &node_path] {
+                if path.exists() {
+                    fs::remove_file(path)?
+                }
+            }
+            fs::File::open(&config_base)?.sync_all()?;
             output(json!({"purged":purged,"stateRemoved":true}));
             Ok(())
         }
@@ -614,9 +640,12 @@ fn decode_public_key(bytes: &[u8]) -> conduit_privileged_helper::Result<[u8; 32]
             conduit_privileged_helper::HelperError::Policy("issuer public key length".into())
         })
 }
-fn registration_bundle(state: &Path) -> conduit_privileged_helper::Result<serde_json::Value> {
-    let policy: RootPolicy =
-        serde_json::from_slice(&fs::read(state.join("privileged-policy.json"))?)?;
+fn registration_bundle(
+    state: &Path,
+    policy_path: &Path,
+    node_path: &Path,
+) -> conduit_privileged_helper::Result<serde_json::Value> {
+    let policy: RootPolicy = serde_json::from_slice(&fs::read(policy_path)?)?;
     let signing = load_receipt_key_root_owned(&state.join("receipt.key"))?;
     let receipt_id = key_id("hkey", signing.verifying_key().as_bytes());
     let policy_digest = policy.digest()?;
@@ -653,7 +682,7 @@ fn registration_bundle(state: &Path) -> conduit_privileged_helper::Result<serde_
             Some("policy_or_systemd_unavailable".into())
         },
     };
-    let node = fs::read(state.join("node-public.key"))?;
+    let node = fs::read(node_path)?;
     let node: [u8; 32] = node.try_into().map_err(|_| {
         conduit_privileged_helper::HelperError::Policy("node public key length".into())
     })?;

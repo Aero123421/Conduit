@@ -168,6 +168,36 @@ impl<M: SystemdManager> HelperEngine<M> {
             _ => unreachable!(),
         }
     }
+    pub fn converge_terminal(&self) -> Result<Vec<HelperReceipt>> {
+        let mut receipts = Vec::new();
+        for runtime in self.journal.nonterminal_runtimes()? {
+            if let Ok(observation) = self.systemd.inspect(&runtime.unit_name) {
+                if matches!(
+                    observation.active_state.as_str(),
+                    "inactive" | "dead" | "failed"
+                ) {
+                    let ticket = runtime.authority_ticket.clone();
+                    let transition = receipt_transition(&observation.active_state);
+                    let receipt = self.receipt(
+                        &ticket,
+                        "terminal_watcher",
+                        transition,
+                        Some(&observation),
+                        runtime.state_revision + 1,
+                        None,
+                    )?;
+                    self.journal.record_observation(
+                        &receipt,
+                        normalize_unit_state(&observation.active_state),
+                        observation.invocation_id.as_deref(),
+                        observation.main_pid,
+                    )?;
+                    receipts.push(receipt)
+                }
+            }
+        }
+        Ok(receipts)
+    }
     pub fn read_stream(
         &self,
         request: &crate::StreamReadRequest,

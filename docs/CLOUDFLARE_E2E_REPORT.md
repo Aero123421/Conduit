@@ -1,11 +1,54 @@
 # Cloudflare remote end-to-end report
 
-This report records the privacy-safe remote verification performed for pull
-request 19. It contains no Cloudflare account name or ID, account email,
-Workers subdomain, local username or absolute path, credential, token, private
-key, raw prompt, or generated Device identifier.
+This report records privacy-safe local and remote verification for pull request
+19. It contains no Cloudflare account name or ID, account email, Workers
+subdomain, local username or absolute path, credential, token, private key, raw
+prompt, or generated Device identifier.
 
-## Result
+## Review 5086220413 verification
+
+- Date: 2026-09-02
+- Implementation commit: `441b794`
+- Local result: PASS
+- Merge state: not merged
+
+The accelerated idle test connects the real Rust `NodeService` and `WssClient`
+through the production Worker route to a SQLite-backed `DeviceRoom`. It runs
+all 36,000 100 ms service polls in the first hour, then advances the same live
+socket at each ten-minute checkpoint through 24 hours. The independent
+Node-only regression executes all 864,000 polls for 24 hours.
+
+| Connected idle evidence | Measured result |
+| --- | ---: |
+| Actual Node application sends after 1 hour | 6 |
+| Actual Node application sends after 24 hours | 144 |
+| DeviceRoom application receives | 144 |
+| D1 statements / binding calls / maximum parameters | 144 / 144 / 5 |
+| D1 rows read / written | 72 / 72 |
+| Durable Object SQL statements / rows read / rows written | 1,152 / 8,640 / 72 |
+| Retained inbound / cumulative ACK rows | 6 / 1 |
+| Alarm schedules / invocations / remaining alarm | 0 / 0 / none |
+| New Node outbox sequence during idle window | 0 |
+
+Outer production-handler probes also passed: the six-message Queue consumer
+used 24 D1 statements, `DeviceRoom.alarm()` used 8, and
+`RetryScheduler.alarm()` used 16. Binding calls matched those statement counts
+and maximum parameters were 6, 2, and 3 respectively. The 24-hour empty
+backstop simulation wrote no D1 or scheduler rows and created no alarm. A
+quiet BoardRoom retained at most 2,048 fanout rows and converged to zero with
+250-row alarm pages. ConnectorLimiter retained one compact budget row while
+100 read admissions produced 300 SQL statements and 100 measured row
+mutations; retained cardinality is not reported as write usage.
+
+The current production migration was retried before any Worker deployment.
+The authenticated Cloudflare API confirmed that the configured D1 resource
+still exists but rejected D1 service access with authorization code `7403`.
+No migration, schema, data, or Worker version was changed. Therefore the
+current implementation commit was not deployed and no current-commit remote
+E2E is claimed. The previous isolated remote result below remains the latest
+remote evidence, and production remains on its previously verified version.
+
+## Previous isolated remote result
 
 - Date: 2026-09-02
 - Conduit commit: `5db228c`

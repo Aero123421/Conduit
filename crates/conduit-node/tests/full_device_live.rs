@@ -842,7 +842,10 @@ fn ticket(
         serde_json::from_value(bundle["signedCapability"].clone()).unwrap();
     let now = OffsetDateTime::now_utc();
     let issued = (now - time::Duration::seconds(2)).format(&Rfc3339).unwrap();
-    let digest = hex::encode(Sha256::digest(ticket_id.as_bytes()));
+    let idempotency_digest = hex::encode(Sha256::digest(ticket_id.as_bytes()));
+    let operation_digest = hex::encode(Sha256::digest(
+        format!("live-operation:{}", plan.operation_id).as_bytes(),
+    ));
     SignedClaims::sign(
         issuer_id.clone(),
         PrivilegeTicketClaims {
@@ -863,8 +866,8 @@ fn ticket(
             device_revision: 1,
             expected_uid: bundle["uid"].as_u64().unwrap() as u32,
             operation_id: plan.operation_id.clone(),
-            idempotency_key_digest: digest.clone(),
-            operation_request_digest: digest,
+            idempotency_key_digest: idempotency_digest,
+            operation_request_digest: operation_digest,
             run_manifest_digest: "66".repeat(32),
             run_id: plan.run_id.clone(),
             runtime_id: plan.runtime_id.clone(),

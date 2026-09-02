@@ -646,9 +646,11 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             let mut stopped = 0;
             let mut units = Vec::new();
             for runtime in helper.nonterminal_runtimes()? {
-                backend.graceful_stop(&runtime.unit_name)?;
-                units.push(runtime.unit_name);
-                stopped += 1;
+                if backend.inspect_optional(&runtime.unit_name)?.is_some() {
+                    backend.graceful_stop(&runtime.unit_name)?;
+                    units.push(runtime.unit_name);
+                    stopped += 1;
+                }
             }
             for unit in units {
                 for _ in 0..100 {

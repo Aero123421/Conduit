@@ -270,17 +270,24 @@ describe.sequential("privileged helper Control Plane", () => {
     };
     const devicePolicySummary = { enabled: true, allowedOperations: ["prepare", "start", "input", "resize_pty", "pause", "resume", "graceful_stop", "force_stop", "reconcile"], allowedAdapters: [], approvalEnforcements: ["exact_command"], allowNever: true, allowUnrestrictedLaunch: true };
     const devicePolicy = { revision: 1, policyDigest: devicePolicyDigest, previousPolicyDigest: null, publicSummary: devicePolicySummary, signature: await sign(devicePrivate, { deviceId, revision: 1, policyDigest: devicePolicyDigest, previousPolicyDigest: null, publicSummary: devicePolicySummary }) };
-    const bundleFor = async (installationId: string, revision: number, operations: string[]) => {
+    const bundleFor = async (installationId: string, revision: number, operations: string[], uid = 1000) => {
       const root = {
-        policyVersion: 1, installationId, deviceId, uid: 1000, revision, enabled: true, origin: env.PUBLIC_ORIGIN, ticketKeyIds: ["pkey_testissuer0001"], allowedOperations: operations,
+        policyVersion: 1, installationId, deviceId, uid, revision, enabled: true, origin: env.PUBLIC_ORIGIN, ticketKeyIds: ["pkey_testissuer0001"], allowedOperations: operations,
         allowedAdapters: [], allowedLaunchProfiles: [], ceilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, allowNever: true,
         allowUnrestrictedLaunch: false, allowPersistentSessions: false, allowOfflineControl: false, receiptRetentionSeconds: 86400,
       };
       const digest = await sha256Hex(canonicalJson(root));
       const capability = { protocol: "conduit.privileged/1", helperVersion: "0.1.0", installationId, receiptKeyId: "hkey_privilegeflow01", policyRevision: revision, policyDigest: digest, enabled: true, observedAt: new Date().toISOString(), systemdSystemManager: true, socketPeerCredentials: true, transientUnits: true, cgroupV2: true, freeze: true, pidfd: true, openat2: true, execveat: true, pty: true, streamReplay: true, neverOptIn: true, unrestrictedLaunchOptIn: false, unavailableReason: null };
-      return { digest, bundle: { protocol: "conduit.privileged/1", installationId, deviceId, deviceKeyId, uid: 1000, origin: env.PUBLIC_ORIGIN, policyRevision: revision, policyDigest: digest, receiptPublicJwk: { ...helperPublicJwk, kid: "hkey_privilegeflow01" }, signedPolicyAttestation: { keyId: "hkey_privilegeflow01", claims: root, signature: await sign(helperPrivate, root) }, signedCapability: { keyId: "hkey_privilegeflow01", claims: capability, signature: await sign(helperPrivate, capability) } } };
+      return { digest, bundle: { protocol: "conduit.privileged/1", installationId, deviceId, deviceKeyId, uid, origin: env.PUBLIC_ORIGIN, policyRevision: revision, policyDigest: digest, receiptPublicJwk: { ...helperPublicJwk, kid: "hkey_privilegeflow01" }, signedPolicyAttestation: { keyId: "hkey_privilegeflow01", claims: root, signature: await sign(helperPrivate, root) }, signedCapability: { keyId: "hkey_privilegeflow01", claims: capability, signature: await sign(helperPrivate, capability) } } };
     };
     try {
+      const initial = await bundleFor("phinst_privbudgetnew1", 1, ["prepare"], 1001);
+      const registrationSequence = String(sequence);
+      await sendFrame("privilege.installation_attestation", { requestId: "phreq_privbudgetnew1", registrationBundle: initial.bundle, devicePolicy, deviceKeyId }, "phreq_privbudgetnew1");
+      await receiveAck(registrationSequence);
+      assertInvocation();
+      expect(await env.DB.prepare("SELECT status,expected_uid FROM device_privilege_installations WHERE installation_id='phinst_privbudgetnew1'").first()).toEqual({ status: "pending_owner", expected_uid: 1001 });
+
       const reattestation = await bundleFor("phinst_privilegeflow01", 4, ["prepare"]);
       const policySequence = String(sequence);
       await sendFrame("privilege.installation_attestation", { requestId: "phreq_privbudgetpol1", registrationBundle: reattestation.bundle, devicePolicy, deviceKeyId }, "phreq_privbudgetpol1");

@@ -98,7 +98,7 @@ for conduit_unit in "$conduit_socket" "$conduit_service"; do
   test "$(stat -c '%a' "$conduit_unit")" = 644
 done
 test "$(stat -c '%a' "$CONDUIT_TEST_PRIVILEGED_STATE")" = 700
-test "$(stat -c '%a' "$CONDUIT_TEST_PRIVILEGED_CONFIG")" = 755
+test "$(stat -c '%a' "$CONDUIT_TEST_PRIVILEGED_CONFIG")" = 700
 test -z "$(find "$CONDUIT_TEST_PRIVILEGED_STATE" -mindepth 1 -print -quit)"
 test -z "$(find "$CONDUIT_TEST_PRIVILEGED_CONFIG" -mindepth 1 -print -quit)"
 grep -Fq 'ListenSequentialPacket=/run/conduit/privileged/%i.sock' "$conduit_socket"
@@ -108,6 +108,7 @@ grep -Fq 'ExecStart=/usr/libexec/conduit/conduit-privileged-helper serve --expec
 grep -Fq 'PrivateNetwork=yes' "$conduit_service"
 grep -Fq 'RestrictAddressFamilies=AF_UNIX' "$conduit_service"
 grep -Fq 'NoNewPrivileges=yes' "$conduit_service"
+grep -Fq 'ConfigurationDirectoryMode=0700' "$conduit_service"
 
 if DESTDIR="$conduit_stage" CONDUIT_BUILD_DIR="$conduit_release_100" \
   "$conduit_root/installers/install-privileged.sh"; then

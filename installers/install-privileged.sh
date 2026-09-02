@@ -62,7 +62,7 @@ done
 
 conduit_privileged_prepare_directory "$(conduit_privileged_target "$conduit_privileged_libexec_dir")" 0755
 conduit_privileged_prepare_directory "$(conduit_privileged_target "$conduit_privileged_systemd_dir")" 0755
-conduit_privileged_prepare_directory "$(conduit_privileged_target "$conduit_privileged_config_dir")" 0755
+conduit_privileged_prepare_directory "$(conduit_privileged_target "$conduit_privileged_config_dir")" 0700
 conduit_privileged_prepare_directory "$(conduit_privileged_target "$conduit_privileged_state_dir")" 0700
 
 conduit_existing_state="$(conduit_privileged_target "$conduit_privileged_state_dir")"

@@ -130,7 +130,7 @@ describe.sequential("control-plane contracts", () => {
       env.DB.prepare("INSERT INTO devices(id,enrollment_id,display_label,os,arch,node_version,protocol_version,status,created_at,updated_at) VALUES (?1,?2,'test','linux','x86_64','0.1.0','conduit.node/1','active',?3,?3)").bind(deviceId, enrollmentId, now),
       env.DB.prepare("INSERT INTO device_keys(id,device_id,public_jwk_json,fingerprint,status,created_at) VALUES (?1,?2,?3,?4,'active',?5)").bind(keyId, deviceId, JSON.stringify(publicJwk), "c".repeat(64), now),
     ]);
-    const response = await exports.default.fetch(new Request(`https://conduit.example.com/v1/devices/${deviceId}/connect`, { headers: { upgrade: "websocket" } }));
+    const response = await exports.default.fetch(new Request(`https://conduit.example.com/api/v1/devices/${deviceId}/connect`, { headers: { upgrade: "websocket" } }));
     expect(response.status).toBe(101);
     const socket = response.webSocket!;
     socket.accept();

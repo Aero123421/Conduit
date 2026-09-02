@@ -870,7 +870,11 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
 
   override async fetch(request: Request): Promise<Response> {
     if (request.headers.get("upgrade")?.toLowerCase() !== "websocket") return new Response("WebSocket required", { status: 426 });
-    const match = new URL(request.url).pathname.match(/^\/v1\/devices\/([^/]+)\/connect$/);
+    // The public Worker normalizes `/api/v1/...` to `/v1/...` for routing but
+    // forwards the original upgrade Request to the Durable Object. Accept the
+    // two canonical public aliases here so the real Node `/api/v1` route does
+    // not fail after the Worker has already authorized it.
+    const match = new URL(request.url).pathname.match(/^\/(?:api\/)?v1\/devices\/([^/]+)\/connect$/);
     if (match?.[1] === undefined) return new Response("Device target required", { status: 400 });
     const pair = new WebSocketPair();
     const client = pair[0];

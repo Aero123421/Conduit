@@ -15,8 +15,9 @@ pub use journal::{
     EffectDisposition, HelperJournal, JOURNAL_SCHEMA_VERSION, JournalEffect, RuntimeRecord,
 };
 pub use service::{
-    HelperConfig, HelperEngine, PinnedTicketKeys, control_target_digest,
-    load_receipt_key_root_owned,
+    HelperConfig, HelperEngine, PinnedTicketKeys, PolicyChangeEvidence, PublicJwk,
+    PublicPolicyAttestation, PublicPolicySummary, RegistrationBundle, build_registration_bundle,
+    control_target_digest, load_receipt_key_root_owned,
 };
 pub use systemd::{FakeSystemd, SystemdBackend, SystemdManager, UnitObservation, UnitSpec};
 pub use transport::{

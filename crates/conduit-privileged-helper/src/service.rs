@@ -9,7 +9,7 @@ use conduit_privileged_protocol::{
     SignedClaims,
 };
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
@@ -66,11 +66,83 @@ pub struct HelperConfig {
     pub state_dir: PathBuf,
     pub worker_path: PathBuf,
     pub device_key_id: String,
+    pub device_public_key: [u8; 32],
+    pub policy_change: PolicyChangeEvidence,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PolicyChangeEvidence {
+    pub revision: u64,
+    pub policy_digest: String,
+    pub previous_policy_digest: Option<String>,
+    pub change_class: String,
+    pub changed_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicPolicySummary {
+    pub enabled: bool,
+    pub ticket_key_ids: Vec<String>,
+    pub allowed_operations: Vec<PrivilegedOperation>,
+    pub allowed_adapters: Vec<String>,
+    pub allowed_launch_profiles: Vec<String>,
+    pub ceilings: conduit_privileged_protocol::ResourceCeilings,
+    pub allow_never: bool,
+    pub allow_unrestricted_launch: bool,
+    pub allow_persistent_sessions: bool,
+    pub allow_offline_control: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicPolicyAttestation {
+    pub revision: u64,
+    pub policy_digest: String,
+    pub previous_policy_digest: Option<String>,
+    pub public_summary: PublicPolicySummary,
+    pub change_class: String,
+    pub signature: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PublicJwk {
+    pub kty: String,
+    pub crv: String,
+    pub x: String,
+    pub kid: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RegistrationBundle {
+    pub installation_id: String,
+    pub device_id: String,
+    pub device_key_id: String,
+    pub expected_uid: u32,
+    pub public_origin: String,
+    pub helper_key_id: String,
+    pub receipt_public_jwk: PublicJwk,
+    pub signed_capability: conduit_privileged_protocol::SignedCapability,
+    pub policy: PublicPolicyAttestation,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PolicyAttestationClaims<'a> {
+    revision: u64,
+    policy_digest: &'a str,
+    previous_policy_digest: &'a Option<String>,
+    public_summary: &'a PublicPolicySummary,
+    change_class: &'a str,
 }
 
 impl HelperConfig {
     pub fn load_policy_root_owned(
         path: &Path,
+        node_key_path: &Path,
         receipt_key_id: String,
         state_dir: PathBuf,
         worker_path: PathBuf,
@@ -87,18 +159,28 @@ impl HelperConfig {
                 "helper state directory ownership or mode invalid".into(),
             ));
         }
+        if state_dir.join("admin-update.json").exists() {
+            return Err(HelperError::RecoveryRequired(
+                "root policy update did not commit atomically".into(),
+            ));
+        }
         let policy: RootPolicy = serde_json::from_slice(&fs::read(path)?)?;
-        let node_key_path = path
-            .parent()
-            .ok_or_else(|| HelperError::Policy("policy parent".into()))?
-            .join("node-public.key");
-        validate_regular(&node_key_path, 0, 0o644)?;
+        validate_regular(node_key_path, 0, 0o644)?;
         let node_key: [u8; 32] = fs::read(node_key_path)?
             .try_into()
             .map_err(|_| HelperError::Policy("node public key length".into()))?;
         VerifyingKey::from_bytes(&node_key)
             .map_err(|_| HelperError::Policy("node public key invalid".into()))?;
         let digest = policy.digest()?;
+        let policy_change_path = state_dir.join("policy-change.json");
+        validate_regular(&policy_change_path, 0, 0o600)?;
+        let policy_change: PolicyChangeEvidence =
+            serde_json::from_slice(&fs::read(policy_change_path)?)?;
+        if policy_change.revision != policy.revision || policy_change.policy_digest != digest {
+            return Err(HelperError::Policy(
+                "policy change evidence does not match root policy".into(),
+            ));
+        }
         Ok(Self {
             policy,
             policy_digest: digest,
@@ -107,6 +189,8 @@ impl HelperConfig {
             state_dir,
             worker_path,
             device_key_id: conduit_privileged_protocol::key_id("dkey", &node_key),
+            device_public_key: node_key,
+            policy_change,
         })
     }
 }
@@ -168,14 +252,47 @@ impl<M: SystemdManager> HelperEngine<M> {
             _ => unreachable!(),
         }
     }
+    pub fn registration_bundle(&self) -> Result<RegistrationBundle> {
+        build_registration_bundle(
+            &self.config.policy,
+            &self.config.policy_change,
+            self.config.device_public_key,
+            &self.receipt_key,
+            self.systemd.available().unwrap_or(false),
+            &self.config.helper_version,
+        )
+    }
+    pub fn handle_managed(
+        &self,
+        authenticated: bool,
+        request: crate::ManagedIoRequest,
+        descriptor_count: usize,
+    ) -> Result<crate::ManagedIoResponse> {
+        if !authenticated {
+            return Err(HelperError::Authentication("handshake_required".into()));
+        }
+        if descriptor_count != 0 {
+            return Err(HelperError::Authentication(
+                "unexpected managed request descriptors".into(),
+            ));
+        }
+        match request {
+            crate::ManagedIoRequest::ReadStream(request) => self.read_stream(&request),
+            crate::ManagedIoRequest::PolicyAttest => self
+                .registration_bundle()
+                .map(crate::ManagedIoResponse::RegistrationBundle),
+        }
+    }
     pub fn converge_terminal(&self) -> Result<Vec<HelperReceipt>> {
         let mut receipts = Vec::new();
         for runtime in self.journal.nonterminal_runtimes()? {
-            if let Ok(observation) = self.systemd.inspect(&runtime.unit_name) {
-                if matches!(
-                    observation.active_state.as_str(),
-                    "inactive" | "dead" | "failed"
-                ) {
+            match self.systemd.inspect_optional(&runtime.unit_name) {
+                Ok(Some(observation))
+                    if matches!(
+                        observation.active_state.as_str(),
+                        "inactive" | "dead" | "failed"
+                    ) =>
+                {
                     let ticket = runtime.authority_ticket.clone();
                     let transition = receipt_transition(&observation.active_state);
                     let receipt = self.receipt(
@@ -184,7 +301,6 @@ impl<M: SystemdManager> HelperEngine<M> {
                         transition,
                         Some(&observation),
                         runtime.state_revision + 1,
-                        None,
                     )?;
                     self.journal.record_observation(
                         &receipt,
@@ -194,6 +310,20 @@ impl<M: SystemdManager> HelperEngine<M> {
                     )?;
                     receipts.push(receipt)
                 }
+                Ok(None) if matches!(runtime.state.as_str(), "starting" | "running" | "paused") => {
+                    let ticket = runtime.authority_ticket.clone();
+                    let receipt = self.receipt(
+                        &ticket,
+                        "terminal_watcher_missing",
+                        "recovery_required",
+                        None,
+                        runtime.state_revision + 1,
+                    )?;
+                    self.journal
+                        .record_observation(&receipt, "recovery_required", None, None)?;
+                    receipts.push(receipt)
+                }
+                _ => {}
             }
         }
         Ok(receipts)
@@ -428,7 +558,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             EffectDisposition::InProgress(effect) => decode_receipt_chain(effect.receipt)?,
         };
         if chain.is_empty() {
-            let admitted = self.receipt(&ticket, &request, "admitted", None, 1, None)?;
+            let admitted = self.receipt(&ticket, &request, "admitted", None, 1)?;
             self.journal.record_effect_boundary(
                 &ticket.claims.ticket_id,
                 &admitted,
@@ -513,7 +643,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             &self.receipt_key,
             unsafe { libc::geteuid() },
         )?;
-        let receipt = self.receipt(&ticket, &request, "prepared", None, 2, None)?;
+        let receipt = self.receipt(&ticket, &request, "prepared", None, 2)?;
         self.journal
             .complete_effect(&ticket.claims.ticket_id, &receipt, "prepared", None, None)?;
         chain.push(receipt);
@@ -564,6 +694,12 @@ impl<M: SystemdManager> HelperEngine<M> {
                 .join("execution-record.json")
                 .to_string_lossy()
                 .into(),
+            receipt_public_key_path: self
+                .config
+                .state_dir
+                .join("receipt.public")
+                .to_string_lossy()
+                .into(),
             stdout_path: runtime_dir.join("stdout.spool").to_string_lossy().into(),
             stderr_path: runtime_dir.join("stderr.spool").to_string_lossy().into(),
             resources: runtime.plan.resources.clone(),
@@ -586,8 +722,7 @@ impl<M: SystemdManager> HelperEngine<M> {
                 &request,
                 "unit_created",
                 Some(&observation),
-                3,
-                None,
+                runtime.state_revision + 1,
             )?;
             self.journal.record_effect_boundary(
                 &ticket.claims.ticket_id,
@@ -599,7 +734,16 @@ impl<M: SystemdManager> HelperEngine<M> {
             )?;
             chain.push(created);
         }
-        let receipt = self.receipt(&ticket, &request, "running", Some(&observation), 4, None)?;
+        let running_revision = chain.last().map_or(runtime.state_revision + 1, |receipt| {
+            receipt.claims.state_revision + 1
+        });
+        let receipt = self.receipt(
+            &ticket,
+            &request,
+            "running",
+            Some(&observation),
+            running_revision,
+        )?;
         self.journal.complete_effect(
             &ticket.claims.ticket_id,
             &receipt,
@@ -620,7 +764,6 @@ impl<M: SystemdManager> HelperEngine<M> {
             receipt_transition(&observation.active_state),
             Some(&observation),
             runtime.state_revision + 1,
-            None,
         )?;
         self.journal.record_observation(
             &receipt,
@@ -708,7 +851,6 @@ impl<M: SystemdManager> HelperEngine<M> {
             "input_applied",
             observation.as_ref(),
             runtime.state_revision + 1,
-            Some(request.clone()),
         )?;
         self.journal.complete_effect(
             &ticket.claims.ticket_id,
@@ -788,7 +930,6 @@ impl<M: SystemdManager> HelperEngine<M> {
             "pty_resized",
             observation.as_ref(),
             runtime.state_revision + 1,
-            Some(request.clone()),
         )?;
         self.journal.complete_effect(
             &ticket.claims.ticket_id,
@@ -875,7 +1016,6 @@ impl<M: SystemdManager> HelperEngine<M> {
             transition,
             Some(&observation),
             runtime.state_revision + 1,
-            Some(request.clone()),
         )?;
         self.journal.complete_effect(
             &ticket.claims.ticket_id,
@@ -893,6 +1033,15 @@ impl<M: SystemdManager> HelperEngine<M> {
         let mut receipts = Vec::new();
         for id in ids {
             if let Some(runtime) = self.journal.runtime(&id)? {
+                if let Some(receipt) = runtime.last_receipt.clone() {
+                    receipts.push(receipt);
+                }
+                if matches!(
+                    runtime.state.as_str(),
+                    "stopped" | "failed" | "terminal" | "recovery_required"
+                ) {
+                    continue;
+                }
                 let observation = self.systemd.inspect(&runtime.unit_name).ok();
                 let ticket = runtime.authority_ticket.clone();
                 let transition = if observation.is_some() {
@@ -910,7 +1059,6 @@ impl<M: SystemdManager> HelperEngine<M> {
                     transition,
                     observation.as_ref(),
                     runtime.state_revision + 1,
-                    None,
                 )?;
                 self.journal.record_observation(
                     &receipt,
@@ -982,6 +1130,15 @@ impl<M: SystemdManager> HelperEngine<M> {
         let now = OffsetDateTime::now_utc();
         let not_before = parse_time(&c.issued_at)?;
         let expires_at = parse_time(&c.expires_at)?;
+        let control_digest_required = matches!(
+            operation,
+            PrivilegedOperation::Input
+                | PrivilegedOperation::ResizePty
+                | PrivilegedOperation::Pause
+                | PrivilegedOperation::Resume
+                | PrivilegedOperation::GracefulStop
+                | PrivilegedOperation::ForceStop
+        );
         if c.protocol != PROTOCOL
             || c.audience != "conduit-privileged-helper"
             || c.helper_installation_id != self.config.policy.installation_id
@@ -1010,6 +1167,8 @@ impl<M: SystemdManager> HelperEngine<M> {
                 && (!c.required_approval_risk_classes.is_empty()
                     || c.approval_receipt_digest.is_some()))
             || !within_ceilings(&c.resource_ceilings, &self.config.policy.ceilings)
+            || (control_digest_required && !c.control_digest.as_deref().is_some_and(valid_sha256))
+            || (!control_digest_required && c.control_digest.is_some())
         {
             return Err(HelperError::Denied("privilege_ticket_invalid".into()));
         }
@@ -1046,7 +1205,6 @@ impl<M: SystemdManager> HelperEngine<M> {
         transition: &str,
         observation: Option<&UnitObservation>,
         revision: u64,
-        control: Option<String>,
     ) -> Result<HelperReceipt> {
         let c = &ticket.claims;
         let runtime = self.journal.runtime(&c.runtime_id)?;
@@ -1077,7 +1235,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             runtime_spec_digest: c.runtime_spec_digest.clone(),
             launch_plan_digest: c.launch_plan_digest.clone(),
             local_execution_plan_digest: c.local_execution_plan_digest.clone(),
-            control_request_digest: control,
+            control_request_digest: c.control_digest.clone(),
             controller_epoch: c.controller_epoch,
             state_revision: revision,
             transition: transition.into(),
@@ -1106,6 +1264,94 @@ impl<M: SystemdManager> HelperEngine<M> {
     }
 }
 
+pub fn build_registration_bundle(
+    policy: &RootPolicy,
+    policy_change: &PolicyChangeEvidence,
+    device_public_key: [u8; 32],
+    receipt_key: &SigningKey,
+    systemd: bool,
+    helper_version: &str,
+) -> Result<RegistrationBundle> {
+    let policy_digest = policy.digest()?;
+    if policy_change.revision != policy.revision || policy_change.policy_digest != policy_digest {
+        return Err(HelperError::Policy(
+            "policy change evidence does not match root policy".into(),
+        ));
+    }
+    let receipt_key_id =
+        conduit_privileged_protocol::key_id("hkey", receipt_key.verifying_key().as_bytes());
+    let summary = PublicPolicySummary {
+        enabled: policy.enabled,
+        ticket_key_ids: policy.ticket_key_ids.clone(),
+        allowed_operations: policy.allowed_operations.clone(),
+        allowed_adapters: policy.allowed_adapters.clone(),
+        allowed_launch_profiles: policy.allowed_launch_profiles.clone(),
+        ceilings: policy.ceilings.clone(),
+        allow_never: policy.allow_never,
+        allow_unrestricted_launch: policy.allow_unrestricted_launch,
+        allow_persistent_sessions: policy.allow_persistent_sessions,
+        allow_offline_control: policy.allow_offline_control,
+    };
+    let policy_claims = PolicyAttestationClaims {
+        revision: policy.revision,
+        policy_digest: &policy_digest,
+        previous_policy_digest: &policy_change.previous_policy_digest,
+        public_summary: &summary,
+        change_class: &policy_change.change_class,
+    };
+    let signature = SignedClaims::sign(&receipt_key_id, policy_claims, receipt_key)?.signature;
+    let capability = CapabilityClaims {
+        protocol: PROTOCOL.into(),
+        helper_version: helper_version.into(),
+        installation_id: policy.installation_id.clone(),
+        receipt_key_id: receipt_key_id.clone(),
+        policy_revision: policy.revision,
+        policy_digest: policy_digest.clone(),
+        enabled: policy.enabled,
+        observed_at: policy_change.changed_at.clone(),
+        systemd_system_manager: systemd,
+        socket_peer_credentials: true,
+        transient_units: systemd,
+        cgroup_v2: Path::new("/sys/fs/cgroup/cgroup.controllers").exists(),
+        freeze: systemd,
+        pidfd: true,
+        openat2: true,
+        execveat: true,
+        pty: true,
+        stream_replay: true,
+        never_opt_in: policy.allow_never,
+        unrestricted_launch_opt_in: policy.allow_unrestricted_launch,
+        unavailable_reason: if policy.enabled && systemd {
+            None
+        } else {
+            Some("root_policy_or_systemd_unavailable".into())
+        },
+    };
+    Ok(RegistrationBundle {
+        installation_id: policy.installation_id.clone(),
+        device_id: policy.device_id.clone(),
+        device_key_id: conduit_privileged_protocol::key_id("dkey", &device_public_key),
+        expected_uid: policy.uid,
+        public_origin: policy.origin.clone(),
+        helper_key_id: receipt_key_id.clone(),
+        receipt_public_jwk: PublicJwk {
+            kty: "OKP".into(),
+            crv: "Ed25519".into(),
+            x: URL_SAFE_NO_PAD.encode(receipt_key.verifying_key().as_bytes()),
+            kid: receipt_key_id.clone(),
+        },
+        signed_capability: SignedClaims::sign(&receipt_key_id, capability, receipt_key)?,
+        policy: PublicPolicyAttestation {
+            revision: policy.revision,
+            policy_digest,
+            previous_policy_digest: policy_change.previous_policy_digest.clone(),
+            public_summary: summary,
+            change_class: policy_change.change_class.clone(),
+            signature,
+        },
+    })
+}
+
 fn parse_time(value: &str) -> Result<OffsetDateTime> {
     OffsetDateTime::parse(value, &Rfc3339)
         .map_err(|_| HelperError::Denied("invalid_ticket_time".into()))
@@ -1128,6 +1374,13 @@ fn within_ceilings(
         && le(requested.tasks_max, policy.tasks_max)
         && le(requested.io_weight, policy.io_weight)
         && le(requested.runtime_max_usec, policy.runtime_max_usec)
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 fn normalize_unit_state(value: &str) -> &str {
     match value {
@@ -1239,7 +1492,16 @@ mod tests {
             enabled: true,
             origin: "https://example.test".into(),
             ticket_key_ids: vec![issuer_id.clone()],
-            allowed_operations: vec![PrivilegedOperation::Prepare, PrivilegedOperation::Start],
+            allowed_operations: vec![
+                PrivilegedOperation::Prepare,
+                PrivilegedOperation::Start,
+                PrivilegedOperation::Input,
+                PrivilegedOperation::ResizePty,
+                PrivilegedOperation::Pause,
+                PrivilegedOperation::Resume,
+                PrivilegedOperation::GracefulStop,
+                PrivilegedOperation::ForceStop,
+            ],
             allowed_adapters: vec![],
             allowed_launch_profiles: vec![],
             ceilings: resources(),
@@ -1249,14 +1511,24 @@ mod tests {
             allow_offline_control: false,
             receipt_retention_seconds: 3600,
         };
+        let policy_digest = policy.digest().unwrap();
+        let device_public_key = [44; 32];
         let config = HelperConfig {
-            policy_digest: policy.digest().unwrap(),
+            policy_digest: policy_digest.clone(),
             policy,
             receipt_key_id: receipt_id,
             helper_version: "test".into(),
             state_dir: directory.clone(),
             worker_path: "/usr/lib/conduit/conduit-privileged-helper".into(),
-            device_key_id: "dkey_test".into(),
+            device_key_id: conduit_privileged_protocol::key_id("dkey", &device_public_key),
+            device_public_key,
+            policy_change: PolicyChangeEvidence {
+                revision: 7,
+                policy_digest,
+                previous_policy_digest: None,
+                change_class: "installation".into(),
+                changed_at: "2026-01-01T00:00:00Z".into(),
+            },
         };
         let plan = LocalExecutionPlan {
             plan_version: 1,
@@ -1315,14 +1587,14 @@ mod tests {
                 helper_policy_revision: engine.config.policy.revision,
                 helper_policy_digest: engine.config.policy_digest.clone(),
                 device_id: engine.config.policy.device_id.clone(),
-                device_key_id: "dkey_test".into(),
+                device_key_id: engine.config.device_key_id.clone(),
                 device_policy_revision: 1,
                 device_revision: 1,
                 expected_uid: engine.config.policy.uid,
                 operation_id: plan.operation_id.clone(),
                 idempotency_key_digest: "11".repeat(32),
                 operation_request_digest: "22".repeat(32),
-                run_manifest_digest: "66".repeat(32),
+                run_manifest_digest: "23".repeat(32),
                 run_id: plan.run_id.clone(),
                 runtime_id: plan.runtime_id.clone(),
                 runtime_spec_digest: "33".repeat(32),
@@ -1453,6 +1725,289 @@ mod tests {
                 .filter(|v| v.starts_with("start:"))
                 .count(),
             1
+        );
+    }
+
+    #[test]
+    fn control_ticket_requires_signed_control_digest_and_receipt_uses_it() {
+        let (engine, _backend, plan, issuer, _) = setup();
+        let missing = ticket(
+            &engine,
+            &issuer,
+            &plan,
+            PrivilegedOperation::Input,
+            "ptkt_input_missing_digest",
+        );
+        assert!(matches!(
+            engine.validate_ticket(&missing, PrivilegedOperation::Input, None),
+            Err(HelperError::Denied(_))
+        ));
+
+        let mut claims = missing.claims;
+        claims.ticket_id = "ptkt_input_bound_digest".into();
+        claims.control_digest = Some("ab".repeat(32));
+        let bound = SignedClaims::sign(
+            engine.config.policy.ticket_key_ids[0].clone(),
+            claims,
+            &issuer,
+        )
+        .unwrap();
+        engine
+            .validate_ticket(&bound, PrivilegedOperation::Input, None)
+            .unwrap();
+        let receipt = engine
+            .receipt(&bound, "local-request-digest", "input_applied", None, 1)
+            .unwrap();
+        assert_eq!(receipt.claims.control_request_digest, Some("ab".repeat(32)));
+        assert_ne!(
+            receipt.claims.control_request_digest.as_deref(),
+            Some("local-request-digest")
+        );
+
+        let mut prepare_claims = bound.claims;
+        prepare_claims.allowed_operation = PrivilegedOperation::Prepare;
+        let prepare_with_control = SignedClaims::sign(
+            engine.config.policy.ticket_key_ids[0].clone(),
+            prepare_claims,
+            &issuer,
+        )
+        .unwrap();
+        assert!(matches!(
+            engine.validate_ticket(
+                &prepare_with_control,
+                PrivilegedOperation::Prepare,
+                Some(&plan)
+            ),
+            Err(HelperError::Denied(_))
+        ));
+    }
+
+    #[test]
+    fn terminal_watcher_converges_missing_running_unit_once() {
+        let (engine, backend, plan, issuer, receipt_key) = setup();
+        engine
+            .prepare(
+                ticket(
+                    &engine,
+                    &issuer,
+                    &plan,
+                    PrivilegedOperation::Prepare,
+                    "ptkt_prepare_missing_unit",
+                ),
+                plan.clone(),
+                vec![],
+            )
+            .unwrap();
+        engine
+            .start(
+                ticket(
+                    &engine,
+                    &issuer,
+                    &plan,
+                    PrivilegedOperation::Start,
+                    "ptkt_start_missing_unit",
+                ),
+                plan.digest().unwrap(),
+            )
+            .unwrap();
+        backend.forget_unit(&plan.systemd_unit);
+        let receipts = engine.converge_terminal().unwrap();
+        assert_eq!(receipts.len(), 1);
+        assert_eq!(receipts[0].claims.transition, "recovery_required");
+        assert_eq!(receipts[0].claims.state_revision, 5);
+        receipts[0].verify(receipt_key.as_bytes()).unwrap();
+        assert!(engine.converge_terminal().unwrap().is_empty());
+        let HelperResponse::Receipts(replayed) =
+            engine.reconcile(vec![plan.runtime_id.clone()]).unwrap()
+        else {
+            panic!("terminal reconcile receipts")
+        };
+        assert_eq!(replayed, receipts);
+    }
+
+    #[test]
+    fn authenticated_registration_bundle_is_public_exact_and_replay_stable() {
+        let (engine, _backend, _plan, _issuer, receipt_key) = setup();
+        assert!(matches!(
+            engine.handle_managed(false, crate::ManagedIoRequest::PolicyAttest, 0),
+            Err(HelperError::Authentication(_))
+        ));
+        let crate::ManagedIoResponse::RegistrationBundle(first) = engine
+            .handle_managed(true, crate::ManagedIoRequest::PolicyAttest, 0)
+            .unwrap()
+        else {
+            panic!("registration bundle response")
+        };
+        let crate::ManagedIoResponse::RegistrationBundle(replay) = engine
+            .handle_managed(true, crate::ManagedIoRequest::PolicyAttest, 0)
+            .unwrap()
+        else {
+            panic!("registration bundle replay")
+        };
+        assert_eq!(first, replay);
+        assert_eq!(first.helper_key_id, first.signed_capability.key_id);
+        assert_eq!(first.device_key_id, engine.config.device_key_id);
+        assert_eq!(first.policy.revision, engine.config.policy.revision);
+        assert_eq!(first.policy.policy_digest, engine.config.policy_digest);
+        first
+            .signed_capability
+            .verify(receipt_key.as_bytes())
+            .unwrap();
+        let value = serde_json::to_value(&first).unwrap();
+        let jwk = value["receiptPublicJwk"].as_object().unwrap();
+        assert_eq!(jwk.len(), 4);
+        assert!(
+            jwk.contains_key("kty")
+                && jwk.contains_key("crv")
+                && jwk.contains_key("x")
+                && jwk.contains_key("kid")
+        );
+        let serialized = serde_json::to_string(&value).unwrap();
+        assert!(!serialized.contains("receipt.key"));
+        assert!(!serialized.contains("/var/") && !serialized.contains("/etc/"));
+    }
+
+    #[test]
+    fn crash_after_each_durable_boundary_replays_without_duplicate_effect() {
+        let (engine, backend, plan, issuer, _) = setup();
+        let prepare_ticket = ticket(
+            &engine,
+            &issuer,
+            &plan,
+            PrivilegedOperation::Prepare,
+            "ptkt_prepare_boundary_crash",
+        );
+        let prepare_request = request_digest(&HelperRequest::Prepare {
+            ticket: prepare_ticket.clone(),
+            plan: plan.clone(),
+        })
+        .unwrap();
+        let prepare_ticket_digest = prepare_ticket.digest().unwrap();
+        let plan_digest = plan.digest().unwrap();
+        assert!(matches!(
+            engine
+                .journal
+                .admit_prepare(
+                    &prepare_ticket,
+                    &prepare_ticket_digest,
+                    &prepare_request,
+                    &plan_digest,
+                    &plan,
+                )
+                .unwrap(),
+            EffectDisposition::Reserved(_)
+        ));
+        let admitted = engine
+            .receipt(&prepare_ticket, &prepare_request, "admitted", None, 1)
+            .unwrap();
+        engine
+            .journal
+            .record_effect_boundary(
+                &prepare_ticket.claims.ticket_id,
+                &admitted,
+                "admitted",
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        let HelperResponse::Receipts(prepared) = engine
+            .prepare(prepare_ticket.clone(), plan.clone(), vec![])
+            .unwrap()
+        else {
+            panic!("prepare chain")
+        };
+        assert_eq!(prepared[0], admitted);
+        assert_eq!(prepared[1].claims.transition, "prepared");
+
+        let start_ticket = ticket(
+            &engine,
+            &issuer,
+            &plan,
+            PrivilegedOperation::Start,
+            "ptkt_start_boundary_crash",
+        );
+        let start_request = request_digest(&HelperRequest::Start {
+            ticket: start_ticket.clone(),
+            plan_digest: plan_digest.clone(),
+        })
+        .unwrap();
+        assert!(matches!(
+            engine
+                .journal
+                .reserve_effect(
+                    &start_ticket,
+                    &start_ticket.digest().unwrap(),
+                    &start_request,
+                    "start",
+                    &plan.runtime_id,
+                )
+                .unwrap(),
+            EffectDisposition::Reserved(_)
+        ));
+        let runtime_dir = engine
+            .config
+            .state_dir
+            .join("runtimes")
+            .join(&plan.runtime_id);
+        let observation = backend
+            .start_transient(&UnitSpec {
+                unit_name: plan.systemd_unit.clone(),
+                worker_path: engine.config.worker_path.to_string_lossy().into(),
+                execution_record_path: runtime_dir
+                    .join("execution-record.json")
+                    .to_string_lossy()
+                    .into(),
+                receipt_public_key_path: engine
+                    .config
+                    .state_dir
+                    .join("receipt.public")
+                    .to_string_lossy()
+                    .into(),
+                stdout_path: runtime_dir.join("stdout.spool").to_string_lossy().into(),
+                stderr_path: runtime_dir.join("stderr.spool").to_string_lossy().into(),
+                resources: plan.resources.clone(),
+            })
+            .unwrap();
+        let unit_created = engine
+            .receipt(
+                &start_ticket,
+                &start_request,
+                "unit_created",
+                Some(&observation),
+                3,
+            )
+            .unwrap();
+        engine
+            .journal
+            .record_effect_boundary(
+                &start_ticket.claims.ticket_id,
+                &unit_created,
+                "starting",
+                observation.invocation_id.as_deref(),
+                observation.main_pid,
+                false,
+            )
+            .unwrap();
+        let HelperResponse::Receipts(started) = engine
+            .start(start_ticket.clone(), plan_digest.clone())
+            .unwrap()
+        else {
+            panic!("start chain")
+        };
+        assert_eq!(started[0], unit_created);
+        assert_eq!(started[1].claims.transition, "running");
+        assert_eq!(
+            backend
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("start:"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            engine.start(start_ticket, plan_digest).unwrap(),
+            HelperResponse::Receipts(started)
         );
     }
 }

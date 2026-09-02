@@ -53,6 +53,7 @@ pub struct StreamReadRequest {
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
 pub enum ManagedIoRequest {
     ReadStream(StreamReadRequest),
+    PolicyAttest,
 }
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "payload", rename_all = "snake_case")]
@@ -63,6 +64,7 @@ pub enum ManagedIoResponse {
         eof: bool,
         terminal: bool,
     },
+    RegistrationBundle(crate::RegistrationBundle),
     Error {
         code: String,
         retryable: bool,
@@ -400,6 +402,16 @@ impl HelperClient {
             &[],
         )
     }
+    pub fn reconcile(&self, runtime_ids: Vec<String>) -> Result<Vec<HelperReceipt>> {
+        match self.call(&HelperRequest::Reconcile { runtime_ids }, &[])? {
+            HelperResponse::Receipt(receipt) => Ok(vec![receipt]),
+            HelperResponse::Receipts(receipts) => Ok(receipts),
+            HelperResponse::Error { code, .. } => Err(HelperError::Denied(code)),
+            _ => Err(HelperError::Protocol(
+                conduit_privileged_protocol::ProtocolError::Invalid("reconcile response".into()),
+            )),
+        }
+    }
     pub fn read_stream(&self, request: StreamReadRequest) -> Result<ManagedIoResponse> {
         let packet = self
             .connection
@@ -410,6 +422,25 @@ impl HelperClient {
             ));
         }
         Ok(conduit_privileged_protocol::decode_packet(&packet.bytes)?)
+    }
+    pub fn registration_bundle(&self) -> Result<crate::RegistrationBundle> {
+        let packet = self
+            .connection
+            .call_serialized(&ManagedIoRequest::PolicyAttest, &[])?;
+        if !packet.descriptors.is_empty() {
+            return Err(HelperError::Authentication(
+                "unexpected registration bundle descriptors".into(),
+            ));
+        }
+        match conduit_privileged_protocol::decode_packet(&packet.bytes)? {
+            ManagedIoResponse::RegistrationBundle(bundle) => Ok(bundle),
+            ManagedIoResponse::Error { code, .. } => Err(HelperError::Denied(code)),
+            _ => Err(HelperError::Protocol(
+                conduit_privileged_protocol::ProtocolError::Invalid(
+                    "registration bundle response".into(),
+                ),
+            )),
+        }
     }
     pub fn verify_capability(value: &SignedCapability, key: &VerifyingKey) -> Result<()> {
         value.verify(key.as_bytes()).map_err(Into::into)

@@ -82,6 +82,68 @@ impl PrivilegedNativeProvider {
         self.tickets = Some(source);
         self
     }
+    pub fn attach_reconciled_privileged(
+        &self,
+        plan: LocalExecutionPlan,
+        spec_digest: String,
+    ) -> Result<PrivilegedRuntimeReceipt, RuntimeError> {
+        let receipts = self
+            .client
+            .lock()
+            .map_err(lock)?
+            .reconcile(vec![plan.runtime_id.clone()])
+            .map_err(helper)?;
+        if receipts.is_empty() {
+            return Err(RuntimeError::NotFound);
+        }
+        for receipt in &receipts {
+            self.verify(receipt)?;
+        }
+        for pair in receipts.windows(2) {
+            let previous_digest = pair[0]
+                .digest()
+                .map_err(|error| RuntimeError::Record(error.to_string()))?;
+            if pair[1].claims.previous_receipt_digest.as_deref() != Some(previous_digest.as_str())
+                || pair[1].claims.state_revision != pair[0].claims.state_revision + 1
+                || pair[1].claims.runtime_id != pair[0].claims.runtime_id
+            {
+                return Err(RuntimeError::Uncertain(
+                    "helper reconcile receipt chain linkage".into(),
+                ));
+            }
+        }
+        let receipt = receipts.last().expect("non-empty reconcile chain").clone();
+        let plan_digest = plan
+            .digest()
+            .map_err(|error| RuntimeError::Record(error.to_string()))?;
+        if receipt.claims.runtime_id != plan.runtime_id
+            || receipt.claims.run_id != plan.run_id
+            || receipt.claims.local_execution_plan_digest != plan_digest
+            || receipt.claims.runtime_spec_digest != spec_digest
+            || !matches!(
+                receipt.claims.transition.as_str(),
+                "prepared"
+                    | "running"
+                    | "paused"
+                    | "stopped"
+                    | "failed"
+                    | "missing"
+                    | "recovery_required"
+            )
+        {
+            return Err(RuntimeError::IdentityMismatch);
+        }
+        let handle = handle(&plan.runtime_id, &spec_digest, &receipt);
+        self.runtimes.lock().map_err(lock)?.insert(
+            plan.runtime_id.clone(),
+            RuntimeEntry {
+                plan,
+                receipt: receipt.clone(),
+                spec_digest,
+            },
+        );
+        Ok(privileged_receipt_from_handle(&handle, receipts))
+    }
     pub fn prepare_privileged(
         &self,
         request: &RuntimeRequest,
@@ -568,6 +630,9 @@ fn read(
             eof,
         }),
         ManagedIoResponse::Error { code, .. } => Err(RuntimeError::Provider { code }),
+        ManagedIoResponse::RegistrationBundle(_) => Err(RuntimeError::Uncertain(
+            "helper returned registration evidence for a stream read".into(),
+        )),
     }
 }
 fn evidence() -> Vec<CapabilityEvidence> {
@@ -598,11 +663,11 @@ fn signal_operation(signal: RuntimeSignal) -> PrivilegedOperation {
 fn state(receipt: &HelperReceipt) -> RuntimeState {
     match receipt.claims.transition.as_str() {
         "prepared" => RuntimeState::Prepared,
-        "started" | "already_running" | "running" | "input_applied" | "pty_resized" => {
+        "started" | "already_running" | "running" | "resumed" | "input_applied" | "pty_resized" => {
             RuntimeState::Running
         }
         "paused" => RuntimeState::Paused,
-        "stopped" | "already_stopped" => RuntimeState::Stopped,
+        "stopped" | "already_stopped" | "completed" => RuntimeState::Stopped,
         "failed" => RuntimeState::Failed,
         "recovery_required" | "missing" => RuntimeState::RecoveryRequired,
         _ => RuntimeState::Uncertain,

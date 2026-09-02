@@ -12,6 +12,7 @@ pub struct UnitSpec {
     pub unit_name: String,
     pub worker_path: String,
     pub execution_record_path: String,
+    pub receipt_public_key_path: String,
     pub stdout_path: String,
     pub stderr_path: String,
     pub resources: ResourceCeilings,
@@ -35,6 +36,9 @@ pub trait SystemdManager: Send + Sync + 'static {
     fn available(&self) -> Result<bool>;
     fn start_transient(&self, spec: &UnitSpec) -> Result<UnitObservation>;
     fn inspect(&self, unit_name: &str) -> Result<UnitObservation>;
+    fn inspect_optional(&self, unit_name: &str) -> Result<Option<UnitObservation>> {
+        self.inspect(unit_name).map(Some)
+    }
     fn pause(&self, unit_name: &str) -> Result<()>;
     fn resume(&self, unit_name: &str) -> Result<()>;
     fn graceful_stop(&self, unit_name: &str) -> Result<()>;
@@ -70,82 +74,19 @@ impl SystemdBackend {
             .map_err(bus_error)
     }
 
-    fn property(&self, path: &OwnedObjectPath, interface: &str, name: &str) -> Result<OwnedValue> {
-        let proxy = Proxy::new(
-            &self.connection,
-            "org.freedesktop.systemd1",
-            path.as_str(),
-            "org.freedesktop.DBus.Properties",
-        )
-        .map_err(bus_error)?;
-        proxy.call("Get", &(interface, name)).map_err(bus_error)
-    }
-}
-
-impl SystemdManager for SystemdBackend {
-    fn available(&self) -> Result<bool> {
-        let _: String = self.manager()?.get_property("Version").map_err(bus_error)?;
-        Ok(true)
+    fn optional_unit_path(&self, unit_name: &str) -> Result<Option<OwnedObjectPath>> {
+        match self.manager()?.call("GetUnit", &(unit_name,)) {
+            Ok(path) => Ok(Some(path)),
+            Err(zbus::Error::MethodError(name, _, _))
+                if name.as_str() == "org.freedesktop.systemd1.NoSuchUnit" =>
+            {
+                Ok(None)
+            }
+            Err(error) => Err(bus_error(error)),
+        }
     }
 
-    fn start_transient(&self, spec: &UnitSpec) -> Result<UnitObservation> {
-        validate_unit_spec(spec)?;
-        let argv = vec![
-            spec.worker_path.clone(),
-            "exec-worker".into(),
-            "--record".into(),
-            spec.execution_record_path.clone(),
-        ];
-        let exec = vec![(spec.worker_path.clone(), argv, false)];
-        let mut properties: Vec<(&str, Value<'_>)> = vec![
-            (
-                "Description",
-                Value::new(format!("Conduit elevated runtime {}", spec.unit_name)),
-            ),
-            ("Type", Value::new("exec")),
-            ("User", Value::new("root")),
-            ("Group", Value::new("root")),
-            ("ExecStart", Value::new(exec)),
-            ("KillMode", Value::new("control-group")),
-            ("Restart", Value::new("no")),
-            (
-                "StandardOutput",
-                Value::new(format!("append:{}", spec.stdout_path)),
-            ),
-            (
-                "StandardError",
-                Value::new(format!("append:{}", spec.stderr_path)),
-            ),
-        ];
-        if let Some(value) = spec.resources.cpu_quota_per_sec_usec {
-            properties.push(("CPUQuotaPerSecUSec", Value::new(value)));
-        }
-        if let Some(value) = spec.resources.memory_max_bytes {
-            properties.push(("MemoryMax", Value::new(value)));
-        }
-        if let Some(value) = spec.resources.tasks_max {
-            properties.push(("TasksMax", Value::new(value as u64)));
-        }
-        if let Some(value) = spec.resources.io_weight {
-            properties.push(("IOWeight", Value::new(value as u64)));
-        }
-        if let Some(value) = spec.resources.runtime_max_usec {
-            properties.push(("RuntimeMaxUSec", Value::new(value)));
-        }
-        let auxiliary: Vec<(&str, Vec<(&str, Value<'_>)>)> = Vec::new();
-        let _: OwnedObjectPath = self
-            .manager()?
-            .call(
-                "StartTransientUnit",
-                &(&spec.unit_name, "fail", properties, auxiliary),
-            )
-            .map_err(bus_error)?;
-        self.inspect(&spec.unit_name)
-    }
-
-    fn inspect(&self, unit_name: &str) -> Result<UnitObservation> {
-        validate_unit_name(unit_name)?;
-        let path = self.unit_path(unit_name)?;
+    fn inspect_path(&self, unit_name: &str, path: OwnedObjectPath) -> Result<UnitObservation> {
         let active_state = String::try_from(self.property(
             &path,
             "org.freedesktop.systemd1.Unit",
@@ -206,6 +147,94 @@ impl SystemdManager for SystemdBackend {
         })
     }
 
+    fn property(&self, path: &OwnedObjectPath, interface: &str, name: &str) -> Result<OwnedValue> {
+        let proxy = Proxy::new(
+            &self.connection,
+            "org.freedesktop.systemd1",
+            path.as_str(),
+            "org.freedesktop.DBus.Properties",
+        )
+        .map_err(bus_error)?;
+        proxy.call("Get", &(interface, name)).map_err(bus_error)
+    }
+}
+
+impl SystemdManager for SystemdBackend {
+    fn available(&self) -> Result<bool> {
+        let _: String = self.manager()?.get_property("Version").map_err(bus_error)?;
+        Ok(true)
+    }
+
+    fn start_transient(&self, spec: &UnitSpec) -> Result<UnitObservation> {
+        validate_unit_spec(spec)?;
+        let argv = vec![
+            spec.worker_path.clone(),
+            "exec-worker".into(),
+            "--record".into(),
+            spec.execution_record_path.clone(),
+            "--receipt-public-key".into(),
+            spec.receipt_public_key_path.clone(),
+        ];
+        let exec = vec![(spec.worker_path.clone(), argv, false)];
+        let mut properties: Vec<(&str, Value<'_>)> = vec![
+            (
+                "Description",
+                Value::new(format!("Conduit elevated runtime {}", spec.unit_name)),
+            ),
+            ("Type", Value::new("exec")),
+            ("User", Value::new("root")),
+            ("Group", Value::new("root")),
+            ("ExecStart", Value::new(exec)),
+            ("KillMode", Value::new("control-group")),
+            ("Restart", Value::new("no")),
+            (
+                "StandardOutput",
+                Value::new(format!("append:{}", spec.stdout_path)),
+            ),
+            (
+                "StandardError",
+                Value::new(format!("append:{}", spec.stderr_path)),
+            ),
+        ];
+        if let Some(value) = spec.resources.cpu_quota_per_sec_usec {
+            properties.push(("CPUQuotaPerSecUSec", Value::new(value)));
+        }
+        if let Some(value) = spec.resources.memory_max_bytes {
+            properties.push(("MemoryMax", Value::new(value)));
+        }
+        if let Some(value) = spec.resources.tasks_max {
+            properties.push(("TasksMax", Value::new(value as u64)));
+        }
+        if let Some(value) = spec.resources.io_weight {
+            properties.push(("IOWeight", Value::new(value as u64)));
+        }
+        if let Some(value) = spec.resources.runtime_max_usec {
+            properties.push(("RuntimeMaxUSec", Value::new(value)));
+        }
+        let auxiliary: Vec<(&str, Vec<(&str, Value<'_>)>)> = Vec::new();
+        let _: OwnedObjectPath = self
+            .manager()?
+            .call(
+                "StartTransientUnit",
+                &(&spec.unit_name, "fail", properties, auxiliary),
+            )
+            .map_err(bus_error)?;
+        self.inspect(&spec.unit_name)
+    }
+
+    fn inspect(&self, unit_name: &str) -> Result<UnitObservation> {
+        validate_unit_name(unit_name)?;
+        let path = self.unit_path(unit_name)?;
+        self.inspect_path(unit_name, path)
+    }
+
+    fn inspect_optional(&self, unit_name: &str) -> Result<Option<UnitObservation>> {
+        validate_unit_name(unit_name)?;
+        self.optional_unit_path(unit_name)?
+            .map(|path| self.inspect_path(unit_name, path))
+            .transpose()
+    }
+
     fn pause(&self, unit_name: &str) -> Result<()> {
         validate_unit_name(unit_name)?;
         self.manager()?
@@ -252,6 +281,10 @@ impl FakeSystemd {
     }
     pub fn fail_next(&self, reason: impl Into<String>) {
         self.inner.lock().unwrap().fail_next = Some(reason.into());
+    }
+    #[cfg(test)]
+    pub fn forget_unit(&self, unit_name: &str) {
+        self.inner.lock().unwrap().units.remove(unit_name);
     }
     fn mutation(&self, call: String) -> Result<()> {
         let mut state = self
@@ -300,6 +333,9 @@ impl SystemdManager for FakeSystemd {
             .get(unit_name)
             .cloned()
             .ok_or_else(|| HelperError::Systemd("unit_not_found".into()))
+    }
+    fn inspect_optional(&self, unit_name: &str) -> Result<Option<UnitObservation>> {
+        Ok(self.inner.lock().unwrap().units.get(unit_name).cloned())
     }
     fn pause(&self, unit_name: &str) -> Result<()> {
         self.mutation(format!("pause:{unit_name}"))?;
@@ -352,6 +388,7 @@ fn validate_unit_spec(spec: &UnitSpec) -> Result<()> {
     for path in [
         &spec.worker_path,
         &spec.execution_record_path,
+        &spec.receipt_public_key_path,
         &spec.stdout_path,
         &spec.stderr_path,
     ] {
@@ -410,6 +447,7 @@ mod tests {
             unit_name: "conduit-elevated-test.service".into(),
             worker_path: "/usr/lib/conduit/helper".into(),
             execution_record_path: "/run/conduit/r.json".into(),
+            receipt_public_key_path: "/var/lib/conduit/receipt.public".into(),
             stdout_path: "/var/lib/conduit/out".into(),
             stderr_path: "/var/lib/conduit/err".into(),
             resources: ResourceCeilings {

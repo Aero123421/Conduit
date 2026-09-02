@@ -8,7 +8,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-pub const JOURNAL_SCHEMA_VERSION: u32 = 2;
+pub const JOURNAL_SCHEMA_VERSION: u32 = 3;
 const MAX_RECORD_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -44,6 +44,7 @@ pub struct RuntimeRecord {
     pub state: String,
     pub state_revision: u64,
     pub previous_receipt_digest: Option<String>,
+    pub last_receipt: Option<HelperReceipt>,
     pub stdout_cursor: u64,
     pub stderr_cursor: u64,
 }
@@ -278,8 +279,8 @@ impl HelperJournal {
         }
         let changed = transaction
             .execute(
-                "UPDATE runtimes SET state=?2,state_revision=?3,invocation_id=COALESCE(?4,invocation_id),main_pid=COALESCE(?5,main_pid),previous_receipt_digest=?6,stdout_cursor=?7,stderr_cursor=?8,updated_at=unixepoch() WHERE runtime_id=?1 AND state_revision<?3",
-                params![receipt.claims.runtime_id, runtime_state, receipt.claims.state_revision, invocation_id, main_pid, digest, receipt.claims.stdout_cursor, receipt.claims.stderr_cursor],
+                "UPDATE runtimes SET state=?2,state_revision=?3,invocation_id=COALESCE(?4,invocation_id),main_pid=COALESCE(?5,main_pid),previous_receipt_digest=?6,stdout_cursor=?7,stderr_cursor=?8,last_receipt=?9,updated_at=unixepoch() WHERE runtime_id=?1 AND state_revision<?3",
+                params![receipt.claims.runtime_id, runtime_state, receipt.claims.state_revision, invocation_id, main_pid, digest, receipt.claims.stdout_cursor, receipt.claims.stderr_cursor,serde_jcs::to_vec(receipt)?],
             )
             .map_err(sql_error)?;
         if changed != 1 {
@@ -303,7 +304,7 @@ impl HelperJournal {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(sql_error)?;
-        let changed=transaction.execute("UPDATE runtimes SET state=?2,state_revision=?3,invocation_id=COALESCE(?4,invocation_id),main_pid=?5,previous_receipt_digest=?6,stdout_cursor=?7,stderr_cursor=?8,updated_at=unixepoch() WHERE runtime_id=?1 AND state_revision<?3",params![receipt.claims.runtime_id,runtime_state,receipt.claims.state_revision,invocation_id,main_pid,digest,receipt.claims.stdout_cursor,receipt.claims.stderr_cursor]).map_err(sql_error)?;
+        let changed=transaction.execute("UPDATE runtimes SET state=?2,state_revision=?3,invocation_id=COALESCE(?4,invocation_id),main_pid=?5,previous_receipt_digest=?6,stdout_cursor=?7,stderr_cursor=?8,last_receipt=?9,updated_at=unixepoch() WHERE runtime_id=?1 AND state_revision<?3",params![receipt.claims.runtime_id,runtime_state,receipt.claims.state_revision,invocation_id,main_pid,digest,receipt.claims.stdout_cursor,receipt.claims.stderr_cursor,serde_jcs::to_vec(receipt)?]).map_err(sql_error)?;
         if changed != 1 {
             return Err(HelperError::RecoveryRequired(
                 "observation state revision did not advance".into(),
@@ -419,7 +420,7 @@ fn query_effect(connection: &Connection, ticket_id: &str) -> Result<Option<Journ
 fn query_runtime(connection: &Connection, runtime_id: &str) -> Result<Option<RuntimeRecord>> {
     connection
         .query_row(
-            "SELECT runtime_id,run_id,operation_id,plan_digest,plan,authority_ticket,unit_name,invocation_id,main_pid,state,state_revision,previous_receipt_digest,stdout_cursor,stderr_cursor FROM runtimes WHERE runtime_id=?1",
+            "SELECT runtime_id,run_id,operation_id,plan_digest,plan,authority_ticket,unit_name,invocation_id,main_pid,state,state_revision,previous_receipt_digest,stdout_cursor,stderr_cursor,last_receipt FROM runtimes WHERE runtime_id=?1",
             [runtime_id],
             |row| {
                 let plan: Vec<u8> = row.get(4)?;
@@ -432,6 +433,10 @@ fn query_runtime(connection: &Connection, runtime_id: &str) -> Result<Option<Run
                 })?;
                 let authority: Option<Vec<u8>>=row.get(5)?;
                 let authority_ticket=authority.ok_or_else(||rusqlite::Error::InvalidQuery).and_then(|bytes|serde_json::from_slice(&bytes).map_err(|error|rusqlite::Error::FromSqlConversionFailure(bytes.len(),rusqlite::types::Type::Blob,Box::new(error))))?;
+                let last_receipt: Option<Vec<u8>> = row.get(14)?;
+                let last_receipt = last_receipt
+                    .map(|bytes| serde_json::from_slice(&bytes).map_err(|error| rusqlite::Error::FromSqlConversionFailure(bytes.len(), rusqlite::types::Type::Blob, Box::new(error))))
+                    .transpose()?;
                 Ok(RuntimeRecord {
                     runtime_id: row.get(0)?,
                     run_id: row.get(1)?,
@@ -447,6 +452,7 @@ fn query_runtime(connection: &Connection, runtime_id: &str) -> Result<Option<Run
                     previous_receipt_digest: row.get(11)?,
                     stdout_cursor: row.get(12)?,
                     stderr_cursor: row.get(13)?,
+                    last_receipt,
                 })
             },
         )
@@ -505,6 +511,11 @@ fn migrate(connection: &Connection) -> Result<()> {
             .execute("ALTER TABLE runtimes ADD COLUMN authority_ticket BLOB", [])
             .map_err(sql_error)?;
     }
+    if existing > 0 && existing < 3 {
+        connection
+            .execute("ALTER TABLE runtimes ADD COLUMN last_receipt BLOB", [])
+            .map_err(sql_error)?;
+    }
     connection
         .execute_batch(
             "BEGIN IMMEDIATE;
@@ -522,9 +533,10 @@ fn migrate(connection: &Connection) -> Result<()> {
                invocation_id TEXT, main_pid INTEGER, state TEXT NOT NULL,
                state_revision INTEGER NOT NULL, previous_receipt_digest TEXT,
                stdout_cursor INTEGER NOT NULL DEFAULT 0, stderr_cursor INTEGER NOT NULL DEFAULT 0,
+               last_receipt BLOB,
                created_at INTEGER NOT NULL DEFAULT(unixepoch()), updated_at INTEGER NOT NULL DEFAULT(unixepoch()),
                CHECK(length(plan_digest)=64), CHECK(length(plan)<=262144));
-             PRAGMA user_version=2;
+             PRAGMA user_version=3;
              COMMIT;",
         )
         .map_err(sql_error)
@@ -650,13 +662,13 @@ mod tests {
                 operation_id: plan.operation_id.clone(),
                 idempotency_key_digest: "22".repeat(32),
                 operation_request_digest: "33".repeat(32),
-                run_manifest_digest: "77".repeat(32),
+                run_manifest_digest: "34".repeat(32),
                 run_id: plan.run_id.clone(),
                 runtime_id: plan.runtime_id.clone(),
                 runtime_spec_digest: "44".repeat(32),
                 launch_plan_digest: "55".repeat(32),
-                control_digest: None,
                 local_execution_plan_digest: plan.digest().unwrap(),
+                control_digest: None,
                 controller_epoch: 1,
                 connector_policy_id: Some("cpol_journal0001".into()),
                 connector_policy_revision: 1,

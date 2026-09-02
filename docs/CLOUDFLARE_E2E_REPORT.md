@@ -8,7 +8,7 @@ prompt, or generated Device identifier.
 ## Review 5086220413 verification
 
 - Date: 2026-09-02
-- Implementation commit: `836317b`
+- Implementation commit: `e33830b`
 - Local result: PASS
 - Merge state: not merged
 
@@ -17,6 +17,10 @@ through the production Worker route to a SQLite-backed `DeviceRoom`. It runs
 all 36,000 100 ms service polls in the first hour, then advances the same live
 socket at each ten-minute checkpoint through 24 hours. The independent
 Node-only regression executes all 864,000 polls for 24 hours.
+The accelerated harness sends all 144 real application frames before counting
+one test-only completion barrier per `DeviceRoom` handler; it removes 144
+serial network round trips without skipping a socket send, handler, D1
+projection, or cost assertion.
 
 | Connected idle evidence | Measured result |
 | --- | ---: |
@@ -25,7 +29,7 @@ Node-only regression executes all 864,000 polls for 24 hours.
 | DeviceRoom application receives | 144 |
 | D1 statements / binding calls / maximum parameters | 72 / 72 / 4 |
 | D1 rows read / written | 144 / 72 |
-| Durable Object SQL statements / rows read / rows written | 1,152 / 8,784 / 72 |
+| Durable Object SQL statements / rows read / rows written | 1,005 / 8,637 / 69 (asserted ceilings 1,152 / 8,784 / 72) |
 | Retained inbound / cumulative ACK rows | 6 / 1 |
 | Alarm schedules / invocations / remaining alarm | 0 / 0 / none |
 | New Node outbox sequence during idle window | 0 |

@@ -117,6 +117,8 @@ async function intent(request: Request, env: LiveEnv): Promise<Response> {
   if (!HASH.test(payloadDigest) || Date.parse(expiresAt) <= Date.now()) throw new Error("invalid live E2E operation validity");
   const now = nowIso();
   const messageId = `cmsg_${operationId}`;
+  const dispatchPayload = { operation, runManifestDigest: manifestDigest };
+  const dispatchPayloadDigest = await sha256Hex(canonicalJson(dispatchPayload));
   const response = { operationId, state: "queued", payloadDigest, expiresAt, runId };
   const statements: D1PreparedStatement[] = [
     env.DB.prepare("INSERT INTO runs(id,device_id,runtime_kind,access_scope,approval_mode,state,revision,manifest_digest,manifest_json,created_at,updated_at) VALUES (?1,?2,'native','full_device','never','queued',1,?3,'{}',?4,?4)").bind(runId, deviceId, manifestDigest, now),
@@ -125,7 +127,7 @@ async function intent(request: Request, env: LiveEnv): Promise<Response> {
   if (input.dispatch === true) {
     statements.push(
       env.DB.prepare("INSERT INTO idempotency_records(scope,idempotency_key,payload_digest,operation_id,state,response_status,response_json,expires_at,created_at) VALUES ('owner:prin_full_device_live:conduit.cli',?1,?2,?3,'queued',202,?4,?5,?6)").bind(String(operation.idempotencyKey), payloadDigest, operationId, JSON.stringify(response), expiresAt, now),
-      env.DB.prepare("INSERT INTO operation_dispatch_outbox(operation_id,device_id,message_id,correlation_id,payload_digest,payload_json,state,next_attempt_at,expires_at,created_at,updated_at,frame_type) VALUES (?1,?2,?3,?1,?4,?5,'pending',?6,?7,?6,?6,'operation.offer')").bind(operationId, deviceId, messageId, payloadDigest, canonicalJson({ operation, runManifestDigest: manifestDigest }), now, expiresAt),
+      env.DB.prepare("INSERT INTO operation_dispatch_outbox(operation_id,device_id,message_id,correlation_id,payload_digest,payload_json,state,next_attempt_at,expires_at,created_at,updated_at,frame_type) VALUES (?1,?2,?3,?1,?4,?5,'pending',?6,?7,?6,?6,'operation.offer')").bind(operationId, deviceId, messageId, dispatchPayloadDigest, canonicalJson(dispatchPayload), now, expiresAt),
     );
   }
   await env.DB.batch(statements);

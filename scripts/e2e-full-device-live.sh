@@ -186,14 +186,34 @@ conduit_control_token="$(openssl rand -hex 24)"
 conduit_control_state="$conduit_user_evidence/control-plane-state"
 conduit_control_log="$conduit_user_evidence/control-plane.log"
 conduit_control_endpoint="https://127.0.0.1:$conduit_control_port"
+conduit_control_tls_ca_key="$conduit_user_evidence/control-plane-ca.key"
+conduit_control_tls_ca_cert="$conduit_user_evidence/control-plane-ca.crt"
 conduit_control_tls_key="$conduit_user_evidence/control-plane.key"
 conduit_control_tls_cert="$conduit_user_evidence/control-plane.crt"
+conduit_control_tls_csr="$conduit_user_evidence/control-plane.csr"
 install -d -m 0700 "$conduit_control_state"
 openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
-  -subj '/CN=127.0.0.1' -addext 'subjectAltName=IP:127.0.0.1' \
-  -keyout "$conduit_control_tls_key" -out "$conduit_control_tls_cert" \
+  -subj '/CN=Conduit isolated E2E CA' \
+  -addext 'basicConstraints=critical,CA:TRUE' \
+  -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+  -keyout "$conduit_control_tls_ca_key" -out "$conduit_control_tls_ca_cert" \
   >/dev/null 2>&1
-chmod 0600 "$conduit_control_tls_key" "$conduit_control_tls_cert"
+openssl req -new -newkey rsa:2048 -nodes -sha256 \
+  -subj '/CN=127.0.0.1' \
+  -addext 'subjectAltName=IP:127.0.0.1' \
+  -addext 'basicConstraints=critical,CA:FALSE' \
+  -addext 'keyUsage=critical,digitalSignature,keyEncipherment' \
+  -addext 'extendedKeyUsage=serverAuth' \
+  -keyout "$conduit_control_tls_key" -out "$conduit_control_tls_csr" \
+  >/dev/null 2>&1
+openssl x509 -req -sha256 -days 1 \
+  -in "$conduit_control_tls_csr" \
+  -CA "$conduit_control_tls_ca_cert" -CAkey "$conduit_control_tls_ca_key" \
+  -CAcreateserial -copy_extensions copy -out "$conduit_control_tls_cert" \
+  >/dev/null 2>&1
+chmod 0600 \
+  "$conduit_control_tls_ca_key" "$conduit_control_tls_ca_cert" \
+  "$conduit_control_tls_key" "$conduit_control_tls_cert" "$conduit_control_tls_csr"
 conduit_node_path="$conduit_node_bin_dir:$(dirname "$conduit_corepack"):$PATH"
 env PATH="$conduit_node_path" "$conduit_corepack" pnpm --filter @conduit/schema build \
   > "$conduit_control_log" 2>&1
@@ -538,7 +558,7 @@ conduit_node_log="$conduit_user_evidence/node-service.log"
 conduit_node_socket="$conduit_user_evidence/node-ipc/node.sock"
 install -d -m 0700 "$(dirname "$conduit_node_socket")"
 conduit_start_node() {
-  env SSL_CERT_FILE="$conduit_control_tls_cert" \
+  env SSL_CERT_FILE="$conduit_control_tls_ca_cert" \
     "$conduit_root/target/release/conduit-node" serve \
     --data-dir "$conduit_user_evidence/node-service-data" \
     --socket "$conduit_node_socket" \

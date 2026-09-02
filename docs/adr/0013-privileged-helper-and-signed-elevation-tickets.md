@@ -76,6 +76,13 @@ digest; supported launches execute the verified object without returning to an
 unverified path string. Shell reconstruction is never used. Environment starts
 from a fixed allowlist and rejects loader/interpreter injection variables.
 
+Transient services use `ExitType=cgroup` so a forked descendant keeps the
+Runtime nonterminal after its original main process exits. `RemainAfterExit`
+retains the completed unit until the helper has read the exact `exited`
+substate and `ExecMainCode`/`ExecMainStatus`; only then may it sign a terminal
+receipt. A missing unit without that observation is recovery-required, not a
+successful completion claim.
+
 Systemd unit, Invocation ID, cgroup, controller epoch, Runtime handle digest,
 PID birth, and state revision form process custody. Controls target that exact
 custody, never an arbitrary PID. Ordinary controls use systemd unit/cgroup

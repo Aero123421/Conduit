@@ -109,6 +109,9 @@ impl SystemdBackend {
             "ActiveState",
         )?)
         .map_err(bus_error)?;
+        let sub_state =
+            String::try_from(self.property(&path, "org.freedesktop.systemd1.Unit", "SubState")?)
+                .map_err(bus_error)?;
         let cgroup = String::try_from(self.property(
             &path,
             "org.freedesktop.systemd1.Service",
@@ -145,6 +148,19 @@ impl SystemdBackend {
         )?)
         .ok();
         let (exit_code, signal) = decode_exec_status(main_code, main_status);
+        // ExitType=cgroup keeps the service running until its entire process
+        // tree exits. RemainAfterExit then retains an exact `exited` state long
+        // enough for the helper to sign the terminal status before systemd
+        // unloads the transient unit.
+        let active_state = if active_state == "active" && sub_state == "exited" {
+            if exit_code == Some(0) {
+                "inactive".into()
+            } else {
+                "failed".into()
+            }
+        } else {
+            active_state
+        };
         Ok(UnitObservation {
             unit_name: unit_name.into(),
             invocation_id: invocation,
@@ -202,6 +218,8 @@ impl SystemdManager for SystemdBackend {
                 Value::new(format!("Conduit elevated runtime {}", spec.unit_name)),
             ),
             ("Type", Value::new("exec")),
+            ("ExitType", Value::new("cgroup")),
+            ("RemainAfterExit", Value::new(true)),
             ("User", Value::new("root")),
             ("Group", Value::new("root")),
             ("ExecStart", Value::new(exec)),

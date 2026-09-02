@@ -10,6 +10,38 @@ conduit_cleanup() {
 }
 trap conduit_cleanup EXIT
 
+# Verify that the package contract consumes the real release artifacts. The
+# deterministic fixtures below exercise failure injection and rollback, but
+# cannot prove that Cargo actually produces both installed executables.
+conduit_real_release="$conduit_root/target/release"
+for conduit_real_binary in conduit-privileged-helper conduit-privileged-exec; do
+  test -x "$conduit_real_release/$conduit_real_binary"
+  test ! -L "$conduit_real_release/$conduit_real_binary"
+  "$conduit_real_release/$conduit_real_binary" --version |
+    grep -Eq "^$conduit_real_binary [0-9]+\\.[0-9]+\\.[0-9]+$"
+done
+conduit_real_stage="$conduit_temp/real-root"
+DESTDIR="$conduit_real_stage" CONDUIT_BUILD_DIR="$conduit_real_release" \
+  "$conduit_root/installers/install-privileged.sh"
+for conduit_real_binary in conduit-privileged-helper conduit-privileged-exec; do
+  test -x "$conduit_real_stage/usr/libexec/conduit/$conduit_real_binary"
+  test "$(stat -c '%a' "$conduit_real_stage/usr/libexec/conduit/$conduit_real_binary")" = 755
+done
+if command -v systemd-analyze >/dev/null 2>&1; then
+  # `--root` deliberately does not read host units. Supply only the minimal
+  # dependency names needed to validate the rendered package units without
+  # coupling this deterministic test to the host's systemd installation.
+  for conduit_fixture_unit in sysinit.target basic.target sockets.target; do
+    printf '[Unit]\nDescription=packaging verification fixture\n' > \
+      "$conduit_real_stage/usr/lib/systemd/system/$conduit_fixture_unit"
+  done
+  printf '[Unit]\nDescription=packaging verification fixture\n[Service]\nType=oneshot\nExecStart=/usr/libexec/conduit/conduit-privileged-helper --version\n' > \
+    "$conduit_real_stage/usr/lib/systemd/system/dbus.service"
+  systemd-analyze verify --root="$conduit_real_stage" \
+    "$conduit_real_stage/usr/lib/systemd/system/conduit-privileged-helper@.socket" \
+    "$conduit_real_stage/usr/lib/systemd/system/conduit-privileged-helper@.service"
+fi
+
 conduit_make_release() {
   local conduit_destination="$1"
   local conduit_version="$2"

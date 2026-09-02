@@ -17,7 +17,11 @@ conduit_cleanup() {
 }
 trap conduit_cleanup EXIT
 
-cargo build --locked --release --bin conduit --bin conduit-node
+cargo build --locked --release \
+  --bin conduit \
+  --bin conduit-node \
+  --bin conduit-privileged-helper \
+  --bin conduit-privileged-exec
 
 # Exercise the real installed artifacts without depending on host user systemd.
 conduit_home="$conduit_temp/artifact-home"

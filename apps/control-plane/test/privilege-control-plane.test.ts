@@ -135,6 +135,22 @@ describe.sequential("privileged helper Control Plane", () => {
       resourceCeilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, redactedSummary: { adapter: null, operation: "prepare", credentialProfiles: [] },
       requestedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 120_000).toISOString(),
     };
+    const storedCapability = await env.DB.prepare("SELECT capability_summary_json FROM device_privilege_installations WHERE installation_id='phinst_privilegeflow01'").first<{ capability_summary_json: string }>();
+    if (storedCapability === null) throw new Error("privilege capability projection disappeared");
+    const effectiveCapability = JSON.parse(storedCapability.capability_summary_json) as Record<string, unknown>;
+    const mandatoryCapabilityFields = ["systemdSystemManager", "socketPeerCredentials", "transientUnits", "cgroupV2", "freeze", "pidfd", "openat2", "execveat", "pty", "streamReplay"];
+    for (const [index, field] of mandatoryCapabilityFields.entries()) {
+      await env.DB.prepare("UPDATE device_privilege_installations SET capability_summary_json=?1 WHERE installation_id='phinst_privilegeflow01'")
+        .bind(canonicalJson({ ...effectiveCapability, [field]: false, unavailableReason: `${field}_unavailable` })).run();
+      const unavailable = await deviceSignedFrame("privilege.ticket_request", `nmsg_capdeny${String(index).padStart(4, "0")}`, "2", {
+        ...ticketPayload,
+        requestId: `ptreq_capdeny${String(index).padStart(4, "0")}`,
+        idempotencyKey: `privilege-capability-denial-${String(index).padStart(4, "0")}`,
+      }, devicePrivate);
+      await expect(projectPrivilegeFrame(env, unavailable)).rejects.toMatchObject({ code: "full_device_capability_unavailable" });
+    }
+    await env.DB.prepare("UPDATE device_privilege_installations SET capability_summary_json=?1 WHERE installation_id='phinst_privilegeflow01'")
+      .bind(storedCapability.capability_summary_json).run();
     const crossRun = await deviceSignedFrame("privilege.ticket_request", "nmsg_privcrossrun01", "2", {
       ...ticketPayload, requestId: "ptreq_privcrossrun01", idempotencyKey: "privilege-cross-run-denial-0001", runManifestDigest: crossRunManifestDigest,
     }, devicePrivate);

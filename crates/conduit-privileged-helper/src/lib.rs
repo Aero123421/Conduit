@@ -16,8 +16,9 @@ pub use journal::{
 };
 pub use service::{
     AuthorityLock, HelperConfig, HelperEngine, PinnedTicketKeys, PolicyChangeEvidence, PublicJwk,
-    PublicPolicyAttestation, PublicPolicySummary, RegistrationBundle, build_registration_bundle,
-    control_target_digest, load_receipt_key_root_owned, runtime_identity_matches,
+    PublicPolicyAttestation, PublicPolicySummary, RegistrationBundle, SystemdCapabilityProbe,
+    build_registration_bundle, control_target_digest, load_receipt_key_root_owned,
+    runtime_identity_matches,
 };
 pub use systemd::{FakeSystemd, SystemdBackend, SystemdManager, UnitObservation, UnitSpec};
 pub use transport::{

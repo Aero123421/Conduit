@@ -34,6 +34,8 @@ pub struct UnitObservation {
 
 pub trait SystemdManager: Send + Sync + 'static {
     fn available(&self) -> Result<bool>;
+    fn transient_units_available(&self) -> Result<bool>;
+    fn freeze_available(&self) -> Result<bool>;
     fn start_transient(&self, spec: &UnitSpec) -> Result<UnitObservation>;
     fn inspect(&self, unit_name: &str) -> Result<UnitObservation>;
     fn inspect_optional(&self, unit_name: &str) -> Result<Option<UnitObservation>> {
@@ -66,6 +68,20 @@ impl SystemdBackend {
             "org.freedesktop.systemd1.Manager",
         )
         .map_err(bus_error)
+    }
+
+    fn manager_exposes(&self, methods: &[&str]) -> Result<bool> {
+        let proxy = Proxy::new(
+            &self.connection,
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.DBus.Introspectable",
+        )
+        .map_err(bus_error)?;
+        let xml: String = proxy.call("Introspect", &()).map_err(bus_error)?;
+        Ok(methods
+            .iter()
+            .all(|method| xml.contains(&format!("<method name=\"{method}\""))))
     }
 
     fn unit_path(&self, unit_name: &str) -> Result<OwnedObjectPath> {
@@ -163,6 +179,14 @@ impl SystemdManager for SystemdBackend {
     fn available(&self) -> Result<bool> {
         let _: String = self.manager()?.get_property("Version").map_err(bus_error)?;
         Ok(true)
+    }
+
+    fn transient_units_available(&self) -> Result<bool> {
+        self.manager_exposes(&["StartTransientUnit"])
+    }
+
+    fn freeze_available(&self) -> Result<bool> {
+        self.manager_exposes(&["FreezeUnit", "ThawUnit"])
     }
 
     fn start_transient(&self, spec: &UnitSpec) -> Result<UnitObservation> {
@@ -308,6 +332,12 @@ impl FakeSystemd {
 
 impl SystemdManager for FakeSystemd {
     fn available(&self) -> Result<bool> {
+        Ok(true)
+    }
+    fn transient_units_available(&self) -> Result<bool> {
+        Ok(true)
+    }
+    fn freeze_available(&self) -> Result<bool> {
         Ok(true)
     }
     fn start_transient(&self, spec: &UnitSpec) -> Result<UnitObservation> {

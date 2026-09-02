@@ -521,6 +521,15 @@ sudo -n systemd-analyze security --no-pager \
   echo "systemd security evidence exceeded the local bound" >&2
   exit 4
 }
+conduit_systemd_exposure="$(sed -nE 's/.*Overall exposure level[^:]*:[[:space:]]*([0-9]+(\.[0-9]+)?).*/\1/p' \
+  "$conduit_user_evidence/systemd-security.txt" | tail -n 1)"
+[[ "$conduit_systemd_exposure" =~ ^[0-9]+([.][0-9]+)?$ ]] || {
+  echo "systemd security evidence omitted its bounded exposure score" >&2
+  exit 4
+}
+printf '{"schemaVersion":1,"systemdExposureScore":"%s","helperIpSockets":0,"signedCapabilityEvidenceInDriverSummary":true,"rawSystemdReportPublished":false}\n' \
+  "$conduit_systemd_exposure" > "$conduit_user_evidence/security-summary.json"
+chmod 0600 "$conduit_user_evidence/security-summary.json"
 
 # Finish by exercising default state preservation followed by an explicit
 # destructive test purge. Transaction rollback is covered by the deterministic
@@ -566,8 +575,23 @@ printf '{"schemaVersion":1,"hostLabel":"dedicated-linux-e2e","commit":"%s","osId
   "$conduit_commit" "$conduit_os_id" "$conduit_os_version" "$conduit_kernel" "$conduit_systemd" \
   > "$conduit_user_evidence/host-summary.json"
 install -d -m 0700 "$conduit_public_evidence_dir"
+for conduit_public_evidence in \
+  "$conduit_driver_summary" \
+  "$conduit_user_evidence/host-summary.json" \
+  "$conduit_user_evidence/security-summary.json"; do
+  (("$(stat -c '%s' "$conduit_public_evidence")" <= 262144)) || {
+    echo "public evidence exceeded the OSS report bound" >&2
+    exit 4
+  }
+  if grep -Eiq '(/home/|machine.?id|boot.?id|hardware.?serial|ip.?address|private.?key|secret.?value|credential.?value|credential.?secret|raw.?prompt|canonical.?path)' \
+    "$conduit_public_evidence"; then
+    echo "public evidence contains a field forbidden from OSS evidence" >&2
+    exit 4
+  fi
+done
 install -m 0600 "$conduit_driver_summary" "$conduit_public_evidence_dir/driver-summary.json"
 install -m 0600 "$conduit_user_evidence/host-summary.json" "$conduit_public_evidence_dir/host-summary.json"
+install -m 0600 "$conduit_user_evidence/security-summary.json" "$conduit_public_evidence_dir/security-summary.json"
 
 echo "Full Device live E2E passed for commit $conduit_commit"
 echo "bounded sanitized evidence was retained below the configured public report directory"

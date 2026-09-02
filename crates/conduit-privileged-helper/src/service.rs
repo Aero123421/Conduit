@@ -13,10 +13,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet},
+    ffi::CString,
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
     os::{
-        fd::{AsRawFd, OwnedFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{
             ffi::OsStrExt,
             fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
@@ -198,6 +199,24 @@ pub struct RegistrationBundle {
     pub signed_capability: conduit_privileged_protocol::SignedCapability,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SystemdCapabilityProbe {
+    pub system_manager: bool,
+    pub transient_units: bool,
+    pub freeze: bool,
+}
+
+impl SystemdCapabilityProbe {
+    pub fn measure<M: SystemdManager>(manager: &M) -> Self {
+        let system_manager = manager.available().unwrap_or(false);
+        Self {
+            system_manager,
+            transient_units: system_manager && manager.transient_units_available().unwrap_or(false),
+            freeze: system_manager && manager.freeze_available().unwrap_or(false),
+        }
+    }
+}
+
 impl HelperConfig {
     pub fn load_policy_root_owned(
         path: &Path,
@@ -365,8 +384,9 @@ impl<M: SystemdManager> HelperEngine<M> {
             &self.config.policy_change,
             self.config.device_public_key,
             &self.receipt_key,
-            self.systemd.available().unwrap_or(false),
+            SystemdCapabilityProbe::measure(&self.systemd),
             &self.config.helper_version,
+            &self.config.state_dir,
         )
     }
     pub fn handle_managed(
@@ -390,7 +410,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             crate::ManagedIoRequest::ReadStream(request) => self.read_stream(&request),
             crate::ManagedIoRequest::PolicyAttest => self
                 .registration_bundle()
-                .map(crate::ManagedIoResponse::RegistrationBundle),
+                .map(|bundle| crate::ManagedIoResponse::RegistrationBundle(Box::new(bundle))),
         }
     }
     pub fn converge_terminal(&self) -> Result<Vec<HelperReceipt>> {
@@ -535,28 +555,28 @@ impl<M: SystemdManager> HelperEngine<M> {
             )),
             _ if !authenticated => Err(HelperError::Authentication("handshake_required".into())),
             HelperRequest::Probe => self.probe(),
-            HelperRequest::Prepare { ticket, plan } => self.prepare(ticket, plan, descriptors),
+            HelperRequest::Prepare { ticket, plan } => self.prepare(*ticket, *plan, descriptors),
             HelperRequest::Start {
                 ticket,
                 plan_digest,
-            } => self.start(ticket, plan_digest),
+            } => self.start(*ticket, plan_digest),
             HelperRequest::Inspect { target } => self.inspect(target),
             HelperRequest::Input {
                 ticket,
                 target,
                 descriptor_index,
-            } => self.input(ticket, target, descriptor_index, descriptors),
+            } => self.input(*ticket, target, descriptor_index, descriptors),
             HelperRequest::ResizePty {
                 ticket,
                 target,
                 rows,
                 columns,
-            } => self.resize(ticket, target, rows, columns),
+            } => self.resize(*ticket, target, rows, columns),
             HelperRequest::Control {
                 ticket,
                 target,
                 operation,
-            } => self.control(ticket, target, operation),
+            } => self.control(*ticket, target, operation),
             HelperRequest::Reconcile { runtime_ids } => self.reconcile(runtime_ids),
         }
     }
@@ -635,34 +655,15 @@ impl<M: SystemdManager> HelperEngine<M> {
     }
     fn probe(&self) -> Result<HelperResponse> {
         let now = OffsetDateTime::now_utc().format(&Rfc3339).unwrap();
-        let systemd = self.systemd.available().unwrap_or(false);
-        let claims = CapabilityClaims {
-            protocol: PROTOCOL.into(),
-            helper_version: self.config.helper_version.clone(),
-            installation_id: self.config.policy.installation_id.clone(),
-            receipt_key_id: self.config.receipt_key_id.clone(),
-            policy_revision: self.config.policy.revision,
-            policy_digest: self.config.policy_digest.clone(),
-            enabled: self.config.policy.enabled,
-            observed_at: now,
-            systemd_system_manager: systemd,
-            socket_peer_credentials: true,
-            transient_units: systemd,
-            cgroup_v2: Path::new("/sys/fs/cgroup/cgroup.controllers").exists(),
-            freeze: systemd,
-            pidfd: true,
-            openat2: true,
-            execveat: true,
-            pty: true,
-            stream_replay: true,
-            never_opt_in: self.config.policy.allow_never,
-            unrestricted_launch_opt_in: self.config.policy.allow_unrestricted_launch,
-            unavailable_reason: if self.config.policy.enabled && systemd {
-                None
-            } else {
-                Some("root_policy_or_systemd_unavailable".into())
-            },
-        };
+        let claims = effective_capability_claims(
+            &self.config.policy,
+            &self.config.policy_digest,
+            &self.config.receipt_key_id,
+            &self.config.helper_version,
+            now,
+            SystemdCapabilityProbe::measure(&self.systemd),
+            &self.config.state_dir,
+        );
         Ok(HelperResponse::Capability(SignedClaims::sign(
             &self.config.receipt_key_id,
             claims,
@@ -686,8 +687,8 @@ impl<M: SystemdManager> HelperEngine<M> {
         }
         let ticket_digest = ticket.digest()?;
         let request = request_digest(&HelperRequest::Prepare {
-            ticket: ticket.clone(),
-            plan: plan.clone(),
+            ticket: Box::new(ticket.clone()),
+            plan: Box::new(plan.clone()),
         })?;
         let plan_digest = plan.digest()?;
         let mut chain = match self.journal.admit_prepare(
@@ -739,7 +740,7 @@ impl<M: SystemdManager> HelperEngine<M> {
                     .create_new(true)
                     .mode(0o400)
                     .open(path)?;
-                file.write_all(&bytes)?;
+                file.write_all(bytes)?;
                 file.sync_all()?;
             }
         }
@@ -786,7 +787,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             return Err(HelperError::Denied("plan_digest_mismatch".into()));
         }
         let request = request_digest(&HelperRequest::Start {
-            ticket: ticket.clone(),
+            ticket: Box::new(ticket.clone()),
             plan_digest,
         })?;
         let ticket_digest = ticket.digest()?;
@@ -895,7 +896,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             observation.invocation_id.as_deref(),
             observation.main_pid,
         )?;
-        Ok(HelperResponse::Receipt(receipt))
+        Ok(HelperResponse::Receipt(Box::new(receipt)))
     }
     fn input(
         &self,
@@ -911,7 +912,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             return Err(HelperError::Denied("descriptor_mismatch".into()));
         }
         let request = request_digest(&HelperRequest::Input {
-            ticket: ticket.clone(),
+            ticket: Box::new(ticket.clone()),
             target,
             descriptor_index: index,
         })?;
@@ -985,7 +986,7 @@ impl<M: SystemdManager> HelperEngine<M> {
                 .and_then(|v| v.invocation_id.as_deref()),
             observation.as_ref().and_then(|v| v.main_pid),
         )?;
-        Ok(HelperResponse::Receipt(receipt))
+        Ok(HelperResponse::Receipt(Box::new(receipt)))
     }
     fn resize(
         &self,
@@ -1006,7 +1007,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             return Err(HelperError::Denied("pty_resize_invalid".into()));
         }
         let request = request_digest(&HelperRequest::ResizePty {
-            ticket: ticket.clone(),
+            ticket: Box::new(ticket.clone()),
             target,
             rows,
             columns,
@@ -1064,7 +1065,7 @@ impl<M: SystemdManager> HelperEngine<M> {
                 .and_then(|v| v.invocation_id.as_deref()),
             observation.as_ref().and_then(|v| v.main_pid),
         )?;
-        Ok(HelperResponse::Receipt(receipt))
+        Ok(HelperResponse::Receipt(Box::new(receipt)))
     }
     fn control(
         &self,
@@ -1076,7 +1077,7 @@ impl<M: SystemdManager> HelperEngine<M> {
         let runtime = self.exact_target(&target)?;
         self.validate_control_authority(&ticket, &target, &runtime)?;
         let request = request_digest(&HelperRequest::Control {
-            ticket: ticket.clone(),
+            ticket: Box::new(ticket.clone()),
             target,
             operation: operation.clone(),
         })?;
@@ -1182,7 +1183,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             observation.invocation_id.as_deref(),
             observation.main_pid,
         )?;
-        Ok(HelperResponse::Receipt(receipt))
+        Ok(HelperResponse::Receipt(Box::new(receipt)))
     }
     fn reconcile(&self, ids: Vec<String>) -> Result<HelperResponse> {
         if ids.len() > 256 {
@@ -1535,8 +1536,9 @@ pub fn build_registration_bundle(
     policy_change: &PolicyChangeEvidence,
     device_public_key: [u8; 32],
     receipt_key: &SigningKey,
-    systemd: bool,
+    systemd: SystemdCapabilityProbe,
     helper_version: &str,
+    state_dir: &Path,
 ) -> Result<RegistrationBundle> {
     let policy_digest = policy.digest()?;
     if policy_change.revision != policy.revision || policy_change.policy_digest != policy_digest {
@@ -1546,33 +1548,15 @@ pub fn build_registration_bundle(
     }
     let receipt_key_id =
         conduit_privileged_protocol::key_id("hkey", receipt_key.verifying_key().as_bytes());
-    let capability = CapabilityClaims {
-        protocol: PROTOCOL.into(),
-        helper_version: helper_version.into(),
-        installation_id: policy.installation_id.clone(),
-        receipt_key_id: receipt_key_id.clone(),
-        policy_revision: policy.revision,
-        policy_digest: policy_digest.clone(),
-        enabled: policy.enabled,
-        observed_at: policy_change.changed_at.clone(),
-        systemd_system_manager: systemd,
-        socket_peer_credentials: true,
-        transient_units: systemd,
-        cgroup_v2: Path::new("/sys/fs/cgroup/cgroup.controllers").exists(),
-        freeze: systemd,
-        pidfd: true,
-        openat2: true,
-        execveat: true,
-        pty: true,
-        stream_replay: true,
-        never_opt_in: policy.allow_never,
-        unrestricted_launch_opt_in: policy.allow_unrestricted_launch,
-        unavailable_reason: if policy.enabled && systemd {
-            None
-        } else {
-            Some("root_policy_or_systemd_unavailable".into())
-        },
-    };
+    let capability = effective_capability_claims(
+        policy,
+        &policy_digest,
+        &receipt_key_id,
+        helper_version,
+        policy_change.changed_at.clone(),
+        systemd,
+        state_dir,
+    );
     Ok(RegistrationBundle {
         protocol: PROTOCOL.into(),
         installation_id: policy.installation_id.clone(),
@@ -1595,6 +1579,242 @@ pub fn build_registration_bundle(
         )?,
         signed_capability: SignedClaims::sign(&receipt_key_id, capability, receipt_key)?,
     })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct HostCapabilityProbe {
+    socket_peer_credentials: bool,
+    cgroup_v2: bool,
+    freeze: bool,
+    pidfd: bool,
+    openat2: bool,
+    execveat: bool,
+    pty: bool,
+    stream_replay: bool,
+}
+
+fn effective_capability_claims(
+    policy: &RootPolicy,
+    policy_digest: &str,
+    receipt_key_id: &str,
+    helper_version: &str,
+    observed_at: String,
+    systemd: SystemdCapabilityProbe,
+    state_dir: &Path,
+) -> CapabilityClaims {
+    let host = probe_host_capabilities(state_dir);
+    let mut claims = CapabilityClaims {
+        protocol: PROTOCOL.into(),
+        helper_version: helper_version.into(),
+        installation_id: policy.installation_id.clone(),
+        receipt_key_id: receipt_key_id.into(),
+        policy_revision: policy.revision,
+        policy_digest: policy_digest.into(),
+        enabled: policy.enabled,
+        observed_at,
+        systemd_system_manager: systemd.system_manager,
+        socket_peer_credentials: host.socket_peer_credentials,
+        transient_units: systemd.system_manager && systemd.transient_units,
+        cgroup_v2: host.cgroup_v2,
+        freeze: systemd.system_manager && systemd.freeze && host.freeze,
+        pidfd: host.pidfd,
+        openat2: host.openat2,
+        execveat: host.execveat,
+        pty: host.pty,
+        stream_replay: host.stream_replay,
+        never_opt_in: policy.allow_never,
+        unrestricted_launch_opt_in: policy.allow_unrestricted_launch,
+        unavailable_reason: None,
+    };
+    claims.unavailable_reason = claims.full_device_unavailable_reason().map(str::to_owned);
+    claims
+}
+
+fn probe_host_capabilities(state_dir: &Path) -> HostCapabilityProbe {
+    let cgroup_v2 = probe_cgroup_v2();
+    HostCapabilityProbe {
+        socket_peer_credentials: probe_socket_peer_credentials(),
+        cgroup_v2,
+        freeze: cgroup_v2 && probe_cgroup_freeze(),
+        pidfd: probe_pidfd(),
+        openat2: probe_openat2(),
+        execveat: probe_execveat(),
+        pty: probe_pty(),
+        stream_replay: probe_stream_replay(state_dir),
+    }
+}
+
+fn probe_socket_peer_credentials() -> bool {
+    let mut descriptors = [-1; 2];
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            descriptors.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return false;
+    }
+    let left = unsafe { OwnedFd::from_raw_fd(descriptors[0]) };
+    let _right = unsafe { OwnedFd::from_raw_fd(descriptors[1]) };
+    let mut credentials = libc::ucred {
+        pid: 0,
+        uid: 0,
+        gid: 0,
+    };
+    let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+    unsafe {
+        libc::getsockopt(
+            left.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            std::ptr::addr_of_mut!(credentials).cast(),
+            &mut length,
+        ) == 0
+            && length as usize == std::mem::size_of::<libc::ucred>()
+            && credentials.pid == libc::getpid()
+            && credentials.uid == libc::geteuid()
+            && credentials.gid == libc::getegid()
+    }
+}
+
+fn probe_cgroup_v2() -> bool {
+    const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
+    let path = CString::new("/sys/fs/cgroup").expect("static path");
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+        return false;
+    }
+    let stat = unsafe { stat.assume_init() };
+    stat.f_type as libc::c_long == CGROUP2_SUPER_MAGIC
+        && File::open("/sys/fs/cgroup/cgroup.controllers").is_ok()
+}
+
+fn probe_cgroup_freeze() -> bool {
+    fn readable_freezer(directory: &Path, remaining_depth: usize) -> bool {
+        if File::open(directory.join("cgroup.freeze")).is_ok() {
+            return true;
+        }
+        if remaining_depth == 0 {
+            return false;
+        }
+        let Ok(entries) = fs::read_dir(directory) else {
+            return false;
+        };
+        entries.filter_map(std::result::Result::ok).any(|entry| {
+            entry
+                .file_type()
+                .is_ok_and(|kind| kind.is_dir() && !kind.is_symlink())
+                && readable_freezer(&entry.path(), remaining_depth - 1)
+        })
+    }
+    readable_freezer(Path::new("/sys/fs/cgroup"), 2)
+}
+
+fn probe_pidfd() -> bool {
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, libc::getpid(), 0) } as i32;
+    if descriptor < 0 {
+        return false;
+    }
+    drop(unsafe { OwnedFd::from_raw_fd(descriptor) });
+    true
+}
+
+#[repr(C)]
+struct ProbeOpenHow {
+    flags: u64,
+    mode: u64,
+    resolve: u64,
+}
+
+fn probe_openat2() -> bool {
+    const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+    let path = CString::new(".").expect("static path");
+    let how = ProbeOpenHow {
+        flags: (libc::O_PATH | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_NO_MAGICLINKS,
+    };
+    let descriptor = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            &how,
+            std::mem::size_of::<ProbeOpenHow>(),
+        )
+    } as i32;
+    if descriptor < 0 {
+        return false;
+    }
+    drop(unsafe { OwnedFd::from_raw_fd(descriptor) });
+    true
+}
+
+fn probe_execveat() -> bool {
+    let empty = CString::new("").expect("static string");
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_execveat,
+            -1,
+            empty.as_ptr(),
+            std::ptr::null::<*const libc::c_char>(),
+            std::ptr::null::<*const libc::c_char>(),
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    result == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF)
+}
+
+fn probe_pty() -> bool {
+    let mut master = -1;
+    let mut slave = -1;
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null(),
+            std::ptr::null(),
+        )
+    } != 0
+    {
+        return false;
+    }
+    drop(unsafe { OwnedFd::from_raw_fd(master) });
+    drop(unsafe { OwnedFd::from_raw_fd(slave) });
+    true
+}
+
+fn probe_stream_replay(state_dir: &Path) -> bool {
+    let nonce = match getrandom::u64() {
+        Ok(value) => value,
+        Err(_) => return false,
+    };
+    let path = state_dir.join(format!(
+        ".capability-stream-probe-{}-{nonce:016x}",
+        std::process::id()
+    ));
+    let result = (|| -> std::io::Result<bool> {
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        let marker = b"conduit-stream-replay-probe";
+        file.write_all(marker)?;
+        file.sync_data()?;
+        file.seek(SeekFrom::Start(0))?;
+        let mut observed = Vec::with_capacity(marker.len());
+        file.take(marker.len() as u64).read_to_end(&mut observed)?;
+        Ok(observed == marker)
+    })();
+    let removed = fs::remove_file(&path).is_ok();
+    result.unwrap_or(false) && removed
 }
 
 fn parse_time(value: &str) -> Result<OffsetDateTime> {
@@ -1797,7 +2017,9 @@ fn decode_receipt(value: Option<Vec<u8>>) -> Result<HelperResponse> {
     if let Ok(chain) = serde_json::from_slice::<Vec<HelperReceipt>>(&value) {
         Ok(HelperResponse::Receipts(chain))
     } else {
-        Ok(HelperResponse::Receipt(serde_json::from_slice(&value)?))
+        Ok(HelperResponse::Receipt(Box::new(serde_json::from_slice(
+            &value,
+        )?)))
     }
 }
 fn decode_receipt_chain(value: Option<Vec<u8>>) -> Result<Vec<HelperReceipt>> {
@@ -2209,8 +2431,8 @@ mod tests {
         ));
 
         let request = request_digest(&HelperRequest::Prepare {
-            ticket: expired.clone(),
-            plan: plan.clone(),
+            ticket: Box::new(expired.clone()),
+            plan: Box::new(plan.clone()),
         })
         .unwrap();
         engine
@@ -2670,6 +2892,19 @@ mod tests {
     }
 
     #[test]
+    fn host_probe_measures_stream_custody_and_leaves_no_probe_file() {
+        let directory = tempdir().unwrap();
+        let before = fs::read_dir(directory.path()).unwrap().count();
+        let observed = probe_host_capabilities(directory.path());
+        assert!(observed.stream_replay);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), before);
+
+        let missing = directory.path().join("missing-state-directory");
+        let unavailable = probe_host_capabilities(&missing);
+        assert!(!unavailable.stream_replay);
+    }
+
+    #[test]
     fn startup_reconcile_observes_root_custody_before_admission() {
         let (engine, backend, plan, issuer, _) = setup();
         engine
@@ -2928,8 +3163,8 @@ mod tests {
             "ptkt_prepare_boundary_crash",
         );
         let prepare_request = request_digest(&HelperRequest::Prepare {
-            ticket: prepare_ticket.clone(),
-            plan: plan.clone(),
+            ticket: Box::new(prepare_ticket.clone()),
+            plan: Box::new(plan.clone()),
         })
         .unwrap();
         let prepare_ticket_digest = prepare_ticket.digest().unwrap();
@@ -2978,7 +3213,7 @@ mod tests {
             "ptkt_start_boundary_crash",
         );
         let start_request = request_digest(&HelperRequest::Start {
-            ticket: start_ticket.clone(),
+            ticket: Box::new(start_ticket.clone()),
             plan_digest: plan_digest.clone(),
         })
         .unwrap();

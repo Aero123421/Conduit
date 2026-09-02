@@ -244,6 +244,11 @@ fn recover() {
     let request: RuntimeRequest = serde_json::from_value(active["request"].clone()).unwrap();
     let expected_invocation = active["invocationId"].as_str().unwrap();
     let (runtime, bundle, issuer) = connect("full-device-live-node-boot-2");
+    let capability: conduit_privileged_protocol::SignedCapability =
+        serde_json::from_value(bundle["signedCapability"].clone()).unwrap();
+    capability.verify(runtime.receipt_key()).unwrap();
+    assert!(capability.claims.supports_full_device());
+    let capability_digest = capability.digest().unwrap();
     let provider = runtime.provider();
     let attached = provider
         .attach_reconciled_privileged(plan.clone(), request.spec_digest.clone())
@@ -276,6 +281,15 @@ fn recover() {
             "schemaVersion":2,"isolatedCryptographicControlPlane":true,
             "registrationActivated":runtime.active(),"ordinaryFullUser":full_user,"cases":cases,
             "packageLifecycle":packaging,
+            "hostCapability":{"signedProbeVerified":true,"signedProbeDigest":capability_digest,
+                "systemdSystemManager":capability.claims.systemd_system_manager,
+                "socketPeerCredentials":capability.claims.socket_peer_credentials,
+                "transientUnits":capability.claims.transient_units,
+                "cgroupV2":capability.claims.cgroup_v2,"freeze":capability.claims.freeze,
+                "pidfd":capability.claims.pidfd,"openat2":capability.claims.openat2,
+                "execveat":capability.claims.execveat,"pty":capability.claims.pty,
+                "streamReplay":capability.claims.stream_replay,
+                "unavailableReason":capability.claims.unavailable_reason},
         "nodeRestart":{"newNodeEpoch":true,"durableAttach":true,"duplicateStart":false,"invocationPreserved":true},
             "helperRestart":{"durableAttach":true,"processCustodyPreserved":true,"invocationPreserved":true},
             "terminalState":"stopped","recoveredTerminalReceiptDigest":stopped.final_helper_receipt().digest().unwrap()
@@ -314,12 +328,29 @@ fn root_exact_and_replay(
     bundle: &Value,
     evidence: &Path,
 ) -> Value {
+    let python = existing(&[
+        "/usr/bin/python3.12",
+        "/usr/bin/python3.11",
+        "/usr/bin/python3.10",
+    ]);
+    let expected_arguments = vec![
+        "space value".to_owned(),
+        "ユニコード".to_owned(),
+        String::new(),
+        "--leading-dash".to_owned(),
+    ];
+    let recorder = r#"import json,sys,time
+print(json.dumps(sys.argv[1:],ensure_ascii=False),flush=True)
+time.sleep(120)
+"#;
+    let mut argv = vec!["python3".into(), "-u".into(), "-c".into(), recorder.into()];
+    argv.extend(expected_arguments.clone());
     let (plan, request) = case_plan(
         "exact",
-        existing(&["/usr/bin/sleep", "/bin/sleep"]),
-        vec!["sleep".into(), "30".into()],
+        python,
+        argv,
         StdioMode::Pipes,
-        30_000_000,
+        120_000_000,
         evidence,
     );
     let prepare_ticket = ticket(
@@ -348,10 +379,13 @@ fn root_exact_and_replay(
         PrivilegedOperation::Start,
         "ptkt_live_exact_start",
     );
-    let started = provider
-        .start_privileged(&prepared.runtime, start_ticket.clone(), &plan)
+    let mut started = provider
+        .start_managed_privileged(&prepared.runtime, start_ticket.clone(), &plan)
         .unwrap();
-    assert_eq!(started.final_helper_receipt().claims.effective_uid, Some(0));
+    assert_eq!(
+        started.receipt.final_helper_receipt().claims.effective_uid,
+        Some(0)
+    );
     let replay = provider
         .start_privileged(&prepared.runtime, start_ticket, &plan)
         .unwrap();
@@ -361,23 +395,40 @@ fn root_exact_and_replay(
     let replay_final = replay.final_helper_receipt();
     assert_eq!(
         replay_final.digest().unwrap(),
-        started.final_helper_receipt().digest().unwrap()
+        started.receipt.final_helper_receipt().digest().unwrap()
     );
     assert_eq!(
         replay_final.claims.invocation_id,
-        started.final_helper_receipt().claims.invocation_id
+        started.receipt.final_helper_receipt().claims.invocation_id
     );
+    let mut output = Vec::new();
+    let mut cursor = 0;
+    for _ in 0..100 {
+        let page = started.io.read_stdout(cursor, 16 * 1024).unwrap();
+        cursor = page.next_cursor;
+        output.extend(page.bytes);
+        if output.contains(&b'\n') {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let record = output.split(|byte| *byte == b'\n').next().unwrap();
+    let observed_arguments: Vec<String> = serde_json::from_slice(record).unwrap();
+    assert_eq!(observed_arguments, expected_arguments);
     let stopped = stop(
         provider,
         issuer,
         bundle,
         &plan,
         &request,
-        &started.runtime.handle,
+        &started.receipt.runtime.handle,
         RuntimeSignal::GracefulStop,
         "ptkt_live_exact_stop",
     );
-    json!({"passed":true,"effectiveUid":0,"exactArgv":true,"prepareReplaySameReceipt":true,
+    json!({"passed":true,"effectiveUid":0,"exactArgv":true,
+        "spaceArgumentPreserved":true,"unicodeArgumentPreserved":true,
+        "emptyArgumentPreserved":true,"leadingDashArgumentPreserved":true,
+        "shellReconstruction":false,"prepareReplaySameReceipt":true,
         "lostStartResponseReplaySameReceipt":true,"duplicateStart":false,"invocationPreserved":true,
         "terminalState":state_name(stopped.runtime.state)})
 }
@@ -1034,6 +1085,9 @@ fn start_sleep(
     (plan, request, started)
 }
 
+// Keep each authority input explicit in the live root harness so a test cannot
+// accidentally reuse an ambient ticket or target while shortening the call.
+#[allow(clippy::too_many_arguments)]
 fn stop(
     provider: &PrivilegedNativeProvider,
     issuer: &SigningKey,

@@ -191,7 +191,7 @@ pub struct PrivilegedAuthority {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RuntimeAuthority {
     Ordinary,
-    Privileged(PrivilegedAuthority),
+    Privileged(Box<PrivilegedAuthority>),
 }
 
 /// Provider-owned I/O for a process that cannot be represented by a local

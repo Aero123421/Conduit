@@ -105,7 +105,7 @@ fn open_spool(path: &Path) -> Result<File> {
 fn run_pty_supervisor(record_path: &Path, plan: &LocalExecutionPlan) -> Result<()> {
     let mut master = -1;
     let mut slave = -1;
-    let mut size = libc::winsize {
+    let size = libc::winsize {
         ws_row: 24,
         ws_col: 80,
         ws_xpixel: 0,
@@ -117,7 +117,7 @@ fn run_pty_supervisor(record_path: &Path, plan: &LocalExecutionPlan) -> Result<(
             &mut slave,
             std::ptr::null_mut(),
             std::ptr::null(),
-            &mut size,
+            &size,
         )
     })?;
     let master = unsafe { OwnedFd::from_raw_fd(master) };
@@ -208,10 +208,8 @@ fn execute(plan: &LocalExecutionPlan, runtime_directory: &Path) -> Result<()> {
     let mut duplicate = unsafe { File::from_raw_fd(libc::dup(executable.as_raw_fd())) };
     let read = duplicate.read(&mut first)?;
     drop(duplicate);
-    if read == 2 && first == *b"#!" {
-        if plan.interpreter.is_none() {
-            return Err(HelperError::Denied("unbound_interpreter".into()));
-        }
+    if read == 2 && first == *b"#!" && plan.interpreter.is_none() {
+        return Err(HelperError::Denied("unbound_interpreter".into()));
     }
     let mut argv_values = plan.argv.clone();
     let exec_fd = if let Some(identity) = &plan.interpreter {

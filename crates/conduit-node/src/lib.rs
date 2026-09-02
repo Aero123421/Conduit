@@ -250,12 +250,13 @@ impl VerifiedPrivilegedAdmission {
         }
         let claims = &ticket.claims;
         let helper = &capability.claims;
+        if !helper.supports_full_device() {
+            return Err(NodeError::Rejected(
+                "full_device_capability_unavailable".into(),
+            ));
+        }
         let exact = claims.protocol == PROTOCOL
             && helper.protocol == PROTOCOL
-            && helper.enabled
-            && helper.systemd_system_manager
-            && helper.socket_peer_credentials
-            && helper.transient_units
             && claims.public_origin == expected_origin
             && claims.helper_installation_id == helper.installation_id
             && claims.helper_key_id == helper.receipt_key_id
@@ -366,10 +367,7 @@ impl Node {
         let helper = &capability.claims;
         if capability.key_id != helper.receipt_key_id
             || helper.protocol != PROTOCOL
-            || !helper.enabled
-            || !helper.systemd_system_manager
-            || !helper.socket_peer_credentials
-            || !helper.transient_units
+            || !helper.supports_full_device()
         {
             return Err(NodeError::Rejected(
                 "full_device_capability_unavailable".into(),
@@ -1452,6 +1450,76 @@ mod tests {
                 capability,
             ),
             Err(NodeError::Rejected(reason)) if reason == "privilege_ticket_invalid"
+        ));
+    }
+
+    #[test]
+    fn privileged_admission_fails_closed_for_each_missing_host_capability() {
+        let directory = tempdir().unwrap();
+        let request = offer(directory.path());
+        let (ticket_key, receipt_key, ticket, plan, capability) = privileged_authority(&request);
+        let mutations: [fn(&mut CapabilityClaims); 11] = [
+            |claims| claims.enabled = false,
+            |claims| claims.systemd_system_manager = false,
+            |claims| claims.socket_peer_credentials = false,
+            |claims| claims.transient_units = false,
+            |claims| claims.cgroup_v2 = false,
+            |claims| claims.freeze = false,
+            |claims| claims.pidfd = false,
+            |claims| claims.openat2 = false,
+            |claims| claims.execveat = false,
+            |claims| claims.pty = false,
+            |claims| claims.stream_replay = false,
+        ];
+        for mutate in mutations {
+            let mut claims = capability.claims.clone();
+            mutate(&mut claims);
+            claims.unavailable_reason = claims.full_device_unavailable_reason().map(str::to_owned);
+            let unavailable =
+                SignedClaims::sign(capability.key_id.clone(), claims, &receipt_key).unwrap();
+            assert!(matches!(
+                VerifiedPrivilegedAdmission::verify(
+                    &request,
+                    "never",
+                    "dev_test0001",
+                    "https://control.invalid",
+                    ticket_key.verifying_key().as_bytes(),
+                    receipt_key.verifying_key().as_bytes(),
+                    ticket.clone(),
+                    plan.clone(),
+                    unavailable.clone(),
+                ),
+                Err(NodeError::Rejected(reason)) if reason == "full_device_capability_unavailable"
+            ));
+            let node = Node::new(NodeStore::open(directory.path().join("node")).unwrap());
+            assert!(matches!(
+                node.admit_privileged_pending(
+                    &request,
+                    "privileged-native",
+                    "never",
+                    &unavailable,
+                    receipt_key.verifying_key().as_bytes(),
+                ),
+                Err(NodeError::Rejected(reason)) if reason == "full_device_capability_unavailable"
+            ));
+        }
+
+        let mut degraded = capability.claims;
+        degraded.unavailable_reason = Some("local_storage_degraded".into());
+        let degraded = SignedClaims::sign(capability.key_id, degraded, &receipt_key).unwrap();
+        assert!(matches!(
+            VerifiedPrivilegedAdmission::verify(
+                &request,
+                "never",
+                "dev_test0001",
+                "https://control.invalid",
+                ticket_key.verifying_key().as_bytes(),
+                receipt_key.verifying_key().as_bytes(),
+                ticket,
+                plan,
+                degraded,
+            ),
+            Err(NodeError::Rejected(reason)) if reason == "full_device_capability_unavailable"
         ));
     }
 

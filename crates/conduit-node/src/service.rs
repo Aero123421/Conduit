@@ -119,12 +119,7 @@ impl LocalPolicy {
         capability: &conduit_privileged_protocol::SignedCapability,
     ) -> Result<(), ServiceError> {
         let helper = &capability.claims;
-        if operation.access_scope != "full_device"
-            || !helper.enabled
-            || !helper.systemd_system_manager
-            || !helper.socket_peer_credentials
-            || !helper.transient_units
-        {
+        if operation.access_scope != "full_device" || !helper.supports_full_device() {
             return Err(ServiceError::Unavailable(
                 "full_device_capability_unavailable".into(),
             ));
@@ -633,9 +628,9 @@ pub struct NodeService {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PrivilegedStartPhase {
-    PrepareTicket,
-    StartTicket,
-    InitialInputTicket,
+    Prepare,
+    Start,
+    InitialInput,
 }
 
 struct PendingPrivilegeRequest {
@@ -1832,11 +1827,11 @@ impl NodeService {
             ));
         }
         let allowed = match phase {
-            PrivilegedStartPhase::PrepareTicket => PrivilegedOperation::Prepare,
-            PrivilegedStartPhase::StartTicket => PrivilegedOperation::Start,
-            PrivilegedStartPhase::InitialInputTicket => PrivilegedOperation::Input,
+            PrivilegedStartPhase::Prepare => PrivilegedOperation::Prepare,
+            PrivilegedStartPhase::Start => PrivilegedOperation::Start,
+            PrivilegedStartPhase::InitialInput => PrivilegedOperation::Input,
         };
-        if matches!(phase, PrivilegedStartPhase::InitialInputTicket) && control_digest.is_none() {
+        if matches!(phase, PrivilegedStartPhase::InitialInput) && control_digest.is_none() {
             return Err(ServiceError::Unavailable("privilege_ticket_invalid".into()));
         }
         let action = privileged_operation_name(&allowed);
@@ -1874,13 +1869,12 @@ impl NodeService {
         } else {
             "exact_command"
         };
-        let control_authority =
-            matches!(phase, PrivilegedStartPhase::InitialInputTicket).then(|| {
-                json!({
-                    "kind": "initial_agent_input",
-                    "agentStateRevision": "1"
-                })
-            });
+        let control_authority = matches!(phase, PrivilegedStartPhase::InitialInput).then(|| {
+            json!({
+                "kind": "initial_agent_input",
+                "agentStateRevision": "1"
+            })
+        });
         let mut payload = json!({
             "requestId": request_id,
             "idempotencyKey": ticket_idempotency_key,
@@ -2812,9 +2806,9 @@ impl NodeService {
             .issuer_key(&ticket.key_id)
             .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_invalid".into()))?;
         let expected_operation = match request.phase {
-            PrivilegedStartPhase::PrepareTicket => PrivilegedOperation::Prepare,
-            PrivilegedStartPhase::StartTicket => PrivilegedOperation::Start,
-            PrivilegedStartPhase::InitialInputTicket => PrivilegedOperation::Input,
+            PrivilegedStartPhase::Prepare => PrivilegedOperation::Prepare,
+            PrivilegedStartPhase::Start => PrivilegedOperation::Start,
+            PrivilegedStartPhase::InitialInput => PrivilegedOperation::Input,
         };
         let (
             pending_offer,
@@ -2875,7 +2869,7 @@ impl NodeService {
         )?;
 
         match request.phase {
-            PrivilegedStartPhase::PrepareTicket => {
+            PrivilegedStartPhase::Prepare => {
                 self.node
                     .bind_privileged_authority(&pending_offer, &authority)?;
                 let result = privileged
@@ -2935,11 +2929,11 @@ impl NodeService {
                 self.queue_privilege_ticket_request(
                     client,
                     &request.operation_id,
-                    PrivilegedStartPhase::StartTicket,
+                    PrivilegedStartPhase::Start,
                     None,
                 )?;
             }
-            PrivilegedStartPhase::StartTicket => {
+            PrivilegedStartPhase::Start => {
                 let mut pending = self
                     .pending_privileged
                     .remove(&request.operation_id)
@@ -3052,12 +3046,12 @@ impl NodeService {
                     self.queue_privilege_ticket_request(
                         client,
                         &request.operation_id,
-                        PrivilegedStartPhase::InitialInputTicket,
+                        PrivilegedStartPhase::InitialInput,
                         Some(control_digest),
                     )?;
                 }
             }
-            PrivilegedStartPhase::InitialInputTicket => {
+            PrivilegedStartPhase::InitialInput => {
                 let mut pending = self
                     .pending_privileged
                     .remove(&request.operation_id)
@@ -3822,7 +3816,7 @@ impl NodeService {
             self.queue_privilege_ticket_request(
                 client,
                 &operation_id,
-                PrivilegedStartPhase::PrepareTicket,
+                PrivilegedStartPhase::Prepare,
                 None,
             )?;
             return Ok(());

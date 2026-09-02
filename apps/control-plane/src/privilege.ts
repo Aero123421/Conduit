@@ -552,7 +552,11 @@ async function operationAuthority(env: ControlPlaneEnv, operationId: string): Pr
 function summaryAllows(summaryJson: string, ticketRequest: Record<string, unknown>, operationRequest: Record<string, unknown>, capabilityJson: string, approvalMode: string, adapterId: string | null): void {
   const policy = JSON.parse(summaryJson) as Record<string, unknown>;
   const capability = JSON.parse(capabilityJson) as Record<string, unknown>;
-  if (policy.enabled !== true || capability.enabled !== true || capability.systemdSystemManager !== true || capability.socketPeerCredentials !== true || capability.transientUnits !== true || capability.cgroupV2 !== true) throw new PublicError("privileged_helper_disabled", 409, "Effective helper capability is disabled");
+  if (policy.enabled !== true || capability.enabled !== true) throw new PublicError("privileged_helper_disabled", 409, "Effective helper capability is disabled");
+  const mandatoryHostCapabilities = ["systemdSystemManager", "socketPeerCredentials", "transientUnits", "cgroupV2", "freeze", "pidfd", "openat2", "execveat", "pty", "streamReplay"] as const;
+  if (mandatoryHostCapabilities.some((field) => capability[field] !== true) || capability.unavailableReason !== null) {
+    throw new PublicError("full_device_capability_unavailable", 409, "Effective helper host capability is incomplete or degraded");
+  }
   const operation = String(ticketRequest.allowedOperation);
   const operations = Array.isArray(policy.allowedOperations) ? policy.allowedOperations : [];
   if (!operations.includes(operation)) throw new PublicError("privileged_helper_policy_mismatch", 409, "Root policy does not allow this operation");

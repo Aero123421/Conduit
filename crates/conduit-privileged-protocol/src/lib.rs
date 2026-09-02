@@ -432,6 +432,46 @@ pub struct CapabilityClaims {
     pub unavailable_reason: Option<String>,
 }
 
+impl CapabilityClaims {
+    /// Return the first stable reason that prevents this signed probe from
+    /// authorizing Native host administrator execution.  Every field here is
+    /// required by the v1 helper boundary; callers must not infer effective
+    /// capability from an installed binary or a subset of these observations.
+    pub fn full_device_unavailable_reason(&self) -> Option<&'static str> {
+        if !self.enabled {
+            Some("privileged_helper_disabled")
+        } else if !self.systemd_system_manager {
+            Some("systemd_system_manager_unavailable")
+        } else if !self.socket_peer_credentials {
+            Some("socket_peer_credentials_unavailable")
+        } else if !self.transient_units {
+            Some("transient_units_unavailable")
+        } else if !self.cgroup_v2 {
+            Some("cgroup_v2_unavailable")
+        } else if !self.freeze {
+            Some("cgroup_freeze_unavailable")
+        } else if !self.pidfd {
+            Some("pidfd_unavailable")
+        } else if !self.openat2 {
+            Some("openat2_unavailable")
+        } else if !self.execveat {
+            Some("execveat_unavailable")
+        } else if !self.pty {
+            Some("pty_unavailable")
+        } else if !self.stream_replay {
+            Some("stream_replay_unavailable")
+        } else if self.unavailable_reason.is_some() {
+            Some("helper_reported_degraded")
+        } else {
+            None
+        }
+    }
+
+    pub fn supports_full_device(&self) -> bool {
+        self.full_device_unavailable_reason().is_none()
+    }
+}
+
 pub type SignedCapability = SignedClaims<CapabilityClaims>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -516,29 +556,29 @@ pub enum HelperRequest {
     },
     Probe,
     Prepare {
-        ticket: PrivilegeTicket,
-        plan: LocalExecutionPlan,
+        ticket: Box<PrivilegeTicket>,
+        plan: Box<LocalExecutionPlan>,
     },
     Start {
-        ticket: PrivilegeTicket,
+        ticket: Box<PrivilegeTicket>,
         plan_digest: String,
     },
     Inspect {
         target: ControlTarget,
     },
     Input {
-        ticket: PrivilegeTicket,
+        ticket: Box<PrivilegeTicket>,
         target: ControlTarget,
         descriptor_index: u16,
     },
     ResizePty {
-        ticket: PrivilegeTicket,
+        ticket: Box<PrivilegeTicket>,
         target: ControlTarget,
         rows: u16,
         columns: u16,
     },
     Control {
-        ticket: PrivilegeTicket,
+        ticket: Box<PrivilegeTicket>,
         target: ControlTarget,
         operation: PrivilegedOperation,
     },
@@ -557,7 +597,7 @@ pub enum HelperResponse {
         policy_revision: u64,
     },
     Capability(SignedCapability),
-    Receipt(HelperReceipt),
+    Receipt(Box<HelperReceipt>),
     Receipts(Vec<HelperReceipt>),
     Error {
         code: String,
@@ -753,5 +793,76 @@ mod tests {
     fn packet_decoder_rejects_empty_and_oversize_packets() {
         assert!(decode_packet::<serde_json::Value>(&[]).is_err());
         assert!(decode_packet::<serde_json::Value>(&vec![b'x'; MAX_PACKET_BYTES + 1]).is_err());
+    }
+
+    #[test]
+    fn full_device_capability_requires_every_effective_host_probe() {
+        let ready = CapabilityClaims {
+            protocol: PROTOCOL.into(),
+            helper_version: "0.1.0".into(),
+            installation_id: "phinst_fixture0001".into(),
+            receipt_key_id: "hkey_fixture0001".into(),
+            policy_revision: 1,
+            policy_digest: "11".repeat(32),
+            enabled: true,
+            observed_at: "2026-09-03T00:00:00Z".into(),
+            systemd_system_manager: true,
+            socket_peer_credentials: true,
+            transient_units: true,
+            cgroup_v2: true,
+            freeze: true,
+            pidfd: true,
+            openat2: true,
+            execveat: true,
+            pty: true,
+            stream_replay: true,
+            never_opt_in: false,
+            unrestricted_launch_opt_in: false,
+            unavailable_reason: None,
+        };
+        assert!(ready.supports_full_device());
+
+        let mut cases = Vec::new();
+        let mut disabled = ready.clone();
+        disabled.enabled = false;
+        cases.push((disabled, "privileged_helper_disabled"));
+        let mut no_systemd = ready.clone();
+        no_systemd.systemd_system_manager = false;
+        cases.push((no_systemd, "systemd_system_manager_unavailable"));
+        let mut no_peer = ready.clone();
+        no_peer.socket_peer_credentials = false;
+        cases.push((no_peer, "socket_peer_credentials_unavailable"));
+        let mut no_transient = ready.clone();
+        no_transient.transient_units = false;
+        cases.push((no_transient, "transient_units_unavailable"));
+        let mut no_cgroup = ready.clone();
+        no_cgroup.cgroup_v2 = false;
+        cases.push((no_cgroup, "cgroup_v2_unavailable"));
+        let mut no_freeze = ready.clone();
+        no_freeze.freeze = false;
+        cases.push((no_freeze, "cgroup_freeze_unavailable"));
+        let mut no_pidfd = ready.clone();
+        no_pidfd.pidfd = false;
+        cases.push((no_pidfd, "pidfd_unavailable"));
+        let mut no_openat2 = ready.clone();
+        no_openat2.openat2 = false;
+        cases.push((no_openat2, "openat2_unavailable"));
+        let mut no_execveat = ready.clone();
+        no_execveat.execveat = false;
+        cases.push((no_execveat, "execveat_unavailable"));
+        let mut no_pty = ready.clone();
+        no_pty.pty = false;
+        cases.push((no_pty, "pty_unavailable"));
+        let mut no_stream = ready.clone();
+        no_stream.stream_replay = false;
+        cases.push((no_stream, "stream_replay_unavailable"));
+        let mut degraded = ready;
+        degraded.unavailable_reason = Some("local_storage_degraded".into());
+        cases.push((degraded, "helper_reported_degraded"));
+
+        for (claims, reason) in cases {
+            assert!(!claims.supports_full_device());
+            assert_eq!(claims.full_device_unavailable_reason(), Some(reason));
+        }
     }
 }

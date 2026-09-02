@@ -64,7 +64,7 @@ pub enum ManagedIoResponse {
         eof: bool,
         terminal: bool,
     },
-    RegistrationBundle(crate::RegistrationBundle),
+    RegistrationBundle(Box<crate::RegistrationBundle>),
     Error {
         code: String,
         retryable: bool,
@@ -104,6 +104,11 @@ impl SeqpacketServer {
 
     /// Takes ownership of a systemd socket-activated descriptor after checking
     /// both type and close-on-exec state.
+    ///
+    /// # Safety
+    ///
+    /// `fd` must be a live descriptor exclusively transferred to this call.
+    /// On success this function owns it; callers must not close or reuse it.
     pub unsafe fn from_fd(fd: RawFd) -> Result<Self> {
         let mut ty = 0i32;
         let mut len = mem::size_of::<i32>() as libc::socklen_t;
@@ -305,7 +310,7 @@ impl HelperClient {
         descriptors: &[RawFd],
     ) -> Result<Vec<HelperReceipt>> {
         match self.call(request, descriptors)? {
-            HelperResponse::Receipt(v) => Ok(vec![v]),
+            HelperResponse::Receipt(v) => Ok(vec![*v]),
             HelperResponse::Receipts(values) if !values.is_empty() => Ok(values),
             HelperResponse::Receipts(_) => {
                 Err(HelperError::RecoveryRequired("empty receipt chain".into()))
@@ -322,7 +327,13 @@ impl HelperClient {
         plan: conduit_privileged_protocol::LocalExecutionPlan,
         descriptors: &[RawFd],
     ) -> Result<Vec<HelperReceipt>> {
-        self.receipt_chain(&HelperRequest::Prepare { ticket, plan }, descriptors)
+        self.receipt_chain(
+            &HelperRequest::Prepare {
+                ticket: Box::new(ticket),
+                plan: Box::new(plan),
+            },
+            descriptors,
+        )
     }
     pub fn start_chain(
         &self,
@@ -331,7 +342,7 @@ impl HelperClient {
     ) -> Result<Vec<HelperReceipt>> {
         self.receipt_chain(
             &HelperRequest::Start {
-                ticket,
+                ticket: Box::new(ticket),
                 plan_digest,
             },
             &[],
@@ -342,7 +353,13 @@ impl HelperClient {
         ticket: conduit_privileged_protocol::PrivilegeTicket,
         plan: conduit_privileged_protocol::LocalExecutionPlan,
     ) -> Result<HelperReceipt> {
-        self.receipt(&HelperRequest::Prepare { ticket, plan }, &[])
+        self.receipt(
+            &HelperRequest::Prepare {
+                ticket: Box::new(ticket),
+                plan: Box::new(plan),
+            },
+            &[],
+        )
     }
     pub fn prepare_with_descriptors(
         &self,
@@ -350,7 +367,13 @@ impl HelperClient {
         plan: conduit_privileged_protocol::LocalExecutionPlan,
         descriptors: &[RawFd],
     ) -> Result<HelperReceipt> {
-        self.receipt(&HelperRequest::Prepare { ticket, plan }, descriptors)
+        self.receipt(
+            &HelperRequest::Prepare {
+                ticket: Box::new(ticket),
+                plan: Box::new(plan),
+            },
+            descriptors,
+        )
     }
     pub fn start(
         &self,
@@ -359,7 +382,7 @@ impl HelperClient {
     ) -> Result<HelperReceipt> {
         self.receipt(
             &HelperRequest::Start {
-                ticket,
+                ticket: Box::new(ticket),
                 plan_digest,
             },
             &[],
@@ -379,7 +402,7 @@ impl HelperClient {
     ) -> Result<HelperReceipt> {
         self.receipt(
             &HelperRequest::Control {
-                ticket,
+                ticket: Box::new(ticket),
                 target,
                 operation,
             },
@@ -394,7 +417,7 @@ impl HelperClient {
     ) -> Result<HelperReceipt> {
         self.receipt(
             &HelperRequest::Input {
-                ticket,
+                ticket: Box::new(ticket),
                 target,
                 descriptor_index: 0,
             },
@@ -410,7 +433,7 @@ impl HelperClient {
     ) -> Result<HelperReceipt> {
         self.receipt(
             &HelperRequest::ResizePty {
-                ticket,
+                ticket: Box::new(ticket),
                 target,
                 rows,
                 columns,
@@ -420,7 +443,7 @@ impl HelperClient {
     }
     pub fn reconcile(&self, runtime_ids: Vec<String>) -> Result<Vec<HelperReceipt>> {
         match self.call(&HelperRequest::Reconcile { runtime_ids }, &[])? {
-            HelperResponse::Receipt(receipt) => Ok(vec![receipt]),
+            HelperResponse::Receipt(receipt) => Ok(vec![*receipt]),
             HelperResponse::Receipts(receipts) => Ok(receipts),
             HelperResponse::Error { code, .. } => Err(HelperError::Denied(code)),
             _ => Err(HelperError::Protocol(
@@ -449,7 +472,7 @@ impl HelperClient {
             ));
         }
         match conduit_privileged_protocol::decode_packet(&packet.bytes)? {
-            ManagedIoResponse::RegistrationBundle(bundle) => Ok(bundle),
+            ManagedIoResponse::RegistrationBundle(bundle) => Ok(*bundle),
             ManagedIoResponse::Error { code, .. } => Err(HelperError::Denied(code)),
             _ => Err(HelperError::Protocol(
                 conduit_privileged_protocol::ProtocolError::Invalid(
@@ -540,7 +563,7 @@ fn send(fd: RawFd, bytes: &[u8], descriptors: &[RawFd]) -> Result<()> {
     let control_len = if descriptors.is_empty() {
         0
     } else {
-        unsafe { libc::CMSG_SPACE((descriptors.len() * mem::size_of::<RawFd>()) as _) as usize }
+        unsafe { libc::CMSG_SPACE(mem::size_of_val(descriptors) as _) as usize }
     };
     let mut control = vec![0u8; control_len];
     let mut message: libc::msghdr = unsafe { mem::zeroed() };
@@ -553,8 +576,7 @@ fn send(fd: RawFd, bytes: &[u8], descriptors: &[RawFd]) -> Result<()> {
             let header = libc::CMSG_FIRSTHDR(&message);
             (*header).cmsg_level = libc::SOL_SOCKET;
             (*header).cmsg_type = libc::SCM_RIGHTS;
-            (*header).cmsg_len =
-                libc::CMSG_LEN((descriptors.len() * mem::size_of::<RawFd>()) as _) as _;
+            (*header).cmsg_len = libc::CMSG_LEN(mem::size_of_val(descriptors) as _) as _;
             std::ptr::copy_nonoverlapping(
                 descriptors.as_ptr(),
                 libc::CMSG_DATA(header).cast(),
@@ -635,7 +657,7 @@ fn receive(fd: RawFd, expected_peer: Option<PeerCredentials>) -> Result<Packet> 
                 ));
             }
             let data_len = (*header).cmsg_len as usize - libc::CMSG_LEN(0) as usize;
-            if data_len % mem::size_of::<RawFd>() != 0 {
+            if !data_len.is_multiple_of(mem::size_of::<RawFd>()) {
                 close_all(&mut descriptors);
                 return Err(HelperError::Authentication(
                     "malformed ancillary data".into(),
@@ -649,12 +671,12 @@ fn receive(fd: RawFd, expected_peer: Option<PeerCredentials>) -> Result<Packet> 
             header = libc::CMSG_NXTHDR(&message, header);
         }
     }
-    if let Some(expected) = expected_peer {
-        if credentials != Some(expected) {
-            return Err(HelperError::Authentication(
-                "SCM_CREDENTIALS mismatch".into(),
-            ));
-        }
+    if let Some(expected) = expected_peer
+        && credentials != Some(expected)
+    {
+        return Err(HelperError::Authentication(
+            "SCM_CREDENTIALS mismatch".into(),
+        ));
     }
     if message.msg_flags & (libc::MSG_TRUNC | libc::MSG_CTRUNC) != 0
         || descriptors.len() > MAX_DESCRIPTORS
@@ -741,7 +763,7 @@ mod tests {
         assert!(client.send(&vec![b'x'; MAX_PACKET_BYTES + 1], &[]).is_err());
         assert!(
             client
-                .send(b"request", &vec![file.as_raw_fd(); MAX_DESCRIPTORS + 1])
+                .send(b"request", &[file.as_raw_fd(); MAX_DESCRIPTORS + 1])
                 .is_err()
         );
         drop(server);

@@ -145,10 +145,9 @@ impl HelperJournal {
             )
             .optional()
             .map_err(sql_error)?
+            && existing_digest != plan_digest
         {
-            if existing_digest != plan_digest {
-                return Err(HelperError::Denied("privilege_ticket_conflict".into()));
-            }
+            return Err(HelperError::Denied("privilege_ticket_conflict".into()));
         }
         transaction
             .execute(

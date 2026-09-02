@@ -1,9 +1,9 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use conduit_privileged_helper::{
     AuthorityLock, HelperConfig, HelperEngine, HelperJournal, JOURNAL_SCHEMA_VERSION,
-    PinnedTicketKeys, PolicyChangeEvidence, SeqpacketServer, SystemdBackend, SystemdManager,
-    build_registration_bundle, load_receipt_key_root_owned, run_exec_worker,
-    runtime_identity_matches,
+    PinnedTicketKeys, PolicyChangeEvidence, SeqpacketServer, SystemdBackend,
+    SystemdCapabilityProbe, SystemdManager, build_registration_bundle, load_receipt_key_root_owned,
+    run_exec_worker, runtime_identity_matches,
 };
 use conduit_privileged_protocol::{
     HelperRequest, HelperResponse, PrivilegedOperation, ResourceCeilings, RootPolicy, key_id,
@@ -150,7 +150,6 @@ fn serve(args: &[String]) -> conduit_privileged_helper::Result<()> {
         }
         connection.set_read_timeout(std::time::Duration::from_secs(5))?;
         let engine = engine.clone();
-        let node = node.clone();
         let active_connections = active_connections.clone();
         std::thread::spawn(move || {
             let _ = serve_connection(connection, engine, node);
@@ -209,9 +208,8 @@ fn serve_connection(
                 signature,
             } => engine
                 .prove(connection.peer_credentials(), challenge, signature, &node)
-                .map(|v| {
+                .inspect(|_| {
                     authenticated = true;
-                    v
                 }),
             _ => engine.handle(
                 connection.peer_credentials(),
@@ -422,12 +420,13 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
                 }
                 keys = serde_json::from_slice::<Existing>(&fs::read(&keys_path)?)?.keys;
             }
-            if let Some(previous) = keys.insert(id.clone(), URL_SAFE_NO_PAD.encode(raw)) {
-                if previous != URL_SAFE_NO_PAD.encode(raw) {
-                    return Err(conduit_privileged_helper::HelperError::Denied(
-                        "issuer_key_id_conflict".into(),
-                    ));
-                }
+            let encoded = URL_SAFE_NO_PAD.encode(raw);
+            if let Some(previous) = keys.insert(id.clone(), encoded.clone())
+                && previous != encoded
+            {
+                return Err(conduit_privileged_helper::HelperError::Denied(
+                    "issuer_key_id_conflict".into(),
+                ));
             }
             if changed {
                 begin_admin_update(&state, "ticket_key_pin")?;
@@ -1168,9 +1167,14 @@ fn registration_bundle(
     let change_path = state.join("policy-change.json");
     validate_root_file(&change_path, 0o600)?;
     let policy_change: PolicyChangeEvidence = serde_json::from_slice(&fs::read(change_path)?)?;
-    let systemd = SystemdBackend::connect_system()
-        .and_then(|v| v.available())
-        .unwrap_or(false);
+    let systemd = match SystemdBackend::connect_system() {
+        Ok(backend) => SystemdCapabilityProbe::measure(&backend),
+        Err(_) => SystemdCapabilityProbe {
+            system_manager: false,
+            transient_units: false,
+            freeze: false,
+        },
+    };
     let node = fs::read(node_path)?;
     let node: [u8; 32] = node.try_into().map_err(|_| {
         conduit_privileged_helper::HelperError::Policy("node public key length".into())
@@ -1182,6 +1186,7 @@ fn registration_bundle(
         &signing,
         systemd,
         env!("CARGO_PKG_VERSION"),
+        state,
     )?)?)
 }
 fn record_policy_change(

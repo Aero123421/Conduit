@@ -112,6 +112,7 @@ export interface LocalExecutionPlan {
   cwd: FileIdentity;
   systemdUnit: string;
   adapterId: string | null;
+  launchProfileId: string | null;
   environment: {
     [k: string]: string;
   };
@@ -236,6 +237,13 @@ export interface RootPolicy {
    * @maxItems 32
    */
   allowedLaunchProfiles: string[];
+  launchProfileExecutableDigests: {
+    [k: string]: Sha256Hex;
+  };
+  /**
+   * @maxItems 32
+   */
+  allowedCredentialProfiles: string[];
   ceilings: ResourceCeilings;
   allowNever: boolean;
   allowUnrestrictedLaunch: boolean;

@@ -570,6 +570,7 @@ dependencies = [
  "conduit-runtime",
  "conduit-workspace",
  "ed25519-dalek",
+ "getrandom 0.3.4",
  "hex",
  "libc",
  "rusqlite",

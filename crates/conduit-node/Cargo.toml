@@ -29,5 +29,6 @@ tungstenite = { version = "=0.28.0", features = ["rustls-tls-native-roots"] }
 url = "=2.5.7"
 
 [dev-dependencies]
+getrandom = "=0.3.4"
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
 tempfile = "=3.23.0"

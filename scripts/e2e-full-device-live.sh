@@ -178,11 +178,39 @@ sudo -n env CONDUIT_BUILD_DIR="$conduit_package_root/bin" \
   "$conduit_package_root/installers/install-privileged.sh"
 
 conduit_helper=/usr/libexec/conduit/conduit-privileged-helper
+export CONDUIT_FULL_DEVICE_E2E=1
+export CONDUIT_FULL_DEVICE_E2E_COMMIT="$conduit_commit"
+export CONDUIT_FULL_DEVICE_E2E_CONTROL_URL="$conduit_control_url"
+export CONDUIT_FULL_DEVICE_E2E_DEVICE_ID="$conduit_device_id"
+export CONDUIT_FULL_DEVICE_E2E_UID="$(id -u)"
+export CONDUIT_FULL_DEVICE_E2E_HELPER="$conduit_helper"
+export CONDUIT_FULL_DEVICE_E2E_EXEC=/usr/libexec/conduit/conduit-privileged-exec
+export CONDUIT_FULL_DEVICE_E2E_SOCKET="/run/conduit/privileged/$(id -u).sock"
+export CONDUIT_FULL_DEVICE_E2E_PACKAGE_ROOT="$conduit_package_root"
+export CONDUIT_FULL_DEVICE_E2E_INSTALLER="$conduit_package_root/installers/install-privileged.sh"
+export CONDUIT_FULL_DEVICE_E2E_UPDATER="$conduit_package_root/installers/update-privileged.sh"
+export CONDUIT_FULL_DEVICE_E2E_UNINSTALLER="$conduit_package_root/installers/uninstall-privileged.sh"
+export CONDUIT_FULL_DEVICE_E2E_EVIDENCE_DIR="$conduit_user_evidence"
+
+# Create the Device identity as the unprivileged Device user. Only the public
+# key is handed to the root helper; the private key remains mode 0600 locally.
+export CONDUIT_FULL_DEVICE_E2E_PHASE=bootstrap
+cargo test --locked -p conduit-node --test full_device_live \
+  -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+conduit_node_public_key="$conduit_user_evidence/node-public.key"
+test "$(stat -c '%u:%a:%s' "$conduit_node_public_key")" = \
+  "$(id -u):600:32"
+
 conduit_registration_bundle="$conduit_user_evidence/registration-bundle.json"
+conduit_prepare_result="$conduit_user_evidence/prepare-result.json"
 sudo -n "$conduit_helper" admin prepare \
   --uid "$(id -u)" \
   --device-id "$conduit_device_id" \
   --public-origin "$conduit_control_url" \
+  --node-public-key-file "$conduit_node_public_key" \
+  --output json > "$conduit_prepare_result"
+sudo -n "$conduit_helper" admin registration-bundle \
+  --uid "$(id -u)" \
   --output json > "$conduit_registration_bundle"
 chmod 0600 "$conduit_registration_bundle"
 [[ -s "$conduit_registration_bundle" ]] || {
@@ -194,20 +222,7 @@ chmod 0600 "$conduit_registration_bundle"
   exit 4
 }
 
-export CONDUIT_FULL_DEVICE_E2E=1
-export CONDUIT_FULL_DEVICE_E2E_COMMIT="$conduit_commit"
-export CONDUIT_FULL_DEVICE_E2E_CONTROL_URL="$conduit_control_url"
-export CONDUIT_FULL_DEVICE_E2E_DEVICE_ID="$conduit_device_id"
-export CONDUIT_FULL_DEVICE_E2E_UID="$(id -u)"
-export CONDUIT_FULL_DEVICE_E2E_HELPER="$conduit_helper"
-export CONDUIT_FULL_DEVICE_E2E_EXEC=/usr/libexec/conduit/conduit-privileged-exec
-export CONDUIT_FULL_DEVICE_E2E_SOCKET="/run/conduit/privileged/$(id -u).sock"
 export CONDUIT_FULL_DEVICE_E2E_REGISTRATION_BUNDLE="$conduit_registration_bundle"
-export CONDUIT_FULL_DEVICE_E2E_PACKAGE_ROOT="$conduit_package_root"
-export CONDUIT_FULL_DEVICE_E2E_INSTALLER="$conduit_package_root/installers/install-privileged.sh"
-export CONDUIT_FULL_DEVICE_E2E_UPDATER="$conduit_package_root/installers/update-privileged.sh"
-export CONDUIT_FULL_DEVICE_E2E_UNINSTALLER="$conduit_package_root/installers/uninstall-privileged.sh"
-export CONDUIT_FULL_DEVICE_E2E_EVIDENCE_DIR="$conduit_user_evidence"
 
 # The first phase creates and Owner-activates the isolated Control Plane ticket
 # issuer, approves the exact helper registration through fresh Passkey, and
@@ -245,16 +260,11 @@ grep -Eq '"ownerActivated"[[:space:]]*:[[:space:]]*true' "$conduit_issuer_key" |
   echo "privilege-ticket issuer lacks Owner activation evidence" >&2
   exit 4
 }
-conduit_registration_digest="$(sed -nE 's/.*"bundleDigest"[[:space:]]*:[[:space:]]*"([0-9a-f]{64})".*/\1/p' "$conduit_registration_bundle")"
+conduit_registration_digest="$(sed -nE 's/.*"registrationBundleDigest"[[:space:]]*:[[:space:]]*"([0-9a-f]{64})".*/\1/p' "$conduit_registration_approval")"
 [[ "$conduit_registration_digest" =~ ^[0-9a-f]{64}$ ]] || {
-  echo "helper registration bundle omitted its canonical digest" >&2
+  echo "registration approval omitted the canonical bundle digest" >&2
   exit 4
 }
-grep -Eq "\"registrationBundleDigest\"[[:space:]]*:[[:space:]]*\"$conduit_registration_digest\"" \
-  "$conduit_registration_approval" || {
-    echo "Control Plane approval does not bind the exact helper registration bundle" >&2
-    exit 4
-  }
 grep -Eq "\"deviceId\"[[:space:]]*:[[:space:]]*\"$conduit_device_id\"" \
   "$conduit_registration_approval" || {
     echo "Control Plane approval does not bind the isolated test Device" >&2
@@ -276,11 +286,16 @@ sudo -n "$conduit_helper" admin pin-ticket-key \
   --issuer-key-file "$conduit_issuer_key" \
   --expected-fingerprint "$conduit_issuer_fingerprint" \
   --output json > "$conduit_user_evidence/root-key-pin.json"
+sudo -n "$conduit_helper" admin policy \
+  --uid "$(id -u)" \
+  --allow-unrestricted-launch true \
+  --output json > "$conduit_user_evidence/root-policy-opt-in.json"
 sudo -n "$conduit_helper" admin enable \
   --uid "$(id -u)" \
   --output json > "$conduit_user_evidence/root-policy-enable.json"
 for conduit_root_evidence in \
   "$conduit_user_evidence/root-key-pin.json" \
+  "$conduit_user_evidence/root-policy-opt-in.json" \
   "$conduit_user_evidence/root-policy-enable.json"; do
   [[ -s "$conduit_root_evidence" ]] || {
     echo "root setup action omitted its bounded evidence" >&2
@@ -313,6 +328,27 @@ grep -Eq '"policyRevision"[[:space:]]*:[[:space:]]*[1-9][0-9]*' \
 grep -Eq '"policyDigest"[[:space:]]*:[[:space:]]*"[0-9a-f]{64}"' \
   "$conduit_user_evidence/root-policy-enable.json" || {
   echo "root enable evidence omitted the effective policy digest" >&2
+  exit 4
+}
+
+# Local issuer pinning and opt-in advance the root policy revision. Refresh the
+# signed public bundle and repeat the Owner activation boundary so Node never
+# activates authority against the earlier disabled policy evidence.
+sudo -n "$conduit_helper" admin registration-bundle \
+  --uid "$(id -u)" \
+  --output json > "$conduit_registration_bundle"
+chmod 0600 "$conduit_registration_bundle"
+export CONDUIT_FULL_DEVICE_E2E_PHASE=registration
+cargo test --locked -p conduit-node --test full_device_live \
+  -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+conduit_enabled_policy_digest="$(sed -nE 's/.*"policyDigest"[[:space:]]*:[[:space:]]*"([0-9a-f]{64})".*/\1/p' "$conduit_registration_bundle")"
+[[ "$conduit_enabled_policy_digest" =~ ^[0-9a-f]{64}$ ]] || {
+  echo "enabled registration bundle omitted policy digest" >&2
+  exit 4
+}
+grep -Eq "\"helperPolicyDigest\"[[:space:]]*:[[:space:]]*\"$conduit_enabled_policy_digest\"" \
+  "$conduit_registration_approval" || {
+  echo "Owner activation did not bind the enabled root policy attestation" >&2
   exit 4
 }
 

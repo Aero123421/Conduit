@@ -59,7 +59,7 @@ fi
 sudo -n true || { echo "non-interactive local root authorization is unavailable" >&2; exit 4; }
 systemctl is-system-running --quiet || { echo "system systemd is not running" >&2; exit 4; }
 busctl --system introspect org.freedesktop.systemd1 /org/freedesktop/systemd1 \
-  org.freedesktop.systemd1.Manager --no-pager | grep -Fq StartTransientUnit || {
+  org.freedesktop.systemd1.Manager --no-pager | grep -F StartTransientUnit >/dev/null || {
     echo "system systemd does not expose the typed transient-unit API" >&2
     exit 4
   }

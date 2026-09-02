@@ -102,6 +102,37 @@ impl VerifiedPrivilegedAdmission {
         plan: LocalExecutionPlan,
         capability: SignedCapability,
     ) -> Result<Self, NodeError> {
+        Self::verify_for_operation(
+            offer,
+            approval_policy,
+            expected_device_id,
+            expected_origin,
+            ticket_verification_key,
+            receipt_verification_key,
+            PrivilegedOperation::Start,
+            ticket,
+            plan,
+            capability,
+        )
+    }
+
+    /// Verifies one action-specific ticket while keeping the immutable Runtime
+    /// and local-plan commitment identical across Prepare, Start, and later
+    /// exact-target controls. Each effect still receives a distinct ticket;
+    /// this method never widens a ticket to another action.
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify_for_operation(
+        offer: &OperationOffer,
+        approval_policy: &str,
+        expected_device_id: &str,
+        expected_origin: &str,
+        ticket_verification_key: &[u8; 32],
+        receipt_verification_key: &[u8; 32],
+        expected_operation: PrivilegedOperation,
+        ticket: PrivilegeTicket,
+        plan: LocalExecutionPlan,
+        capability: SignedCapability,
+    ) -> Result<Self, NodeError> {
         ticket
             .verify(ticket_verification_key)
             .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
@@ -152,7 +183,7 @@ impl VerifiedPrivilegedAdmission {
             && claims.device_policy_revision == offer.local_policy_revision
             && claims.access_scope == "full_device"
             && claims.approval_mode == approval_policy
-            && claims.allowed_operation == PrivilegedOperation::Start
+            && claims.allowed_operation == expected_operation
             && claims.controller_epoch > 0
             && plan.operation_id == offer.operation_id
             && plan.run_id == offer.runtime.run_id
@@ -1267,6 +1298,53 @@ mod tests {
             ),
             Err(NodeError::Rejected(reason)) if reason == "privilege_ticket_invalid"
         ));
+    }
+
+    #[test]
+    fn privileged_authority_never_widens_an_action_ticket() {
+        let directory = tempdir().unwrap();
+        let request = offer(directory.path());
+        let (ticket_key, receipt_key, ticket, plan, capability) = privileged_authority(&request);
+        assert!(matches!(
+            VerifiedPrivilegedAdmission::verify_for_operation(
+                &request,
+                "never",
+                "dev_test0001",
+                "https://control.invalid",
+                ticket_key.verifying_key().as_bytes(),
+                receipt_key.verifying_key().as_bytes(),
+                PrivilegedOperation::Prepare,
+                ticket.clone(),
+                plan.clone(),
+                capability.clone(),
+            ),
+            Err(NodeError::Rejected(reason)) if reason == "privilege_ticket_invalid"
+        ));
+
+        let prepare = SignedClaims::sign(
+            ticket.key_id,
+            PrivilegeTicketClaims {
+                allowed_operation: PrivilegedOperation::Prepare,
+                ticket_id: "ptkt_prepare0001".into(),
+                nonce: "ticket-nonce-prepare0001".into(),
+                ..ticket.claims
+            },
+            &ticket_key,
+        )
+        .unwrap();
+        VerifiedPrivilegedAdmission::verify_for_operation(
+            &request,
+            "never",
+            "dev_test0001",
+            "https://control.invalid",
+            ticket_key.verifying_key().as_bytes(),
+            receipt_key.verifying_key().as_bytes(),
+            PrivilegedOperation::Prepare,
+            prepare,
+            plan,
+            capability,
+        )
+        .unwrap();
     }
 
     #[test]

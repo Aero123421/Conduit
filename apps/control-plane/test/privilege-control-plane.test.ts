@@ -155,6 +155,25 @@ describe.sequential("privileged helper Control Plane", () => {
       ...ticketPayload, requestId: "ptreq_privcreddeny02", idempotencyKey: "privilege-device-credential-denial", redactedSummary: { operation: "prepare", credentialProfiles: [{ profileId: "cred_rootonly01", revision: 1 }] },
     }, devicePrivate);
     await expect(projectPrivilegeFrame(env, deviceDeniedCredential)).rejects.toMatchObject({ code: "privilege_ticket_invalid" });
+    const activeRootSummary = JSON.parse((await env.DB.prepare("SELECT public_summary_json FROM privilege_policy_attestations WHERE installation_id='phinst_privilegeflow01' AND revision=1").first<{ public_summary_json: string }>())!.public_summary_json) as Record<string, unknown>;
+    const activeCapabilitySummary = JSON.parse((await env.DB.prepare("SELECT capability_summary_json FROM device_privilege_installations WHERE installation_id='phinst_privilegeflow01'").first<{ capability_summary_json: string }>())!.capability_summary_json) as Record<string, unknown>;
+    const activeDeviceSummary = JSON.parse((await env.DB.prepare("SELECT public_summary_json FROM device_user_policy_attestations WHERE device_id='dev_privilegeflow01' AND revision=1").first<{ public_summary_json: string }>())!.public_summary_json) as Record<string, unknown>;
+    const neverAttempt = async (suffix: string) => projectPrivilegeFrame(env, await deviceSignedFrame("privilege.ticket_request", `nmsg_privnever${suffix}`, "2", {
+      ...ticketPayload, requestId: `ptreq_privnever${suffix}`, idempotencyKey: `privilege-never-matrix-${suffix}-01`,
+    }, devicePrivate));
+    await env.DB.prepare("UPDATE privilege_policy_attestations SET public_summary_json=?1 WHERE installation_id='phinst_privilegeflow01' AND revision=1").bind(canonicalJson({ ...activeRootSummary, allowNever: false })).run();
+    await expect(neverAttempt("rootdeny1")).rejects.toMatchObject({ code: "full_device_never_local_opt_in_required" });
+    await env.DB.batch([
+      env.DB.prepare("UPDATE privilege_policy_attestations SET public_summary_json=?1 WHERE installation_id='phinst_privilegeflow01' AND revision=1").bind(canonicalJson(activeRootSummary)),
+      env.DB.prepare("UPDATE device_privilege_installations SET capability_summary_json=?1 WHERE installation_id='phinst_privilegeflow01'").bind(canonicalJson({ ...activeCapabilitySummary, neverOptIn: false })),
+    ]);
+    await expect(neverAttempt("capdeny1")).rejects.toMatchObject({ code: "full_device_never_local_opt_in_required" });
+    await env.DB.batch([
+      env.DB.prepare("UPDATE device_privilege_installations SET capability_summary_json=?1 WHERE installation_id='phinst_privilegeflow01'").bind(canonicalJson(activeCapabilitySummary)),
+      env.DB.prepare("UPDATE device_user_policy_attestations SET public_summary_json=?1 WHERE device_id='dev_privilegeflow01' AND revision=1").bind(canonicalJson({ ...activeDeviceSummary, approvalModes: [] })),
+    ]);
+    await expect(neverAttempt("serverdn1")).rejects.toMatchObject({ code: "privileged_helper_policy_mismatch" });
+    await env.DB.prepare("UPDATE device_user_policy_attestations SET public_summary_json=?1 WHERE device_id='dev_privilegeflow01' AND revision=1").bind(canonicalJson(activeDeviceSummary)).run();
     const ticketFrame = await deviceSignedFrame("privilege.ticket_request", "nmsg_privticket001", "2", ticketPayload, devicePrivate);
     const measured = instrumentD1(env.DB);
     const measuredEnv = new Proxy(env as ControlPlaneEnv, { get: (target, property, receiver) => property === "DB" ? measured.db : Reflect.get(target, property, receiver) });

@@ -122,11 +122,16 @@ conduit_root_stage="$(sudo -n mktemp -d "$conduit_root_parent/run.XXXXXXXX")"
 conduit_package_root="$conduit_root_stage/package"
 conduit_cleanup_started=0
 conduit_control_pid=0
+conduit_node_pid=0
 
 conduit_cleanup() {
   local conduit_status=$?
   trap - EXIT INT TERM
   set +e
+  if ((conduit_node_pid)); then
+    kill "$conduit_node_pid" >/dev/null 2>&1 || true
+    wait "$conduit_node_pid" >/dev/null 2>&1 || true
+  fi
   if ((conduit_control_pid)); then
     kill "$conduit_control_pid" >/dev/null 2>&1 || true
     wait "$conduit_control_pid" >/dev/null 2>&1 || true
@@ -161,16 +166,33 @@ trap 'exit 130' INT TERM
 # and DeviceRoom. Its bearer capability is generated per run, accepted only on
 # loopback, and does not expose helper installation or root-policy operations.
 conduit_corepack="${CONDUIT_FULL_DEVICE_E2E_COREPACK:-/home/sahur/.local/bin/corepack}"
-[[ "$conduit_corepack" == /* && -x "$conduit_corepack" && ! -L "$conduit_corepack" ]] || {
-  echo "CONDUIT_FULL_DEVICE_E2E_COREPACK must be an absolute executable non-symlink" >&2
+[[ "$conduit_corepack" == /* && -x "$conduit_corepack" ]] || {
+  echo "CONDUIT_FULL_DEVICE_E2E_COREPACK must be an absolute executable" >&2
+  exit 4
+}
+conduit_corepack_resolved="$(readlink -f "$conduit_corepack")"
+[[ "$conduit_corepack_resolved" == /* && -f "$conduit_corepack_resolved" && -x "$conduit_corepack_resolved" ]] || {
+  echo "CONDUIT_FULL_DEVICE_E2E_COREPACK did not resolve to an executable file" >&2
+  exit 4
+}
+conduit_node_bin_dir="${CONDUIT_FULL_DEVICE_E2E_NODE_BIN_DIR:-$(dirname "$conduit_corepack")}"
+[[ "$conduit_node_bin_dir" == /* && -x "$conduit_node_bin_dir/node" ]] || {
+  echo "CONDUIT_FULL_DEVICE_E2E_NODE_BIN_DIR must contain the selected Node.js executable" >&2
   exit 4
 }
 conduit_control_token="$(openssl rand -hex 24)"
 conduit_control_state="$conduit_user_evidence/control-plane-state"
 conduit_control_log="$conduit_user_evidence/control-plane.log"
 conduit_control_endpoint="https://127.0.0.1:$conduit_control_port"
+conduit_control_tls_key="$conduit_user_evidence/control-plane.key"
+conduit_control_tls_cert="$conduit_user_evidence/control-plane.crt"
 install -d -m 0700 "$conduit_control_state"
-conduit_node_path="$(dirname "$conduit_corepack"):$PATH"
+openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
+  -subj '/CN=127.0.0.1' -addext 'subjectAltName=IP:127.0.0.1' \
+  -keyout "$conduit_control_tls_key" -out "$conduit_control_tls_cert" \
+  >/dev/null 2>&1
+chmod 0600 "$conduit_control_tls_key" "$conduit_control_tls_cert"
+conduit_node_path="$conduit_node_bin_dir:$(dirname "$conduit_corepack"):$PATH"
 env PATH="$conduit_node_path" "$conduit_corepack" pnpm --filter @conduit/control-plane exec wrangler \
   d1 migrations apply conduit-full-device-live --local \
   --config wrangler.full-device-live.jsonc --persist-to "$conduit_control_state" \
@@ -178,6 +200,8 @@ env PATH="$conduit_node_path" "$conduit_corepack" pnpm --filter @conduit/control
 env PATH="$conduit_node_path" "$conduit_corepack" pnpm --filter @conduit/control-plane exec wrangler dev \
   --config wrangler.full-device-live.jsonc --local --ip 127.0.0.1 \
   --port "$conduit_control_port" --local-protocol https \
+  --https-key-path "$conduit_control_tls_key" \
+  --https-cert-path "$conduit_control_tls_cert" \
   --persist-to "$conduit_control_state" \
   --var "PUBLIC_ORIGIN:$conduit_control_url" \
   --var "OAUTH_ISSUER:$conduit_control_url" \
@@ -483,6 +507,61 @@ cargo test --locked -p conduit-node --test full_device_live \
 export CONDUIT_FULL_DEVICE_E2E_PHASE=never_allowed
 cargo test --locked -p conduit-node --test full_device_live \
   -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+
+# Exercise the production NodeService/WssClient event loop, real Worker
+# upgrade route, DeviceRoom durable outbox, D1 projection, and privileged
+# helper. The operation is persisted and offered before Node connects, proving
+# that delivery is replayed from durable custody rather than process memory.
+export CONDUIT_FULL_DEVICE_E2E_PHASE=node_prepare
+cargo test --locked -p conduit-node --test full_device_live \
+  -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+curl --insecure --silent --show-error --fail-with-body --max-time 15 \
+  --request POST \
+  --header "Authorization: Bearer $conduit_control_token" \
+  --header 'Content-Type: application/json' \
+  --data-binary "@$conduit_user_evidence/node-operation-intent.json" \
+  "$conduit_control_endpoint/__full-device-live/intent" \
+  > "$conduit_user_evidence/node-operation-custody.json"
+
+conduit_node_log="$conduit_user_evidence/node-service.log"
+conduit_node_socket="$conduit_user_evidence/node-ipc/node.sock"
+install -d -m 0700 "$(dirname "$conduit_node_socket")"
+conduit_start_node() {
+  env SSL_CERT_FILE="$conduit_control_tls_cert" \
+    "$conduit_root/target/release/conduit-node" serve \
+    --data-dir "$conduit_user_evidence/node-service-data" \
+    --socket "$conduit_node_socket" \
+    --launch-profiles "$conduit_user_evidence/node-launch-profiles.json" \
+    --control-url "wss://127.0.0.1:$conduit_control_port/api/v1/devices/$conduit_device_id/connect" \
+    --device-id "$conduit_device_id" \
+    --privileged-socket "$CONDUIT_FULL_DEVICE_E2E_SOCKET" \
+    --privileged-registration-bundle "$conduit_registration_bundle" \
+    >> "$conduit_node_log" 2>&1 &
+  conduit_node_pid=$!
+}
+conduit_start_node
+export CONDUIT_FULL_DEVICE_E2E_PHASE=node_running
+cargo test --locked -p conduit-node --test full_device_live \
+  -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+kill "$conduit_node_pid"
+wait "$conduit_node_pid" || true
+conduit_node_pid=0
+rm -f "$conduit_node_socket"
+
+# Restart the actual Node process against the same durable Node store while
+# systemd retains root process custody. Reconciliation must attach the same
+# Runtime/Invocation and must not request another Start ticket.
+conduit_start_node
+export CONDUIT_FULL_DEVICE_E2E_PHASE=node_recovered
+cargo test --locked -p conduit-node --test full_device_live \
+  -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+export CONDUIT_FULL_DEVICE_E2E_PHASE=node_stop
+cargo test --locked -p conduit-node --test full_device_live \
+  -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+kill "$conduit_node_pid"
+wait "$conduit_node_pid" || true
+conduit_node_pid=0
+rm -f "$conduit_node_socket"
 
 # The first process sends an authenticated Start frame and intentionally drops
 # its local seqpacket endpoint without receiving. It exits only after typed

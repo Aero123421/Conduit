@@ -332,7 +332,9 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     if (liveEnv.FULL_DEVICE_LIVE_E2E !== "enabled" || liveEnv.FULL_DEVICE_LIVE_E2E_TOKEN === undefined || token !== liveEnv.FULL_DEVICE_LIVE_E2E_TOKEN) throw new TypeError("full_device_live_e2e_unavailable");
     const positions = this.ctx.storage.sql.exec<{ direction: string; durable_sequence: number }>("SELECT direction,durable_sequence FROM transport_positions ORDER BY direction").toArray();
     const rows = this.ctx.storage.sql.exec<{ inbound: number; projected: number; outbound: number }>("SELECT (SELECT COUNT(*) FROM inbound_frames) AS inbound,(SELECT COUNT(*) FROM inbound_frames WHERE projected=1) AS projected,(SELECT COUNT(*) FROM outbound_message_receipts) AS outbound").one();
-    return { ...rows, positions };
+    const connection = this.ctx.storage.sql.exec<{ device_id: string; epoch: number; connection_id: string; reconciliation_state: string }>("SELECT device_id,epoch,connection_id,reconciliation_state FROM connection_state WHERE singleton=1").toArray()[0] ?? null;
+    const activeSocketCount = this.ctx.getWebSockets().length;
+    return { ...rows, positions, connection, activeSocketCount };
   }
 
   async acknowledgeFullDeviceLiveRegistrationE2E(token: string, installationId: string): Promise<void> {

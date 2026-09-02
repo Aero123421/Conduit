@@ -52,6 +52,10 @@ fn full_device_live_systemd_root_e2e() {
         "never_allowed" => never_allowed(),
         "lost_start_issue" => lost_start_issue(),
         "lost_start_recover" => lost_start_recover(),
+        "node_prepare" => node_prepare(),
+        "node_running" => node_running(false),
+        "node_recovered" => node_running(true),
+        "node_stop" => node_stop(),
         "exercise" => exercise(),
         "recover" => recover(),
         phase => panic!("unknown Full Device E2E phase {phase}"),
@@ -112,16 +116,37 @@ fn registration() {
         }),
     );
     assert_eq!(bootstrap["status"], "ready");
+    let never_enabled = capability.claims.never_opt_in;
+    let policy_revision = if never_enabled { 2 } else { 1 };
+    let previous_policy_digest = if never_enabled {
+        Some(
+            fs::read_to_string(evidence.join("initial-device-policy-digest"))
+                .expect("initial Device policy digest")
+                .trim()
+                .to_owned(),
+        )
+    } else {
+        None
+    };
     let policy_summary = json!({
-        "revision":1,"capabilities":["command.start"],"providers":["privileged-native"],
-        "accessScopes":["full_device"],"approvalModes":["never"],
+        "revision":policy_revision,"capabilities":["command.start"],"providers":["privileged-native"],
+        "accessScopes":["full_device"],"approvalModes":if never_enabled { json!(["never"]) } else { json!([]) },
         "requiredApprovalRiskClasses":[],"launchProfiles":["full-device-live"],
         "credentialProfiles":["cred_full_device_live"],"maxCpu":null,
-        "maxMemoryBytes":null,"maxStorageBytes":null,"allowFullAccessWithoutApproval":true
+        "maxMemoryBytes":null,"maxStorageBytes":null,"allowFullAccessWithoutApproval":never_enabled
     });
-    let request_id = format!("phreq_live_policy_{:08}", capability.claims.policy_revision);
-    let registration_payload =
-        signed_registration_payload(&bundle, &identity, &request_id, policy_summary, 1);
+    let request_id = format!(
+        "phreq_live_policy_{:08}_{policy_revision}",
+        capability.claims.policy_revision
+    );
+    let registration_payload = signed_registration_payload(
+        &bundle,
+        &identity,
+        &request_id,
+        policy_summary.clone(),
+        policy_revision,
+        previous_policy_digest.as_deref(),
+    );
     let projection = worker_post(
         "/__full-device-live/frame",
         &json!({"deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),"frame":signed_frame("privilege.installation_attestation", &request_id, registration_payload, &identity)}),
@@ -130,6 +155,13 @@ fn registration() {
         projection.pointer("/result/state").and_then(Value::as_str),
         Some("pending_owner" | "active")
     ));
+    let policy_digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&policy_summary).unwrap()));
+    if !never_enabled {
+        write_private(
+            &evidence.join("initial-device-policy-digest"),
+            policy_digest.as_bytes(),
+        );
+    }
     let mut approval = worker_post(
         "/__full-device-live/approve",
         &json!({"installationId":object["installationId"]}),
@@ -233,6 +265,30 @@ fn never_denied() {
         30_000_000,
         &evidence,
     );
+    let operation_digest = hex::encode(Sha256::digest(b"never-denied-control-operation"));
+    let manifest_digest = hex::encode(Sha256::digest(b"never-denied-control-manifest"));
+    register_manual_intent(&plan, &operation_digest, &manifest_digest);
+    let (server_result, denied_request_id) = control_plane_ticket_result(
+        &bundle,
+        &DeviceIdentity::load_or_create(evidence.join("device.ed25519")).unwrap(),
+        &plan,
+        &request,
+        &manifest_digest,
+        &operation_digest,
+        PrivilegedOperation::Prepare,
+        false,
+    );
+    assert_eq!(server_result["status"], "denied");
+    let server_denial = worker_post(
+        "/__full-device-live/assert-never-denied",
+        &json!({
+            "installationId":bundle["installationId"],
+            "deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),
+            "deniedRequestId":denied_request_id,
+            "initialDevicePolicyRevision":1,
+            "result":server_result,
+        }),
+    );
     let error = provider
         .prepare_privileged(
             &request,
@@ -255,7 +311,7 @@ fn never_denied() {
     );
     write_json(
         &evidence.join("never-local-denial.json"),
-        &json!({"schemaVersion":1,"rootOptIn":false,"deniedBeforeRootEffect":true,"reason":"full_device_never_local_opt_in_required"}),
+        &json!({"schemaVersion":1,"rootOptIn":false,"deniedBeforeRootEffect":true,"reason":"full_device_never_local_opt_in_required","server":server_denial}),
     );
 }
 
@@ -271,20 +327,35 @@ fn never_allowed() {
         30_000_000,
         &evidence,
     );
+    let operation_digest = hex::encode(Sha256::digest(b"never-allowed-control-operation"));
+    let manifest_digest = hex::encode(Sha256::digest(b"never-allowed-control-manifest"));
+    register_manual_intent(&plan, &operation_digest, &manifest_digest);
+    let identity = DeviceIdentity::load_or_create(evidence.join("device.ed25519")).unwrap();
+    let (issued_result, issued_request_id) = control_plane_ticket_result(
+        &bundle,
+        &identity,
+        &plan,
+        &request,
+        &manifest_digest,
+        &operation_digest,
+        PrivilegedOperation::Prepare,
+        true,
+    );
+    let server_enabled = worker_post(
+        "/__full-device-live/assert-never-enabled",
+        &json!({
+            "installationId":bundle["installationId"],
+            "deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),
+            "deniedRequestId":read_json(&evidence.join("never-local-denial.json"))["server"]["deniedRequestId"],
+            "issuedRequestId":issued_request_id,
+            "initialDevicePolicyRevision":1,
+            "enabledDevicePolicyRevision":2,
+        }),
+    );
+    let prepare_ticket: PrivilegeTicket =
+        serde_json::from_value(issued_result["ticket"].clone()).unwrap();
     let prepared = provider
-        .prepare_privileged(
-            &request,
-            ticket_with_approval(
-                &issuer,
-                &bundle,
-                &plan,
-                &request,
-                PrivilegedOperation::Prepare,
-                "ptkt_live_never_allowed_prepare",
-                "never",
-            ),
-            plan.clone(),
-        )
+        .prepare_privileged(&request, prepare_ticket, plan.clone())
         .unwrap();
     let started = provider
         .start_privileged(
@@ -315,7 +386,172 @@ fn never_allowed() {
     let local_denial = read_json(&evidence.join("never-local-denial.json"));
     write_json(
         &evidence.join("never-summary.json"),
-        &json!({"schemaVersion":1,"rootDisabled":local_denial,"serverCeilingsEnabled":true,"rootOptIn":true,"approvalReceiptPresent":false,"rootStartSucceeded":true,"terminalState":state_name(stopped.runtime.state)}),
+        &json!({"schemaVersion":1,"rootDisabled":local_denial,"server":server_enabled,"rootOptIn":true,"approvalReceiptPresent":false,"rootStartSucceeded":true,"terminalState":state_name(stopped.runtime.state)}),
+    );
+}
+
+const NODE_LIVE_OPERATION_ID: &str = "op_live_node_service_0001";
+const NODE_LIVE_RUN_ID: &str = "run_live_node_service_0001";
+
+fn node_prepare() {
+    let evidence = evidence_dir();
+    let data = evidence.join("node-service-data");
+    let identity_dir = data.join("identity");
+    fs::create_dir_all(&identity_dir).unwrap();
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&identity_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let private = fs::read(evidence.join("device.ed25519")).unwrap();
+    write_private(&identity_dir.join("device.ed25519"), &private);
+
+    let executable = existing(&["/usr/bin/sleep", "/bin/sleep"]);
+    write_json(
+        &evidence.join("node-launch-profiles.json"),
+        &json!({
+            "localPolicy":{
+                "revision":2,"capabilities":["command.start"],
+                "providers":["privileged-native"],"accessScopes":["full_device"],
+                "approvalModes":["never"],"requiredApprovalRiskClasses":[],
+                "launchProfiles":["full-device-live"],"credentialProfiles":[],
+                "maxCpu":null,"maxMemoryBytes":null,"maxStorageBytes":null,
+                "allowFullAccessWithoutApproval":true
+            },
+            "profiles":{
+                "full-device-live":{
+                    "providerId":"privileged-native","executable":executable,
+                    "argv":["sleep","300"],"cwd":evidence,
+                    "environment":{},"ioMode":"pipes","timeoutMs":300000
+                }
+            }
+        }),
+    );
+    let operation_digest = hex::encode(Sha256::digest(b"node-service-live-operation-v1"));
+    let manifest_digest = hex::encode(Sha256::digest(b"node-service-live-manifest-v1"));
+    let now = OffsetDateTime::now_utc();
+    let operation = json!({
+        "schemaVersion":1,"operationId":NODE_LIVE_OPERATION_ID,
+        "idempotencyKey":"node-service-live-operation-v1",
+        "actorPrincipalId":"prin_full_device_live","clientId":"conduit.cli",
+        "deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),"runId":NODE_LIVE_RUN_ID,
+        "connectorPolicyId":"cpol_owner_first_party_v1","connectorPolicyRevision":1,
+        "capability":"command.start","accessScope":"full_device","approvalMode":"never",
+        "requiredApprovalRiskClasses":[],
+        "runtime":{"kind":"native","providerId":"privileged-native","configurationRevision":1},
+        "sourceRevisions":[],"arguments":{"launchProfileId":"full-device-live"},
+        "issuedAt":now.format(&Rfc3339).unwrap(),
+        "expiresAt":(now+time::Duration::minutes(5)).format(&Rfc3339).unwrap(),
+        "validForMs":300000,"payloadDigest":operation_digest
+    });
+    write_json(
+        &evidence.join("node-operation-intent.json"),
+        &json!({"operation":operation,"runManifestDigest":manifest_digest,"dispatch":true}),
+    );
+}
+
+fn node_running(recovered: bool) {
+    let evidence = evidence_dir();
+    let mut latest = Value::Null;
+    for _ in 0..300 {
+        latest = worker_post(
+            "/__full-device-live/inspect",
+            &json!({"deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),"operationId":NODE_LIVE_OPERATION_ID}),
+        );
+        if latest.pointer("/runtime/state") == Some(&Value::String("running".into()))
+            && latest.pointer("/operation/state") == Some(&Value::String("claimed".into()))
+            && latest
+                .pointer("/deviceRoom/activeSocketCount")
+                .and_then(Value::as_u64)
+                == Some(1)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        latest.pointer("/runtime/state").and_then(Value::as_str),
+        Some("running")
+    );
+    assert_eq!(
+        latest.pointer("/operation/state").and_then(Value::as_str),
+        Some("claimed")
+    );
+    assert_eq!(
+        latest
+            .pointer("/deviceRoom/activeSocketCount")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    assert_eq!(latest["operationTicketCount"], 2);
+    let runtime_id = latest
+        .pointer("/runtime/runtime_id")
+        .and_then(Value::as_str)
+        .unwrap();
+    let invocation_id = latest
+        .pointer("/runtime/invocation_id")
+        .and_then(Value::as_str)
+        .unwrap();
+    let current = json!({
+        "schemaVersion":1,"actualNodeService":true,"actualWssClient":true,
+        "actualWorkerRoute":true,"actualDeviceRoomWebSocket":true,
+        "durableOperationOutbox":true,"operationId":NODE_LIVE_OPERATION_ID,
+        "runtimeId":runtime_id,"invocationId":invocation_id,
+        "operationTicketCount":latest["operationTicketCount"],
+        "connectionEpoch":latest.pointer("/deviceRoom/connection/epoch"),
+        "running":true
+    });
+    if recovered {
+        let before = read_json(&evidence.join("node-service-running.json"));
+        assert_eq!(current["runtimeId"], before["runtimeId"]);
+        assert_eq!(current["invocationId"], before["invocationId"]);
+        assert_eq!(
+            current["operationTicketCount"],
+            before["operationTicketCount"]
+        );
+        let mut summary = current;
+        summary["nodeProcessRestarted"] = json!(true);
+        summary["sameDurableNodeStore"] = json!(true);
+        summary["duplicateStartTicketIssued"] = json!(false);
+        write_json(&evidence.join("node-service-recovered.json"), &summary);
+    } else {
+        write_json(&evidence.join("node-service-running.json"), &current);
+    }
+}
+
+fn node_stop() {
+    let evidence = evidence_dir();
+    let current = worker_post(
+        "/__full-device-live/inspect",
+        &json!({"deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),"operationId":NODE_LIVE_OPERATION_ID}),
+    );
+    let control = worker_post(
+        "/__full-device-live/control",
+        &json!({
+            "runtimeId":current["runtime"]["runtime_id"],
+            "expectedState":"running","expectedRevision":current["runtime"]["revision"]
+        }),
+    );
+    let mut latest = Value::Null;
+    for _ in 0..300 {
+        latest = worker_post(
+            "/__full-device-live/inspect",
+            &json!({"deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),"operationId":NODE_LIVE_OPERATION_ID}),
+        );
+        if latest.pointer("/runtime/state") == Some(&Value::String("stopped".into())) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(
+        latest.pointer("/runtime/state").and_then(Value::as_str),
+        Some("stopped")
+    );
+    let recovered = read_json(&evidence.join("node-service-recovered.json"));
+    write_json(
+        &evidence.join("node-service-summary.json"),
+        &json!({
+            "schemaVersion":1,"running":recovered,"exactRuntimeControl":true,
+            "controlOperationId":control["operationId"],"terminalState":"stopped",
+            "helperReceiptProjected":true,"rootRuntimeCustodyReleased":true
+        }),
     );
 }
 
@@ -339,6 +575,10 @@ fn exercise() {
     cases.insert(
         "lostStartResponse".into(),
         read_json(&evidence.join("lost-start-summary.json")),
+    );
+    cases.insert(
+        "actualNodeServiceRestart".into(),
+        read_json(&evidence.join("node-service-summary.json")),
     );
     cases.insert(
         "ptyInputResize".into(),
@@ -952,6 +1192,29 @@ fn control_plane_ticket(
     operation_digest: &str,
     operation: PrivilegedOperation,
 ) -> PrivilegeTicket {
+    let (projection, _) = control_plane_ticket_result(
+        bundle,
+        identity,
+        plan,
+        request,
+        manifest_digest,
+        operation_digest,
+        operation,
+        true,
+    );
+    serde_json::from_value(projection["ticket"].clone()).unwrap()
+}
+
+fn control_plane_ticket_result(
+    bundle: &Value,
+    identity: &DeviceIdentity,
+    plan: &LocalExecutionPlan,
+    request: &RuntimeRequest,
+    manifest_digest: &str,
+    operation_digest: &str,
+    operation: PrivilegedOperation,
+    expect_issued: bool,
+) -> (Value, String) {
     let capability: conduit_privileged_protocol::SignedCapability =
         serde_json::from_value(bundle["signedCapability"].clone()).unwrap();
     let action = serde_json::to_value(&operation)
@@ -971,7 +1234,8 @@ fn control_plane_ticket(
         "localExecutionPlanDigest":plan.digest().unwrap(),"controlRequestDigest":Value::Null,
         "controlAuthority":Value::Null,"runManifestDigest":manifest_digest,
         "helperPolicyRevision":capability.claims.policy_revision,
-        "helperPolicyDigest":capability.claims.policy_digest,"devicePolicyRevision":1,
+        "helperPolicyDigest":capability.claims.policy_digest,
+        "devicePolicyRevision":if capability.claims.never_opt_in { 2 } else { 1 },
         "approvalReceiptDigest":Value::Null,"approvalEnforcement":"exact_command",
         "allowedOperation":action,"resourceCeilings":plan.resources,
         "redactedSummary":{"operation":action,"runtimeKind":"native","reasonCodes":[],"resourceProfile":"root-policy-bounded","credentialProfiles":[]},
@@ -988,14 +1252,42 @@ fn control_plane_ticket(
         "/__full-device-live/frame",
         &json!({"deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),"frame":signed_frame("privilege.ticket_request", &request_id, payload, identity)}),
     );
-    assert_eq!(
-        projection.pointer("/result/status"),
-        Some(&Value::String("issued".into()))
+    let result = projection.pointer("/result").unwrap().clone();
+    if expect_issued {
+        assert_eq!(result["status"], "issued");
+        let ticket: PrivilegeTicket = serde_json::from_value(result["ticket"].clone()).unwrap();
+        assert_eq!(ticket.claims.operation_request_digest, operation_digest);
+    } else {
+        assert_eq!(result["status"], "denied");
+    }
+    (result, request_id)
+}
+
+fn register_manual_intent(
+    plan: &LocalExecutionPlan,
+    operation_digest: &str,
+    manifest_digest: &str,
+) {
+    let now = OffsetDateTime::now_utc();
+    let operation = json!({
+        "schemaVersion":1,"operationId":plan.operation_id,
+        "idempotencyKey":format!("manual-intent-{}", plan.operation_id),
+        "actorPrincipalId":"prin_full_device_live","clientId":"conduit.cli",
+        "deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),"runId":plan.run_id,
+        "connectorPolicyId":"cpol_owner_first_party_v1","connectorPolicyRevision":1,
+        "capability":"command.start","accessScope":"full_device","approvalMode":"never",
+        "requiredApprovalRiskClasses":[],
+        "runtime":{"kind":"native","providerId":"privileged-native","configurationRevision":1},
+        "sourceRevisions":[],"arguments":{"launchProfileId":"full-device-live"},
+        "issuedAt":now.format(&Rfc3339).unwrap(),
+        "expiresAt":(now+time::Duration::minutes(5)).format(&Rfc3339).unwrap(),
+        "validForMs":300000,"payloadDigest":operation_digest
+    });
+    let result = worker_post(
+        "/__full-device-live/intent",
+        &json!({"operation":operation,"runManifestDigest":manifest_digest,"dispatch":false}),
     );
-    let ticket: PrivilegeTicket =
-        serde_json::from_value(projection.pointer("/result/ticket").unwrap().clone()).unwrap();
-    assert_eq!(ticket.claims.operation_request_digest, operation_digest);
-    ticket
+    assert_eq!(result["status"], "custodied");
 }
 
 fn project_receipts(
@@ -1985,16 +2277,17 @@ fn signed_registration_payload(
     request_id: &str,
     policy_summary: Value,
     policy_revision: u64,
+    previous_policy_digest: Option<&str>,
 ) -> Value {
     let policy_digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&policy_summary).unwrap()));
     let policy_unsigned = json!({
         "deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),
         "revision":policy_revision,"policyDigest":policy_digest,
-        "previousPolicyDigest":Value::Null,"publicSummary":policy_summary,
+        "previousPolicyDigest":previous_policy_digest,"publicSummary":policy_summary,
     });
     let device_policy = json!({
         "revision":policy_revision,"policyDigest":policy_digest,
-        "previousPolicyDigest":Value::Null,"publicSummary":policy_unsigned["publicSummary"],
+        "previousPolicyDigest":previous_policy_digest,"publicSummary":policy_unsigned["publicSummary"],
         "signature":identity.sign(&serde_jcs::to_vec(&policy_unsigned).unwrap())
     });
     let unsigned = json!({

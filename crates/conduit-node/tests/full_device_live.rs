@@ -583,7 +583,7 @@ fn invalid_ticket(provider: &PrivilegedNativeProvider, bundle: &Value, evidence:
             plan,
         )
         .unwrap_err();
-    assert!(denied.to_string().contains("privilege_ticket"));
+    assert!(denied.to_string().contains("ticket_key_unpinned"));
     json!({"passed":true,"untrustedIssuerDenied":true,"runtimeStarted":false})
 }
 

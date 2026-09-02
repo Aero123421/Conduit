@@ -956,17 +956,30 @@ impl<M: SystemdManager> HelperEngine<M> {
     fn inspect(&self, target: ControlTarget) -> Result<HelperResponse> {
         let runtime = self.exact_target(&target)?;
         let observation = self.systemd.inspect(&runtime.unit_name)?;
+        let transition = receipt_transition(&observation.active_state);
+        let state = normalize_unit_state(&observation.active_state);
+        if runtime.state == state
+            && runtime
+                .last_receipt
+                .as_ref()
+                .is_some_and(|receipt| receipt.claims.transition == transition)
+            && runtime_identity_matches(&runtime, &observation)
+        {
+            return Ok(HelperResponse::Receipt(Box::new(
+                runtime.last_receipt.expect("checked signed receipt"),
+            )));
+        }
         let ticket = runtime.authority_ticket.clone();
         let receipt = self.receipt(
             &ticket,
             &target.runtime_handle_digest,
-            receipt_transition(&observation.active_state),
+            transition,
             Some(&observation),
             runtime.state_revision + 1,
         )?;
         self.journal.record_observation(
             &receipt,
-            normalize_unit_state(&observation.active_state),
+            state,
             observation.invocation_id.as_deref(),
             observation.main_pid,
         )?;
@@ -2049,6 +2062,8 @@ pub fn runtime_identity_matches(
 }
 fn normalize_unit_state(value: &str) -> &str {
     match value {
+        "active" | "activating" | "running" => "running",
+        "frozen" | "paused" => "paused",
         "inactive" | "dead" => "stopped",
         "failed" => "failed",
         other => other,
@@ -2309,7 +2324,7 @@ mod tests {
     }
     #[test]
     fn prepare_start_receipts_are_signed_and_start_replays() {
-        let (engine, _backend, plan, issuer, receipt_key) = setup();
+        let (engine, backend, plan, issuer, receipt_key) = setup();
         let prepared = engine
             .prepare(
                 ticket(
@@ -2357,6 +2372,36 @@ mod tests {
         for receipt in &started {
             receipt.verify(receipt_key.as_bytes()).unwrap()
         }
+        let runtime = engine.journal.runtime(&plan.runtime_id).unwrap().unwrap();
+        assert_eq!(runtime.state, "running");
+        assert_eq!(
+            runtime
+                .last_receipt
+                .as_ref()
+                .map(|receipt| receipt.claims.transition.as_str()),
+            Some("running")
+        );
+        assert!(runtime_identity_matches(
+            &runtime,
+            &backend.inspect(&plan.systemd_unit).unwrap()
+        ));
+        let mut target = ControlTarget {
+            runtime_id: runtime.runtime_id,
+            unit_name: runtime.unit_name,
+            invocation_id: runtime.invocation_id.unwrap(),
+            controller_epoch: 1,
+            expected_state_revision: runtime.state_revision,
+            runtime_handle_digest: String::new(),
+        };
+        target.runtime_handle_digest = control_target_digest(&target).unwrap();
+        assert_eq!(
+            engine.inspect(target.clone()).unwrap(),
+            HelperResponse::Receipt(Box::new(started.last().unwrap().clone()))
+        );
+        assert_eq!(
+            engine.inspect(target).unwrap(),
+            HelperResponse::Receipt(Box::new(started.last().unwrap().clone()))
+        );
         let replay = engine.start(start, plan.digest().unwrap()).unwrap();
         assert_eq!(replay, HelperResponse::Receipts(started));
     }

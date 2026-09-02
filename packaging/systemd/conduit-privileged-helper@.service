@@ -39,7 +39,10 @@ ProtectKernelLogs=yes
 ProtectControlGroups=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
-RestrictSUIDSGID=yes
+# systemd 255 implements RestrictSUIDSGID with a syscall filter that also
+# returns ENOSYS for openat2 on supported kernels. The helper requires openat2
+# for fail-closed path resolution, so keep this setting disabled and verify the
+# effective sandbox plus helper capabilities in the live root E2E.
 LockPersonality=yes
 SystemCallArchitectures=native
 MemoryDenyWriteExecute=yes

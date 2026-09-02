@@ -137,6 +137,14 @@ activation, preserve active systemd custody, and roll back atomically on failed
 health. Uninstall refuses active Runs by default and preserves keys and journal;
 purge is a separate destructive local action.
 
+Helper-service hardening must preserve the capabilities used by its fail-closed
+path checks. In particular, the packaged service does not enable
+`RestrictSUIDSGID`: systemd 255 applies that option with a syscall filter which
+causes required `openat2` probes to return `ENOSYS` even when the kernel supports
+the syscall. The live root E2E verifies the effective sandbox, absence of helper
+IP sockets, and signed capability evidence instead of inferring correctness from
+the hardening option name or `systemd-analyze security` score.
+
 ## Security limitation
 
 A running root Agent can alter host software and local evidence. Helper signing

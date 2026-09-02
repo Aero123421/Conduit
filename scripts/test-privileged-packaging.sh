@@ -144,6 +144,10 @@ grep -Fq 'ExecStart=/usr/libexec/conduit/conduit-privileged-helper serve --expec
 grep -Fq 'PrivateNetwork=yes' "$conduit_service"
 grep -Fq 'RestrictAddressFamilies=AF_UNIX' "$conduit_service"
 grep -Fq 'NoNewPrivileges=yes' "$conduit_service"
+if grep -Fq 'RestrictSUIDSGID=' "$conduit_service"; then
+  echo "helper service enabled a systemd syscall filter that blocks required openat2" >&2
+  exit 1
+fi
 grep -Fq 'ConfigurationDirectoryMode=0700' "$conduit_service"
 
 if DESTDIR="$conduit_stage" CONDUIT_BUILD_DIR="$conduit_release_100" \

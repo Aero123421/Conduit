@@ -429,11 +429,13 @@ function summaryAllows(summaryJson: string, request: Record<string, unknown>, ca
   if (!operations.includes(operation)) throw new PublicError("privileged_helper_policy_mismatch", 409, "Root policy does not allow this operation");
   const adapters = Array.isArray(policy.allowedAdapters) ? policy.allowedAdapters : [];
   if (adapterId !== null && !adapters.includes(adapterId)) throw new PublicError("privileged_helper_policy_mismatch", 409, "Root policy does not allow this Adapter");
-  // The canonical root policy has no free-form enforcement allowlist. Exact
-  // command enforcement is the only independently verifiable mode in v1;
-  // adapter-mediated authority is fail-closed until a signed policy field is
-  // added to the helper protocol.
-  if (request.approvalEnforcement !== "exact_command") throw new PublicError("full_device_approval_enforcement_unavailable", 409, "Local policy cannot attest this approval enforcement");
+  // Exact commands bind the complete launch plan. Structured Agents may use
+  // adapter mediation only when the signed root policy names that Adapter;
+  // the Adapter allowlist is the local root authorization for this v1 mode.
+  if (request.approvalEnforcement !== "exact_command" &&
+      (request.approvalEnforcement !== "adapter_mediated" || adapterId === null || !adapters.includes(adapterId))) {
+    throw new PublicError("full_device_approval_enforcement_unavailable", 409, "Local policy cannot attest this approval enforcement");
+  }
   if (approvalMode === "never" && (policy.allowNever !== true || capability.neverOptIn !== true)) throw new PublicError("full_device_never_local_opt_in_required", 409, "Never approval requires both root-policy and effective helper opt-in");
 }
 

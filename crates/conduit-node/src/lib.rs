@@ -110,6 +110,7 @@ impl VerifiedPrivilegedAdmission {
             expected_origin,
             ticket_verification_key,
             receipt_verification_key,
+            &offer.idempotency_key,
             PrivilegedOperation::Start,
             ticket,
             plan,
@@ -129,6 +130,7 @@ impl VerifiedPrivilegedAdmission {
         expected_origin: &str,
         ticket_verification_key: &[u8; 32],
         receipt_verification_key: &[u8; 32],
+        expected_ticket_idempotency_key: &str,
         expected_operation: PrivilegedOperation,
         ticket: PrivilegeTicket,
         plan: LocalExecutionPlan,
@@ -150,7 +152,8 @@ impl VerifiedPrivilegedAdmission {
             .digest()
             .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
         let launch_digest = digest_jcs(&offer.launch)?;
-        let idempotency_key_digest = hex::encode(Sha256::digest(offer.idempotency_key.as_bytes()));
+        let idempotency_key_digest =
+            hex::encode(Sha256::digest(expected_ticket_idempotency_key.as_bytes()));
         let now = OffsetDateTime::now_utc();
         let not_before = OffsetDateTime::parse(&ticket.claims.issued_at, &Rfc3339)
             .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
@@ -1390,6 +1393,7 @@ mod tests {
                 "https://control.invalid",
                 ticket_key.verifying_key().as_bytes(),
                 receipt_key.verifying_key().as_bytes(),
+                &request.idempotency_key,
                 PrivilegedOperation::Prepare,
                 ticket.clone(),
                 plan.clone(),
@@ -1416,6 +1420,7 @@ mod tests {
             "https://control.invalid",
             ticket_key.verifying_key().as_bytes(),
             receipt_key.verifying_key().as_bytes(),
+            &request.idempotency_key,
             PrivilegedOperation::Prepare,
             prepare,
             plan,

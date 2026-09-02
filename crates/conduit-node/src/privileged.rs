@@ -152,6 +152,9 @@ impl PrivilegedNodeRuntime {
         capability
             .verify(receipt_key.as_bytes())
             .map_err(|_| PrivilegedNodeError::RegistrationMissing)?;
+        if jwk.get("kid").and_then(Value::as_str) != Some(capability.key_id.as_str()) {
+            return Err(PrivilegedNodeError::RegistrationMissing);
+        }
         if capability.claims.installation_id != installation_id
             || capability.claims.receipt_key_id != capability.key_id
             || capability.claims.policy_revision
@@ -283,8 +286,9 @@ impl PrivilegedNodeRuntime {
                 .map_err(|_| PrivilegedNodeError::RegistrationMissing)?
                 .try_into()
                 .map_err(|_| PrivilegedNodeError::RegistrationMissing)?;
-            if hex::encode(Sha256::digest(raw))
-                != string(item.get("fingerprint"), "issuer fingerprint")?
+            if hex::encode(Sha256::digest(
+                string(jwk.get("x"), "issuer JWK x")?.as_bytes(),
+            )) != string(item.get("fingerprint"), "issuer fingerprint")?
             {
                 return Err(PrivilegedNodeError::RegistrationMissing);
             }
@@ -314,12 +318,7 @@ impl PrivilegedNodeRuntime {
             .ok_or(PrivilegedNodeError::RegistrationMissing)?;
         let mut payload = json!({
             "requestId": request_id,
-            "installationId": self.capability.claims.installation_id,
-            "expectedUid": unsafe { libc::geteuid() },
-            "publicOrigin": object.get("publicOrigin").or_else(|| object.get("origin")).cloned().ok_or(PrivilegedNodeError::RegistrationMissing)?,
-            "receiptPublicJwk": object.get("receiptPublicJwk").cloned().ok_or(PrivilegedNodeError::RegistrationMissing)?,
-            "signedCapability": self.capability,
-            "policy": object.get("policy").or_else(|| object.get("signedPolicyAttestation")).cloned().ok_or(PrivilegedNodeError::RegistrationMissing)?,
+            "registrationBundle": self.bundle,
             "devicePolicy": {
                 "revision": device_policy_revision,
                 "policyDigest": hex::encode(Sha256::digest(serde_jcs::to_vec(&device_policy_summary).map_err(|error| PrivilegedNodeError::Config(error.to_string()))?)),

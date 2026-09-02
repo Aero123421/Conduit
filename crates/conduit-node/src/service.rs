@@ -648,6 +648,7 @@ enum PrivilegedStartPhase {
 struct PendingPrivilegeRequest {
     operation_id: String,
     phase: PrivilegedStartPhase,
+    ticket_idempotency_key: String,
 }
 
 struct PendingPrivilegedStart {
@@ -1518,6 +1519,7 @@ impl NodeService {
             PendingPrivilegeRequest {
                 operation_id: operation_id.to_owned(),
                 phase,
+                ticket_idempotency_key,
             },
         );
         let message_id = self.message_id();
@@ -1627,6 +1629,7 @@ impl NodeService {
             &expected_origin,
             &issuer_key,
             privileged.receipt_key(),
+            &request.ticket_idempotency_key,
             expected_operation.clone(),
             ticket,
             pending_plan.clone(),

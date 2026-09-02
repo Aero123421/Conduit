@@ -106,6 +106,41 @@ TypeScript validators separately reject malformed wire shapes and generated
 code drift. These deterministic checks are not substitutes for the protected
 real-root/systemd live test described in `docs/LINUX_E2E.md`.
 
+## Threat model and verification map
+
+`Prevented` means the request is rejected before a new root effect. `Detected`
+means custody converges to a signed terminal, uncertain, or recovery-required
+record. `Limited` means the design reduces reusable authority but cannot remove
+the stated host-admin consequence. `Inherent` is an explicit consequence of an
+already authorized root Agent.
+
+| Threat | Treatment | Enforced and exercised by |
+|---|---|---|
+| Narrow remote MCP Connector | Prevented | Connector/Assignment/Device ceilings and Control Plane cross-project and privilege-ticket tests |
+| Stolen or stale OAuth token | Prevented/limited | grant revision, expiry, revocation, fresh-Passkey and CSRF/replay tests |
+| Compromised Device-user process | Limited | root policy, pinned issuer, one-use exact ticket, peer plus Device proof; it cannot edit root authority |
+| `full_user` Agent attempts elevation | Prevented | explicit provider selection and the live helper-disabled Full User case |
+| Malicious same-UID helper client | Prevented | challenge transcript, Device signature, exact ticket and peer process-birth checks |
+| Stale Node after restart/update | Prevented/detected | controller-epoch fencing, helper reconciliation, signed recovery receipt and restart tests |
+| Replayed ticket | Prevented | root-journal one-use admission and exact same-digest receipt replay tests |
+| Ticket copied to another Device/helper | Prevented | installation, key, Device, UID and public-origin binding tests |
+| Plan changed after approval | Prevented | Runtime Spec, local plan, launch/control and immutable operation digest tests |
+| Executable/cwd/symlink/interpreter race | Prevented | descriptor-relative identity/digest validation and helper worker replacement tests |
+| Forged helper receipt | Prevented | active helper-key signature, receipt chain and Node/Control Plane binding tests |
+| Helper restart during launch | Detected | durable boundary fault injection, journal/systemd reconcile and no-duplicate-start tests |
+| Node restart with live root process | Detected/limited | helper-signed reconcile, same Invocation attach where safe, otherwise `recovery_required`; no respawn |
+| Lost Control Plane response and retry | Prevented | request/idempotency uniqueness and DeviceRoom replay tests |
+| Root Agent tampers with local software/evidence | Inherent | disclosed below; previously projected remote commitments remain the stronger evidence |
+| Storage exhaustion or SQLite failure | Prevented/detected | pre-effect durable admission and crash/storage fault tests |
+| Ticket signing-key rotation or compromise | Limited | Owner-activated revisions, overlap/revocation and explicit locally pinned replacement fingerprint |
+| Helper/protocol downgrade | Prevented | package compatibility probe, schema version checks and rollback tests |
+| Unexpected, duplicated, truncated or forged FDs | Prevented | `SOCK_SEQPACKET` ancillary bounds and sealed descriptor manifest tests |
+| User enables elevation without root setup | Prevented | root-owned package/policy commands and remote MCP/HTTP administration-denial tests |
+
+The live script covers only the cases it reports in its bounded result artifact.
+The table also cites deterministic protocol/fault tests; it does not relabel
+those tests as live host evidence.
+
 ## Audit limitation
 
 Host root is intentionally broad authority. A root Agent can alter Node/helper

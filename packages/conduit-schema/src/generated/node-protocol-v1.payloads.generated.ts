@@ -60,6 +60,9 @@ export type OperationStatusPayload = {
   runtimeTargetDigest?: Sha256Hex;
   selectedRuntimeProvider?: string;
   runtimeHandleDigest?: Sha256Hex;
+  privilegeTicketDigest?: Sha256Hex;
+  privilegeReceiptDigest?: Sha256Hex;
+  privilegeStateRevision?: U64Decimal;
   observedAt: Timestamp;
 };
 export type TerminalState =
@@ -104,6 +107,8 @@ export type RuntimeControlPayload = {
   custodyComplete?: boolean;
 };
 export type ApprovalId = string;
+export type Base64Url = string;
+export type DeviceKeyId = string;
 
 export interface NodeProtocolPayloadCatalogV1 {
   "transport.ack": TransportAckPayload;
@@ -125,6 +130,11 @@ export interface NodeProtocolPayloadCatalogV1 {
   "event.batch": EventBatchPayload;
   "event.gap": EventGapPayload;
   "device.health": DeviceHealthPayload;
+  "privilege.installation_attestation": PrivilegeInstallationAttestationPayload;
+  "privilege.policy_attestation": PrivilegePolicyAttestationPayload;
+  "privilege.ticket_request": PrivilegeTicketRequestPayload;
+  "privilege.ticket_result": PrivilegeTicketResultPayload;
+  "privilege.receipt": PrivilegeReceiptPayload;
 }
 export interface TransportAckPayload {
   direction: Direction;
@@ -294,6 +304,9 @@ export interface OperationAdmissionPayload {
   effectiveApprovalMode?: ApprovalMode;
   localPolicyRevision: number;
   receiptDigest: Sha256Hex;
+  privilegeTicketDigest?: Sha256Hex;
+  privilegeReceiptDigest?: Sha256Hex;
+  helperInstallationId?: string;
   reasonCode?: string;
 }
 export interface OperationTerminalPayload {
@@ -302,6 +315,9 @@ export interface OperationTerminalPayload {
   state: TerminalState;
   requestDigest: Sha256Hex;
   receiptDigest: Sha256Hex;
+  privilegeTicketDigest?: Sha256Hex;
+  privilegeReceiptDigest?: Sha256Hex;
+  privilegeStateRevision?: U64Decimal;
   lastRunEventSequence: U64Decimal;
   resultSummary?: {
     [k: string]: unknown;
@@ -369,6 +385,9 @@ export interface RuntimeControlResultPayload {
     [k: string]: unknown;
   };
   receiptDigest: Sha256Hex;
+  privilegeTicketDigest?: Sha256Hex;
+  privilegeReceiptDigest?: Sha256Hex;
+  privilegeStateRevision?: U64Decimal;
   observedAt: Timestamp;
 }
 export interface OperationApprovalRequestPayload {
@@ -480,4 +499,109 @@ export interface DeviceHealthPayload {
   activeCommands?: number;
   activeAgentRuns?: number;
   activeRuntimes?: number;
+  privilegedHelper?: {
+    installationId: string;
+    helperKeyId: string;
+    policyRevision: U64Decimal;
+    policyDigest: Sha256Hex;
+    capabilityDigest: Sha256Hex;
+    state: "effective" | "disabled" | "mismatch" | "unavailable" | "recovery_required";
+    activeRuntimes: number;
+  };
+}
+export interface PrivilegeInstallationAttestationPayload {
+  requestId: string;
+  installationId: string;
+  deviceId: DeviceId;
+  uid: number;
+  origin: string;
+  helperVersion: string;
+  protocol: "conduit.privileged/1";
+  receiptKeyId: string;
+  receiptPublicKey: Base64Url;
+  receiptKeyFingerprint: Sha256Hex;
+  policyRevision: U64Decimal;
+  policyDigest: Sha256Hex;
+  capabilityDigest: Sha256Hex;
+  attestationDigest: Sha256Hex;
+  deviceKeyId: DeviceKeyId;
+  deviceSignature: Base64Url;
+  observedAt: Timestamp;
+}
+export interface PrivilegePolicyAttestationPayload {
+  requestId: string;
+  installationId: string;
+  revision: U64Decimal;
+  previousRevision: U64Decimal;
+  policyDigest: Sha256Hex;
+  previousPolicyDigest: Sha256Hex;
+  changeClass: "same" | "narrowed" | "broadened";
+  enabled: boolean;
+  allowNever: boolean;
+  allowUnrestrictedLaunch: boolean;
+  capabilityDigest: Sha256Hex;
+  helperKeyId: string;
+  helperSignature: Base64Url;
+  deviceKeyId: DeviceKeyId;
+  deviceSignature: Base64Url;
+  observedAt: Timestamp;
+}
+export interface PrivilegeTicketRequestPayload {
+  requestId: string;
+  idempotencyKey: string;
+  requestDigest: Sha256Hex;
+  operationId: OperationId;
+  runId: RunId;
+  runtimeId: string;
+  runtimeSpecDigest: Sha256Hex;
+  launchPlanDigest: Sha256Hex;
+  localExecutionPlanDigest: Sha256Hex;
+  controlRequestDigest?: Sha256Hex;
+  controllerEpoch: U64Decimal;
+  installationId: string;
+  helperKeyId: string;
+  helperPolicyRevision: U64Decimal;
+  helperPolicyDigest: Sha256Hex;
+  devicePolicyRevision: U64Decimal;
+  adapterCapabilityDigest: Sha256Hex;
+  approvalReceiptDigest: Sha256Hex | null;
+  redactedSummary: {
+    [k: string]: unknown;
+  };
+  deviceKeyId: DeviceKeyId;
+  deviceSignature: Base64Url;
+  expiresAt: Timestamp;
+}
+export interface PrivilegeTicketResultPayload {
+  requestId: string;
+  requestDigest: Sha256Hex;
+  decision: "issued" | "denied" | "expired" | "conflict";
+  ticketId: string | null;
+  ticketDigest: Sha256Hex | null;
+  ticket: {
+    [k: string]: unknown;
+  } | null;
+  reasonCode: string | null;
+  observedAt: Timestamp;
+}
+export interface PrivilegeReceiptPayload {
+  receiptId: string;
+  receiptDigest: Sha256Hex;
+  installationId: string;
+  helperKeyId: string;
+  ticketId: string;
+  ticketDigest: Sha256Hex;
+  operationId: OperationId;
+  requestDigest: Sha256Hex;
+  runId: RunId;
+  runtimeId: string;
+  controllerEpoch: U64Decimal;
+  stateRevision: U64Decimal;
+  transition: string;
+  localExecutionPlanDigest: Sha256Hex;
+  controlRequestDigest?: Sha256Hex;
+  signedReceipt: {
+    [k: string]: unknown;
+  };
+  observedAt: Timestamp;
 }

@@ -354,6 +354,9 @@
         "effectiveApprovalMode": { "$ref": "#/$defs/ApprovalMode" },
         "localPolicyRevision": { "type": "integer", "minimum": 1 },
         "receiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "privilegeTicketDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "privilegeReceiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "helperInstallationId": { "type": "string", "pattern": "^phinst_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
         "reasonCode": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" }
       }
     },
@@ -374,6 +377,9 @@
         "runtimeTargetDigest": { "$ref": "#/$defs/Sha256Hex" },
         "selectedRuntimeProvider": { "type": "string", "pattern": "^[a-z][a-z0-9_.-]{0,127}$" },
         "runtimeHandleDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "privilegeTicketDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "privilegeReceiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "privilegeStateRevision": { "$ref": "#/$defs/U64Decimal" },
         "observedAt": { "$ref": "#/$defs/Timestamp" }
       },
       "allOf": [{
@@ -391,6 +397,9 @@
         "state": { "$ref": "#/$defs/TerminalState" },
         "requestDigest": { "$ref": "#/$defs/Sha256Hex" },
         "receiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "privilegeTicketDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "privilegeReceiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "privilegeStateRevision": { "$ref": "#/$defs/U64Decimal" },
         "lastRunEventSequence": { "$ref": "#/$defs/U64Decimal" },
         "resultSummary": { "type": "object", "maxProperties": 64 },
         "artifactIds": {
@@ -463,7 +472,49 @@
         "processCountDelta": { "const": 0 },
         "result": { "type": "object", "maxProperties": 32 },
         "receiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "privilegeTicketDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "privilegeReceiptDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "privilegeStateRevision": { "$ref": "#/$defs/U64Decimal" },
         "observedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "PrivilegeInstallationAttestationPayload": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["requestId", "installationId", "deviceId", "uid", "origin", "helperVersion", "protocol", "receiptKeyId", "receiptPublicKey", "receiptKeyFingerprint", "policyRevision", "policyDigest", "capabilityDigest", "attestationDigest", "deviceKeyId", "deviceSignature", "observedAt"],
+      "properties": {
+        "requestId": { "type": "string", "pattern": "^phreq_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "installationId": { "type": "string", "pattern": "^phinst_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "deviceId": { "$ref": "#/$defs/DeviceId" }, "uid": { "type": "integer", "minimum": 1, "maximum": 4294967294 }, "origin": { "type": "string", "format": "uri", "maxLength": 512 }, "helperVersion": { "type": "string", "maxLength": 64 }, "protocol": { "const": "conduit.privileged/1" },
+        "receiptKeyId": { "type": "string", "pattern": "^hkey_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "receiptPublicKey": { "$ref": "#/$defs/Base64Url" }, "receiptKeyFingerprint": { "$ref": "#/$defs/Sha256Hex" }, "policyRevision": { "$ref": "#/$defs/U64Decimal" }, "policyDigest": { "$ref": "#/$defs/Sha256Hex" }, "capabilityDigest": { "$ref": "#/$defs/Sha256Hex" }, "attestationDigest": { "$ref": "#/$defs/Sha256Hex" }, "deviceKeyId": { "$ref": "#/$defs/DeviceKeyId" }, "deviceSignature": { "$ref": "#/$defs/Base64Url" }, "observedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "PrivilegePolicyAttestationPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["requestId", "installationId", "revision", "previousRevision", "policyDigest", "previousPolicyDigest", "changeClass", "enabled", "allowNever", "allowUnrestrictedLaunch", "capabilityDigest", "helperKeyId", "helperSignature", "deviceKeyId", "deviceSignature", "observedAt"],
+      "properties": {
+        "requestId": { "type": "string", "pattern": "^phreq_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "installationId": { "type": "string", "pattern": "^phinst_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "revision": { "$ref": "#/$defs/U64Decimal" }, "previousRevision": { "$ref": "#/$defs/U64Decimal" }, "policyDigest": { "$ref": "#/$defs/Sha256Hex" }, "previousPolicyDigest": { "$ref": "#/$defs/Sha256Hex" }, "changeClass": { "enum": ["same", "narrowed", "broadened"] }, "enabled": { "type": "boolean" }, "allowNever": { "type": "boolean" }, "allowUnrestrictedLaunch": { "type": "boolean" }, "capabilityDigest": { "$ref": "#/$defs/Sha256Hex" }, "helperKeyId": { "type": "string", "pattern": "^hkey_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "helperSignature": { "$ref": "#/$defs/Base64Url" }, "deviceKeyId": { "$ref": "#/$defs/DeviceKeyId" }, "deviceSignature": { "$ref": "#/$defs/Base64Url" }, "observedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "PrivilegeTicketRequestPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["requestId", "idempotencyKey", "requestDigest", "operationId", "runId", "runtimeId", "runtimeSpecDigest", "launchPlanDigest", "localExecutionPlanDigest", "controllerEpoch", "installationId", "helperKeyId", "helperPolicyRevision", "helperPolicyDigest", "devicePolicyRevision", "adapterCapabilityDigest", "approvalReceiptDigest", "redactedSummary", "deviceKeyId", "deviceSignature", "expiresAt"],
+      "properties": {
+        "requestId": { "type": "string", "pattern": "^ptreq_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "idempotencyKey": { "type": "string", "minLength": 16, "maxLength": 256 }, "requestDigest": { "$ref": "#/$defs/Sha256Hex" }, "operationId": { "$ref": "#/$defs/OperationId" }, "runId": { "$ref": "#/$defs/RunId" }, "runtimeId": { "type": "string", "pattern": "^rt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "runtimeSpecDigest": { "$ref": "#/$defs/Sha256Hex" }, "launchPlanDigest": { "$ref": "#/$defs/Sha256Hex" }, "localExecutionPlanDigest": { "$ref": "#/$defs/Sha256Hex" }, "controlRequestDigest": { "$ref": "#/$defs/Sha256Hex" }, "controllerEpoch": { "$ref": "#/$defs/U64Decimal" }, "installationId": { "type": "string", "pattern": "^phinst_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "helperKeyId": { "type": "string", "pattern": "^hkey_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "helperPolicyRevision": { "$ref": "#/$defs/U64Decimal" }, "helperPolicyDigest": { "$ref": "#/$defs/Sha256Hex" }, "devicePolicyRevision": { "$ref": "#/$defs/U64Decimal" }, "adapterCapabilityDigest": { "$ref": "#/$defs/Sha256Hex" }, "approvalReceiptDigest": { "anyOf": [{ "$ref": "#/$defs/Sha256Hex" }, { "type": "null" }] }, "redactedSummary": { "type": "object", "maxProperties": 16 }, "deviceKeyId": { "$ref": "#/$defs/DeviceKeyId" }, "deviceSignature": { "$ref": "#/$defs/Base64Url" }, "expiresAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "PrivilegeTicketResultPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["requestId", "requestDigest", "decision", "ticketId", "ticketDigest", "ticket", "reasonCode", "observedAt"],
+      "properties": {
+        "requestId": { "type": "string", "pattern": "^ptreq_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "requestDigest": { "$ref": "#/$defs/Sha256Hex" }, "decision": { "enum": ["issued", "denied", "expired", "conflict"] }, "ticketId": { "type": ["string", "null"], "pattern": "^ptkt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "ticketDigest": { "anyOf": [{ "$ref": "#/$defs/Sha256Hex" }, { "type": "null" }] }, "ticket": { "type": ["object", "null"], "maxProperties": 3 }, "reasonCode": { "type": ["string", "null"], "pattern": "^[a-z][a-z0-9_.-]{0,127}$" }, "observedAt": { "$ref": "#/$defs/Timestamp" }
+      }
+    },
+    "PrivilegeReceiptPayload": {
+      "type": "object", "additionalProperties": false,
+      "required": ["receiptId", "receiptDigest", "installationId", "helperKeyId", "ticketId", "ticketDigest", "operationId", "requestDigest", "runId", "runtimeId", "controllerEpoch", "stateRevision", "transition", "localExecutionPlanDigest", "signedReceipt", "observedAt"],
+      "properties": {
+        "receiptId": { "type": "string", "pattern": "^phrcpt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "receiptDigest": { "$ref": "#/$defs/Sha256Hex" }, "installationId": { "type": "string", "pattern": "^phinst_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "helperKeyId": { "type": "string", "pattern": "^hkey_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "ticketId": { "type": "string", "pattern": "^ptkt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "ticketDigest": { "$ref": "#/$defs/Sha256Hex" }, "operationId": { "$ref": "#/$defs/OperationId" }, "requestDigest": { "$ref": "#/$defs/Sha256Hex" }, "runId": { "$ref": "#/$defs/RunId" }, "runtimeId": { "type": "string", "pattern": "^rt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "controllerEpoch": { "$ref": "#/$defs/U64Decimal" }, "stateRevision": { "$ref": "#/$defs/U64Decimal" }, "transition": { "type": "string", "pattern": "^[a-z][a-z0-9_]{0,63}$" }, "localExecutionPlanDigest": { "$ref": "#/$defs/Sha256Hex" }, "controlRequestDigest": { "$ref": "#/$defs/Sha256Hex" }, "signedReceipt": { "type": "object", "maxProperties": 3 }, "observedAt": { "$ref": "#/$defs/Timestamp" }
       }
     },
     "OperationApprovalRequestPayload": {
@@ -748,6 +799,11 @@
         "activeCommands": { "type": "integer", "minimum": 0 },
         "activeAgentRuns": { "type": "integer", "minimum": 0 },
         "activeRuntimes": { "type": "integer", "minimum": 0 }
+        ,"privilegedHelper": {
+          "type": "object", "additionalProperties": false,
+          "required": ["installationId", "helperKeyId", "policyRevision", "policyDigest", "capabilityDigest", "state", "activeRuntimes"],
+          "properties": { "installationId": { "type": "string", "pattern": "^phinst_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "helperKeyId": { "type": "string", "pattern": "^hkey_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "policyRevision": { "$ref": "#/$defs/U64Decimal" }, "policyDigest": { "$ref": "#/$defs/Sha256Hex" }, "capabilityDigest": { "$ref": "#/$defs/Sha256Hex" }, "state": { "enum": ["effective", "disabled", "mismatch", "unavailable", "recovery_required"] }, "activeRuntimes": { "type": "integer", "minimum": 0 } }
+        }
       }
     },
     "PostAuthFrame": {
@@ -781,7 +837,12 @@
             "operation.approval_request",
             "event.batch",
             "event.gap",
-            "device.health"
+            "device.health",
+            "privilege.installation_attestation",
+            "privilege.policy_attestation",
+            "privilege.ticket_request",
+            "privilege.ticket_result",
+            "privilege.receipt"
           ]
         },
         "correlationId": { "type": "string", "maxLength": 128 },
@@ -861,6 +922,26 @@
         {
           "if": { "properties": { "type": { "const": "device.health" } }, "required": ["type"] },
           "then": { "properties": { "payload": { "$ref": "#/$defs/DeviceHealthPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "privilege.installation_attestation" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/PrivilegeInstallationAttestationPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "privilege.policy_attestation" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/PrivilegePolicyAttestationPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "privilege.ticket_request" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/PrivilegeTicketRequestPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "privilege.ticket_result" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/PrivilegeTicketResultPayload" } } }
+        },
+        {
+          "if": { "properties": { "type": { "const": "privilege.receipt" } }, "required": ["type"] },
+          "then": { "properties": { "payload": { "$ref": "#/$defs/PrivilegeReceiptPayload" } } }
         }
       ]
     }

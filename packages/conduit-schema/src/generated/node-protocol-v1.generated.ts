@@ -43,7 +43,12 @@ export type PostAuthFrame = {
     | "operation.approval_request"
     | "event.batch"
     | "event.gap"
-    | "device.health";
+    | "device.health"
+    | "privilege.installation_attestation"
+    | "privilege.policy_attestation"
+    | "privilege.ticket_request"
+    | "privilege.ticket_result"
+    | "privilege.receipt";
   correlationId?: string;
   controlAppliedThrough?: U64Decimal;
   payloadDigest: Sha256Hex;

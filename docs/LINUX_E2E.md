@@ -32,10 +32,10 @@ account.
    and Queue bindings; the Rust E2E starts a real Node IPC service. For an
    interactive run, start `pnpm --filter @conduit/control-plane dev`, then
    `conduit-node serve` with an owner-only launch-policy file.
-2. **Enroll `sahur-pc`:** the Device ceremony tests generate an Ed25519 key,
-   prove the complete JCS transcript and retain the private key locally. A live
-   run additionally needs a real passkey and owner approval at the configured
-   origin.
+2. **Enroll an example Linux Node:** the Device ceremony tests generate an
+   Ed25519 key, prove the complete JCS transcript and retain the private key
+   locally. A live run additionally needs a real passkey and owner approval at
+   the configured origin.
 3. **Multi-Source Project:** API/schema tests cover Project, Source and opaque
    Location records. Node workspace tests bind each Location revision to its
    Device-local canonical path and reject stale or changed filesystem identity.
@@ -119,3 +119,6 @@ Record these separately for each host and deployment:
 
 Do not attach Device databases, canonical private paths, credentials, raw
 prompts, hidden reasoning or unredacted logs to public evidence.
+
+A sanitized remote Cloudflare execution record is available in
+[`CLOUDFLARE_E2E_REPORT.md`](CLOUDFLARE_E2E_REPORT.md).

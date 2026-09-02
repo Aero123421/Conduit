@@ -39,4 +39,6 @@ unavailable prerequisites without claiming provider support:
 
 Start with [`docs/LINUX_OPERATIONS.md`](docs/LINUX_OPERATIONS.md) for local
 development, deployment, installation, Runtime setup, security, backup and
-recovery. Domain and protocol design documents are under [`docs/`](docs/).
+recovery. The sanitized live deployment evidence is recorded in
+[`docs/CLOUDFLARE_E2E_REPORT.md`](docs/CLOUDFLARE_E2E_REPORT.md). Domain and
+protocol design documents are under [`docs/`](docs/).

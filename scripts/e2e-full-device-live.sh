@@ -407,6 +407,57 @@ grep -Eq '"activeRuntimeCount"[[:space:]]*:[[:space:]]*1' \
   echo "package update lost active elevated Runtime custody" >&2
   exit 4
 }
+
+# Force a post-replacement compatibility failure from a root-owned candidate.
+# The candidate succeeds only from its staging path, so the installed probe
+# fails after replacement and must restore every previous package inode.
+conduit_rollback_candidate="$conduit_root_stage/rollback-candidate"
+sudo -n install -d -o root -g root -m 0700 "$conduit_rollback_candidate"
+conduit_rollback_helper="$conduit_user_evidence/rollback-helper"
+printf '%s\n' \
+  '#!/bin/sh' \
+  'case "$0" in' \
+  '  /var/lib/conduit-full-device-e2e/run.*/rollback-candidate/conduit-privileged-helper)' \
+  '    [ "$1" = admin ] && [ "$2" = package-check ] && exit 0' \
+  '    ;;' \
+  'esac' \
+  'exit 42' > "$conduit_rollback_helper"
+chmod 0700 "$conduit_rollback_helper"
+sudo -n install -o root -g root -m 0755 \
+  "$conduit_rollback_helper" \
+  "$conduit_rollback_candidate/conduit-privileged-helper"
+sudo -n install -o root -g root -m 0755 \
+  "$conduit_package_root/bin/conduit-privileged-exec" \
+  "$conduit_rollback_candidate/conduit-privileged-exec"
+conduit_helper_hash_before="$(sudo -n sha256sum /usr/libexec/conduit/conduit-privileged-helper | cut -d' ' -f1)"
+set +e
+sudo -n env CONDUIT_BUILD_DIR="$conduit_rollback_candidate" \
+  "$conduit_package_root/installers/update-privileged.sh" \
+  > "$conduit_user_evidence/rollback-update.txt" 2>&1
+conduit_rollback_status=$?
+set -e
+[[ $conduit_rollback_status -eq 4 ]] || {
+  echo "live injected update did not fail at the installed compatibility probe" >&2
+  exit 4
+}
+conduit_helper_hash_after="$(sudo -n sha256sum /usr/libexec/conduit/conduit-privileged-helper | cut -d' ' -f1)"
+[[ "$conduit_helper_hash_before" = "$conduit_helper_hash_after" ]] || {
+  echo "live package rollback did not restore the helper binary" >&2
+  exit 4
+}
+sudo -n find /var/lib/conduit/privileged-helper/package-upgrades \
+  -mindepth 2 -maxdepth 2 -type f -name result -exec grep -Fxq rolled_back {} \; -print \
+  | grep -F /result >/dev/null || {
+  echo "live package rollback omitted durable rolled_back evidence" >&2
+  exit 4
+}
+sudo -n "$conduit_helper" admin package-status --uid "$(id -u)" --output json \
+  > "$conduit_user_evidence/active-after-rollback.json"
+grep -Eq '"activeRuntimeCount"[[:space:]]*:[[:space:]]*1' \
+  "$conduit_user_evidence/active-after-rollback.json" || {
+  echo "live package rollback lost active elevated Runtime custody" >&2
+  exit 4
+}
 set +e
 sudo -n "$conduit_package_root/installers/uninstall-privileged.sh" \
   > "$conduit_user_evidence/active-uninstall.txt" 2>&1
@@ -424,7 +475,18 @@ grep -Eq '"activeRuntimeCount"[[:space:]]*:[[:space:]]*1' \
   echo "helper restart did not preserve active elevated Runtime custody" >&2
   exit 4
 }
-printf '%s\n' '{"schemaVersion":1,"activeUpdate":{"passed":true,"custodyBefore":1,"custodyAfter":1,"activationRestarted":false},"activeUninstall":{"passed":true,"refused":true,"exitStatus":3},"helperServiceRestart":{"passed":true,"custodyBefore":1,"custodyAfter":1}}' \
+conduit_helper_pid="$(systemctl show --property MainPID --value "conduit-privileged-helper@$(id -u).service")"
+[[ "$conduit_helper_pid" =~ ^[1-9][0-9]*$ ]] || {
+  echo "helper service omitted its live process identity" >&2
+  exit 4
+}
+sudo -n ss -H -a -n -t -u -p > "$conduit_user_evidence/ip-sockets.local"
+if grep -F "pid=$conduit_helper_pid," "$conduit_user_evidence/ip-sockets.local" >/dev/null; then
+  echo "privileged helper unexpectedly owns an IP socket" >&2
+  exit 4
+fi
+rm -f "$conduit_user_evidence/ip-sockets.local"
+printf '%s\n' '{"schemaVersion":1,"activeUpdate":{"passed":true,"custodyBefore":1,"custodyAfter":1,"activationRestarted":false},"rollback":{"passed":true,"postReplacementFailureInjected":true,"previousBinaryRestored":true,"activeCustodyPreserved":true},"activeUninstall":{"passed":true,"refused":true,"exitStatus":3},"helperServiceRestart":{"passed":true,"custodyBefore":1,"custodyAfter":1},"networkIsolation":{"passed":true,"helperIpSockets":0}}' \
   > "$conduit_user_evidence/packaging-live-summary.json"
 chmod 0600 "$conduit_user_evidence/packaging-live-summary.json"
 

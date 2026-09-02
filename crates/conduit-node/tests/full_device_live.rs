@@ -24,7 +24,7 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     env, fs,
-    os::unix::fs::{OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     thread,
     time::Duration,
@@ -625,7 +625,7 @@ fn root_marker(
             create_plan.clone(),
         )
         .unwrap();
-    let created = provider
+    let _created = provider
         .start_privileged(
             &prepared.runtime,
             ticket(
@@ -640,6 +640,8 @@ fn root_marker(
         )
         .unwrap();
     thread::sleep(Duration::from_millis(300));
+    let marker_owner = fs::metadata(&marker).unwrap().uid();
+    assert_eq!(marker_owner, 0);
     let _ = provider
         .attach_reconciled_privileged(create_plan, create_request.spec_digest)
         .unwrap();
@@ -683,7 +685,8 @@ fn root_marker(
     let _ = provider
         .attach_reconciled_privileged(remove_plan, remove_request.spec_digest)
         .unwrap();
-    json!({"passed":true,"createdByUid":created.final_helper_receipt().claims.effective_uid,
+    json!({"passed":true,"createdByUid":marker_owner,
+        "startReceiptVerified":true,
         "independentSignedCleanup":true,"cleanupLaunchUid":removed.final_helper_receipt().claims.effective_uid})
 }
 

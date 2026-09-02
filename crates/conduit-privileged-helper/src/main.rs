@@ -36,22 +36,41 @@ fn run() -> conduit_privileged_helper::Result<()> {
     }
 }
 fn serve(args: &[String]) -> conduit_privileged_helper::Result<()> {
-    let policy = path_arg(args, "--policy", "/etc/conduit/privileged-policy.json");
-    let keys = path_arg(args, "--ticket-keys", "/etc/conduit/ticket-keys.json");
-    let receipt = path_arg(
-        args,
-        "--receipt-key",
-        "/var/lib/conduit/privileged/receipt.key",
-    );
-    let node_key = path_arg(args, "--node-public-key", "/etc/conduit/node-public.key");
-    let journal_path = path_arg(
-        args,
-        "--journal",
-        "/var/lib/conduit/privileged/helper.sqlite3",
-    );
-    let state = path_arg(args, "--state-dir", "/var/lib/conduit/privileged");
+    let expected_uid: u32 = value_arg(args, "--expected-uid")
+        .ok_or_else(|| {
+            conduit_privileged_helper::HelperError::Policy("--expected-uid required".into())
+        })?
+        .parse()
+        .map_err(|_| {
+            conduit_privileged_helper::HelperError::Policy("invalid expected uid".into())
+        })?;
+    let config_base = PathBuf::from("/etc/conduit/privileged-helper.d");
+    let state_default =
+        PathBuf::from("/var/lib/conduit/privileged-helper").join(expected_uid.to_string());
+    let policy = value_arg(args, "--policy")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config_base.join(format!("{expected_uid}.json")));
+    let keys = value_arg(args, "--ticket-keys")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config_base.join(format!("{expected_uid}.ticket-keys.json")));
+    let node_key = value_arg(args, "--node-public-key")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| config_base.join(format!("{expected_uid}.node-public.key")));
+    let state = value_arg(args, "--state-dir")
+        .map(PathBuf::from)
+        .unwrap_or(state_default);
+    let receipt = value_arg(args, "--receipt-key")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.join("receipt.key"));
+    let journal_path = value_arg(args, "--journal")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| state.join("helper.sqlite3"));
     let socket = path_arg(args, "--socket", "/run/conduit/privileged-helper.sock");
-    let worker = env::current_exe()?;
+    let worker = path_arg(
+        args,
+        "--exec-worker",
+        "/usr/libexec/conduit/conduit-privileged-exec",
+    );
     let signing = load_receipt_key_root_owned(&receipt)?;
     let config = HelperConfig::load_policy_root_owned(
         &policy,
@@ -59,6 +78,11 @@ fn serve(args: &[String]) -> conduit_privileged_helper::Result<()> {
         state,
         worker,
     )?;
+    if config.policy.uid != expected_uid {
+        return Err(conduit_privileged_helper::HelperError::Policy(
+            "systemd instance uid differs from root policy".into(),
+        ));
+    }
     let pinned = PinnedTicketKeys::load_root_owned(&keys)?;
     let journal = HelperJournal::open_root_owned(&journal_path)?;
     let node = load_public(&node_key)?;

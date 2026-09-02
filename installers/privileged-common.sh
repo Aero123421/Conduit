@@ -158,8 +158,13 @@ conduit_privileged_render_unit() {
 
 conduit_privileged_package_status() {
   local conduit_helper="$1"
+  local conduit_uid="${2:-}"
   local conduit_output
-  conduit_output="$($conduit_helper admin package-status --output json)" || {
+  local -a conduit_status_args=(admin package-status --output json)
+  if [[ -n "$conduit_uid" ]]; then
+    conduit_status_args+=(--uid "$conduit_uid")
+  fi
+  conduit_output="$($conduit_helper "${conduit_status_args[@]}")" || {
     conduit_privileged_fail "installed helper could not report durable package custody"
     return 4
   }

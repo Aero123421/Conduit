@@ -58,34 +58,64 @@ if ((!conduit_purge)) && [[ -n "$conduit_purge_confirmation" ]]; then
   exit 2
 fi
 
-conduit_privileged_package_status "$conduit_privileged_helper"
-if ((conduit_privileged_active_runtime_count != 0 && !conduit_terminate_active)); then
-  echo "uninstall refused: elevated Runtime custody is active" >&2
-  echo "stop each Runtime normally, or repeat with the explicit --terminate-active root action" >&2
-  exit 3
-fi
-if ((conduit_privileged_active_runtime_count != 0)); then
-  "$conduit_privileged_helper" admin stop-active --output json >/dev/null || {
-    echo "helper could not produce terminal custody for every active elevated Runtime" >&2
-    exit 4
-  }
-  conduit_privileged_package_status "$conduit_privileged_helper"
-  ((conduit_privileged_active_runtime_count == 0)) || {
-    echo "uninstall refused: active elevated Runtime custody remains after stop-active" >&2
-    exit 4
-  }
-fi
-
 conduit_policy_root="$(conduit_privileged_target "$conduit_privileged_config_dir")"
 shopt -s nullglob
 conduit_policy_files=("$conduit_policy_root"/*.json)
 shopt -u nullglob
 conduit_policy_uids=()
 for conduit_policy in "${conduit_policy_files[@]}"; do
-  conduit_uid="$(basename "$conduit_policy" .json)"
-  conduit_privileged_validate_uid "$conduit_uid"
-  conduit_policy_uids+=("$conduit_uid")
+  conduit_policy_name="$(basename "$conduit_policy")"
+  if [[ "$conduit_policy_name" =~ ^([0-9]+)\.json$ ]]; then
+    conduit_uid="${BASH_REMATCH[1]}"
+    conduit_privileged_validate_uid "$conduit_uid"
+    conduit_policy_uids+=("$conduit_uid")
+  fi
 done
+
+conduit_privileged_active_runtime_count=0
+if ((${#conduit_policy_uids[@]} == 0)); then
+  # DESTDIR fixtures and an unprepared package have no per-UID policy yet.
+  conduit_privileged_package_status "$conduit_privileged_helper"
+else
+  conduit_total_active_runtime_count=0
+  for conduit_uid in "${conduit_policy_uids[@]}"; do
+    conduit_privileged_package_status "$conduit_privileged_helper" "$conduit_uid"
+    conduit_total_active_runtime_count=$((
+      conduit_total_active_runtime_count + conduit_privileged_active_runtime_count
+    ))
+  done
+  conduit_privileged_active_runtime_count="$conduit_total_active_runtime_count"
+fi
+if ((conduit_privileged_active_runtime_count != 0 && !conduit_terminate_active)); then
+  echo "uninstall refused: elevated Runtime custody is active" >&2
+  echo "stop each Runtime normally, or repeat with the explicit --terminate-active root action" >&2
+  exit 3
+fi
+if ((conduit_privileged_active_runtime_count != 0)); then
+  if ((${#conduit_policy_uids[@]} == 0)); then
+    "$conduit_privileged_helper" admin stop-active --output json >/dev/null || {
+      echo "helper could not produce terminal custody for every active elevated Runtime" >&2
+      exit 4
+    }
+    conduit_privileged_package_status "$conduit_privileged_helper"
+    ((conduit_privileged_active_runtime_count == 0)) || {
+      echo "uninstall refused: active elevated Runtime custody remains after stop-active" >&2
+      exit 4
+    }
+  else
+    for conduit_uid in "${conduit_policy_uids[@]}"; do
+      "$conduit_privileged_helper" admin stop-active --uid "$conduit_uid" --output json >/dev/null || {
+        echo "helper could not produce terminal custody for every active elevated Runtime" >&2
+        exit 4
+      }
+      conduit_privileged_package_status "$conduit_privileged_helper" "$conduit_uid"
+      ((conduit_privileged_active_runtime_count == 0)) || {
+        echo "uninstall refused: active elevated Runtime custody remains after stop-active" >&2
+        exit 4
+      }
+    done
+  fi
+fi
 
 if [[ -z "$conduit_privileged_destdir" ]]; then
   for conduit_uid in "${conduit_policy_uids[@]}"; do
@@ -113,10 +143,19 @@ if [[ -z "$conduit_privileged_destdir" ]]; then
 fi
 
 if ((conduit_purge)); then
-  "$conduit_privileged_helper" admin purge --output json >/dev/null || {
-    echo "helper refused the explicit state purge" >&2
-    exit 4
-  }
+  if ((${#conduit_policy_uids[@]} == 0)); then
+    "$conduit_privileged_helper" admin purge --output json >/dev/null || {
+      echo "helper refused the explicit state purge" >&2
+      exit 4
+    }
+  else
+    for conduit_uid in "${conduit_policy_uids[@]}"; do
+      "$conduit_privileged_helper" admin purge --uid "$conduit_uid" --output json >/dev/null || {
+        echo "helper refused the explicit state purge" >&2
+        exit 4
+      }
+    done
+  fi
 fi
 
 for conduit_target in \

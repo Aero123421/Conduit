@@ -232,8 +232,12 @@ cargo test --locked -p conduit-node --test full_device_live \
   -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
 
 conduit_issuer_key="$conduit_user_evidence/issuer-public-key.json"
+conduit_issuer_jwk="$conduit_user_evidence/issuer-public-jwk.json"
 conduit_registration_approval="$conduit_user_evidence/registration-approval.json"
-for conduit_registration_evidence in "$conduit_issuer_key" "$conduit_registration_approval"; do
+for conduit_registration_evidence in \
+  "$conduit_issuer_key" \
+  "$conduit_issuer_jwk" \
+  "$conduit_registration_approval"; do
   [[ -f "$conduit_registration_evidence" && ! -L "$conduit_registration_evidence" ]] || {
     echo "registration phase omitted required public activation evidence" >&2
     exit 4
@@ -283,7 +287,7 @@ grep -Eq '"status"[[:space:]]*:[[:space:]]*"active"' "$conduit_registration_appr
 # root actions. Neither action is exposed through the remote Control Plane.
 sudo -n "$conduit_helper" admin pin-ticket-key \
   --uid "$(id -u)" \
-  --issuer-key-file "$conduit_issuer_key" \
+  --issuer-key-file "$conduit_issuer_jwk" \
   --expected-fingerprint "$conduit_issuer_fingerprint" \
   --output json > "$conduit_user_evidence/root-key-pin.json"
 sudo -n "$conduit_helper" admin policy \

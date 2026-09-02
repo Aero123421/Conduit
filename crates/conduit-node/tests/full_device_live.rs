@@ -99,6 +99,7 @@ fn registration() {
         "crv":"Ed25519",
         "x":URL_SAFE_NO_PAD.encode(issuer.verifying_key().as_bytes())
     });
+    write_json(&evidence.join("issuer-public-jwk.json"), &public_jwk);
     write_json(
         &evidence.join("issuer-public-key.json"),
         &json!({

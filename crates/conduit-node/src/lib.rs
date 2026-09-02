@@ -10,17 +10,23 @@ pub mod startup;
 pub mod transport;
 
 use conduit_node_store::{AdmissionResult, NodeStore, OperationState, StoreError};
+use conduit_privileged_protocol::{
+    ApprovalEnforcement, LocalExecutionPlan, PROTOCOL, PrivilegeTicket, PrivilegedOperation,
+    SignedCapability,
+};
 use conduit_runtime::{
     InteractiveRuntime, LaunchPlan, PreparedRuntime, RuntimeError, RuntimeHandle, RuntimeProvider,
     RuntimeRequest, RuntimeState, RuntimeStateReceipt,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
     collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
 use thiserror::Error;
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 #[derive(Debug, Error)]
 pub enum NodeError {
@@ -72,6 +78,122 @@ pub struct RecoveredOperation {
     pub journal_state: OperationState,
 }
 
+/// A privilege ticket and helper capability that have been verified against
+/// both signing keys and every Device-local execution commitment. Fields are
+/// private so callers cannot bypass `verify` and accidentally remove the
+/// ordinary Node's fail-closed `full_device` guard.
+#[derive(Debug, Clone)]
+pub struct VerifiedPrivilegedAdmission {
+    ticket: PrivilegeTicket,
+    plan: LocalExecutionPlan,
+    capability: SignedCapability,
+}
+
+impl VerifiedPrivilegedAdmission {
+    #[allow(clippy::too_many_arguments)]
+    pub fn verify(
+        offer: &OperationOffer,
+        approval_policy: &str,
+        expected_device_id: &str,
+        expected_origin: &str,
+        ticket_verification_key: &[u8; 32],
+        receipt_verification_key: &[u8; 32],
+        ticket: PrivilegeTicket,
+        plan: LocalExecutionPlan,
+        capability: SignedCapability,
+    ) -> Result<Self, NodeError> {
+        ticket
+            .verify(ticket_verification_key)
+            .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
+        capability
+            .verify(receipt_verification_key)
+            .map_err(|_| NodeError::Rejected("privileged_helper_registration_missing".into()))?;
+        plan.validate()
+            .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
+        let plan_digest = plan
+            .digest()
+            .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
+        let launch_digest = digest_jcs(&offer.launch)?;
+        let idempotency_key_digest = hex::encode(Sha256::digest(offer.idempotency_key.as_bytes()));
+        let now = OffsetDateTime::now_utc();
+        let not_before = OffsetDateTime::parse(&ticket.claims.not_before, &Rfc3339)
+            .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
+        let expires_at = OffsetDateTime::parse(&ticket.claims.expires_at, &Rfc3339)
+            .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
+        if now < not_before {
+            return Err(NodeError::Rejected("privilege_ticket_invalid".into()));
+        }
+        if now >= expires_at {
+            return Err(NodeError::Rejected("privilege_ticket_expired".into()));
+        }
+        let claims = &ticket.claims;
+        let helper = &capability.claims;
+        let exact = claims.protocol == PROTOCOL
+            && helper.protocol == PROTOCOL
+            && helper.enabled
+            && helper.systemd_system_manager
+            && helper.socket_peer_credentials
+            && helper.transient_units
+            && claims.origin == expected_origin
+            && claims.installation_id == helper.installation_id
+            && claims.helper_key_id == helper.receipt_key_id
+            && claims.helper_policy_revision == helper.policy_revision
+            && claims.helper_policy_digest == helper.policy_digest
+            && claims.device_id == expected_device_id
+            && claims.uid == unsafe { libc::geteuid() }
+            && claims.operation_id == offer.operation_id
+            && claims.idempotency_key_digest == idempotency_key_digest
+            && claims.request_digest == offer.request_digest
+            && claims.run_id == offer.runtime.run_id
+            && claims.runtime_id == offer.runtime.runtime_id
+            && claims.runtime_spec_digest == offer.runtime.spec_digest
+            && claims.launch_plan_digest == launch_digest
+            && claims.local_execution_plan_digest == plan_digest
+            && claims.device_policy_revision == offer.local_policy_revision
+            && claims.access_scope == "full_device"
+            && claims.approval_mode == approval_policy
+            && claims.allowed_operation == PrivilegedOperation::Start
+            && claims.controller_epoch > 0
+            && plan.operation_id == offer.operation_id
+            && plan.run_id == offer.runtime.run_id
+            && plan.runtime_id == offer.runtime.runtime_id
+            && plan.helper_protocol == PROTOCOL;
+        if !exact {
+            return Err(NodeError::Rejected("privilege_ticket_invalid".into()));
+        }
+        if matches!(
+            claims.approval_enforcement,
+            ApprovalEnforcement::Unavailable
+        ) {
+            return Err(NodeError::Rejected(
+                "full_device_approval_enforcement_unavailable".into(),
+            ));
+        }
+        if approval_policy == "never" && !helper.never_opt_in {
+            return Err(NodeError::Rejected(
+                "full_device_never_local_opt_in_required".into(),
+            ));
+        }
+        Ok(Self {
+            ticket,
+            plan,
+            capability,
+        })
+    }
+
+    pub fn ticket(&self) -> &PrivilegeTicket {
+        &self.ticket
+    }
+
+    pub fn plan(&self) -> &LocalExecutionPlan {
+        &self.plan
+    }
+
+    pub fn capability(&self) -> &SignedCapability {
+        &self.capability
+    }
+}
+
 /// Runtime registry is selected locally. A remote request cannot introduce an
 /// arbitrary provider executable or weaken a missing required capability.
 pub struct Node {
@@ -105,6 +227,79 @@ impl Node {
                 "full_device_capability_unavailable".into(),
             ));
         }
+        self.admit_inner(offer, provider_id, access_scope, approval_policy)
+    }
+
+    pub fn admit_privileged_pending(
+        &self,
+        offer: &OperationOffer,
+        provider_id: &str,
+        approval_policy: &str,
+        capability: &SignedCapability,
+        receipt_verification_key: &[u8; 32],
+    ) -> Result<AdmissionReceipt, NodeError> {
+        capability
+            .verify(receipt_verification_key)
+            .map_err(|_| NodeError::Rejected("privileged_helper_registration_missing".into()))?;
+        let helper = &capability.claims;
+        if capability.key_id != helper.receipt_key_id
+            || helper.protocol != PROTOCOL
+            || !helper.enabled
+            || !helper.systemd_system_manager
+            || !helper.socket_peer_credentials
+            || !helper.transient_units
+        {
+            return Err(NodeError::Rejected(
+                "full_device_capability_unavailable".into(),
+            ));
+        }
+        if provider_id != "privileged-native"
+            || offer.runtime.kind != conduit_runtime::RuntimeKind::Native
+        {
+            return Err(NodeError::Rejected("runtime_provider_unavailable".into()));
+        }
+        self.admit_inner(offer, provider_id, "full_device", approval_policy)
+    }
+
+    pub fn bind_privileged_authority(
+        &self,
+        offer: &OperationOffer,
+        authority: &VerifiedPrivilegedAdmission,
+    ) -> Result<(), NodeError> {
+        let ticket = authority.ticket();
+        let capability = authority.capability();
+        let signed_ticket =
+            serde_jcs::to_vec(ticket).map_err(|error| NodeError::Rejected(error.to_string()))?;
+        let local_plan = serde_jcs::to_vec(authority.plan())
+            .map_err(|error| NodeError::Rejected(error.to_string()))?;
+        let ticket_digest = ticket
+            .digest()
+            .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
+        self.store.bind_privileged_operation(
+            &offer.idempotency_key,
+            &ticket.claims.installation_id,
+            ticket.claims.helper_policy_revision,
+            &ticket.claims.helper_policy_digest,
+            &capability.claims.receipt_key_id,
+            &ticket.claims.ticket_id,
+            &ticket_digest,
+            &signed_ticket,
+            &ticket.claims.runtime_spec_digest,
+            &ticket.claims.launch_plan_digest,
+            &ticket.claims.local_execution_plan_digest,
+            &local_plan,
+            ticket.claims.controller_epoch,
+        )?;
+        Ok(())
+    }
+
+    fn admit_inner(
+        &self,
+        offer: &OperationOffer,
+        provider_id: &str,
+        access_scope: &str,
+        approval_policy: &str,
+    ) -> Result<AdmissionReceipt, NodeError> {
         if !self.providers.contains_key(provider_id) {
             return Err(NodeError::Rejected("runtime_provider_unavailable".into()));
         }
@@ -705,6 +900,12 @@ fn receipt_commitment(receipt: &AdmissionReceipt) -> Result<String, NodeError> {
     )))
 }
 
+fn digest_jcs(value: &impl Serialize) -> Result<String, NodeError> {
+    Ok(hex::encode(Sha256::digest(
+        serde_jcs::to_vec(value).map_err(|error| NodeError::Rejected(error.to_string()))?,
+    )))
+}
+
 fn value_commitment(value: &serde_json::Value) -> Result<String, NodeError> {
     use sha2::{Digest, Sha256};
     Ok(hex::encode(Sha256::digest(
@@ -715,12 +916,18 @@ fn value_commitment(value: &serde_json::Value) -> Result<String, NodeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use conduit_privileged_protocol::{
+        CapabilityClaims, FileIdentity, PrivilegeTicketClaims, ResourceCeilings, SignedClaims,
+        StdioMode,
+    };
     use conduit_runtime::{
         IoMode, NativeProvider, NetworkMode, ProcessSupervisor, ResourceLimits, RuntimeKind,
         RuntimeSignal,
     };
+    use ed25519_dalek::SigningKey;
     use serde_json::json;
     use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
     use tempfile::tempdir;
 
     fn offer(cwd: &std::path::Path) -> OperationOffer {
@@ -784,6 +991,170 @@ mod tests {
         request.request_digest = digest;
         request.manifest = serde_jcs::to_vec(&manifest).unwrap();
         request
+    }
+
+    fn privileged_authority(
+        request: &OperationOffer,
+    ) -> (
+        SigningKey,
+        SigningKey,
+        PrivilegeTicket,
+        LocalExecutionPlan,
+        SignedCapability,
+    ) {
+        let ticket_key = SigningKey::from_bytes(&[7; 32]);
+        let receipt_key = SigningKey::from_bytes(&[9; 32]);
+        let resources = ResourceCeilings {
+            cpu_quota_per_sec_usec: None,
+            memory_max_bytes: None,
+            tasks_max: None,
+            io_weight: None,
+            runtime_max_usec: None,
+        };
+        let file = |path: &str| FileIdentity {
+            opaque_path_id: path.into(),
+            device: 1,
+            inode: 1,
+            mode: 0o100755,
+            uid: unsafe { libc::geteuid() },
+            size: 1,
+            sha256: "11".repeat(32),
+        };
+        let plan = LocalExecutionPlan {
+            plan_version: 1,
+            runtime_id: request.runtime.runtime_id.clone(),
+            run_id: request.runtime.run_id.clone(),
+            operation_id: request.operation_id.clone(),
+            executable: file("opaque-executable"),
+            interpreter: None,
+            argv: vec!["probe".into()],
+            cwd: file("opaque-cwd"),
+            systemd_unit: "conduit-elevated-test.service".into(),
+            adapter_id: None,
+            environment: BTreeMap::new(),
+            environment_value_digests: BTreeMap::new(),
+            workspaces: vec![],
+            credentials: vec![],
+            stdio: StdioMode::Pipes,
+            resources: resources.clone(),
+            helper_protocol: PROTOCOL.into(),
+            helper_min_version: "0.1.0".into(),
+        };
+        let observed = OffsetDateTime::now_utc();
+        let capability = SignedClaims::sign(
+            "hkey_test0001",
+            CapabilityClaims {
+                protocol: PROTOCOL.into(),
+                helper_version: "0.1.0".into(),
+                installation_id: "phinst_test0001".into(),
+                receipt_key_id: "hkey_test0001".into(),
+                policy_revision: 3,
+                policy_digest: "22".repeat(32),
+                enabled: true,
+                observed_at: observed.format(&Rfc3339).unwrap(),
+                systemd_system_manager: true,
+                socket_peer_credentials: true,
+                transient_units: true,
+                cgroup_v2: true,
+                freeze: true,
+                pidfd: true,
+                openat2: true,
+                execveat: true,
+                pty: true,
+                stream_replay: true,
+                never_opt_in: true,
+                unrestricted_launch_opt_in: true,
+                unavailable_reason: None,
+            },
+            &receipt_key,
+        )
+        .unwrap();
+        let ticket = SignedClaims::sign(
+            "pkey_test0001",
+            PrivilegeTicketClaims {
+                protocol: PROTOCOL.into(),
+                ticket_id: "ptkt_test0001".into(),
+                issuer: "https://control.invalid".into(),
+                audience: "conduit-privileged-helper".into(),
+                origin: "https://control.invalid".into(),
+                installation_id: "phinst_test0001".into(),
+                helper_key_id: "hkey_test0001".into(),
+                helper_policy_revision: 3,
+                helper_policy_digest: "22".repeat(32),
+                device_id: "dev_test0001".into(),
+                device_key_id: "dkey_test0001".into(),
+                device_policy_revision: request.local_policy_revision,
+                uid: unsafe { libc::geteuid() },
+                operation_id: request.operation_id.clone(),
+                idempotency_key_digest: hex::encode(Sha256::digest(
+                    request.idempotency_key.as_bytes(),
+                )),
+                request_digest: request.request_digest.clone(),
+                run_id: request.runtime.run_id.clone(),
+                runtime_id: request.runtime.runtime_id.clone(),
+                runtime_spec_digest: request.runtime.spec_digest.clone(),
+                launch_plan_digest: digest_jcs(&request.launch).unwrap(),
+                local_execution_plan_digest: plan.digest().unwrap(),
+                controller_epoch: 4,
+                connector_policy_id: "cpol_test0001".into(),
+                connector_policy_revision: 2,
+                project_id: None,
+                assignment_id: None,
+                access_scope: "full_device".into(),
+                approval_mode: "never".into(),
+                approval_receipt_digest: None,
+                approval_enforcement: ApprovalEnforcement::ExactCommand,
+                required_risk_classes: vec![],
+                allowed_operation: PrivilegedOperation::Start,
+                resource_ceilings: resources,
+                not_before: (observed - time::Duration::seconds(1))
+                    .format(&Rfc3339)
+                    .unwrap(),
+                expires_at: (observed + time::Duration::minutes(1))
+                    .format(&Rfc3339)
+                    .unwrap(),
+                nonce: "ticket-nonce-test0001".into(),
+            },
+            &ticket_key,
+        )
+        .unwrap();
+        (ticket_key, receipt_key, ticket, plan, capability)
+    }
+
+    #[test]
+    fn privileged_authority_is_exact_and_signature_bound() {
+        let directory = tempdir().unwrap();
+        let request = offer(directory.path());
+        let (ticket_key, receipt_key, ticket, plan, capability) = privileged_authority(&request);
+        VerifiedPrivilegedAdmission::verify(
+            &request,
+            "never",
+            "dev_test0001",
+            "https://control.invalid",
+            ticket_key.verifying_key().as_bytes(),
+            receipt_key.verifying_key().as_bytes(),
+            ticket.clone(),
+            plan.clone(),
+            capability.clone(),
+        )
+        .unwrap();
+
+        let mut changed = ticket;
+        changed.claims.runtime_id = "rt_other0001".into();
+        assert!(matches!(
+            VerifiedPrivilegedAdmission::verify(
+                &request,
+                "never",
+                "dev_test0001",
+                "https://control.invalid",
+                ticket_key.verifying_key().as_bytes(),
+                receipt_key.verifying_key().as_bytes(),
+                changed,
+                plan,
+                capability,
+            ),
+            Err(NodeError::Rejected(reason)) if reason == "privilege_ticket_invalid"
+        ));
     }
 
     #[test]

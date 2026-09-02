@@ -278,7 +278,8 @@ pub enum ControlEffectResult {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrivilegeTicketRequestRecord {
     pub request_id: String,
-    pub idempotency_key: String,
+    pub operation_idempotency_key: String,
+    pub ticket_idempotency_key: String,
     pub request_digest: String,
     pub request_payload: Vec<u8>,
     pub state: String,
@@ -317,6 +318,8 @@ pub struct PrivilegedOperationBinding {
 pub struct PrivilegedReceiptRecord {
     pub receipt_digest: String,
     pub idempotency_key: String,
+    pub ticket_id: String,
+    pub ticket_digest: String,
     pub runtime_id: String,
     pub state_revision: u64,
     pub transition: String,
@@ -1131,7 +1134,8 @@ impl NodeStore {
     pub fn reserve_privilege_ticket_request(
         &self,
         request_id: &str,
-        idempotency_key: &str,
+        operation_idempotency_key: &str,
+        ticket_idempotency_key: &str,
         request_digest: &str,
         request_payload: &[u8],
     ) -> Result<PrivilegeTicketRequestResult, StoreError> {
@@ -1140,6 +1144,8 @@ impl NodeStore {
             || request_id.len() > 128
             || request_payload.is_empty()
             || request_payload.len() > MAX_EVENT_BYTES
+            || ticket_idempotency_key.len() < 16
+            || ticket_idempotency_key.len() > 256
         {
             return Err(StoreError::Invalid(
                 "invalid privilege ticket request fields".into(),
@@ -1149,11 +1155,12 @@ impl NodeStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sql)?;
-        if query_operation(&transaction, idempotency_key)?.is_none() {
+        if query_operation(&transaction, operation_idempotency_key)?.is_none() {
             return Err(StoreError::NotFound);
         }
         if let Some(existing) = query_privilege_ticket_request(&transaction, request_id)? {
-            if existing.idempotency_key != idempotency_key
+            if existing.operation_idempotency_key != operation_idempotency_key
+                || existing.ticket_idempotency_key != ticket_idempotency_key
                 || existing.request_digest != request_digest
                 || existing.request_payload != request_payload
             {
@@ -1168,8 +1175,8 @@ impl NodeStore {
         }
         let conflicting = transaction
             .query_row(
-                "SELECT 1 FROM privilege_ticket_requests WHERE idempotency_key=?1 LIMIT 1",
-                [idempotency_key],
+                "SELECT 1 FROM privilege_ticket_requests WHERE ticket_idempotency_key=?1 LIMIT 1",
+                [ticket_idempotency_key],
                 |_| Ok(()),
             )
             .optional()
@@ -1179,8 +1186,8 @@ impl NodeStore {
             return Err(StoreError::IdempotencyConflict);
         }
         transaction.execute(
-            "INSERT INTO privilege_ticket_requests(request_id,idempotency_key,request_digest,request_payload,state) VALUES(?1,?2,?3,?4,'pending')",
-            params![request_id,idempotency_key,request_digest,request_payload],
+            "INSERT INTO privilege_ticket_requests(request_id,operation_idempotency_key,ticket_idempotency_key,request_digest,request_payload,state) VALUES(?1,?2,?3,?4,?5,'pending')",
+            params![request_id,operation_idempotency_key,ticket_idempotency_key,request_digest,request_payload],
         ).map_err(map_sql)?;
         let record = query_privilege_ticket_request(&transaction, request_id)?
             .ok_or_else(|| StoreError::Corrupt("privilege ticket request missing".into()))?;
@@ -1304,8 +1311,8 @@ impl NodeStore {
         }
         let issued_ticket = transaction
             .query_row(
-                "SELECT ticket_id,ticket_digest,signed_ticket FROM privilege_ticket_requests WHERE idempotency_key=?1 AND state='issued'",
-                [idempotency_key],
+                "SELECT ticket_id,ticket_digest,signed_ticket FROM privilege_ticket_requests WHERE operation_idempotency_key=?1 AND ticket_id=?2 AND state='issued'",
+                params![idempotency_key,ticket_id],
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?)),
             )
             .optional()
@@ -1355,6 +1362,8 @@ impl NodeStore {
         &self,
         idempotency_key: &str,
         receipt_digest: &str,
+        ticket_id: &str,
+        ticket_digest: &str,
         runtime_id: &str,
         state_revision: u64,
         transition: &str,
@@ -1362,10 +1371,13 @@ impl NodeStore {
         signed_receipt: &[u8],
     ) -> Result<PrivilegedReceiptRecord, StoreError> {
         validate_digest(receipt_digest)?;
+        validate_digest(ticket_digest)?;
         if let Some(digest) = previous_receipt_digest {
             validate_digest(digest)?;
         }
-        if runtime_id.is_empty()
+        if ticket_id.is_empty()
+            || ticket_id.len() > 128
+            || runtime_id.is_empty()
             || runtime_id.len() > 128
             || state_revision == 0
             || transition.is_empty()
@@ -1379,8 +1391,20 @@ impl NodeStore {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(map_sql)?;
-        let binding =
+        let _binding =
             query_privileged_binding(&transaction, idempotency_key)?.ok_or(StoreError::NotFound)?;
+        let issued_ticket = transaction
+            .query_row(
+                "SELECT ticket_digest FROM privilege_ticket_requests WHERE operation_idempotency_key=?1 AND ticket_id=?2 AND state='issued' LIMIT 1",
+                params![idempotency_key,ticket_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sql)?
+            .ok_or(StoreError::NotFound)?;
+        if issued_ticket != ticket_digest {
+            return Err(StoreError::IdempotencyConflict);
+        }
         let last = query_last_privileged_receipt(&transaction, idempotency_key)?;
         let expected_revision = last
             .as_ref()
@@ -1389,6 +1413,8 @@ impl NodeStore {
         if state_revision != expected_revision || previous_receipt_digest != expected_previous {
             if let Some(existing) = query_privileged_receipt(&transaction, receipt_digest)? {
                 if existing.idempotency_key == idempotency_key
+                    && existing.ticket_id == ticket_id
+                    && existing.ticket_digest == ticket_digest
                     && existing.runtime_id == runtime_id
                     && existing.state_revision == state_revision
                     && existing.transition == transition
@@ -1402,15 +1428,15 @@ impl NodeStore {
             return Err(StoreError::SequenceConflict);
         }
         transaction.execute(
-            "INSERT INTO privileged_receipt_chain(receipt_digest,idempotency_key,runtime_id,state_revision,transition,previous_receipt_digest,signed_receipt) VALUES(?1,?2,?3,?4,?5,?6,?7)",
-            params![receipt_digest,idempotency_key,runtime_id,state_revision,transition,previous_receipt_digest,signed_receipt],
+            "INSERT INTO privileged_receipt_chain(receipt_digest,idempotency_key,ticket_id,ticket_digest,runtime_id,state_revision,transition,previous_receipt_digest,signed_receipt) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)",
+            params![receipt_digest,idempotency_key,ticket_id,ticket_digest,runtime_id,state_revision,transition,previous_receipt_digest,signed_receipt],
         ).map_err(|error| match map_sql(error) {
             StoreError::Unavailable(_) => StoreError::IdempotencyConflict,
             other => other,
         })?;
         transaction.execute(
-            "UPDATE privileged_operation_bindings SET state=?2,updated_at=unixepoch() WHERE idempotency_key=?1 AND ticket_id=?3",
-            params![idempotency_key,transition,binding.ticket_id],
+            "UPDATE privileged_operation_bindings SET state=?2,updated_at=unixepoch() WHERE idempotency_key=?1",
+            params![idempotency_key,transition],
         ).map_err(map_sql)?;
         let record = query_privileged_receipt(&transaction, receipt_digest)?
             .ok_or_else(|| StoreError::Corrupt("privileged receipt missing".into()))?;
@@ -1440,7 +1466,7 @@ impl NodeStore {
     ) -> Result<Vec<PrivilegedReceiptRecord>, StoreError> {
         let connection = self.conn()?;
         let mut statement = connection.prepare(
-            "SELECT receipt_digest,idempotency_key,runtime_id,state_revision,transition,previous_receipt_digest,signed_receipt FROM privileged_receipt_chain WHERE idempotency_key=?1 ORDER BY state_revision",
+            "SELECT receipt_digest,idempotency_key,ticket_id,ticket_digest,runtime_id,state_revision,transition,previous_receipt_digest,signed_receipt FROM privileged_receipt_chain WHERE idempotency_key=?1 ORDER BY state_revision",
         ).map_err(map_sql)?;
         statement
             .query_map([idempotency_key], row_to_privileged_receipt)
@@ -2040,19 +2066,20 @@ fn query_privilege_ticket_request(
 ) -> Result<Option<PrivilegeTicketRequestRecord>, StoreError> {
     connection
         .query_row(
-            "SELECT request_id,idempotency_key,request_digest,request_payload,state,ticket_id,ticket_digest,signed_ticket,error_code FROM privilege_ticket_requests WHERE request_id=?1",
+            "SELECT request_id,operation_idempotency_key,ticket_idempotency_key,request_digest,request_payload,state,ticket_id,ticket_digest,signed_ticket,error_code FROM privilege_ticket_requests WHERE request_id=?1",
             [request_id],
             |row| {
                 Ok(PrivilegeTicketRequestRecord {
                     request_id: row.get(0)?,
-                    idempotency_key: row.get(1)?,
-                    request_digest: row.get(2)?,
-                    request_payload: row.get(3)?,
-                    state: row.get(4)?,
-                    ticket_id: row.get(5)?,
-                    ticket_digest: row.get(6)?,
-                    signed_ticket: row.get(7)?,
-                    error_code: row.get(8)?,
+                    operation_idempotency_key: row.get(1)?,
+                    ticket_idempotency_key: row.get(2)?,
+                    request_digest: row.get(3)?,
+                    request_payload: row.get(4)?,
+                    state: row.get(5)?,
+                    ticket_id: row.get(6)?,
+                    ticket_digest: row.get(7)?,
+                    signed_ticket: row.get(8)?,
+                    error_code: row.get(9)?,
                 })
             },
         )
@@ -2095,11 +2122,13 @@ fn row_to_privileged_receipt(row: &rusqlite::Row<'_>) -> rusqlite::Result<Privil
     Ok(PrivilegedReceiptRecord {
         receipt_digest: row.get(0)?,
         idempotency_key: row.get(1)?,
-        runtime_id: row.get(2)?,
-        state_revision: row.get(3)?,
-        transition: row.get(4)?,
-        previous_receipt_digest: row.get(5)?,
-        signed_receipt: row.get(6)?,
+        ticket_id: row.get(2)?,
+        ticket_digest: row.get(3)?,
+        runtime_id: row.get(4)?,
+        state_revision: row.get(5)?,
+        transition: row.get(6)?,
+        previous_receipt_digest: row.get(7)?,
+        signed_receipt: row.get(8)?,
     })
 }
 
@@ -2109,7 +2138,7 @@ fn query_privileged_receipt(
 ) -> Result<Option<PrivilegedReceiptRecord>, StoreError> {
     connection
         .query_row(
-            "SELECT receipt_digest,idempotency_key,runtime_id,state_revision,transition,previous_receipt_digest,signed_receipt FROM privileged_receipt_chain WHERE receipt_digest=?1",
+            "SELECT receipt_digest,idempotency_key,ticket_id,ticket_digest,runtime_id,state_revision,transition,previous_receipt_digest,signed_receipt FROM privileged_receipt_chain WHERE receipt_digest=?1",
             [receipt_digest],
             row_to_privileged_receipt,
         )
@@ -2123,7 +2152,7 @@ fn query_last_privileged_receipt(
 ) -> Result<Option<PrivilegedReceiptRecord>, StoreError> {
     connection
         .query_row(
-            "SELECT receipt_digest,idempotency_key,runtime_id,state_revision,transition,previous_receipt_digest,signed_receipt FROM privileged_receipt_chain WHERE idempotency_key=?1 ORDER BY state_revision DESC LIMIT 1",
+            "SELECT receipt_digest,idempotency_key,ticket_id,ticket_digest,runtime_id,state_revision,transition,previous_receipt_digest,signed_receipt FROM privileged_receipt_chain WHERE idempotency_key=?1 ORDER BY state_revision DESC LIMIT 1",
             [idempotency_key],
             row_to_privileged_receipt,
         )
@@ -2292,12 +2321,15 @@ CREATE TABLE IF NOT EXISTS control_effect_journal(
  CHECK(length(request_digest)=64), CHECK(length(target_digest)=64), CHECK(length(command) BETWEEN 1 AND 64),
  CHECK(controller_epoch>0), CHECK(expected_revision>0), CHECK(receipt IS NULL OR length(receipt)<=60000));
 CREATE TABLE IF NOT EXISTS privilege_ticket_requests(
- request_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE REFERENCES operations(idempotency_key) ON DELETE RESTRICT,
+ request_id TEXT PRIMARY KEY,
+ operation_idempotency_key TEXT NOT NULL REFERENCES operations(idempotency_key) ON DELETE RESTRICT,
+ ticket_idempotency_key TEXT NOT NULL UNIQUE,
  request_digest TEXT NOT NULL, request_payload BLOB NOT NULL,
  state TEXT NOT NULL CHECK(state IN ('pending','issued','rejected')),
  ticket_id TEXT UNIQUE, ticket_digest TEXT UNIQUE, signed_ticket BLOB, error_code TEXT,
  created_at INTEGER NOT NULL DEFAULT(unixepoch()), updated_at INTEGER NOT NULL DEFAULT(unixepoch()),
  CHECK(length(request_id) BETWEEN 1 AND 128), CHECK(length(request_digest)=64),
+ CHECK(length(ticket_idempotency_key) BETWEEN 16 AND 256),
  CHECK(length(request_payload) BETWEEN 1 AND 60000),
  CHECK(ticket_id IS NULL OR length(ticket_id) BETWEEN 1 AND 128),
  CHECK(ticket_digest IS NULL OR length(ticket_digest)=64),
@@ -2306,6 +2338,7 @@ CREATE TABLE IF NOT EXISTS privilege_ticket_requests(
  CHECK((state='pending' AND ticket_id IS NULL AND signed_ticket IS NULL AND error_code IS NULL)
     OR (state='issued' AND ticket_id IS NOT NULL AND ticket_digest IS NOT NULL AND signed_ticket IS NOT NULL AND error_code IS NULL)
     OR (state='rejected' AND ticket_id IS NULL AND ticket_digest IS NULL AND signed_ticket IS NULL AND error_code IS NOT NULL)));
+CREATE INDEX IF NOT EXISTS privilege_ticket_operation_idx ON privilege_ticket_requests(operation_idempotency_key,created_at);
 CREATE TABLE IF NOT EXISTS privileged_operation_bindings(
  idempotency_key TEXT PRIMARY KEY REFERENCES operations(idempotency_key) ON DELETE RESTRICT,
  installation_id TEXT NOT NULL, policy_revision INTEGER NOT NULL, policy_digest TEXT NOT NULL,
@@ -2320,11 +2353,13 @@ CREATE TABLE IF NOT EXISTS privileged_operation_bindings(
  CHECK(length(signed_ticket) BETWEEN 1 AND 60000));
 CREATE TABLE IF NOT EXISTS privileged_receipt_chain(
  receipt_digest TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL REFERENCES privileged_operation_bindings(idempotency_key) ON DELETE RESTRICT,
+ ticket_id TEXT NOT NULL, ticket_digest TEXT NOT NULL,
  runtime_id TEXT NOT NULL, state_revision INTEGER NOT NULL, transition TEXT NOT NULL,
  previous_receipt_digest TEXT, signed_receipt BLOB NOT NULL,
  created_at INTEGER NOT NULL DEFAULT(unixepoch()),
  UNIQUE(idempotency_key,state_revision),
- CHECK(length(receipt_digest)=64), CHECK(state_revision>0),
+ CHECK(length(receipt_digest)=64), CHECK(length(ticket_id) BETWEEN 1 AND 128),
+ CHECK(length(ticket_digest)=64), CHECK(state_revision>0),
  CHECK(length(transition) BETWEEN 1 AND 64),
  CHECK(previous_receipt_digest IS NULL OR length(previous_receipt_digest)=64),
  CHECK(length(signed_receipt) BETWEEN 1 AND 60000));
@@ -3104,18 +3139,36 @@ INSERT INTO agent_approval_journal(approval_id,idempotency_key,operation_digest,
             .unwrap();
         assert!(matches!(
             store
-                .reserve_privilege_ticket_request("ptreq_0001", key, &digest(2), b"ticket-request")
+                .reserve_privilege_ticket_request(
+                    "ptreq_0001",
+                    key,
+                    "ticket-idempotency-0001",
+                    &digest(2),
+                    b"ticket-request",
+                )
                 .unwrap(),
             PrivilegeTicketRequestResult::Reserved(_)
         ));
         assert!(matches!(
             store
-                .reserve_privilege_ticket_request("ptreq_0001", key, &digest(2), b"ticket-request")
+                .reserve_privilege_ticket_request(
+                    "ptreq_0001",
+                    key,
+                    "ticket-idempotency-0001",
+                    &digest(2),
+                    b"ticket-request",
+                )
                 .unwrap(),
             PrivilegeTicketRequestResult::Uncertain(_)
         ));
         assert!(matches!(
-            store.reserve_privilege_ticket_request("ptreq_0001", key, &digest(3), b"changed"),
+            store.reserve_privilege_ticket_request(
+                "ptreq_0001",
+                key,
+                "ticket-idempotency-0001",
+                &digest(3),
+                b"changed",
+            ),
             Err(StoreError::IdempotencyConflict)
         ));
         store
@@ -3146,6 +3199,8 @@ INSERT INTO agent_approval_journal(approval_id,idempotency_key,operation_digest,
             .append_privileged_receipt(
                 key,
                 &digest(8),
+                "ptkt_0001",
+                &digest(3),
                 "runtime_0001",
                 1,
                 "prepared",
@@ -3157,10 +3212,28 @@ INSERT INTO agent_approval_journal(approval_id,idempotency_key,operation_digest,
         drop(store);
 
         let reopened = NodeStore::open(directory.path()).unwrap();
+        reopened
+            .reserve_privilege_ticket_request(
+                "ptreq_0001_start",
+                key,
+                "ticket-idempotency-0001-start",
+                &digest(11),
+                b"start-ticket-request",
+            )
+            .unwrap();
+        reopened
+            .complete_privilege_ticket_request(
+                "ptreq_0001_start",
+                Some(("ptkt_0001_start", &digest(12), b"signed-start-ticket")),
+                None,
+            )
+            .unwrap();
         let second = reopened
             .append_privileged_receipt(
                 key,
                 &digest(9),
+                "ptkt_0001_start",
+                &digest(12),
                 "runtime_0001",
                 2,
                 "running",
@@ -3174,6 +3247,8 @@ INSERT INTO agent_approval_journal(approval_id,idempotency_key,operation_digest,
             reopened.append_privileged_receipt(
                 key,
                 &digest(10),
+                "ptkt_0001",
+                &digest(3),
                 "runtime_0001",
                 3,
                 "completed",
@@ -3193,7 +3268,13 @@ INSERT INTO agent_approval_journal(approval_id,idempotency_key,operation_digest,
             .reserve_operation("op_privileged_0002", key, &digest(1), b"{}", 7)
             .unwrap();
         store
-            .reserve_privilege_ticket_request("ptreq_0002", key, &digest(2), b"request")
+            .reserve_privilege_ticket_request(
+                "ptreq_0002",
+                key,
+                "ticket-idempotency-0002",
+                &digest(2),
+                b"request",
+            )
             .unwrap();
         store
             .complete_privilege_ticket_request(

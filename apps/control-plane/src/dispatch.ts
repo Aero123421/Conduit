@@ -107,7 +107,7 @@ async function repairOfferedProjection(env: ControlPlaneEnv, row: DispatchRow, r
   await env.DB.batch([
     env.DB.prepare("UPDATE operation_journal SET state='offered',updated_at=?1,result_json=?2 WHERE id=?3 AND state='queued' AND EXISTS (SELECT 1 FROM operation_dispatch_outbox WHERE operation_id=?3 AND state='offered')")
       .bind(now.toISOString(), JSON.stringify(response.delivery ?? {}), row.operation_id),
-    env.DB.prepare("UPDATE idempotency_records SET state='offered',response_json=?1 WHERE operation_id=?2 AND EXISTS (SELECT 1 FROM operation_dispatch_outbox WHERE operation_id=?2 AND state='offered')")
+    env.DB.prepare("UPDATE idempotency_records SET state='offered',response_json=?1 WHERE operation_id=?2 AND EXISTS (SELECT 1 FROM operation_dispatch_outbox WHERE operation_id=?2 AND state='offered') AND EXISTS (SELECT 1 FROM operation_journal WHERE id=?2 AND state='offered')")
       .bind(JSON.stringify(response), row.operation_id),
   ]);
 }
@@ -116,7 +116,7 @@ async function repairExpiredProjection(env: ControlPlaneEnv, row: DispatchRow, r
   await env.DB.batch([
     env.DB.prepare("UPDATE operation_journal SET state='expired',result_json=?1,updated_at=?2 WHERE id=?3 AND state='queued' AND EXISTS (SELECT 1 FROM operation_dispatch_outbox WHERE operation_id=?3 AND state='expired')")
       .bind(JSON.stringify(response), now.toISOString(), row.operation_id),
-    env.DB.prepare("UPDATE idempotency_records SET state='expired',response_json=?1 WHERE operation_id=?2 AND EXISTS (SELECT 1 FROM operation_dispatch_outbox WHERE operation_id=?2 AND state='expired')")
+    env.DB.prepare("UPDATE idempotency_records SET state='expired',response_json=?1 WHERE operation_id=?2 AND EXISTS (SELECT 1 FROM operation_dispatch_outbox WHERE operation_id=?2 AND state='expired') AND EXISTS (SELECT 1 FROM operation_journal WHERE id=?2 AND state='expired')")
       .bind(JSON.stringify(response), row.operation_id),
   ]);
   const projected = await operationRow(env, row.operation_id);
@@ -246,7 +246,7 @@ export async function reconcileOperationDispatches(
 ): Promise<DispatchReconcileResult> {
   const now = options.now ?? new Date();
   const limit = Math.min(Math.max(options.limit ?? MAX_RECONCILE_BATCH, 1), MAX_RECONCILE_BATCH);
-  const rows = await env.DB.prepare("SELECT outbox.operation_id FROM operation_dispatch_outbox AS outbox JOIN operation_journal AS operation ON operation.id=outbox.operation_id LEFT JOIN idempotency_records AS idem ON idem.operation_id=outbox.operation_id WHERE (outbox.state IN ('pending','dispatching') AND (outbox.expires_at<=?1 OR (outbox.state='pending' AND outbox.next_attempt_at<=?1) OR (outbox.state='dispatching' AND outbox.lease_expires_at<=?1))) OR (outbox.state='offered' AND (operation.state='queued' OR idem.state<>'offered')) OR (outbox.state='expired' AND (operation.state='queued' OR idem.state<>'expired' OR operation.concurrency_released_at IS NULL)) ORDER BY outbox.expires_at,outbox.next_attempt_at,outbox.operation_id LIMIT ?2")
+  const rows = await env.DB.prepare("SELECT outbox.operation_id FROM operation_dispatch_outbox AS outbox JOIN operation_journal AS operation ON operation.id=outbox.operation_id LEFT JOIN idempotency_records AS idem ON idem.operation_id=outbox.operation_id WHERE (operation.state IN ('queued','offered') AND outbox.state IN ('pending','dispatching') AND (outbox.expires_at<=?1 OR (outbox.state='pending' AND outbox.next_attempt_at<=?1) OR (outbox.state='dispatching' AND outbox.lease_expires_at<=?1))) OR (outbox.state='offered' AND (operation.state='queued' OR (operation.state='offered' AND idem.state<>'offered'))) OR (outbox.state='expired' AND (operation.state='queued' OR (operation.state='expired' AND (idem.state<>'expired' OR operation.concurrency_released_at IS NULL)))) ORDER BY outbox.expires_at,outbox.next_attempt_at,outbox.operation_id LIMIT ?2")
     .bind(now.toISOString(), limit)
     .all<{ operation_id: string }>();
   const result: DispatchReconcileResult = { examined: 0, offered: 0, pending: 0, expired: 0 };

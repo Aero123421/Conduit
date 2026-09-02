@@ -2,6 +2,7 @@ import { env, exports } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { parseWireDocumentText, schemaIds } from "@conduit/schema";
 import { base64url, canonicalJson, sha256Hex } from "../src/crypto.ts";
+import { reconcileOperationDispatches } from "../src/dispatch.ts";
 
 describe.sequential("DeviceRoom terminal and exact-control security projections", () => {
   it("rejects non-completed or invalid submissions, keeps missing submissions out of review, and terminalizes correlated control errors", async () => {
@@ -118,6 +119,9 @@ describe.sequential("DeviceRoom terminal and exact-control security projections"
     ]);
     const idempotency = await env.DB.prepare("SELECT state FROM idempotency_records WHERE operation_id=?1").bind(controlOperationId).first<{ state: string }>();
     expect(idempotency?.state).toBe("failed");
+    expect(await reconcileOperationDispatches(env, { now: new Date(Date.now() + 1_000) })).toMatchObject({ examined: 0 });
+    const reconciled = await env.DB.prepare("SELECT operation.state AS operation_state,idem.state AS idempotency_state FROM operation_journal AS operation JOIN idempotency_records AS idem ON idem.operation_id=operation.id WHERE operation.id=?1").bind(controlOperationId).first<Record<string, unknown>>();
+    expect(reconciled).toEqual({ operation_state: "failed", idempotency_state: "failed" });
     socket.close(1000, "complete");
   });
 });

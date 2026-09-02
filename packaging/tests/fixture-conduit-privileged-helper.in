@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == --version ]]; then
+  echo "conduit-privileged-helper @VERSION@"
+  exit 0
+fi
+
+[[ "${1:-}" == admin ]] || { echo "fixture accepts admin commands only" >&2; exit 2; }
+conduit_command="${2:-}"
+conduit_state="${CONDUIT_TEST_PRIVILEGED_STATE:?}"
+conduit_config="${CONDUIT_TEST_PRIVILEGED_CONFIG:?}"
+install -d -m 0700 "$conduit_state"
+conduit_active_file="$conduit_state/active-count"
+[[ -f "$conduit_active_file" ]] || printf '0\n' > "$conduit_active_file"
+
+case "$conduit_command" in
+  package-status)
+    conduit_active="$(<"$conduit_active_file")"
+    [[ "$conduit_active" =~ ^[0-9]+$ ]] || exit 4
+    printf '{"activeRuntimeCount":%s,"journalSchemaVersion":1,"protocolVersion":"@PROTOCOL@","version":"@VERSION@"}\n' "$conduit_active"
+    ;;
+  package-check)
+    conduit_installed_state=""
+    conduit_exec=""
+    shift 2
+    while (($#)); do
+      case "$1" in
+        --installed-state) conduit_installed_state="$2"; shift 2 ;;
+        --exec) conduit_exec="$2"; shift 2 ;;
+        --output) shift 2 ;;
+        *) exit 2 ;;
+      esac
+    done
+    [[ "$conduit_installed_state" == "$conduit_state" ]] || exit 4
+    [[ -x "$conduit_exec" && ! -L "$conduit_exec" ]] || exit 4
+    conduit_required_protocol="$(<"$conduit_state/required-protocol")"
+    [[ "@PROTOCOL@" -ge "$conduit_required_protocol" ]] || exit 4
+    if [[ "@FAIL_INSTALLED@" == 1 && "$0" == */usr/libexec/conduit/conduit-privileged-helper ]]; then
+      exit 70
+    fi
+    printf '{"compatible":true,"protocolVersion":"@PROTOCOL@"}\n'
+    ;;
+  stop-active)
+    printf '0\n' > "$conduit_active_file"
+    printf '{"stopped":true,"activeRuntimeCount":0}\n'
+    ;;
+  purge)
+    find "$conduit_state" -mindepth 1 -depth -delete
+    if [[ -d "$conduit_config" ]]; then
+      find "$conduit_config" -mindepth 1 -depth -delete
+    fi
+    printf '{"purged":true}\n'
+    ;;
+  *)
+    echo "unsupported fixture admin command: $conduit_command" >&2
+    exit 2
+    ;;
+esac

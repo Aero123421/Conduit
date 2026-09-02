@@ -30,3 +30,4 @@ for conduit_agent in codex claude opencode pi agy; do
 done
 
 echo "No daemon-backed provider lifecycle or paid Agent inference was started by this deterministic suite."
+echo "LIVE NOT RUN full_device: use scripts/e2e-full-device-live.sh on the dedicated authorized systemd host"

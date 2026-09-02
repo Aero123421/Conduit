@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == --version ]]; then
+  echo "conduit-privileged-exec @VERSION@"
+  exit 0
+fi
+echo "the packaging exec fixture is not a Runtime worker" >&2
+exit 2

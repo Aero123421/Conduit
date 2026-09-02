@@ -115,6 +115,73 @@ Doctor output distinguishes `effective`, `degraded`, and `unavailable`. An
 installed executable alone is not effective evidence. Provider and Agent live
 protocol probes remain opt-in where they could consume paid inference.
 
+### Privileged helper package
+
+Native host `full_device` does not run `conduit-node` as root. It uses the
+separate `conduit-privileged-helper` system service and the fixed
+`conduit-privileged-exec` worker. The helper is socket activated per Device UID
+at `/run/conduit/privileged/<uid>.sock`; the endpoint is owned by that UID with
+mode `0600`, while its parent remains root-owned. The helper service has a
+private network namespace and permits only `AF_UNIX`. Elevated target units are
+separate transient system units and intentionally represent broad host
+authority.
+
+Build both binaries from the reviewed commit:
+
+```sh
+cargo build --locked --release \
+  --bin conduit-privileged-helper \
+  --bin conduit-privileged-exec
+```
+
+The root installer refuses binaries, unit templates, or target ancestors that
+are symlinked, non-root-owned, or writable by group/other. Consequently, do not
+run a privileged installer directly from a mutable checkout. Copy the two
+release binaries, the four `installers/*privileged*.sh` files, and the two
+`packaging/systemd/conduit-privileged-helper@.*` units to a root-owned,
+mode-`0700` staging directory first. Invoke the staged installer locally as
+root with `CONDUIT_BUILD_DIR` pointing to its root-owned binary directory.
+
+Installation places the binaries below `/usr/libexec/conduit`, installs the
+system units, creates only empty root custody directories, and reloads systemd.
+It does not generate a key, create a policy, enable a socket, or grant Full
+Device authority. Identity and policy changes use the installed root-owned
+binary:
+
+```sh
+sudo /usr/libexec/conduit/conduit-privileged-helper admin prepare \
+  --uid "$(id -u)" --device-id dev_... --public-origin https://example.invalid \
+  --output json
+sudo /usr/libexec/conduit/conduit-privileged-helper admin enable \
+  --uid "$(id -u)" --output json
+sudo systemctl enable --now "conduit-privileged-helper@$(id -u).socket"
+```
+
+`prepare` output is a bounded public registration bundle; it never contains the
+receipt private key. Registration, fresh-Passkey approval, active ticket key,
+matching root policy, and a valid signed capability probe are still required
+before the Node may advertise `full_device`. Enabling the helper does not enable
+`full_device + never` or unrestricted elevated launch. Those remain separate
+root-local policy actions.
+
+Use `admin package-status --output json` before maintenance. The updater calls
+the candidate's read-only `admin package-check` against the installed journal
+and exec worker, then probes the installed files again before committing. It
+rejects protocol or journal downgrade. With active elevated Runtime custody it
+may atomically install a compatible package, but it does not restart the running
+helper or target units. Use `--activate-uid <uid>` only when the reported active
+count is zero.
+
+Uninstall fails closed when active elevated Runtime custody exists. The explicit
+`--terminate-active` action first requires terminal helper custody. Ordinary
+uninstall removes binaries and units but preserves root policy, keys, journal,
+and update evidence. Destructive removal additionally requires both `--purge`
+and `--confirm-purge DELETE-CONDUIT-PRIVILEGED-STATE`.
+
+`DESTDIR` install/update/uninstall never invoke systemd. Run
+`scripts/test-privileged-packaging.sh` for deterministic layout, symlink,
+compatibility, active-custody, rollback, preservation, and purge tests.
+
 ## Enrollment and identities
 
 Owner browser sessions, MCP OAuth grants, Device keys, and provider credentials

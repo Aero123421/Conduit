@@ -191,3 +191,4 @@ test -d "$XDG_CACHE_HOME/conduit"
 test "$(<"$XDG_DATA_HOME/conduit/packaging-marker")" = "original state"
 
 echo "packaging smoke passed"
+"$conduit_root/scripts/test-privileged-packaging.sh"

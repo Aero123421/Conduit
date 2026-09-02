@@ -120,5 +120,66 @@ Record these separately for each host and deployment:
 Do not attach Device databases, canonical private paths, credentials, raw
 prompts, hidden reasoning or unredacted logs to public evidence.
 
+## Full Device live root E2E
+
+`scripts/e2e-full-device-live.sh` is separate from ordinary CI. It runs reviewed
+code as root and is restricted by default to the dedicated `sahur-pc` host. It
+refuses a dirty checkout, commit mismatch, existing privileged-helper
+installation, missing systemd/cgroup-v2 support, or unavailable non-interactive
+local root authorization. It never substitutes a fake helper for a missing
+prerequisite.
+
+The test requires an isolated HTTPS Control Plane deployment and Device record:
+
+```sh
+export CONDUIT_FULL_DEVICE_E2E_CONTROL_URL=https://isolated-test.example
+export CONDUIT_FULL_DEVICE_E2E_DEVICE_ID=dev_...
+export CONDUIT_FULL_DEVICE_E2E_EXPECTED_COMMIT="$(git rev-parse HEAD)"
+./scripts/e2e-full-device-live.sh \
+  --i-understand-this-runs-reviewed-code-as-root
+```
+
+An optional `CONDUIT_FULL_DEVICE_E2E_CONTROL_CREDENTIAL_FILE` must be an
+absolute regular file owned by the Device user with mode `0600`. The script does
+not print or copy its contents.
+
+The orchestrator builds the exact commit, copies package inputs into a new
+root-owned staging directory, installs production paths, creates a helper
+installation through the installed admin binary, and then runs the ignored
+integration target in two mandatory phases:
+
+```sh
+cargo test --locked -p conduit-node --test full_device_live -- \
+  --ignored --exact full_device_live_systemd_root_e2e --nocapture
+```
+
+The `registration` phase creates and Owner-activates an issuer at the isolated
+Control Plane, approves the exact helper registration with fresh-Passkey
+evidence, and writes the bounded public issuer key. The script then invokes the
+installed root-owned helper to pin that exact key and, as a separate command,
+enable the root policy. Only after both root receipts are checked does it enable
+the real sequential-packet socket and enter the `exercise` phase. Remote routes
+cannot perform either root action.
+
+The driver receives only the documented `CONDUIT_FULL_DEVICE_E2E_*` paths,
+identifiers, and `registration`/`exercise` phase. It exercises the real
+Node/helper/systemd/Control Plane chain,
+including signed tickets and receipts, exact argv and I/O, PTY, controls, root
+marker confinement, same-user denial, Node/helper restart, response-loss replay,
+server/root `never` opt-ins, structured Agent separation, update/rollback with
+live custody, and active-run uninstall refusal. It writes a bounded sanitized
+`driver-summary.json` and leaves zero active elevated Runtimes.
+
+After the driver returns, the orchestrator records bounded package-status and
+`systemd-analyze security` evidence, verifies preservation uninstall, reinstalls,
+performs the explicit E2E purge, and checks every managed path is absent. If
+terminal custody cannot be proven during failure cleanup, it retains root-owned
+staging for explicit recovery instead of blindly deleting custody state.
+
+Public PR evidence may include the commit, generic host label, OS/kernel/systemd
+versions, protocol versions, counts, bounded reason codes, and receipt digests.
+It must omit user names, home paths, machine/boot IDs, hardware serials, IP
+addresses, credentials, local canonical paths, raw prompts, and private state.
+
 A sanitized remote Cloudflare execution record is available in
 [`CLOUDFLARE_E2E_REPORT.md`](CLOUDFLARE_E2E_REPORT.md).

@@ -43,7 +43,7 @@ interface InstallationRow {
   status: string;
 }
 
-const NEVER_DENIAL_CODE = "privileged_helper_policy_mismatch";
+const NEVER_DENIAL_CODE = "full_device_never_local_opt_in_required";
 
 function object(value: string, label: string): Record<string, unknown> {
   let parsed: unknown;

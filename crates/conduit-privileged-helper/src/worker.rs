@@ -67,10 +67,10 @@ pub fn run_exec_worker(record_path: &Path, public_key: &VerifyingKey) -> Result<
     }
     match record.claims.plan.stdio {
         StdioMode::Pipes => {
-            let fifo = record_path
+            let directory = record_path
                 .parent()
-                .ok_or_else(|| HelperError::Denied("record parent".into()))?
-                .join("stdin.fifo");
+                .ok_or_else(|| HelperError::Denied("record parent".into()))?;
+            let fifo = directory.join("stdin.fifo");
             let raw = unsafe {
                 libc::open(
                     CString::new(fifo.as_os_str().as_encoded_bytes())
@@ -83,11 +83,23 @@ pub fn run_exec_worker(record_path: &Path, public_key: &VerifyingKey) -> Result<
                 return Err(HelperError::Io(std::io::Error::last_os_error()));
             }
             let stdin = unsafe { OwnedFd::from_raw_fd(raw) };
+            let stdout = open_spool(&directory.join("stdout.spool"))?;
+            let stderr = open_spool(&directory.join("stderr.spool"))?;
             cvt(unsafe { libc::dup2(stdin.as_raw_fd(), libc::STDIN_FILENO) })?;
+            cvt(unsafe { libc::dup2(stdout.as_raw_fd(), libc::STDOUT_FILENO) })?;
+            cvt(unsafe { libc::dup2(stderr.as_raw_fd(), libc::STDERR_FILENO) })?;
             execute(&record.claims.plan)
         }
         StdioMode::Pty => run_pty_supervisor(record_path, &record.claims.plan),
     }
+}
+
+fn open_spool(path: &Path) -> Result<File> {
+    validate_regular(path, unsafe { libc::geteuid() }, 0o600)?;
+    OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(HelperError::Io)
 }
 
 fn run_pty_supervisor(record_path: &Path, plan: &LocalExecutionPlan) -> Result<()> {

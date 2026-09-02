@@ -187,14 +187,8 @@ impl SystemdManager for SystemdBackend {
             ("ExecStart", Value::new(exec)),
             ("KillMode", Value::new("control-group")),
             ("Restart", Value::new("no")),
-            (
-                "StandardOutput",
-                Value::new(format!("append:{}", spec.stdout_path)),
-            ),
-            (
-                "StandardError",
-                Value::new(format!("append:{}", spec.stderr_path)),
-            ),
+            ("StandardOutput", Value::new("null")),
+            ("StandardError", Value::new("null")),
         ];
         if let Some(value) = spec.resources.cpu_quota_per_sec_usec {
             properties.push(("CPUQuotaPerSecUSec", Value::new(value)));

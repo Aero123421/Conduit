@@ -646,6 +646,26 @@ wait "$conduit_node_pid" || true
 conduit_node_pid=0
 rm -f "$conduit_node_socket"
 
+# The production WebSocket exercise advances the durable Device connection
+# epoch and leaves its authenticated transport history in the DeviceRoom. The
+# following fault driver is a separate synthetic courier using that current
+# epoch, so clear only transport-local state after the real socket is closed.
+# D1 authority, Runtime receipts, and the monotonic Device epoch are preserved.
+curl --insecure --silent --show-error --fail-with-body --max-time 15 \
+  --request POST \
+  --header "Authorization: Bearer $conduit_control_token" \
+  --header 'Content-Type: application/json' \
+  --data-binary "{\"deviceId\":\"$conduit_device_id\"}" \
+  "$conduit_control_endpoint/__full-device-live/reset-transport" \
+  > "$conduit_user_evidence/isolated-transport-reset.json"
+grep -Eq '"authorityRecordsPreserved"[[:space:]]*:[[:space:]]*true' \
+  "$conduit_user_evidence/isolated-transport-reset.json" || {
+    echo "post-Node transport reset did not preserve authority records" >&2
+    exit 4
+  }
+printf '0' > "$conduit_user_evidence/control-plane-sequence"
+chmod 0600 "$conduit_user_evidence/control-plane-sequence"
+
 # The first process sends an authenticated Start frame and intentionally drops
 # its local seqpacket endpoint without receiving. It exits only after typed
 # systemd observation proves the root invocation exists. The second process

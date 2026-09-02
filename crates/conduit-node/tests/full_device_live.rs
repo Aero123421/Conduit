@@ -2320,6 +2320,7 @@ fn signed_frame(
     _identity: &DeviceIdentity,
 ) -> Value {
     let sequence = next_worker_sequence();
+    let connection_epoch = worker_connection_epoch();
     let message_digest = hex::encode(Sha256::digest(
         format!("{frame_type}:{correlation_id}:{sequence}").as_bytes(),
     ));
@@ -2327,7 +2328,7 @@ fn signed_frame(
         "protocol":"conduit.node/1",
         "messageId":format!("nmsg_{}", &message_digest[..24]),
         "deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),
-        "connectionEpoch":"1","direction":"node_to_control",
+        "connectionEpoch":connection_epoch,"direction":"node_to_control",
         "sequence":sequence.to_string(),"type":frame_type,
         "correlationId":correlation_id,
         "payloadDigest":hex::encode(Sha256::digest(serde_jcs::to_vec(&payload).unwrap())),
@@ -2336,12 +2337,30 @@ fn signed_frame(
 }
 
 fn sign_device_payload(frame_type: &str, payload: &Value, identity: &DeviceIdentity) -> String {
+    let connection_epoch = worker_connection_epoch();
     let transcript = json!({
         "domain":format!("conduit.{frame_type}.v1"),
         "deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),
-        "connectionEpoch":"1","payload":payload,
+        "connectionEpoch":connection_epoch,"payload":payload,
     });
     identity.sign(&serde_jcs::to_vec(&transcript).unwrap())
+}
+
+fn worker_connection_epoch() -> String {
+    let summary = evidence_dir().join("node-service-summary.json");
+    if !summary.exists() {
+        return "1".into();
+    }
+    let value = read_json(&summary);
+    value
+        .pointer("/running/connectionEpoch")
+        .and_then(|epoch| {
+            epoch
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| epoch.as_u64().map(|number| number.to_string()))
+        })
+        .expect("actual Node summary connection epoch")
 }
 
 fn signed_registration_payload(

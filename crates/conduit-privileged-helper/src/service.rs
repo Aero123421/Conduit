@@ -1209,14 +1209,35 @@ impl<M: SystemdManager> HelperEngine<M> {
                     continue;
                 }
                 let ticket = runtime.authority_ticket.clone();
-                let transition = if let Some(observation) = exact_observation {
+                // A structured Agent process may still be alive after the
+                // unprivileged Node restarts, but the adapter's pending
+                // request correlation is process-local.  Never claim that
+                // such a session was resumed merely because systemd still
+                // owns the process.  Preserve process custody and return a
+                // helper-signed recovery decision instead.  Exact command
+                // Runtimes have no adapter correlation and can be attached
+                // to the same invocation.
+                let adapter_state_lost = runtime.plan.adapter_id.is_some()
+                    && exact_observation.is_some_and(|value| {
+                        matches!(
+                            value.active_state.as_str(),
+                            "active" | "activating" | "running" | "frozen" | "paused"
+                        )
+                    });
+                let transition = if adapter_state_lost {
+                    "recovery_required"
+                } else if let Some(observation) = exact_observation {
                     receipt_transition(observation.active_state.as_str())
                 } else {
                     "recovery_required"
                 };
-                let state = exact_observation
-                    .map(|v| normalize_unit_state(&v.active_state))
-                    .unwrap_or("recovery_required");
+                let state = if adapter_state_lost {
+                    "recovery_required"
+                } else {
+                    exact_observation
+                        .map(|v| normalize_unit_state(&v.active_state))
+                        .unwrap_or("recovery_required")
+                };
                 let receipt = self.receipt(
                     &ticket,
                     "reconcile",
@@ -2042,6 +2063,64 @@ mod tests {
         }
         let replay = engine.start(start, plan.digest().unwrap()).unwrap();
         assert_eq!(replay, HelperResponse::Receipts(started));
+    }
+
+    #[test]
+    fn running_agent_reconcile_is_helper_signed_recovery_required_without_respawn() {
+        let (engine, backend, mut plan, issuer, receipt_key) = setup();
+        plan.adapter_id = Some("codex".into());
+        plan.launch_profile_id = None;
+        let prepared = ticket(
+            &engine,
+            &issuer,
+            &plan,
+            PrivilegedOperation::Prepare,
+            "ptkt_agent_prepare01",
+        );
+        engine.prepare(prepared, plan.clone(), vec![]).unwrap();
+        let started = ticket(
+            &engine,
+            &issuer,
+            &plan,
+            PrivilegedOperation::Start,
+            "ptkt_agent_start001",
+        );
+        engine.start(started, plan.digest().unwrap()).unwrap();
+        let starts_before = backend
+            .calls()
+            .into_iter()
+            .filter(|call| call.starts_with("start:"))
+            .count();
+
+        let HelperResponse::Receipts(receipts) =
+            engine.reconcile(vec![plan.runtime_id.clone()]).unwrap()
+        else {
+            panic!("agent reconcile receipts")
+        };
+        let final_receipt = receipts.last().unwrap();
+        final_receipt.verify(receipt_key.as_bytes()).unwrap();
+        assert_eq!(final_receipt.claims.transition, "recovery_required");
+        assert_eq!(
+            final_receipt.claims.invocation_id.as_deref(),
+            Some(format!("inv-{}", plan.systemd_unit).as_str())
+        );
+        assert_eq!(
+            backend
+                .calls()
+                .into_iter()
+                .filter(|call| call.starts_with("start:"))
+                .count(),
+            starts_before
+        );
+        assert_eq!(
+            engine
+                .journal
+                .runtime(&plan.runtime_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "recovery_required"
+        );
     }
 
     #[test]

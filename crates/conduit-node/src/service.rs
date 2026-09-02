@@ -770,6 +770,11 @@ impl NodeService {
         let message_counter = node.store().transport_positions()?.node_sent_through;
         let mut runtime_custody = HashMap::new();
         for admission in node.store().admissions()? {
+            if admission.provider_id == "privileged-native" {
+                // Root-owned custody is restored only after helper
+                // authentication and Control Plane issuer re-registration.
+                continue;
+            }
             let Ok(runtime) = serde_json::from_slice::<RuntimeRequest>(&admission.runtime_request)
             else {
                 continue;
@@ -1237,12 +1242,13 @@ impl NodeService {
                 }
             }
             "privilege.registration_result" => {
-                let privileged = self.privileged.as_ref().ok_or_else(|| {
+                let privileged = self.privileged.clone().ok_or_else(|| {
                     ServiceError::Unavailable("privileged_helper_not_installed".into())
                 })?;
                 privileged
                     .activate_registration(&frame.payload)
                     .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                self.reconcile_privileged_after_registration(client)?;
             }
             "privilege.ticket_result" => {
                 if let Err(error) = self.apply_privilege_ticket_result(client, &frame.payload) {
@@ -1486,6 +1492,322 @@ impl NodeService {
             payload,
             0,
         )?;
+        Ok(())
+    }
+
+    /// Re-establish root-owned Runtime custody after a Node restart.
+    ///
+    /// This deliberately runs only after `activate_registration`: persisted
+    /// ticket bytes are not enough to authenticate a new helper observation.
+    /// The re-registration result restores the Control Plane issuer keys,
+    /// then every helper receipt is checked against both that ticket and the
+    /// root-owned receipt key before any local or remote state is changed.
+    fn reconcile_privileged_after_registration(
+        &mut self,
+        client: &mut WssClient,
+    ) -> Result<(), ServiceError> {
+        let privileged = self
+            .privileged
+            .clone()
+            .ok_or_else(|| ServiceError::Unavailable("privileged_helper_not_installed".into()))?;
+        if !privileged.active() {
+            return Err(ServiceError::Unavailable(
+                "privileged_helper_registration_missing".into(),
+            ));
+        }
+        let admissions = self.node.store().nonterminal_admissions()?;
+        for admission in admissions
+            .into_iter()
+            .filter(|value| value.provider_id == "privileged-native")
+        {
+            let operation = admission.operation;
+            if operation.state == OperationState::Admitted {
+                // No helper start boundary was acknowledged. The ordinary
+                // offer replay will safely continue ticket issuance.
+                continue;
+            }
+            let runtime: RuntimeRequest = serde_json::from_slice(&admission.runtime_request)
+                .map_err(|_| ServiceError::Unavailable("durable_runtime_request_corrupt".into()))?;
+            let launch: LaunchPlan = serde_json::from_slice(&admission.launch_plan)
+                .map_err(|_| ServiceError::Unavailable("durable_launch_plan_corrupt".into()))?;
+            let op: WireOperation = serde_json::from_slice(&operation.manifest).map_err(|_| {
+                ServiceError::Unavailable("durable_operation_manifest_corrupt".into())
+            })?;
+            if op.operation_id != operation.operation_id
+                || op.idempotency_key != operation.idempotency_key
+                || op.payload_digest != operation.request_digest
+                || op
+                    .run_id
+                    .as_deref()
+                    .is_some_and(|value| value != runtime.run_id)
+            {
+                return Err(ServiceError::Unavailable(
+                    "privileged_runtime_recovery_identity_mismatch".into(),
+                ));
+            }
+            let binding = self
+                .node
+                .store()
+                .privileged_binding(&operation.idempotency_key)?
+                .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_required".into()))?;
+            let plan: conduit_privileged_protocol::LocalExecutionPlan =
+                serde_json::from_slice(&binding.local_plan).map_err(|_| {
+                    ServiceError::Unavailable("durable_privileged_plan_corrupt".into())
+                })?;
+            let plan_digest = plan
+                .digest()
+                .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+            if plan_digest != binding.local_plan_digest
+                || plan.runtime_id != runtime.runtime_id
+                || plan.run_id != runtime.run_id
+                || binding.runtime_spec_digest != runtime.spec_digest
+            {
+                return Err(ServiceError::Unavailable(
+                    "privileged_runtime_recovery_identity_mismatch".into(),
+                ));
+            }
+            let authority_ticket: PrivilegeTicket = serde_json::from_slice(&binding.signed_ticket)
+                .map_err(|_| ServiceError::Unavailable("privilege_ticket_invalid".into()))?;
+            let issuer_key = privileged
+                .issuer_key(&authority_ticket.key_id)
+                .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_invalid".into()))?;
+            authority_ticket
+                .verify(&issuer_key)
+                .map_err(|_| ServiceError::Unavailable("privilege_ticket_invalid".into()))?;
+            authority_ticket
+                .claims
+                .validate(&authority_ticket.key_id)
+                .map_err(|_| ServiceError::Unavailable("privilege_ticket_invalid".into()))?;
+            let authority_ticket_digest = authority_ticket
+                .digest()
+                .map_err(|_| ServiceError::Unavailable("privilege_ticket_invalid".into()))?;
+            if authority_ticket.claims.allowed_operation != PrivilegedOperation::Prepare
+                || authority_ticket.claims.ticket_id != binding.ticket_id
+                || authority_ticket_digest != binding.ticket_digest
+                || authority_ticket.claims.helper_installation_id != binding.installation_id
+                || authority_ticket.claims.helper_key_id != binding.helper_key_id
+                || authority_ticket.claims.helper_policy_revision != binding.policy_revision
+                || authority_ticket.claims.helper_policy_digest != binding.policy_digest
+                || authority_ticket.claims.operation_id != operation.operation_id
+                || authority_ticket.claims.operation_request_digest != operation.request_digest
+                || authority_ticket.claims.device_id != self.device_id
+                || authority_ticket.claims.run_id != runtime.run_id
+                || authority_ticket.claims.runtime_id != runtime.runtime_id
+                || authority_ticket.claims.runtime_spec_digest != binding.runtime_spec_digest
+                || authority_ticket.claims.launch_plan_digest != binding.launch_plan_digest
+                || authority_ticket.claims.local_execution_plan_digest != binding.local_plan_digest
+                || authority_ticket.claims.controller_epoch != binding.controller_epoch
+            {
+                return Err(ServiceError::Unavailable("privilege_ticket_invalid".into()));
+            }
+            let offer = OperationOffer {
+                operation_id: operation.operation_id.clone(),
+                idempotency_key: operation.idempotency_key.clone(),
+                request_digest: operation.request_digest.clone(),
+                manifest: operation.manifest.clone(),
+                local_policy_revision: operation.local_policy_revision,
+                runtime: runtime.clone(),
+                launch,
+            };
+            let reconciled = privileged
+                .provider()
+                .attach_reconciled_privileged(plan.clone(), runtime.spec_digest.clone())
+                .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+            let mut final_digest = None;
+            for receipt in &reconciled.helper_receipts {
+                let ticket_record = self
+                    .node
+                    .store()
+                    .privilege_ticket_for_operation(
+                        &operation.idempotency_key,
+                        &receipt.claims.ticket_id,
+                    )?
+                    .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_required".into()))?;
+                let signed_ticket = ticket_record
+                    .signed_ticket
+                    .as_deref()
+                    .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_required".into()))?;
+                let ticket: PrivilegeTicket = serde_json::from_slice(signed_ticket)
+                    .map_err(|_| ServiceError::Unavailable("privilege_ticket_invalid".into()))?;
+                let receipt_issuer_key = privileged
+                    .issuer_key(&ticket.key_id)
+                    .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_invalid".into()))?;
+                let digest = self.node.verify_and_record_privileged_receipt(
+                    &offer,
+                    receipt,
+                    privileged.receipt_key(),
+                    &receipt_issuer_key,
+                )?;
+                self.queue_privileged_receipt(client, receipt)?;
+                final_digest = Some(digest);
+            }
+            let final_receipt = reconciled.final_helper_receipt();
+            let final_digest = final_digest.ok_or_else(|| {
+                ServiceError::Unavailable("privileged_runtime_recovery_required".into())
+            })?;
+            let is_agent = op.capability == "agent.run.start";
+            self.privileged_custody.insert(
+                operation.operation_id.clone(),
+                PrivilegedCustodyContext {
+                    op,
+                    offer: offer.clone(),
+                    plan,
+                    run_manifest_digest: authority_ticket.claims.run_manifest_digest,
+                    is_agent,
+                },
+            );
+            let controller_epoch = final_receipt.claims.controller_epoch;
+            let revision = final_receipt.claims.state_revision;
+            match final_receipt.claims.transition.as_str() {
+                "running" | "resumed" | "paused" if !is_agent => {
+                    let runtime_state = if final_receipt.claims.transition == "paused" {
+                        RuntimeState::Paused
+                    } else {
+                        RuntimeState::Running
+                    };
+                    let handle = reconciled.runtime.handle.clone();
+                    if operation.state == OperationState::Starting {
+                        self.node.store().transition_operation(
+                            &operation.idempotency_key,
+                            OperationState::Starting,
+                            OperationState::Running,
+                            Some(&runtime.runtime_id),
+                            handle.process_identity.as_deref(),
+                            None,
+                        )?;
+                    }
+                    self.active.insert(
+                        operation.operation_id.clone(),
+                        Active {
+                            key: operation.idempotency_key.clone(),
+                            operation_id: operation.operation_id.clone(),
+                            run_id: runtime.run_id.clone(),
+                            request_digest: operation.request_digest.clone(),
+                            provider_id: "privileged-native".into(),
+                            handle: handle.clone(),
+                            journal_state: OperationState::Running,
+                            controller_epoch,
+                            revision,
+                        },
+                    );
+                    self.runtime_custody.insert(
+                        runtime.runtime_id.clone(),
+                        RuntimeCustody {
+                            start_operation_id: operation.operation_id.clone(),
+                            run_id: runtime.run_id.clone(),
+                            request_digest: operation.request_digest.clone(),
+                            provider_id: "privileged-native".into(),
+                            handle: handle.clone(),
+                            state: runtime_state,
+                            controller_epoch,
+                            revision,
+                        },
+                    );
+                    let mut status = running_status_payload(
+                        &operation.operation_id,
+                        &runtime.run_id,
+                        &operation.request_digest,
+                        &runtime.runtime_id,
+                        "privileged-native",
+                        &handle,
+                        controller_epoch,
+                        revision,
+                        false,
+                        "helper_reconciled_after_node_restart",
+                    )?;
+                    if runtime_state == RuntimeState::Paused {
+                        status["state"] = Value::String("paused".into());
+                    }
+                    status["privilegeReceiptDigest"] = Value::String(final_digest);
+                    let message_id = self.message_id();
+                    client.session.queue_outbound(
+                        &message_id,
+                        "operation.status",
+                        Some(operation.operation_id),
+                        status,
+                        0,
+                    )?;
+                }
+                transition => {
+                    self.privileged_custody.remove(&operation.operation_id);
+                    let terminal = match transition {
+                        "completed" => OperationState::Completed,
+                        "cancelled" => OperationState::Cancelled,
+                        "timed_out" => OperationState::TimedOut,
+                        "failed" => OperationState::Failed,
+                        "uncertain" => OperationState::Uncertain,
+                        _ => OperationState::RecoveryRequired,
+                    };
+                    let mut payload = json!({
+                        "operationId": operation.operation_id,
+                        "runId": runtime.run_id,
+                        "runtimeId": runtime.runtime_id,
+                        "state": terminal_state_name(terminal),
+                        "requestDigest": operation.request_digest,
+                        "lastRunEventSequence": operation.last_event_sequence.to_string(),
+                        "reasonCode": if terminal == OperationState::RecoveryRequired {
+                            "privileged_agent_protocol_state_not_resumable"
+                        } else {
+                            "helper_reconciled_after_node_restart"
+                        },
+                        "privilegeReceiptDigest": final_digest,
+                        "resultSummary": {
+                            "automaticReplay": false,
+                            "helperReconciliation": true,
+                            "systemdCustodyPreserved": final_receipt.claims.invocation_id.is_some()
+                        },
+                        "observedAt": now()
+                    });
+                    let receipt_digest = hex::encode(Sha256::digest(
+                        serde_jcs::to_vec(&payload).map_err(|_| TransportError::Malformed)?,
+                    ));
+                    payload["receiptDigest"] = Value::String(receipt_digest);
+                    let encoded =
+                        serde_jcs::to_vec(&payload).map_err(|_| TransportError::Malformed)?;
+                    let mut current = operation.state;
+                    if terminal == OperationState::Completed {
+                        if current == OperationState::Starting {
+                            self.node.store().transition_operation(
+                                &operation.idempotency_key,
+                                current,
+                                OperationState::Running,
+                                Some(&runtime.runtime_id),
+                                reconciled.runtime.handle.process_identity.as_deref(),
+                                None,
+                            )?;
+                            current = OperationState::Running;
+                        }
+                        if current == OperationState::Running {
+                            self.node.store().transition_operation(
+                                &operation.idempotency_key,
+                                current,
+                                OperationState::Finishing,
+                                Some(&runtime.runtime_id),
+                                None,
+                                None,
+                            )?;
+                            current = OperationState::Finishing;
+                        }
+                    }
+                    self.node.store().transition_operation(
+                        &operation.idempotency_key,
+                        current,
+                        terminal,
+                        Some(&runtime.runtime_id),
+                        None,
+                        Some(&encoded),
+                    )?;
+                    let message_id = self.message_id();
+                    client.session.queue_outbound(
+                        &message_id,
+                        "operation.terminal",
+                        Some(operation.operation_id),
+                        payload,
+                        0,
+                    )?;
+                }
+            }
+        }
         Ok(())
     }
 

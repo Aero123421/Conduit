@@ -215,7 +215,13 @@ impl HelperJournal {
             operation,
             runtime_id,
         )?;
-        transaction.execute("UPDATE runtimes SET authority_ticket=?2,updated_at=unixepoch() WHERE runtime_id=?1",params![runtime_id,serde_jcs::to_vec(ticket)?]).map_err(sql_error)?;
+        // Reconciliation observations are bound to the immutable launch
+        // authority.  Later input/control tickets authorize only their exact
+        // effect and must not replace the Start ticket used to sign a restart
+        // observation.
+        if operation == "start" {
+            transaction.execute("UPDATE runtimes SET authority_ticket=?2,updated_at=unixepoch() WHERE runtime_id=?1",params![runtime_id,serde_jcs::to_vec(ticket)?]).map_err(sql_error)?;
+        }
         let effect = query_effect(&transaction, &ticket.claims.ticket_id)?
             .ok_or_else(|| HelperError::Journal("durable effect admission missing".into()))?;
         transaction.commit().map_err(sql_error)?;
@@ -774,6 +780,80 @@ mod tests {
         .unwrap()
         .integrity_check()
         .unwrap();
+    }
+
+    #[test]
+    fn exact_control_ticket_does_not_replace_launch_reconciliation_authority() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let journal = HelperJournal::open_owned(directory.path().join("helper.sqlite3"), unsafe {
+            libc::geteuid()
+        })
+        .unwrap();
+        let (prepare, plan) = fixtures();
+        journal
+            .admit_prepare(
+                &prepare,
+                &prepare.digest().unwrap(),
+                &"71".repeat(32),
+                &plan.digest().unwrap(),
+                &plan,
+            )
+            .unwrap();
+        let key = SigningKey::from_bytes(&[7; 32]);
+        let start = SignedClaims::sign(
+            prepare.key_id.clone(),
+            PrivilegeTicketClaims {
+                ticket_id: "ptkt_journal_start01".into(),
+                allowed_operation: PrivilegedOperation::Start,
+                nonce: "nonce-journal-start".into(),
+                ..prepare.claims.clone()
+            },
+            &key,
+        )
+        .unwrap();
+        journal
+            .reserve_effect(
+                &start,
+                &start.digest().unwrap(),
+                &"72".repeat(32),
+                "start",
+                &plan.runtime_id,
+            )
+            .unwrap();
+        let control = SignedClaims::sign(
+            prepare.key_id,
+            PrivilegeTicketClaims {
+                ticket_id: "ptkt_journal_pause01".into(),
+                allowed_operation: PrivilegedOperation::Pause,
+                operation_id: "op_journal_pause01".into(),
+                operation_request_digest: "73".repeat(32),
+                control_digest: Some("73".repeat(32)),
+                nonce: "nonce-journal-pause".into(),
+                ..prepare.claims
+            },
+            &key,
+        )
+        .unwrap();
+        journal
+            .reserve_effect(
+                &control,
+                &control.digest().unwrap(),
+                &"74".repeat(32),
+                "pause",
+                &plan.runtime_id,
+            )
+            .unwrap();
+
+        let runtime = journal.runtime(&plan.runtime_id).unwrap().unwrap();
+        assert_eq!(
+            runtime.authority_ticket.claims.ticket_id,
+            start.claims.ticket_id
+        );
+        assert_eq!(
+            runtime.authority_ticket.claims.allowed_operation,
+            PrivilegedOperation::Start
+        );
     }
 
     #[test]

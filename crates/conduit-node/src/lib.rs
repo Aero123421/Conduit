@@ -945,38 +945,13 @@ impl Node {
                 .as_deref()
                 == Some("agent.run.start");
             if admission.provider_id == "privileged-native" {
-                let receipts = self.store.privileged_receipts(&operation.idempotency_key)?;
-                let last_receipt_digest = receipts
-                    .last()
-                    .map(|receipt| serde_json::Value::String(receipt.receipt_digest.clone()));
-                let mut evidence = serde_json::json!({
-                    "operationId": operation.operation_id,
-                    "runId": request.run_id,
-                    "runtimeId": request.runtime_id,
-                    "state": "recovery_required",
-                    "requestDigest": operation.request_digest,
-                    "lastRunEventSequence": operation.last_event_sequence.to_string(),
-                    "reasonCode": "privileged_runtime_recovery_required",
-                    "resultSummary": {
-                        "automaticReplay": false,
-                        "helperReconciliationRequired": true,
-                        "lastVerifiedHelperReceiptDigest": last_receipt_digest
-                    },
-                    "observedAt": time::OffsetDateTime::now_utc()
-                        .format(&time::format_description::well_known::Rfc3339)
-                        .map_err(|error| NodeError::Rejected(error.to_string()))?
-                });
-                evidence["receiptDigest"] = serde_json::Value::String(value_commitment(&evidence)?);
-                let encoded = serde_jcs::to_vec(&evidence)
-                    .map_err(|error| NodeError::Rejected(error.to_string()))?;
-                self.store.transition_operation(
-                    &operation.idempotency_key,
-                    operation.state,
-                    OperationState::RecoveryRequired,
-                    Some(&request.runtime_id),
-                    None,
-                    Some(&encoded),
-                )?;
+                // The ordinary provider registry cannot inspect root-owned
+                // systemd custody.  NodeService reconciles these admissions
+                // only after the helper is authenticated and the Control
+                // Plane has re-established the pinned ticket issuer keys.
+                // Inventing an unsigned recovery receipt here would destroy
+                // the evidence chain and make a healthy invocation
+                // impossible to attach after restart.
                 continue;
             }
             let handle = RuntimeHandle {
@@ -1628,6 +1603,60 @@ mod tests {
         provider
             .signal(&recovered[0].handle, RuntimeSignal::ForceStop)
             .unwrap();
+    }
+
+    #[test]
+    fn generic_restart_defers_privileged_custody_without_unsigned_state_change() {
+        let directory = tempdir().unwrap();
+        let store = NodeStore::open(directory.path().join("store")).unwrap();
+        let request = offer(directory.path());
+        let runtime = serde_jcs::to_vec(&request.runtime).unwrap();
+        let launch = serde_jcs::to_vec(&request.launch).unwrap();
+        store
+            .admit_operation(
+                &request.operation_id,
+                &request.idempotency_key,
+                &request.request_digest,
+                &request.manifest,
+                request.local_policy_revision,
+                "privileged-native",
+                "full_device",
+                "always",
+                &runtime,
+                &launch,
+                br#"{"receipt":"admitted"}"#,
+            )
+            .unwrap();
+        store
+            .transition_operation(
+                &request.idempotency_key,
+                OperationState::Admitted,
+                OperationState::Starting,
+                Some(&request.runtime.runtime_id),
+                None,
+                None,
+            )
+            .unwrap();
+        store
+            .transition_operation(
+                &request.idempotency_key,
+                OperationState::Starting,
+                OperationState::Running,
+                Some(&request.runtime.runtime_id),
+                Some("root-owned-systemd-invocation"),
+                None,
+            )
+            .unwrap();
+
+        let restarted = Node::new(store.clone());
+        assert!(restarted.recover_nonterminal().unwrap().is_empty());
+        let unchanged = store.operation(&request.idempotency_key).unwrap().unwrap();
+        assert_eq!(unchanged.state, OperationState::Running);
+        assert_eq!(
+            unchanged.process_identity.as_deref(),
+            Some("root-owned-systemd-invocation")
+        );
+        assert!(unchanged.receipt.is_none());
     }
 
     #[test]

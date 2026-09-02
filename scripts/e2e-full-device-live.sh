@@ -192,7 +192,6 @@ export CONDUIT_FULL_DEVICE_E2E_INSTALLER="$conduit_package_root/installers/insta
 export CONDUIT_FULL_DEVICE_E2E_UPDATER="$conduit_package_root/installers/update-privileged.sh"
 export CONDUIT_FULL_DEVICE_E2E_UNINSTALLER="$conduit_package_root/installers/uninstall-privileged.sh"
 export CONDUIT_FULL_DEVICE_E2E_EVIDENCE_DIR="$conduit_user_evidence"
-export CONDUIT_FULL_DEVICE_E2E_ROOT_STAGE="$conduit_root_stage"
 
 # Create the Device identity as the unprivileged Device user. Only the public
 # key is handed to the root helper; the private key remains mode 0600 locally.
@@ -493,7 +492,7 @@ chmod 0600 "$conduit_user_evidence/packaging-live-summary.json"
 export CONDUIT_FULL_DEVICE_E2E_PHASE=recover
 cargo test --locked -p conduit-node --test full_device_live \
   -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
-sudo -n test ! -e "$conduit_root_stage/root-marker"
+test ! -e "$conduit_user_evidence/root-marker"
 
 conduit_driver_summary="$conduit_user_evidence/driver-summary.json"
 [[ -f "$conduit_driver_summary" && ! -L "$conduit_driver_summary" ]] || {

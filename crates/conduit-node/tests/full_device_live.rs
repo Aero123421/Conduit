@@ -602,7 +602,7 @@ fn root_marker(
     bundle: &Value,
     evidence: &Path,
 ) -> Value {
-    let marker = PathBuf::from(required("CONDUIT_FULL_DEVICE_E2E_ROOT_STAGE")).join("root-marker");
+    let marker = evidence.join("root-marker");
     let (create_plan, create_request) = case_plan(
         "marker_create",
         existing(&["/usr/bin/touch", "/bin/touch"]),

@@ -603,10 +603,21 @@ fn root_marker(
     evidence: &Path,
 ) -> Value {
     let marker = evidence.join("root-marker");
+    let python = existing(&[
+        "/usr/bin/python3.12",
+        "/usr/bin/python3.11",
+        "/usr/bin/python3.10",
+    ]);
     let (create_plan, create_request) = case_plan(
         "marker_create",
-        existing(&["/usr/bin/touch", "/bin/touch"]),
-        vec!["touch".into(), marker.to_string_lossy().into()],
+        python.clone(),
+        vec![
+            "python3".into(),
+            "-u".into(),
+            "-c".into(),
+            "import pathlib,sys,time; pathlib.Path(sys.argv[1]).touch(exist_ok=False); time.sleep(120)".into(),
+            marker.to_string_lossy().into(),
+        ],
         StdioMode::Pipes,
         10_000_000,
         evidence,
@@ -625,7 +636,7 @@ fn root_marker(
             create_plan.clone(),
         )
         .unwrap();
-    let _created = provider
+    let created = provider
         .start_privileged(
             &prepared.runtime,
             ticket(
@@ -647,13 +658,26 @@ fn root_marker(
     }
     let marker_owner = fs::metadata(&marker).unwrap().uid();
     assert_eq!(marker_owner, 0);
-    let _ = provider
-        .attach_reconciled_privileged(create_plan, create_request.spec_digest)
-        .unwrap();
+    let created_stopped = stop(
+        provider,
+        issuer,
+        bundle,
+        &create_plan,
+        &create_request,
+        &created.runtime.handle,
+        RuntimeSignal::GracefulStop,
+        "ptkt_live_marker_create_stop",
+    );
     let (remove_plan, remove_request) = case_plan(
         "marker_remove",
-        existing(&["/usr/bin/rm", "/bin/rm"]),
-        vec!["rm".into(), "--".into(), marker.to_string_lossy().into()],
+        python,
+        vec![
+            "python3".into(),
+            "-u".into(),
+            "-c".into(),
+            "import pathlib,sys,time; pathlib.Path(sys.argv[1]).unlink(); time.sleep(120)".into(),
+            marker.to_string_lossy().into(),
+        ],
         StdioMode::Pipes,
         10_000_000,
         evidence,
@@ -686,13 +710,29 @@ fn root_marker(
             &remove_plan,
         )
         .unwrap();
-    thread::sleep(Duration::from_millis(300));
-    let _ = provider
-        .attach_reconciled_privileged(remove_plan, remove_request.spec_digest)
-        .unwrap();
+    for _ in 0..100 {
+        if !marker.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(!marker.exists());
+    let removed_stopped = stop(
+        provider,
+        issuer,
+        bundle,
+        &remove_plan,
+        &remove_request,
+        &removed.runtime.handle,
+        RuntimeSignal::GracefulStop,
+        "ptkt_live_marker_remove_stop",
+    );
     json!({"passed":true,"createdByUid":marker_owner,
-        "startReceiptVerified":true,
-        "independentSignedCleanup":true,"cleanupLaunchUid":removed.final_helper_receipt().claims.effective_uid})
+        "startReceiptVerified":created.final_helper_receipt().claims.effective_uid == Some(0),
+        "createTerminalReceiptVerified":created_stopped.runtime.state == RuntimeState::Stopped,
+        "independentSignedCleanup":true,
+        "cleanupLaunchUid":removed.final_helper_receipt().claims.effective_uid,
+        "cleanupTerminalReceiptVerified":removed_stopped.runtime.state == RuntimeState::Stopped})
 }
 
 fn structured_codex_agent(

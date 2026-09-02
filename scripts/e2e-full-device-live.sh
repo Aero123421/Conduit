@@ -574,8 +574,8 @@ grep -Eq '"activeRuntimeCountAfter"[[:space:]]*:[[:space:]]*0' \
 
 # Exercise the production NodeService/WssClient event loop, real Worker
 # upgrade route, DeviceRoom durable outbox, D1 projection, and privileged
-# helper. The operation is persisted and offered before Node connects, proving
-# that delivery is replayed from durable custody rather than process memory.
+# helper. Establish the independently approved helper/Device-policy binding
+# first: an older root operation must never bypass that fail-closed bootstrap.
 curl --insecure --silent --show-error --fail-with-body --max-time 15 \
   --request POST \
   --header "Authorization: Bearer $conduit_control_token" \
@@ -591,13 +591,6 @@ grep -Eq '"authorityRecordsPreserved"[[:space:]]*:[[:space:]]*true' \
 export CONDUIT_FULL_DEVICE_E2E_PHASE=node_prepare
 cargo test --locked -p conduit-node --test full_device_live \
   -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
-curl --insecure --silent --show-error --fail-with-body --max-time 15 \
-  --request POST \
-  --header "Authorization: Bearer $conduit_control_token" \
-  --header 'Content-Type: application/json' \
-  --data-binary "@$conduit_user_evidence/node-operation-intent.json" \
-  "$conduit_control_endpoint/__full-device-live/intent" \
-  > "$conduit_user_evidence/node-operation-custody.json"
 
 conduit_node_log="$conduit_user_evidence/node-service.log"
 conduit_node_socket="$conduit_user_evidence/node-ipc/node.sock"
@@ -616,6 +609,20 @@ conduit_start_node() {
   conduit_node_pid=$!
 }
 conduit_start_node
+export CONDUIT_FULL_DEVICE_E2E_PHASE=node_registered
+cargo test --locked -p conduit-node --test full_device_live \
+  -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+
+# Persist the exact root operation and its dispatch outbox before observing a
+# send or admission receipt. The live socket is already registered, so the
+# result cannot race ahead of the authority needed to validate it.
+curl --insecure --silent --show-error --fail-with-body --max-time 15 \
+  --request POST \
+  --header "Authorization: Bearer $conduit_control_token" \
+  --header 'Content-Type: application/json' \
+  --data-binary "@$conduit_user_evidence/node-operation-intent.json" \
+  "$conduit_control_endpoint/__full-device-live/intent" \
+  > "$conduit_user_evidence/node-operation-custody.json"
 export CONDUIT_FULL_DEVICE_E2E_PHASE=node_running
 cargo test --locked -p conduit-node --test full_device_live \
   -- --ignored --exact full_device_live_systemd_root_e2e --nocapture

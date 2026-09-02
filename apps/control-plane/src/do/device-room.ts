@@ -12,7 +12,7 @@ import { planReconciliationSets } from "../reconciliation-set.ts";
 import { usageProfileForEnv } from "../usage-profile.ts";
 import { instrumentD1, type InstrumentedD1 } from "../usage-instrumentation.ts";
 import type { ControlPlaneEnv } from "../types.ts";
-import { isPrivilegeFrameType, parsePrivilegeTransportFrame, privilegeDenialResult, privilegeRegistrationResultType, privilegeResultType, projectPrivilegeFrame, requireVerifiedPrivilegeReceipt, type PrivilegeTransportFrame } from "../privilege.ts";
+import { activePrivilegeRegistrationResult, isPrivilegeFrameType, parsePrivilegeTransportFrame, privilegeDenialResult, privilegeRegistrationResultType, privilegeResultType, projectPrivilegeFrame, requireVerifiedPrivilegeReceipt, type PrivilegeTransportFrame } from "../privilege.ts";
 
 type ProjectableDeviceFrame = NodeV1PostAuthFrame | PrivilegeTransportFrame;
 
@@ -1348,6 +1348,9 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       if (frame.type === "privilege.ticket_request") {
         const requestId = typeof frame.payload.requestId === "string" ? frame.payload.requestId : frame.messageId;
         await this.enqueueControlFrame(privilegeResultType(), result, requestId, new Date(Date.now() + 300_000).toISOString(), undefined, `cmsg_${requestId}`, frame.deviceId);
+      } else if (frame.type === "privilege.installation_attestation" && result.status === "active") {
+        const { state: _state, ...registration } = result;
+        await this.enqueueControlFrame(privilegeRegistrationResultType(), registration, String(result.installationId), new Date(Date.now() + 300_000).toISOString(), undefined, `cmsg_preg_${String(result.attestationDigest).slice(0, 16)}_${frame.connectionEpoch}`, frame.deviceId);
       }
       return;
     }
@@ -1844,7 +1847,8 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     const persistedDevice = this.ctx.storage.sql.exec<{ device_id: string }>("SELECT device_id FROM connection_state WHERE singleton=1").toArray()[0]?.device_id;
     const targetDevice = await this.env.DB.prepare("SELECT device_id FROM device_privilege_installations WHERE installation_id=?1 AND status='active' LIMIT 1").bind(installationId).first<{ device_id: string }>();
     if (targetDevice === null || (persistedDevice !== undefined && persistedDevice !== targetDevice.device_id)) throw new TypeError("privilege registration target conflicts with room identity");
-    return this.enqueueControlFrame(privilegeRegistrationResultType(), payload, installationId, new Date(Date.now() + 300_000).toISOString(), undefined, `cmsg_preg_${installationId}`, targetDevice.device_id);
+    const exact = await activePrivilegeRegistrationResult(this.env, installationId, typeof payload.attestationDigest === "string" ? payload.attestationDigest : undefined);
+    return this.enqueueControlFrame(privilegeRegistrationResultType(), exact, installationId, new Date(Date.now() + 300_000).toISOString(), undefined, `cmsg_preg_${String(exact.attestationDigest).slice(0, 24)}`, targetDevice.device_id);
   }
 
   async revoke(reason: string): Promise<void> {

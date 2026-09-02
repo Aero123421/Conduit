@@ -588,6 +588,13 @@ struct PendingReconciliation {
     control_applied_through: u64,
 }
 
+#[derive(Clone)]
+struct PendingPrivilegeRegistration {
+    revision: u64,
+    digest: String,
+    previous_digest: Option<String>,
+}
+
 pub struct NodeService {
     node: Arc<Node>,
     identity: Arc<DeviceIdentity>,
@@ -619,6 +626,7 @@ pub struct NodeService {
     health_frontier_dirty: bool,
     health_fault: Option<String>,
     privileged: Option<Arc<PrivilegedNodeRuntime>>,
+    pending_privilege_registration: Option<PendingPrivilegeRegistration>,
     credential_store: Option<Arc<CredentialStore>>,
     pending_privileged: HashMap<String, PendingPrivilegedStart>,
     privileged_custody: HashMap<String, PrivilegedCustodyContext>,
@@ -822,6 +830,7 @@ impl NodeService {
             health_frontier_dirty: false,
             health_fault: None,
             privileged: None,
+            pending_privilege_registration: None,
             credential_store: None,
             pending_privileged: HashMap::new(),
             privileged_custody: HashMap::new(),
@@ -1240,9 +1249,31 @@ impl NodeService {
                 let privileged = self.privileged.clone().ok_or_else(|| {
                     ServiceError::Unavailable("privileged_helper_not_installed".into())
                 })?;
+                let pending = self.pending_privilege_registration.clone().ok_or_else(|| {
+                    ServiceError::Unavailable("privileged_helper_registration_missing".into())
+                })?;
+                if frame.payload["devicePolicyRevision"].as_u64() != Some(pending.revision)
+                    || frame.payload["devicePolicyDigest"].as_str() != Some(pending.digest.as_str())
+                    || frame
+                        .payload
+                        .get("devicePolicyPreviousDigest")
+                        .and_then(Value::as_str)
+                        != pending.previous_digest.as_deref()
+                    || (pending.previous_digest.is_none()
+                        && !frame.payload["devicePolicyPreviousDigest"].is_null())
+                {
+                    return Err(ServiceError::Unavailable(
+                        "privileged_helper_policy_mismatch".into(),
+                    ));
+                }
                 privileged
                     .activate_registration(&frame.payload)
                     .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
+                self.node.store().commit_privilege_registration_state(
+                    pending.revision,
+                    &pending.digest,
+                    pending.previous_digest.as_deref(),
+                )?;
                 self.reconcile_privileged_after_registration(client)?;
             }
             "privilege.ticket_result" => {
@@ -1458,8 +1489,23 @@ impl NodeService {
         let Some(privileged) = self.privileged.as_ref() else {
             return Ok(());
         };
+        let summary =
+            serde_json::to_value(&self.local_policy).map_err(|_| TransportError::Malformed)?;
+        let digest = hex::encode(Sha256::digest(
+            serde_jcs::to_vec(&summary).map_err(|_| TransportError::Malformed)?,
+        ));
+        let accepted = self.node.store().privilege_registration_state()?;
+        let previous_digest = accepted.as_ref().and_then(|state| {
+            if state.device_policy_revision == self.local_policy.revision
+                && state.device_policy_digest == digest
+            {
+                state.previous_device_policy_digest.clone()
+            } else {
+                Some(state.device_policy_digest.clone())
+            }
+        });
         let request_id = format!(
-            "phreq_{}_{:08}",
+            "phreq_{}_{:08}_{:08}_{}",
             &privileged.capability().claims.installation_id[privileged
                 .capability()
                 .claims
@@ -1467,14 +1513,15 @@ impl NodeService {
                 .len()
                 .saturating_sub(8)..],
             privileged.capability().claims.policy_revision,
+            self.local_policy.revision,
+            &digest[..16],
         );
-        let summary =
-            serde_json::to_value(&self.local_policy).map_err(|_| TransportError::Malformed)?;
         let payload = privileged
             .registration_payload(
                 &request_id,
                 self.local_policy.revision,
                 summary,
+                previous_digest.as_deref(),
                 client.session.epoch(),
                 &self.identity,
             )
@@ -1487,6 +1534,11 @@ impl NodeService {
             payload,
             0,
         )?;
+        self.pending_privilege_registration = Some(PendingPrivilegeRegistration {
+            revision: self.local_policy.revision,
+            digest,
+            previous_digest,
+        });
         Ok(())
     }
 

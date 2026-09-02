@@ -341,6 +341,7 @@ impl PrivilegedNodeRuntime {
         request_id: &str,
         device_policy_revision: u64,
         device_policy_summary: Value,
+        previous_device_policy_digest: Option<&str>,
         connection_epoch: u64,
         identity: &DeviceIdentity,
     ) -> Result<Value, PrivilegedNodeError> {
@@ -354,7 +355,7 @@ impl PrivilegedNodeRuntime {
             "devicePolicy": {
                 "revision": device_policy_revision,
                 "policyDigest": hex::encode(Sha256::digest(serde_jcs::to_vec(&device_policy_summary).map_err(|error| PrivilegedNodeError::Config(error.to_string()))?)),
-                "previousPolicyDigest": Value::Null,
+                "previousPolicyDigest": previous_device_policy_digest,
                 "publicSummary": device_policy_summary,
                 "signature": "pending"
             },
@@ -366,7 +367,7 @@ impl PrivilegedNodeRuntime {
             "deviceId": object.get("deviceId").cloned().ok_or(PrivilegedNodeError::RegistrationMissing)?,
             "revision": device_policy_revision,
             "policyDigest": device_policy["policyDigest"],
-            "previousPolicyDigest": Value::Null,
+            "previousPolicyDigest": previous_device_policy_digest,
             "publicSummary": device_policy["publicSummary"]
         });
         payload["devicePolicy"]["signature"] = Value::String(

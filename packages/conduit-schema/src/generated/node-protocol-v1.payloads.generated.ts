@@ -574,6 +574,9 @@ export interface PrivilegeRegistrationResultPayload {
   helperKeyFingerprint: Sha256Hex;
   helperPolicyRevision: number;
   helperPolicyDigest: Sha256Hex;
+  devicePolicyRevision: number;
+  devicePolicyDigest: Sha256Hex;
+  devicePolicyPreviousDigest: Sha256Hex | null;
   /**
    * @minItems 1
    * @maxItems 4

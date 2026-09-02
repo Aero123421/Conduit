@@ -53,6 +53,7 @@ fn full_device_live_systemd_root_e2e() {
         "lost_start_issue" => lost_start_issue(),
         "lost_start_recover" => lost_start_recover(),
         "node_prepare" => node_prepare(),
+        "node_registered" => node_registered(),
         "node_running" => node_running(false),
         "node_recovered" => node_running(true),
         "node_stop" => node_stop(),
@@ -386,7 +387,7 @@ fn node_prepare() {
                 "revision":2,"capabilities":["command.start"],
                 "providers":["privileged-native"],"accessScopes":["full_device"],
                 "approvalModes":["never"],"requiredApprovalRiskClasses":[],
-                "launchProfiles":["full-device-live"],"credentialProfiles":[],
+                "launchProfiles":["full-device-live"],"credentialProfiles":["cred_full_device_live"],
                 "maxCpu":null,"maxMemoryBytes":null,"maxStorageBytes":null,
                 "allowFullAccessWithoutApproval":true
             },
@@ -420,6 +421,52 @@ fn node_prepare() {
     write_json(
         &evidence.join("node-operation-intent.json"),
         &json!({"operation":operation,"runManifestDigest":manifest_digest,"dispatch":true}),
+    );
+}
+
+fn node_registered() {
+    let evidence = evidence_dir();
+    let policy = read_json(&evidence.join("node-launch-profiles.json"))["localPolicy"].clone();
+    let expected_digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&policy).unwrap()));
+    let mut observed = None;
+    let mut remote = Value::Null;
+    for _ in 0..300 {
+        observed = NodeStore::open_read_only(evidence.join("node-service-data"))
+            .ok()
+            .and_then(|store| store.privilege_registration_state().ok().flatten());
+        remote = worker_post(
+            "/__full-device-live/inspect",
+            &json!({"deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID")}),
+        );
+        if observed.as_ref().is_some_and(|state| {
+            state.device_policy_revision == 2 && state.device_policy_digest == expected_digest
+        }) && remote
+            .pointer("/deviceRoom/activeSocketCount")
+            .and_then(Value::as_u64)
+            == Some(1)
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    let observed = observed.expect("production Node did not persist accepted Device policy");
+    assert_eq!(observed.device_policy_revision, 2);
+    assert_eq!(observed.device_policy_digest, expected_digest);
+    assert_eq!(
+        remote
+            .pointer("/deviceRoom/activeSocketCount")
+            .and_then(Value::as_u64),
+        Some(1)
+    );
+    write_json(
+        &evidence.join("node-registration-summary.json"),
+        &json!({
+            "schemaVersion":1,"actualNodeService":true,"actualWssClient":true,
+            "actualWorkerRoute":true,"actualDeviceRoomWebSocket":true,
+            "devicePolicyRevision":observed.device_policy_revision,
+            "devicePolicyDigest":observed.device_policy_digest,
+            "acceptedStatePersisted":true
+        }),
     );
 }
 

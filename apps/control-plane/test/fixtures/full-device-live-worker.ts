@@ -1,6 +1,6 @@
 import worker, { BoardRoom, ConnectorLimiter, DeviceRoom, RetryScheduler } from "../../src/index.ts";
 import { canonicalJson, fromBase64url, keyedHash, nowIso, sha256Hex } from "../../src/crypto.ts";
-import { handlePrivilegeAdmin } from "../../src/privilege.ts";
+import { activePrivilegeRegistrationResult, handlePrivilegeAdmin } from "../../src/privilege.ts";
 import type { ControlPlaneEnv } from "../../src/types.ts";
 import { attemptOperationDispatch } from "../../src/dispatch.ts";
 import { createExistingTargetControl } from "../../src/controls.ts";
@@ -90,16 +90,10 @@ async function approve(request: Request, env: LiveEnv): Promise<Response> {
   if (installation === null) throw new Error("live E2E registration was not projected");
   const response = await handlePrivilegeAdmin(adminRequest(env, `/v1/privileged/installations/${installationId}/decision`, { decision: "approve", expectedAttestationDigest: installation.device_attestation_digest }), env, `/v1/privileged/installations/${installationId}/decision`);
   if (response === null || response.status !== 200) throw new Error(`live E2E approval failed: ${response === null ? "missing" : await response.text()}`);
-  const active = await env.DB.prepare("SELECT active_key_id,active_policy_revision,active_policy_digest,owner_decision_digest FROM device_privilege_installations WHERE installation_id=?1 AND status='active' LIMIT 1").bind(installationId).first<{ active_key_id: string; active_policy_revision: number; active_policy_digest: string; owner_decision_digest: string }>();
-  const helper = active === null ? null : await env.DB.prepare("SELECT public_jwk_json,fingerprint FROM privilege_installation_keys WHERE installation_id=?1 AND key_id=?2 AND status='active' LIMIT 1").bind(installationId, active.active_key_id).first<{ public_jwk_json: string; fingerprint: string }>();
-  const issuers = await env.DB.prepare("SELECT key_id,revision,public_jwk_json,fingerprint,status,valid_from,valid_until,predecessor_key_id,rotation_statement_digest,rotation_signature FROM privilege_issuer_keys WHERE status IN ('active','retiring') ORDER BY revision DESC LIMIT 4").all<Record<string, unknown>>();
-  if (active === null || helper === null) throw new Error("live E2E registration did not become active");
+  const active = await activePrivilegeRegistrationResult(env, installationId, installation.device_attestation_digest);
   await env.DEVICE_ROOMS.getByName(installation.device_id).acknowledgeFullDeviceLiveRegistrationE2E(env.FULL_DEVICE_LIVE_E2E_TOKEN, installationId);
   return Response.json({
-    installationId, status: "active", helperKeyId: active.active_key_id, helperPublicJwk: JSON.parse(helper.public_jwk_json), helperKeyFingerprint: helper.fingerprint,
-    helperPolicyRevision: active.active_policy_revision, helperPolicyDigest: active.active_policy_digest,
-    issuerKeys: issuers.results.map((key) => ({ keyId: key.key_id, revision: key.revision, publicJwk: JSON.parse(String(key.public_jwk_json)), fingerprint: key.fingerprint, status: key.status, validFrom: key.valid_from, validUntil: key.valid_until, predecessorKeyId: key.predecessor_key_id, rotationStatementDigest: key.rotation_statement_digest, rotationSignature: key.rotation_signature })),
-    attestationDigest: installation.device_attestation_digest, ownerDecisionDigest: active.owner_decision_digest,
+    ...active,
     isolatedCryptographicTestDeployment: true, freshPasskey: false,
   });
 }

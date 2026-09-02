@@ -371,6 +371,21 @@ export function isDevicePolicyNarrower(previous: Record<string, unknown>, next: 
   return true;
 }
 
+export function assertDevicePolicyTransition(
+  current: { revision: number; policyDigest: string; previousPolicyDigest: string | null } | null,
+  next: { revision: number; policyDigest: string; previousPolicyDigest: string | null },
+): void {
+  if (current === null) {
+    if (next.previousPolicyDigest !== null) throw new PublicError("privilege_ticket_conflict", 409, "Initial Device policy cannot name a predecessor");
+    return;
+  }
+  if (current.policyDigest === next.policyDigest) {
+    if (next.revision !== current.revision || next.previousPolicyDigest !== current.previousPolicyDigest) throw new PublicError("privilege_ticket_conflict", 409, "Device policy replay differs from the active attestation");
+    return;
+  }
+  if (next.revision <= current.revision || next.previousPolicyDigest !== current.policyDigest) throw new PublicError("privilege_ticket_conflict", 409, "Device policy update must name the exact active predecessor and increase its revision");
+}
+
 async function projectInstallation(env: ControlPlaneEnv, frame: PrivilegeTransportFrame): Promise<Record<string, unknown>> {
   const payload = frame.payload;
   exactKeys(payload, ["requestId", "registrationBundle", "devicePolicy", "deviceKeyId", "deviceSignature"], "installation attestation");
@@ -438,10 +453,11 @@ async function projectInstallation(env: ControlPlaneEnv, frame: PrivilegeTranspo
   const policyStatus = actualChangeClass === "same" || actualChangeClass === "narrowed" && existing?.active_key_id === helperKeyId ? "active" : "pending_owner";
   const policyInsertStatus = actualChangeClass === "narrowed" ? "pending_owner" : policyStatus;
   const predecessorKeyId = existing?.active_key_id !== undefined && existing.active_key_id !== null && existing.active_key_id !== helperKeyId ? existing.active_key_id : null;
-  const currentDevicePolicy = await env.DB.prepare("SELECT revision,policy_digest,public_summary_json FROM device_user_policy_attestations WHERE device_id=?1 AND status='active' ORDER BY revision DESC LIMIT 1").bind(frame.deviceId).first<{ revision: number; policy_digest: string; public_summary_json: string }>();
-  if (currentDevicePolicy !== null && currentDevicePolicy.policy_digest !== devicePolicyDigest && devicePolicyRevision <= currentDevicePolicy.revision) {
-    throw new PublicError("privilege_ticket_conflict", 409, "Device policy revision must increase monotonically");
-  }
+  const currentDevicePolicy = await env.DB.prepare("SELECT revision,policy_digest,previous_policy_digest,public_summary_json FROM device_user_policy_attestations WHERE device_id=?1 AND status='active' ORDER BY revision DESC LIMIT 1").bind(frame.deviceId).first<{ revision: number; policy_digest: string; previous_policy_digest: string | null; public_summary_json: string }>();
+  assertDevicePolicyTransition(
+    currentDevicePolicy === null ? null : { revision: currentDevicePolicy.revision, policyDigest: currentDevicePolicy.policy_digest, previousPolicyDigest: currentDevicePolicy.previous_policy_digest },
+    { revision: devicePolicyRevision, policyDigest: devicePolicyDigest, previousPolicyDigest: previousDevicePolicyDigest },
+  );
   const devicePolicyNarrowed = currentDevicePolicy !== null && currentDevicePolicy.policy_digest !== devicePolicyDigest && isDevicePolicyNarrower(JSON.parse(currentDevicePolicy.public_summary_json) as Record<string, unknown>, devicePolicySummary);
   const devicePolicyStatus = currentDevicePolicy?.policy_digest === devicePolicyDigest || devicePolicyNarrowed ? "active" : "pending_owner";
   await env.DB.batch([
@@ -464,7 +480,27 @@ async function projectInstallation(env: ControlPlaneEnv, frame: PrivilegeTranspo
       env.DB.prepare("UPDATE device_user_policy_attestations SET status='superseded' WHERE device_id=?1 AND status='active' AND revision<?2").bind(frame.deviceId, devicePolicyRevision),
     ] : []),
   ]);
-  return { installationId, state: existing?.status === "active" && policyStatus === "active" ? "active" : "pending_owner", attestationDigest };
+  const state = existing?.status === "active" && policyStatus === "active" && devicePolicyStatus === "active" ? "active" : "pending_owner";
+  if (state === "active") return { state, ...await activePrivilegeRegistrationResult(env, installationId, attestationDigest) };
+  return { installationId, state, attestationDigest };
+}
+
+export async function activePrivilegeRegistrationResult(env: ControlPlaneEnv, installationId: string, expectedAttestationDigest?: string): Promise<Record<string, unknown>> {
+  const active = await env.DB.prepare("SELECT device_id,active_key_id,active_policy_revision,active_policy_digest,device_attestation_digest,owner_decision_digest FROM device_privilege_installations WHERE installation_id=?1 AND status='active' LIMIT 1").bind(installationId).first<{ device_id: string; active_key_id: string; active_policy_revision: number; active_policy_digest: string; device_attestation_digest: string; owner_decision_digest: string | null }>();
+  if (active === null || active.owner_decision_digest === null || expectedAttestationDigest !== undefined && active.device_attestation_digest !== expectedAttestationDigest) throw new PublicError("privileged_helper_registration_missing", 409, "Active helper registration does not match the attestation");
+  const helper = await env.DB.prepare("SELECT public_jwk_json,fingerprint FROM privilege_installation_keys WHERE installation_id=?1 AND key_id=?2 AND status='active' LIMIT 1").bind(installationId, active.active_key_id).first<{ public_jwk_json: string; fingerprint: string }>();
+  const devicePolicy = await env.DB.prepare("SELECT revision,policy_digest,previous_policy_digest FROM device_user_policy_attestations WHERE device_id=?1 AND status='active' ORDER BY revision DESC LIMIT 1").bind(active.device_id).first<{ revision: number; policy_digest: string; previous_policy_digest: string | null }>();
+  const issuerKeys = await env.DB.prepare("SELECT key_id,revision,public_jwk_json,fingerprint,status,valid_from,valid_until,predecessor_key_id,rotation_statement_digest,rotation_signature FROM privilege_issuer_keys WHERE status IN ('active','retiring') ORDER BY revision DESC LIMIT 4").all<Record<string, unknown>>();
+  if (helper === null || devicePolicy === null || !issuerKeys.results.some((key) => key.status === "active")) throw new PublicError("privileged_helper_registration_missing", 409, "Active helper registration evidence is incomplete");
+  return {
+    installationId, status: "active", helperKeyId: active.active_key_id,
+    helperPublicJwk: JSON.parse(helper.public_jwk_json), helperKeyFingerprint: helper.fingerprint,
+    helperPolicyRevision: active.active_policy_revision, helperPolicyDigest: active.active_policy_digest,
+    devicePolicyRevision: devicePolicy.revision, devicePolicyDigest: devicePolicy.policy_digest,
+    devicePolicyPreviousDigest: devicePolicy.previous_policy_digest,
+    issuerKeys: issuerKeys.results.map((key) => ({ keyId: key.key_id, revision: key.revision, publicJwk: JSON.parse(String(key.public_jwk_json)), fingerprint: key.fingerprint, status: key.status, validFrom: key.valid_from, validUntil: key.valid_until, predecessorKeyId: key.predecessor_key_id, rotationStatementDigest: key.rotation_statement_digest, rotationSignature: key.rotation_signature })),
+    attestationDigest: active.device_attestation_digest, ownerDecisionDigest: active.owner_decision_digest,
+  };
 }
 
 function parseIssuerSecret(env: ControlPlaneEnv): IssuerKeySet {
@@ -1099,12 +1135,9 @@ export async function handlePrivilegeAdmin(request: Request, env: ControlPlaneEn
     if (results[6]?.meta.changes !== 1) throw new PublicError("revision_conflict", 409, "Helper approval raced with another decision");
     const approved = await env.DB.prepare("SELECT key.public_jwk_json,key.fingerprint FROM privilege_installation_keys AS key WHERE key.installation_id=?1 AND key.key_id=?2 AND key.status='active' LIMIT 1").bind(installationId, pending.key_id).first<{ public_jwk_json: string; fingerprint: string }>();
     if (approved === null) throw new PublicError("privileged_helper_registration_missing", 409, "Approved helper key is unavailable");
-    await env.DEVICE_ROOMS.getByName(row.device_id).deliverPrivilegeRegistration({
-      installationId, status: "active", helperKeyId: pending.key_id, helperPublicJwk: JSON.parse(approved.public_jwk_json), helperKeyFingerprint: approved.fingerprint,
-      helperPolicyRevision: pending.revision, helperPolicyDigest: pending.policy_digest,
-      issuerKeys: issuerKeys.results.map((key) => ({ keyId: key.key_id, revision: key.revision, publicJwk: JSON.parse(String(key.public_jwk_json)), fingerprint: key.fingerprint, status: key.status, validFrom: key.valid_from, validUntil: key.valid_until, predecessorKeyId: key.predecessor_key_id, rotationStatementDigest: key.rotation_statement_digest, rotationSignature: key.rotation_signature })),
-      attestationDigest: expectedDigest, ownerDecisionDigest,
-    });
+    await env.DEVICE_ROOMS.getByName(row.device_id).deliverPrivilegeRegistration(
+      await activePrivilegeRegistrationResult(env, installationId, expectedDigest),
+    );
     await repo.audit("privileged_helper.approved", { installationId, attestationDigest: expectedDigest, helperKeyId: pending.key_id, policyRevision: pending.revision, policyDigest: pending.policy_digest }, session.principal_id, undefined, row.device_id);
     return Response.json({ installationId, state: "active", policyRevision: pending.revision });
   }

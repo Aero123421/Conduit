@@ -29,7 +29,7 @@ use thiserror::Error;
 pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 pub const MAX_FRAME_BYTES: usize = 65_536;
 pub const MAX_EVENT_BYTES: usize = 60_000;
-const STORE_SCHEMA_VERSION: u32 = 10;
+const STORE_SCHEMA_VERSION: u32 = 11;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -328,6 +328,13 @@ pub struct PrivilegedReceiptRecord {
     pub transition: String,
     pub previous_receipt_digest: Option<String>,
     pub signed_receipt: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivilegeRegistrationState {
+    pub device_policy_revision: u64,
+    pub device_policy_digest: String,
+    pub previous_device_policy_digest: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1496,6 +1503,90 @@ impl NodeStore {
             .map_err(map_sql)
     }
 
+    pub fn privilege_registration_state(
+        &self,
+    ) -> Result<Option<PrivilegeRegistrationState>, StoreError> {
+        let connection = self.conn()?;
+        connection
+            .query_row(
+                "SELECT device_policy_revision,device_policy_digest,previous_device_policy_digest FROM privilege_registration_state WHERE singleton=1",
+                [],
+                |row| {
+                    Ok(PrivilegeRegistrationState {
+                        device_policy_revision: row.get(0)?,
+                        device_policy_digest: row.get(1)?,
+                        previous_device_policy_digest: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(map_sql)
+    }
+
+    /// Commit only a Control Plane-accepted Device policy attestation. This
+    /// record lets reconnects reproduce the original predecessor and lets a
+    /// later revision prove the exact active digest it replaces.
+    pub fn commit_privilege_registration_state(
+        &self,
+        revision: u64,
+        digest: &str,
+        previous_digest: Option<&str>,
+    ) -> Result<PrivilegeRegistrationState, StoreError> {
+        if revision == 0
+            || digest.len() != 64
+            || !digest.bytes().all(|value| value.is_ascii_hexdigit())
+            || previous_digest.is_some_and(|value| {
+                value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        {
+            return Err(StoreError::Invalid(
+                "invalid privilege registration state".into(),
+            ));
+        }
+        let mut connection = self.conn()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        let current = transaction
+            .query_row(
+                "SELECT device_policy_revision,device_policy_digest,previous_device_policy_digest FROM privilege_registration_state WHERE singleton=1",
+                [],
+                |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?)),
+            )
+            .optional()
+            .map_err(map_sql)?;
+        match current.as_ref() {
+            Some((current_revision, current_digest, current_previous))
+                if *current_revision == revision
+                    && current_digest == digest
+                    && current_previous.as_deref() == previous_digest => {}
+            Some((current_revision, current_digest, _))
+                if revision > *current_revision
+                    && previous_digest == Some(current_digest.as_str()) =>
+            {
+                transaction
+                    .execute(
+                        "UPDATE privilege_registration_state SET device_policy_revision=?1,device_policy_digest=?2,previous_device_policy_digest=?3,updated_at=unixepoch() WHERE singleton=1",
+                        params![revision, digest, previous_digest],
+                    )
+                    .map_err(map_sql)?;
+            }
+            None if previous_digest.is_none() => {
+                transaction
+                    .execute(
+                        "INSERT INTO privilege_registration_state(singleton,device_policy_revision,device_policy_digest,previous_device_policy_digest) VALUES(1,?1,?2,NULL)",
+                        params![revision, digest],
+                    )
+                    .map_err(map_sql)?;
+            }
+            _ => return Err(StoreError::IdempotencyConflict),
+        }
+        transaction.commit().map_err(map_sql)?;
+        drop(connection);
+        self.privilege_registration_state()?
+            .ok_or_else(|| StoreError::Corrupt("privilege registration state missing".into()))
+    }
+
     pub fn record_agent_session(
         &self,
         idempotency_key: &str,
@@ -2384,6 +2475,14 @@ CREATE TABLE IF NOT EXISTS privileged_receipt_chain(
  CHECK(length(transition) BETWEEN 1 AND 64),
  CHECK(previous_receipt_digest IS NULL OR length(previous_receipt_digest)=64),
  CHECK(length(signed_receipt) BETWEEN 1 AND 60000));
+CREATE TABLE IF NOT EXISTS privilege_registration_state(
+ singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+ device_policy_revision INTEGER NOT NULL,
+ device_policy_digest TEXT NOT NULL,
+ previous_device_policy_digest TEXT,
+ updated_at INTEGER NOT NULL DEFAULT(unixepoch()),
+ CHECK(device_policy_revision>0), CHECK(length(device_policy_digest)=64),
+ CHECK(previous_device_policy_digest IS NULL OR length(previous_device_policy_digest)=64));
 CREATE TABLE IF NOT EXISTS agent_sessions(
  idempotency_key TEXT PRIMARY KEY REFERENCES operations(idempotency_key) ON DELETE RESTRICT,
  policy TEXT NOT NULL CHECK(policy IN ('close_on_settle','persistent')),
@@ -2412,7 +2511,7 @@ CREATE TABLE IF NOT EXISTS agent_approval_journal(
  CHECK(resolution_authority IS NULL OR (length(resolution_authority)>=1 AND length(resolution_authority)<=256)));
 CREATE INDEX IF NOT EXISTS agent_approval_pending_idx ON agent_approval_journal(state,expires_at_unix_ms);
 CREATE UNIQUE INDEX IF NOT EXISTS agent_approval_provider_request_unique_idx ON agent_approval_journal(idempotency_key,provider_request_id);
-INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9),(10),(11);
 COMMIT;"#).map_err(map_sql)
 }
 
@@ -2475,6 +2574,42 @@ mod tests {
                 b"{}",
                 1
             ),
+            Err(StoreError::IdempotencyConflict)
+        ));
+    }
+
+    #[test]
+    fn accepted_privilege_policy_predecessor_survives_restart() {
+        let directory = tempdir().unwrap();
+        let first = digest(1);
+        let second = digest(2);
+        let store = NodeStore::open(directory.path()).unwrap();
+        assert_eq!(
+            store
+                .commit_privilege_registration_state(1, &first, None)
+                .unwrap(),
+            PrivilegeRegistrationState {
+                device_policy_revision: 1,
+                device_policy_digest: first.clone(),
+                previous_device_policy_digest: None,
+            }
+        );
+        drop(store);
+        let store = NodeStore::open(directory.path()).unwrap();
+        assert_eq!(
+            store
+                .commit_privilege_registration_state(2, &second, Some(&first))
+                .unwrap()
+                .previous_device_policy_digest
+                .as_deref(),
+            Some(first.as_str())
+        );
+        assert!(matches!(
+            store.commit_privilege_registration_state(3, &digest(3), Some(&digest(9))),
+            Err(StoreError::IdempotencyConflict)
+        ));
+        assert!(matches!(
+            store.commit_privilege_registration_state(2, &second, Some(&second)),
             Err(StoreError::IdempotencyConflict)
         ));
     }

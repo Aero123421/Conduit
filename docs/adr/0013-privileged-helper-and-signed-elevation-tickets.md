@@ -96,6 +96,15 @@ ready-for-review from an ordinary Node claim alone. D1 retains bounded public
 metadata and digests, never local canonical paths, private keys, credential
 plaintext, or the raw plan.
 
+The Device-signed policy attestation also forms a monotonic chain. A changed
+policy must increase its revision and name the exact active policy digest as
+`previousPolicyDigest`; an exact replay must reproduce its original
+predecessor. The Node persists only the last Control Plane-accepted revision,
+digest, and predecessor in its local journal. The Control Plane registration
+result returns those exact values, and a fresh result is durably delivered for
+each connection epoch so a restarted Node cannot activate issuer keys from an
+uncorrelated or stale policy response.
+
 ### One-shot and retained Agent sessions
 
 A one-shot command ends with its root process. A structured root Agent may be

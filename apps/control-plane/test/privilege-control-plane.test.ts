@@ -3,7 +3,7 @@ import { runInDurableObject } from "cloudflare:test";
 import { parseWireDocument, parseWireDocumentText, schemaIds } from "@conduit/schema";
 import { beforeAll, describe, expect, it } from "vitest";
 import { base64url, canonicalJson, fromBase64url, keyedHash, sha256Hex } from "../src/crypto.ts";
-import { handlePrivilegeAdmin, isDevicePolicyNarrower, parsePrivilegeTransportFrame, projectPrivilegeFrame, requireVerifiedPrivilegeReceipt, rootPolicySummary, type PrivilegeTransportFrame } from "../src/privilege.ts";
+import { assertDevicePolicyTransition, handlePrivilegeAdmin, isDevicePolicyNarrower, parsePrivilegeTransportFrame, projectPrivilegeFrame, requireVerifiedPrivilegeReceipt, rootPolicySummary, type PrivilegeTransportFrame } from "../src/privilege.ts";
 import { assertFreeD1Ceilings, instrumentD1, PRIVILEGE_OUTER_INVOCATION_D1_ROW_CEILINGS, type D1UsageSnapshot } from "../src/usage-instrumentation.ts";
 import type { ControlPlaneEnv } from "../src/types.ts";
 import { projectNodeState } from "../src/node-projection.ts";
@@ -77,6 +77,12 @@ describe.sequential("privileged helper Control Plane", () => {
     const localPolicy = { revision: 1, capabilities: ["command.start"], providers: ["privileged-native"], accessScopes: ["full_device"], approvalModes: ["never"], requiredApprovalRiskClasses: ["shell"], launchProfiles: ["safe"], credentialProfiles: ["cred_allowed01"], maxCpu: 2, maxMemoryBytes: 2048, maxStorageBytes: 4096, allowFullAccessWithoutApproval: true };
     expect(isDevicePolicyNarrower(localPolicy, { ...localPolicy, revision: 2, capabilities: [], requiredApprovalRiskClasses: ["shell", "network"], maxCpu: 1, allowFullAccessWithoutApproval: false })).toBe(true);
     expect(isDevicePolicyNarrower(localPolicy, { ...localPolicy, revision: 2, requiredApprovalRiskClasses: [] })).toBe(false);
+    const firstDigest = "1".repeat(64);
+    const secondDigest = "2".repeat(64);
+    expect(() => assertDevicePolicyTransition(null, { revision: 1, policyDigest: firstDigest, previousPolicyDigest: null })).not.toThrow();
+    expect(() => assertDevicePolicyTransition({ revision: 1, policyDigest: firstDigest, previousPolicyDigest: null }, { revision: 2, policyDigest: secondDigest, previousPolicyDigest: firstDigest })).not.toThrow();
+    expect(() => assertDevicePolicyTransition({ revision: 1, policyDigest: firstDigest, previousPolicyDigest: null }, { revision: 2, policyDigest: secondDigest, previousPolicyDigest: null })).toThrow(/exact active predecessor/);
+    expect(() => assertDevicePolicyTransition({ revision: 1, policyDigest: firstDigest, previousPolicyDigest: null }, { revision: 1, policyDigest: secondDigest, previousPolicyDigest: firstDigest })).toThrow(/increase its revision/);
     const executableDigest = "d".repeat(64);
     expect(rootPolicySummary({ enabled: true, ticketKeyIds: [], allowedOperations: [], allowedAdapters: [], allowedLaunchProfiles: ["safe"], launchProfileExecutableDigests: { safe: executableDigest }, allowedCredentialProfiles: ["cred_allowed01"], ceilings: {}, allowNever: false, allowUnrestrictedLaunch: false, allowPersistentSessions: false, allowOfflineControl: false, receiptRetentionSeconds: 60 })).toMatchObject({ launchProfileExecutableDigests: { safe: executableDigest }, allowedCredentialProfiles: ["cred_allowed01"] });
     expect(() => rootPolicySummary({ launchProfileExecutableDigests: { "/home/user/bin/tool": executableDigest } })).toThrow(/bounded profile IDs/);
@@ -114,7 +120,7 @@ describe.sequential("privileged helper Control Plane", () => {
       env.DB.prepare("UPDATE privilege_installation_keys SET status='active',approved_at=?1 WHERE installation_id='phinst_privilegeflow01' AND key_id='hkey_privilegeflow01'").bind(now),
       env.DB.prepare("UPDATE privilege_policy_attestations SET status='active',approved_by='prin_privilegeflow01',approved_at=?1 WHERE installation_id='phinst_privilegeflow01' AND revision=1").bind(now),
       env.DB.prepare("UPDATE device_user_policy_attestations SET status='active' WHERE device_id='dev_privilegeflow01' AND revision=1"),
-      env.DB.prepare("UPDATE device_privilege_installations SET active_key_id='hkey_privilegeflow01',active_policy_revision=1,active_policy_digest=?1,status='active',owner_principal_id='prin_privilegeflow01',approved_at=?2 WHERE installation_id='phinst_privilegeflow01'").bind(rootPolicyDigest, now),
+      env.DB.prepare("UPDATE device_privilege_installations SET active_key_id='hkey_privilegeflow01',active_policy_revision=1,active_policy_digest=?1,status='active',owner_principal_id='prin_privilegeflow01',owner_decision_digest=?2,approved_at=?3 WHERE installation_id='phinst_privilegeflow01'").bind(rootPolicyDigest, "6".repeat(64), now),
       env.DB.prepare("INSERT INTO privilege_issuer_keys(key_id,revision,public_jwk_json,fingerprint,status,valid_from,created_at) VALUES ('pkey_testissuer0001',1,?1,?2,'active',?3,?3)").bind(canonicalJson({ kty: "OKP", crv: "Ed25519", x: "BqRlMWvAVKLe2h6jRtRBlfOlZ8I2m5nuwkFqhm_cD0M" }), await sha256Hex(fromBase64url("BqRlMWvAVKLe2h6jRtRBlfOlZ8I2m5nuwkFqhm_cD0M")), now),
     ]);
     const storedRootPolicy = await env.DB.prepare("SELECT public_summary_json FROM privilege_policy_attestations WHERE installation_id='phinst_privilegeflow01' AND revision=1").first<{ public_summary_json: string }>();

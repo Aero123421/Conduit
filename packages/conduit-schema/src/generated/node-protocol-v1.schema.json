@@ -665,12 +665,15 @@
     },
     "PrivilegeRegistrationResultPayload": {
       "type": "object", "additionalProperties": false,
-      "required": ["installationId", "status", "helperKeyId", "helperPublicJwk", "helperKeyFingerprint", "helperPolicyRevision", "helperPolicyDigest", "issuerKeys", "attestationDigest", "ownerDecisionDigest"],
+      "required": ["installationId", "status", "helperKeyId", "helperPublicJwk", "helperKeyFingerprint", "helperPolicyRevision", "helperPolicyDigest", "devicePolicyRevision", "devicePolicyDigest", "devicePolicyPreviousDigest", "issuerKeys", "attestationDigest", "ownerDecisionDigest"],
       "properties": {
         "installationId": { "type": "string", "pattern": "^phinst_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "status": { "const": "active" },
         "helperKeyId": { "type": "string", "minLength": 1, "maxLength": 128 }, "helperPublicJwk": { "$ref": "#/$defs/Ed25519ReceiptPublicJwk" },
         "helperKeyFingerprint": { "$ref": "#/$defs/Sha256Hex" }, "helperPolicyRevision": { "type": "integer", "minimum": 1 },
-        "helperPolicyDigest": { "$ref": "#/$defs/Sha256Hex" }, "issuerKeys": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "$ref": "#/$defs/PrivilegeIssuerKey" } },
+        "helperPolicyDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "devicePolicyRevision": { "type": "integer", "minimum": 1 }, "devicePolicyDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "devicePolicyPreviousDigest": { "anyOf": [{ "$ref": "#/$defs/Sha256Hex" }, { "type": "null" }] },
+        "issuerKeys": { "type": "array", "minItems": 1, "maxItems": 4, "items": { "$ref": "#/$defs/PrivilegeIssuerKey" } },
         "attestationDigest": { "$ref": "#/$defs/Sha256Hex" }, "ownerDecisionDigest": { "$ref": "#/$defs/Sha256Hex" }
       }
     },

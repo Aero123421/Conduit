@@ -4415,16 +4415,18 @@ mod tests {
     }
 
     fn run_wrangler(app: &Path, arguments: &[&str]) {
-        let status = Command::new("corepack")
-            .args(["pnpm", "exec", "wrangler"])
+        let output = Command::new(app.join("node_modules/.bin/wrangler"))
             .args(arguments)
             .current_dir(app)
             .env("CI", "true")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
+            .output()
             .expect("wrangler must start");
-        assert!(status.success(), "wrangler command failed: {arguments:?}");
+        assert!(
+            output.status.success(),
+            "wrangler command failed: {arguments:?}\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
     }
 
     struct ControlOnlyProvider {
@@ -4827,11 +4829,8 @@ mod tests {
             .unwrap()
             .port();
         let origin = format!("http://127.0.0.1:{port}");
-        let child = Command::new("corepack")
+        let child = Command::new(app.join("node_modules/.bin/wrangler"))
             .args([
-                "pnpm",
-                "exec",
-                "wrangler",
                 "dev",
                 "--config",
                 "wrangler.idle-e2e.jsonc",

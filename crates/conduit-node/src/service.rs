@@ -4999,10 +4999,14 @@ mod tests {
         assert_eq!(status, 200);
         client.reset_application_sends();
         let started = Instant::now();
-        // Exercise every real 100 ms service poll for the first ten minutes.
-        // If the old eager resend loop returns, this alone observes ~6,000
-        // sends. The Node-only regression above executes all 864,000 polls.
-        for tick in 1_u64..=10 * 60 * 10 {
+        let next_unacknowledged_sequence = store
+            .transport_positions()
+            .unwrap()
+            .node_acknowledged_through
+            .saturating_add(1);
+        // Exercise every real 100 ms service poll for the first hour. If the
+        // old eager resend loop returns, this alone observes ~36,000 sends.
+        for tick in 1_u64..=60 * 60 * 10 {
             let health_sent = service
                 .queue_health_if_due_at(
                     &mut client,
@@ -5010,10 +5014,9 @@ mod tests {
                     started + Duration::from_millis(tick * 100),
                 )
                 .unwrap();
-            let positions = store.transport_positions().unwrap();
             assert_eq!(
                 client
-                    .flush_unacknowledged(positions.node_acknowledged_through.saturating_add(1),)
+                    .flush_unacknowledged(next_unacknowledged_sequence)
                     .unwrap(),
                 0
             );
@@ -5021,11 +5024,11 @@ mod tests {
                 client.await_idle_e2e_settled().unwrap();
             }
         }
-        let mut one_hour_sends = 0;
-        // Continue the same real socket and service clock at every remaining
+        let one_hour_sends = client.application_sends();
+        // Continue the same real socket and service clock at each remaining
         // ten-minute checkpoint through 24 hours. The regular Node unit test
         // separately executes all 864,000 poll iterations.
-        for checkpoint in 2_u64..=144 {
+        for checkpoint in 7_u64..=144 {
             let health_sent = service
                 .queue_health_if_due_at(
                     &mut client,
@@ -5033,18 +5036,14 @@ mod tests {
                     started + Duration::from_secs(checkpoint * 10 * 60),
                 )
                 .unwrap();
-            let positions = store.transport_positions().unwrap();
             assert_eq!(
                 client
-                    .flush_unacknowledged(positions.node_acknowledged_through.saturating_add(1),)
+                    .flush_unacknowledged(next_unacknowledged_sequence)
                     .unwrap(),
                 0
             );
             assert!(health_sent);
             client.await_idle_e2e_settled().unwrap();
-            if checkpoint == 6 {
-                one_hour_sends = client.application_sends();
-            }
         }
         let inspect_path = format!("/__idle-e2e/devices/{device_id}/inspect");
         let (status, body) = loopback_http(port, "GET", &inspect_path, None).unwrap();

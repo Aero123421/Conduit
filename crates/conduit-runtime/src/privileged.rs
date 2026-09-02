@@ -266,7 +266,11 @@ impl PrivilegedNativeProvider {
             .map_err(lock)?
             .inspect(target)
             .map_err(helper)?;
-        self.verify_chain(std::slice::from_ref(&receipt), Some(&entry.receipt), &[])?;
+        if receipt == entry.receipt {
+            self.verify(&receipt)?;
+        } else {
+            self.verify_chain(std::slice::from_ref(&receipt), Some(&entry.receipt), &[])?;
+        }
         entry.receipt = receipt.clone();
         Ok(privileged_receipt_from_handle(handle, vec![receipt]))
     }

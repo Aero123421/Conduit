@@ -119,10 +119,13 @@ impl LocalPolicy {
         capability: &conduit_privileged_protocol::SignedCapability,
     ) -> Result<(), ServiceError> {
         let helper = &capability.claims;
-        if operation.access_scope != "full_device" || !helper.supports_full_device() {
+        if operation.access_scope != "full_device" {
             return Err(ServiceError::Unavailable(
                 "full_device_capability_unavailable".into(),
             ));
+        }
+        if let Some(reason) = helper.full_device_unavailable_reason() {
+            return Err(ServiceError::Unavailable(reason.into()));
         }
         if operation.approval_mode == "never" && !helper.never_opt_in {
             return Err(ServiceError::Unavailable(
@@ -3482,10 +3485,13 @@ impl NodeService {
                     "privileged_helper_registration_missing".into(),
                 ));
             }
-            if selected != "privileged-native" || op.runtime.kind != "native" {
+            if selected != "privileged-native" {
                 return Err(ServiceError::Unavailable(
-                    "full_device_capability_unavailable".into(),
+                    "runtime_provider_unavailable".into(),
                 ));
+            }
+            if op.runtime.kind != "native" {
+                return Err(ServiceError::Unavailable("runtime_kind_unavailable".into()));
             }
             if is_agent
                 && op.approval_mode != "never"

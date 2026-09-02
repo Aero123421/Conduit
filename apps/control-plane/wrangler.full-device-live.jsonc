@@ -1,0 +1,38 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "conduit-full-device-live",
+  "main": "test/fixtures/full-device-live-worker.ts",
+  "compatibility_date": "2026-09-01",
+  "compatibility_flags": ["nodejs_compat"],
+  "vars": {
+    "PUBLIC_ORIGIN": "https://isolated-full-device-live.invalid",
+    "OAUTH_ISSUER": "https://isolated-full-device-live.invalid",
+    "WEBAUTHN_RP_ID": "isolated-full-device-live.invalid",
+    "WEBAUTHN_RP_NAME": "Conduit isolated Full Device live E2E",
+    "DCR_MODE": "disabled",
+    "CLOUDFLARE_USAGE_PROFILE": "free",
+    "FULL_DEVICE_LIVE_E2E": "enabled",
+    "BOOTSTRAP_VERIFIER": "isolated-live-e2e-unused-bootstrap-verifier",
+    "TOKEN_PEPPER": "isolated-live-e2e-token-pepper-at-least-32-bytes",
+    "RECEIPT_SIGNING_KEY": "isolated-live-e2e-receipt-key-at-least-32-bytes",
+    "PRIVILEGE_TICKET_SIGNING_KEYS_JSON": "{\"activeKeyId\":\"pkey_testissuer0001\",\"keys\":[{\"keyId\":\"pkey_testissuer0001\",\"revision\":1,\"privateJwk\":{\"crv\":\"Ed25519\",\"d\":\"nrtJu6YH_rZfrr6JSuItGhCt3C4zFkXIxHOQgsLD6Os\",\"x\":\"BqRlMWvAVKLe2h6jRtRBlfOlZ8I2m5nuwkFqhm_cD0M\",\"kty\":\"OKP\"}}]}"
+  },
+  "d1_databases": [{
+    "binding": "DB",
+    "database_name": "conduit-full-device-live",
+    "database_id": "00000000-0000-0000-0000-000000000014",
+    "migrations_dir": "migrations"
+  }],
+  "durable_objects": {
+    "bindings": [
+      { "name": "DEVICE_ROOMS", "class_name": "DeviceRoom" },
+      { "name": "BOARD_ROOMS", "class_name": "BoardRoom" },
+      { "name": "CONNECTOR_LIMITERS", "class_name": "ConnectorLimiter" },
+      { "name": "RETRY_SCHEDULER", "class_name": "RetryScheduler" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["DeviceRoom", "BoardRoom", "ConnectorLimiter"] },
+    { "tag": "v2", "new_sqlite_classes": ["RetryScheduler"] }
+  ]
+}

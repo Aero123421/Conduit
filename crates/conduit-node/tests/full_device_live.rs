@@ -28,11 +28,13 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
     env, fs,
+    io::Write as _,
     os::{
         fd::AsRawFd,
         unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     },
     path::{Path, PathBuf},
+    process::{Command, Stdio},
     thread,
     time::Duration,
 };
@@ -100,47 +102,74 @@ fn registration() {
         object["policyDigest"].as_str().unwrap()
     );
 
-    let issuer_seed_path = evidence.join("issuer.ed25519");
-    let issuer = if issuer_seed_path.exists() {
-        let raw: [u8; 32] = fs::read(&issuer_seed_path).unwrap().try_into().unwrap();
-        SigningKey::from_bytes(&raw)
-    } else {
-        let mut raw = [0_u8; 32];
-        getrandom::fill(&mut raw).unwrap();
-        write_private(&issuer_seed_path, &raw);
-        SigningKey::from_bytes(&raw)
-    };
-    let issuer_id = key_id("pkey", issuer.verifying_key().as_bytes());
-    let fingerprint = hex::encode(Sha256::digest(issuer.verifying_key().as_bytes()));
+    let public_jwk = json!({"kty":"OKP","crv":"Ed25519","x":identity.public_key_base64url()});
+    let bootstrap = worker_post(
+        "/__full-device-live/bootstrap",
+        &json!({
+            "deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),
+            "deviceKeyId":identity.key_id(),"expectedUid":unsafe { libc::geteuid() },
+            "publicJwk":public_jwk
+        }),
+    );
+    assert_eq!(bootstrap["status"], "ready");
+    let policy_summary = json!({
+        "revision":1,"capabilities":["command.start"],"providers":["privileged-native"],
+        "accessScopes":["full_device"],"approvalModes":["never"],
+        "requiredApprovalRiskClasses":[],"launchProfiles":["full-device-live"],
+        "credentialProfiles":["cred_full_device_live"],"maxCpu":null,
+        "maxMemoryBytes":null,"maxStorageBytes":null,"allowFullAccessWithoutApproval":true
+    });
+    let request_id = format!("phreq_live_policy_{:08}", capability.claims.policy_revision);
+    let registration_payload =
+        signed_registration_payload(&bundle, &identity, &request_id, policy_summary, 1);
+    let projection = worker_post(
+        "/__full-device-live/frame",
+        &json!({"deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),"frame":signed_frame("privilege.installation_attestation", &request_id, registration_payload, &identity)}),
+    );
+    assert!(matches!(
+        projection.pointer("/result/state").and_then(Value::as_str),
+        Some("pending_owner" | "active")
+    ));
+    let mut approval = worker_post(
+        "/__full-device-live/approve",
+        &json!({"installationId":object["installationId"]}),
+    );
+    assert_eq!(approval["status"], "active");
+    assert_eq!(approval["isolatedCryptographicTestDeployment"], true);
+    assert_eq!(approval["freshPasskey"], false);
+    approval["schemaVersion"] = json!(1);
+    approval["deviceId"] = object["deviceId"].clone();
+    approval["registrationBundleDigest"] = Value::String(hex::encode(Sha256::digest(
+        serde_jcs::to_vec(&bundle).unwrap(),
+    )));
+    write_json(&evidence.join("registration-approval.json"), &approval);
+    let issuer = approval["issuerKeys"]
+        .as_array()
+        .and_then(|keys| keys.iter().find(|key| key["status"] == "active"))
+        .expect("active isolated issuer");
+    let issuer_id = issuer["keyId"].as_str().unwrap();
+    let fingerprint = issuer["fingerprint"].as_str().unwrap();
+    let issuer_jwk = issuer["publicJwk"].clone();
     let public_jwk = json!({
-        "kty":"OKP","crv":"Ed25519",
-        "x":URL_SAFE_NO_PAD.encode(issuer.verifying_key().as_bytes()),
-        "kid":issuer_id,"revision":1
+        "kty":"OKP","crv":"Ed25519","x":issuer_jwk["x"],
+        "kid":issuer_id,"revision":issuer["revision"]
     });
     write_json(&evidence.join("issuer-public-jwk.json"), &public_jwk);
     write_json(
         &evidence.join("issuer-public-key.json"),
         &json!({
             "schemaVersion":1,"keyId":issuer_id,"fingerprint":fingerprint,
-            "publicJwk":public_jwk,"status":"active","ownerActivated":true
+            "publicJwk":public_jwk,"status":"active","ownerActivated":true,
+            "isolatedCryptographicTestDeployment":true,"freshPasskey":false
         }),
     );
-    let bundle_digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&bundle).unwrap()));
-    let owner_decision_digest = hex::encode(Sha256::digest(
-        format!("owner-passkey:{bundle_digest}").as_bytes(),
-    ));
-    write_json(
-        &evidence.join("registration-approval.json"),
-        &json!({
-            "schemaVersion":1,"status":"active","freshPasskey":true,
-            "deviceId":object["deviceId"],"installationId":object["installationId"],
-            "helperKeyId":capability.claims.receipt_key_id,
-            "helperPolicyRevision":capability.claims.policy_revision,
-            "helperPolicyDigest":capability.claims.policy_digest,
-            "registrationBundleDigest":bundle_digest,"ownerDecisionDigest":owner_decision_digest,
-            "issuerKeys":[{"keyId":issuer_id,"fingerprint":fingerprint,"publicJwk":public_jwk,"status":"active"}]
-        }),
-    );
+    // Other live cases remain deterministic local protocol coverage. They use
+    // the fixture's published test key, while control_plane_root_exact below
+    // obtains its own tickets from D1 and never reads this seed.
+    let deterministic_seed = URL_SAFE_NO_PAD
+        .decode("nrtJu6YH_rZfrr6JSuItGhCt3C4zFkXIxHOQgsLD6Os")
+        .unwrap();
+    write_private(&evidence.join("issuer.ed25519"), &deterministic_seed);
 }
 
 /// Runs while the system helper socket is still disabled. This makes helper
@@ -300,6 +329,10 @@ fn exercise() {
         read_json(&evidence.join("never-summary.json")),
     );
     cases.insert(
+        "controlPlaneRootExact".into(),
+        control_plane_root_exact(&runtime, &provider, &bundle, &evidence),
+    );
+    cases.insert(
         "rootExactArgv".into(),
         root_exact_and_replay(&runtime, &provider, &issuer, &bundle, &evidence),
     );
@@ -391,7 +424,8 @@ fn recover() {
     write_json(
         &evidence.join("driver-summary.json"),
         &json!({
-            "schemaVersion":2,"isolatedCryptographicControlPlane":true,
+            "schemaVersion":3,"isolatedWorkerD1DeviceRoomControlPlane":true,
+            "controlPlaneTransport":"guarded_device_room_rpc","deviceRoomWebSocketTransport":false,
             "registrationActivated":runtime.active(),"ordinaryFullUser":full_user,"cases":cases,
             "packageLifecycle":packaging,
             "hostCapability":{"signedProbeVerified":true,"signedProbeDigest":capability_digest,
@@ -757,6 +791,234 @@ time.sleep(120)
         "shellReconstruction":false,"prepareReplaySameReceipt":true,
         "exactStartReplaySameReceipt":true,"duplicateStart":false,"invocationPreserved":true,
         "terminalState":state_name(stopped.runtime.state)})
+}
+
+fn control_plane_root_exact(
+    runtime: &PrivilegedNodeRuntime,
+    provider: &PrivilegedNativeProvider,
+    bundle: &Value,
+    evidence: &Path,
+) -> Value {
+    let identity = DeviceIdentity::load_or_create(evidence.join("device.ed25519")).unwrap();
+    let python = existing(&[
+        "/usr/bin/python3.12",
+        "/usr/bin/python3.11",
+        "/usr/bin/python3.10",
+    ]);
+    let program = "import os,time;print(os.geteuid(),flush=True);time.sleep(1)";
+    let (plan, request) = case_plan(
+        "control_plane",
+        python,
+        vec!["python3".into(), "-u".into(), "-c".into(), program.into()],
+        StdioMode::Pipes,
+        10_000_000,
+        evidence,
+    );
+    let now = OffsetDateTime::now_utc();
+    let issued_at = now.format(&Rfc3339).unwrap();
+    let expires_at = (now + time::Duration::minutes(5)).format(&Rfc3339).unwrap();
+    let operation_digest = hex::encode(Sha256::digest(
+        format!("control-plane-operation:{}", plan.operation_id).as_bytes(),
+    ));
+    let manifest_digest = hex::encode(Sha256::digest(
+        format!("control-plane-manifest:{}", plan.run_id).as_bytes(),
+    ));
+    let operation = json!({
+        "schemaVersion":1,"operationId":plan.operation_id,
+        "idempotencyKey":format!("control-plane-operation-{}", std::process::id()),
+        "actorPrincipalId":"prin_full_device_live","clientId":"conduit.cli",
+        "deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),"runId":plan.run_id,
+        "connectorPolicyId":"cpol_owner_first_party_v1","connectorPolicyRevision":1,
+        "capability":"command.start","accessScope":"full_device","approvalMode":"never",
+        "requiredApprovalRiskClasses":[],
+        "runtime":{"kind":"native","providerId":"privileged-native","configurationRevision":1},
+        "sourceRevisions":[],"arguments":{"launchProfileId":"full-device-live"},
+        "issuedAt":issued_at,"expiresAt":expires_at,"validForMs":300000,
+        "payloadDigest":operation_digest
+    });
+    let intent = worker_post(
+        "/__full-device-live/intent",
+        &json!({"operation":operation,"runManifestDigest":manifest_digest}),
+    );
+    assert_eq!(intent["status"], "custodied");
+
+    let prepare_ticket = control_plane_ticket(
+        bundle,
+        &identity,
+        &plan,
+        &request,
+        &manifest_digest,
+        &operation_digest,
+        PrivilegedOperation::Prepare,
+    );
+    let prepared = provider
+        .prepare_privileged(&request, prepare_ticket, plan.clone())
+        .unwrap();
+    project_receipts(&identity, &prepared.helper_receipts);
+
+    let start_ticket = control_plane_ticket(
+        bundle,
+        &identity,
+        &plan,
+        &request,
+        &manifest_digest,
+        &operation_digest,
+        PrivilegedOperation::Start,
+    );
+    let mut managed = provider
+        .start_managed_privileged(&prepared.runtime, start_ticket, &plan)
+        .unwrap();
+    project_receipts(&identity, &managed.receipt.helper_receipts);
+    assert_eq!(
+        managed.receipt.final_helper_receipt().claims.effective_uid,
+        Some(0)
+    );
+    let mut output = Vec::new();
+    let mut cursor = 0;
+    for _ in 0..100 {
+        let page = managed.io.read_stdout(cursor, 4096).unwrap();
+        cursor = page.next_cursor;
+        output.extend(page.bytes);
+        if output.contains(&b'\n') {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(String::from_utf8(output).unwrap().trim(), "0");
+    let terminal = loop {
+        let receipt = provider
+            .inspect_privileged(&managed.receipt.runtime.handle)
+            .unwrap();
+        if receipt.runtime.state == RuntimeState::Stopped {
+            break receipt;
+        }
+        thread::sleep(Duration::from_millis(25));
+    };
+    project_receipts(&identity, &terminal.helper_receipts);
+    for receipt in prepared
+        .helper_receipts
+        .iter()
+        .chain(managed.receipt.helper_receipts.iter())
+        .chain(terminal.helper_receipts.iter())
+    {
+        receipt.verify(runtime.receipt_key()).unwrap();
+    }
+    let inspection = worker_post(
+        "/__full-device-live/inspect",
+        &json!({"deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID")}),
+    );
+    let remote_denials = worker_post("/__full-device-live/assert-remote-denials", &json!({}));
+    assert_eq!(remote_denials["privilegedAuthorityUnchanged"], true);
+    assert_eq!(inspection["worker"], true);
+    assert!(
+        inspection
+            .pointer("/d1/tickets")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            >= 2
+    );
+    assert!(
+        inspection
+            .pointer("/d1/receipts")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            >= 5
+    );
+    assert!(
+        inspection
+            .pointer("/deviceRoom/projected")
+            .and_then(Value::as_u64)
+            .unwrap_or(0)
+            >= 1
+    );
+    json!({
+        "passed":true,"workerIsolate":true,"d1Custody":true,"deviceRoomDurableCourier":true,
+        "deviceRoomWebSocketTransport":false,"controlPlaneIssuedPrepareAndStartTickets":true,
+        "helperReceiptsProjected":true,"effectiveUid":0,"stdoutUidZero":true,
+        "terminalState":state_name(terminal.runtime.state),
+        "ticketCount":inspection.pointer("/d1/tickets"),
+        "receiptCount":inspection.pointer("/d1/receipts"),
+        "deviceRoomInboundCount":inspection.pointer("/deviceRoom/inbound"),
+        "remoteRootAdministration":remote_denials
+    })
+}
+
+fn control_plane_ticket(
+    bundle: &Value,
+    identity: &DeviceIdentity,
+    plan: &LocalExecutionPlan,
+    request: &RuntimeRequest,
+    manifest_digest: &str,
+    operation_digest: &str,
+    operation: PrivilegedOperation,
+) -> PrivilegeTicket {
+    let capability: conduit_privileged_protocol::SignedCapability =
+        serde_json::from_value(bundle["signedCapability"].clone()).unwrap();
+    let action = serde_json::to_value(&operation)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(matches!(action.as_str(), "prepare" | "start"));
+    let request_id = format!("ptreq_livecp_{}_{}", action, std::process::id());
+    let now = OffsetDateTime::now_utc();
+    let unsigned = json!({
+        "requestId":request_id,
+        "idempotencyKey":format!("full-device-live-control-plane-{action}-{}", std::process::id()),
+        "installationId":bundle["installationId"],"deviceKeyId":identity.key_id(),
+        "operationId":plan.operation_id,"runId":plan.run_id,"runtimeId":plan.runtime_id,
+        "runtimeSpecDigest":request.spec_digest,"launchPlanDigest":"44".repeat(32),
+        "localExecutionPlanDigest":plan.digest().unwrap(),"controlRequestDigest":Value::Null,
+        "controlAuthority":Value::Null,"runManifestDigest":manifest_digest,
+        "helperPolicyRevision":capability.claims.policy_revision,
+        "helperPolicyDigest":capability.claims.policy_digest,"devicePolicyRevision":1,
+        "approvalReceiptDigest":Value::Null,"approvalEnforcement":"exact_command",
+        "allowedOperation":action,"resourceCeilings":plan.resources,
+        "redactedSummary":{"operation":action,"runtimeKind":"native","reasonCodes":[],"resourceProfile":"root-policy-bounded","credentialProfiles":[]},
+        "requestedAt":(now-time::Duration::seconds(1)).format(&Rfc3339).unwrap(),
+        "expiresAt":(now+time::Duration::minutes(2)).format(&Rfc3339).unwrap()
+    });
+    let mut payload = unsigned.clone();
+    payload["deviceSignature"] = Value::String(sign_device_payload(
+        "privilege.ticket_request",
+        &unsigned,
+        identity,
+    ));
+    let projection = worker_post(
+        "/__full-device-live/frame",
+        &json!({"deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),"frame":signed_frame("privilege.ticket_request", &request_id, payload, identity)}),
+    );
+    assert_eq!(
+        projection.pointer("/result/status"),
+        Some(&Value::String("issued".into()))
+    );
+    let ticket: PrivilegeTicket =
+        serde_json::from_value(projection.pointer("/result/ticket").unwrap().clone()).unwrap();
+    assert_eq!(ticket.claims.operation_request_digest, operation_digest);
+    ticket
+}
+
+fn project_receipts(
+    identity: &DeviceIdentity,
+    receipts: &[conduit_privileged_protocol::HelperReceipt],
+) {
+    for receipt in receipts {
+        let unsigned = json!({"receipt":receipt,"deviceKeyId":identity.key_id()});
+        let mut payload = unsigned.clone();
+        payload["deviceSignature"] = Value::String(sign_device_payload(
+            "privilege.receipt",
+            &unsigned,
+            identity,
+        ));
+        let result = worker_post(
+            "/__full-device-live/frame",
+            &json!({"deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),"frame":signed_frame("privilege.receipt", &receipt.claims.operation_id, payload, identity)}),
+        );
+        assert_eq!(
+            result.pointer("/result/status"),
+            Some(&Value::String("verified".into()))
+        );
+    }
 }
 
 fn pty_input_resize(
@@ -1630,6 +1892,122 @@ fn required(name: &str) -> String {
 }
 fn evidence_dir() -> PathBuf {
     PathBuf::from(required("CONDUIT_FULL_DEVICE_E2E_EVIDENCE_DIR"))
+}
+
+fn worker_post(path: &str, value: &Value) -> Value {
+    let mut child = Command::new("curl")
+        .args([
+            "--insecure",
+            "--silent",
+            "--show-error",
+            "--fail-with-body",
+            "--max-time",
+            "15",
+            "--request",
+            "POST",
+            "--header",
+            &format!(
+                "Authorization: Bearer {}",
+                required("CONDUIT_FULL_DEVICE_E2E_WORKER_TOKEN")
+            ),
+            "--header",
+            "Content-Type: application/json",
+            "--data-binary",
+            "@-",
+            &format!("{}{}", required("CONDUIT_FULL_DEVICE_E2E_WORKER_URL"), path),
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&serde_jcs::to_vec(value).unwrap())
+        .unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "isolated Control Plane request failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
+}
+
+fn next_worker_sequence() -> u64 {
+    let path = evidence_dir().join("control-plane-sequence");
+    let prior = if path.exists() {
+        fs::read_to_string(&path).unwrap().parse::<u64>().unwrap()
+    } else {
+        0
+    };
+    let next = prior.checked_add(1).unwrap();
+    write_private(&path, next.to_string().as_bytes());
+    next
+}
+
+fn signed_frame(
+    frame_type: &str,
+    correlation_id: &str,
+    payload: Value,
+    _identity: &DeviceIdentity,
+) -> Value {
+    let sequence = next_worker_sequence();
+    let message_digest = hex::encode(Sha256::digest(
+        format!("{frame_type}:{correlation_id}:{sequence}").as_bytes(),
+    ));
+    json!({
+        "protocol":"conduit.node/1",
+        "messageId":format!("nmsg_{}", &message_digest[..24]),
+        "deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),
+        "connectionEpoch":"1","direction":"node_to_control",
+        "sequence":sequence.to_string(),"type":frame_type,
+        "correlationId":correlation_id,
+        "payloadDigest":hex::encode(Sha256::digest(serde_jcs::to_vec(&payload).unwrap())),
+        "payload":payload,
+    })
+}
+
+fn sign_device_payload(frame_type: &str, payload: &Value, identity: &DeviceIdentity) -> String {
+    let transcript = json!({
+        "domain":format!("conduit.{frame_type}.v1"),
+        "deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),
+        "connectionEpoch":"1","payload":payload,
+    });
+    identity.sign(&serde_jcs::to_vec(&transcript).unwrap())
+}
+
+fn signed_registration_payload(
+    bundle: &Value,
+    identity: &DeviceIdentity,
+    request_id: &str,
+    policy_summary: Value,
+    policy_revision: u64,
+) -> Value {
+    let policy_digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&policy_summary).unwrap()));
+    let policy_unsigned = json!({
+        "deviceId":required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),
+        "revision":policy_revision,"policyDigest":policy_digest,
+        "previousPolicyDigest":Value::Null,"publicSummary":policy_summary,
+    });
+    let device_policy = json!({
+        "revision":policy_revision,"policyDigest":policy_digest,
+        "previousPolicyDigest":Value::Null,"publicSummary":policy_unsigned["publicSummary"],
+        "signature":identity.sign(&serde_jcs::to_vec(&policy_unsigned).unwrap())
+    });
+    let unsigned = json!({
+        "requestId":request_id,"registrationBundle":bundle,
+        "devicePolicy":device_policy,"deviceKeyId":identity.key_id()
+    });
+    let mut payload = unsigned.clone();
+    payload["deviceSignature"] = Value::String(sign_device_payload(
+        "privilege.installation_attestation",
+        &unsigned,
+        identity,
+    ));
+    payload
 }
 fn read_json(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()

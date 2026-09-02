@@ -131,7 +131,8 @@ installation, missing systemd/cgroup-v2 support, or unavailable non-interactive
 local root authorization. It never substitutes a fake helper for a missing
 prerequisite.
 
-The test requires an isolated HTTPS Control Plane deployment and Device record:
+The test requires an HTTPS public-origin identity for the isolated per-run
+Control Plane fixture and an isolated Device ID:
 
 ```sh
 export CONDUIT_FULL_DEVICE_E2E_CONTROL_URL=https://isolated-test.example
@@ -155,20 +156,31 @@ cargo test --locked -p conduit-node --test full_device_live -- \
   --ignored --exact full_device_live_systemd_root_e2e --nocapture
 ```
 
-The `registration` phase creates and Owner-activates an issuer at the isolated
-Control Plane, approves the exact helper registration with fresh-Passkey
-evidence, and writes the bounded public issuer key. The script then invokes the
+The script starts a per-run loopback Wrangler fixture with its own Worker
+isolate, D1 files, and DeviceRoom storage. The `registration` phase activates
+the fixture issuer through the production privilege-admin implementation,
+approves the exact helper registration under the fixture's isolated test
+authority, and writes the bounded public issuer key. It records
+`freshPasskey=false`; this path is the explicitly isolated cryptographic test
+deployment allowed by the implementation task, not evidence that a browser
+Passkey ceremony occurred. The script then invokes the
 installed root-owned helper to pin that exact key and, as a separate command,
 enable the root policy. Only after both root receipts are checked does it enable
 the real sequential-packet socket and enter the `exercise` phase. Remote routes
 cannot perform either root action.
 
 The driver receives only the documented `CONDUIT_FULL_DEVICE_E2E_*` paths,
-identifiers, and `registration`/`exercise` phase. It exercises the real
-Node/helper/systemd/Control Plane chain,
-including signed tickets and receipts, exact argv and I/O, PTY, controls, root
+identifiers, and phase values. One exact-command case uses tickets issued by
+the Worker from durable D1 authority, crosses a token-gated DeviceRoom RPC with
+the Device-signed frames, executes through the installed helper and real system
+systemd, and projects the signed helper receipt chain back into D1. This proves
+the Worker/D1/DeviceRoom/helper/systemd integration, but it does not claim the
+production DeviceRoom WebSocket handshake was exercised; that remains a
+separate transport test. The remaining cases exercise signed tickets and
+receipts, exact argv and I/O, PTY, controls, root
 marker confinement, same-user denial, Node/helper restart, response-loss replay,
-server/root `never` opt-ins, structured Agent separation, update/rollback with
+the root-owned `never` opt-in plus a Control-Plane-issued `never` launch after
+server policy permits it, structured Agent separation, update/rollback with
 live custody, and active-run uninstall refusal. It writes a bounded sanitized
 `driver-summary.json` and leaves zero active elevated Runtimes.
 

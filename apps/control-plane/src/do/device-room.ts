@@ -282,6 +282,75 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
   }
 
   /**
+   * Isolated live-E2E courier entrypoint. The production configuration never
+   * defines either binding, so this cannot be enabled by an HTTP request. The
+   * dedicated loopback fixture uses it to exercise the same durable inbox,
+   * D1 privilege projection, and durable result outbox without manufacturing
+   * a browser- or Device-auth bypass in the production Worker entrypoint.
+   */
+  async projectFullDeviceLiveE2E(token: string, document: unknown): Promise<Record<string, unknown>> {
+    const liveEnv = this.env as ControlPlaneEnv & {
+      FULL_DEVICE_LIVE_E2E?: string;
+      FULL_DEVICE_LIVE_E2E_TOKEN?: string;
+    };
+    if (liveEnv.FULL_DEVICE_LIVE_E2E !== "enabled" || liveEnv.FULL_DEVICE_LIVE_E2E_TOKEN === undefined || token !== liveEnv.FULL_DEVICE_LIVE_E2E_TOKEN) {
+      throw new TypeError("full_device_live_e2e_unavailable");
+    }
+    const frame = parsePrivilegeTransportFrame(parseWireDocumentText(schemaIds.nodeV1, JSON.stringify(document)));
+    const computed = await sha256Hex(canonicalJson(frame.payload));
+    if (computed !== frame.payloadDigest) throw new TypeError("payload_digest_mismatch");
+    const sequence = Number(frame.sequence);
+    if (!Number.isSafeInteger(sequence) || sequence < 1) throw new TypeError("sequence_out_of_range");
+    const state = this.ctx.storage.sql.exec<{ device_id: string; epoch: number }>("SELECT device_id,epoch FROM connection_state WHERE singleton=1").toArray()[0];
+    if (state === undefined) {
+      this.ctx.storage.sql.exec("INSERT INTO connection_state(singleton,device_id,epoch,key_id,connection_id,protocol,capability_digest,reconciliation_state,updated_at) VALUES (1,?,?,?,?,?,?,\'complete\',?)", frame.deviceId, Number(frame.connectionEpoch), null, "full-device-live-e2e", "conduit.node/1", "full-device-live-e2e", nowIso());
+    } else if (state.device_id !== frame.deviceId || String(state.epoch) !== frame.connectionEpoch) {
+      throw new TypeError("full_device_live_e2e_room_identity_conflict");
+    }
+    const position = this.ctx.storage.sql.exec<{ durable_sequence: number }>("SELECT durable_sequence FROM transport_positions WHERE direction=\'node_to_control\'").one().durable_sequence;
+    if (sequence !== position + 1) throw new TypeError("full_device_live_e2e_sequence_conflict");
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("INSERT INTO inbound_frames(sequence,message_id,correlation_id,payload_digest,frame_json,projected,kind,created_at) VALUES (?,?,?,?,?,3,\'app\',?)", sequence, frame.messageId, frame.correlationId ?? null, frame.payloadDigest, JSON.stringify(frame), nowIso());
+      this.ctx.storage.sql.exec("UPDATE transport_positions SET durable_sequence=? WHERE direction=\'node_to_control\'", sequence);
+    });
+    try {
+      const result = await projectPrivilegeFrame(this.env, frame);
+      if (frame.type === "privilege.ticket_request") {
+        await this.enqueueControlFrame(privilegeResultType(), result, String(frame.payload.requestId), new Date(Date.now() + 300_000).toISOString(), undefined, `cmsg_${String(frame.payload.requestId)}`, frame.deviceId);
+      }
+      this.ctx.storage.sql.exec("UPDATE inbound_frames SET projected=1 WHERE sequence=? AND projected=3", sequence);
+      const counts = this.ctx.storage.sql.exec<{ inbound: number; outbound: number }>("SELECT (SELECT COUNT(*) FROM inbound_frames) AS inbound,(SELECT COUNT(*) FROM outbound_message_receipts) AS outbound").one();
+      return { result, durableSequence: String(sequence), inboundRows: counts.inbound, outboundRows: counts.outbound };
+    } catch (error) {
+      this.ctx.storage.sql.exec("UPDATE inbound_frames SET projected=0 WHERE sequence=? AND projected=3", sequence);
+      throw error;
+    }
+  }
+
+  async inspectFullDeviceLiveE2E(token: string): Promise<Record<string, unknown>> {
+    const liveEnv = this.env as ControlPlaneEnv & { FULL_DEVICE_LIVE_E2E?: string; FULL_DEVICE_LIVE_E2E_TOKEN?: string };
+    if (liveEnv.FULL_DEVICE_LIVE_E2E !== "enabled" || liveEnv.FULL_DEVICE_LIVE_E2E_TOKEN === undefined || token !== liveEnv.FULL_DEVICE_LIVE_E2E_TOKEN) throw new TypeError("full_device_live_e2e_unavailable");
+    const positions = this.ctx.storage.sql.exec<{ direction: string; durable_sequence: number }>("SELECT direction,durable_sequence FROM transport_positions ORDER BY direction").toArray();
+    const rows = this.ctx.storage.sql.exec<{ inbound: number; projected: number; outbound: number }>("SELECT (SELECT COUNT(*) FROM inbound_frames) AS inbound,(SELECT COUNT(*) FROM inbound_frames WHERE projected=1) AS projected,(SELECT COUNT(*) FROM outbound_message_receipts) AS outbound").one();
+    return { ...rows, positions };
+  }
+
+  async acknowledgeFullDeviceLiveRegistrationE2E(token: string, installationId: string): Promise<void> {
+    const liveEnv = this.env as ControlPlaneEnv & { FULL_DEVICE_LIVE_E2E?: string; FULL_DEVICE_LIVE_E2E_TOKEN?: string };
+    if (liveEnv.FULL_DEVICE_LIVE_E2E !== "enabled" || liveEnv.FULL_DEVICE_LIVE_E2E_TOKEN === undefined || token !== liveEnv.FULL_DEVICE_LIVE_E2E_TOKEN) throw new TypeError("full_device_live_e2e_unavailable");
+    const messageId = `cmsg_preg_${installationId}`;
+    const queued = this.ctx.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_frames WHERE message_id=?", messageId).one().count;
+    if (queued !== 1) throw new TypeError("full_device_live_registration_delivery_missing");
+    // Model the isolated client's application plus cumulative ACK. Removing
+    // this exact test delivery permits a later policy attestation to reuse the
+    // production registration correlation identity during the same live run.
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("DELETE FROM outbound_frames WHERE message_id=?", messageId);
+      this.ctx.storage.sql.exec("DELETE FROM outbound_message_receipts WHERE message_id=?", messageId);
+    });
+  }
+
+  /**
    * Mark work before returning custody of a row. The marker is deliberately
    * local to this DO: it is the durable wake-up hint, not a second source of
    * truth for any protocol record.

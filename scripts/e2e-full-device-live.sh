@@ -8,6 +8,7 @@ cd "$conduit_root"
 
 conduit_confirm=0
 conduit_control_url="${CONDUIT_FULL_DEVICE_E2E_CONTROL_URL:-}"
+conduit_control_port="${CONDUIT_FULL_DEVICE_E2E_LOCAL_CONTROL_PORT:-18787}"
 while (($#)); do
   case "$1" in
     --i-understand-this-runs-reviewed-code-as-root)
@@ -32,6 +33,10 @@ done
 }
 [[ "$conduit_control_url" =~ ^https://([A-Za-z0-9.-]+|\[[0-9A-Fa-f:]+\])(:[0-9]{1,5})?$ ]] || {
   echo "CONDUIT_FULL_DEVICE_E2E_CONTROL_URL must be the exact HTTPS test origin" >&2
+  exit 2
+}
+[[ "$conduit_control_port" =~ ^[1-9][0-9]{3,4}$ && "$conduit_control_port" -le 65535 ]] || {
+  echo "CONDUIT_FULL_DEVICE_E2E_LOCAL_CONTROL_PORT must be an unprivileged TCP port" >&2
   exit 2
 }
 conduit_device_id="${CONDUIT_FULL_DEVICE_E2E_DEVICE_ID:-}"
@@ -116,11 +121,16 @@ conduit_root_stage="$(sudo -n mktemp -d "$conduit_root_parent/run.XXXXXXXX")"
 }
 conduit_package_root="$conduit_root_stage/package"
 conduit_cleanup_started=0
+conduit_control_pid=0
 
 conduit_cleanup() {
   local conduit_status=$?
   trap - EXIT INT TERM
   set +e
+  if ((conduit_control_pid)); then
+    kill "$conduit_control_pid" >/dev/null 2>&1 || true
+    wait "$conduit_control_pid" >/dev/null 2>&1 || true
+  fi
   conduit_cleanup_package_ok=1
   if ((conduit_cleanup_started)); then
     if sudo -n test -x /usr/libexec/conduit/conduit-privileged-helper; then
@@ -146,6 +156,55 @@ conduit_cleanup() {
 }
 trap conduit_cleanup EXIT
 trap 'exit 130' INT TERM
+
+# Run the dedicated fixture through a real local Workers isolate, D1 database,
+# and DeviceRoom. Its bearer capability is generated per run, accepted only on
+# loopback, and does not expose helper installation or root-policy operations.
+conduit_corepack="${CONDUIT_FULL_DEVICE_E2E_COREPACK:-/home/sahur/.local/bin/corepack}"
+[[ "$conduit_corepack" == /* && -x "$conduit_corepack" && ! -L "$conduit_corepack" ]] || {
+  echo "CONDUIT_FULL_DEVICE_E2E_COREPACK must be an absolute executable non-symlink" >&2
+  exit 4
+}
+conduit_control_token="$(openssl rand -hex 24)"
+conduit_control_state="$conduit_user_evidence/control-plane-state"
+conduit_control_log="$conduit_user_evidence/control-plane.log"
+conduit_control_endpoint="https://127.0.0.1:$conduit_control_port"
+install -d -m 0700 "$conduit_control_state"
+conduit_node_path="$(dirname "$conduit_corepack"):$PATH"
+env PATH="$conduit_node_path" "$conduit_corepack" pnpm --filter @conduit/control-plane exec wrangler \
+  d1 migrations apply conduit-full-device-live --local \
+  --config wrangler.full-device-live.jsonc --persist-to "$conduit_control_state" \
+  > "$conduit_control_log" 2>&1
+env PATH="$conduit_node_path" "$conduit_corepack" pnpm --filter @conduit/control-plane exec wrangler dev \
+  --config wrangler.full-device-live.jsonc --local --ip 127.0.0.1 \
+  --port "$conduit_control_port" --local-protocol https \
+  --persist-to "$conduit_control_state" \
+  --var "PUBLIC_ORIGIN:$conduit_control_url" \
+  --var "OAUTH_ISSUER:$conduit_control_url" \
+  --var "FULL_DEVICE_LIVE_E2E_TOKEN:$conduit_control_token" \
+  --log-level warn --show-interactive-dev-session false \
+  >> "$conduit_control_log" 2>&1 &
+conduit_control_pid=$!
+for _ in $(seq 1 200); do
+  if curl --insecure --silent --fail --max-time 1 \
+    -H "Authorization: Bearer $conduit_control_token" \
+    "$conduit_control_endpoint/__full-device-live/health" >/dev/null; then
+    break
+  fi
+  kill -0 "$conduit_control_pid" >/dev/null 2>&1 || {
+    echo "isolated Control Plane Worker exited during startup" >&2
+    tail -n 80 "$conduit_control_log" >&2
+    exit 4
+  }
+  sleep 0.05
+done
+curl --insecure --silent --fail --max-time 2 \
+  -H "Authorization: Bearer $conduit_control_token" \
+  "$conduit_control_endpoint/__full-device-live/health" >/dev/null || {
+    echo "isolated Control Plane Worker did not become ready" >&2
+    tail -n 80 "$conduit_control_log" >&2
+    exit 4
+  }
 
 sudo -n install -d -o root -g root -m 0700 \
   "$conduit_package_root" \
@@ -192,6 +251,8 @@ export CONDUIT_FULL_DEVICE_E2E_INSTALLER="$conduit_package_root/installers/insta
 export CONDUIT_FULL_DEVICE_E2E_UPDATER="$conduit_package_root/installers/update-privileged.sh"
 export CONDUIT_FULL_DEVICE_E2E_UNINSTALLER="$conduit_package_root/installers/uninstall-privileged.sh"
 export CONDUIT_FULL_DEVICE_E2E_EVIDENCE_DIR="$conduit_user_evidence"
+export CONDUIT_FULL_DEVICE_E2E_WORKER_URL="$conduit_control_endpoint"
+export CONDUIT_FULL_DEVICE_E2E_WORKER_TOKEN="$conduit_control_token"
 
 # Create the Device identity as the unprivileged Device user. Only the public
 # key is handed to the root helper; the private key remains mode 0600 locally.
@@ -225,9 +286,10 @@ chmod 0600 "$conduit_registration_bundle"
 
 export CONDUIT_FULL_DEVICE_E2E_REGISTRATION_BUNDLE="$conduit_registration_bundle"
 
-# The first phase creates and Owner-activates the isolated Control Plane ticket
-# issuer, approves the exact helper registration through fresh Passkey, and
-# exports only its public key/activation evidence. It cannot change root policy.
+# The first phase activates the per-run isolated Control Plane ticket issuer,
+# approves the exact helper registration under explicit test-deployment
+# authority, and exports only its public key/activation evidence. It does not
+# claim a browser Passkey ceremony and cannot change root policy.
 export CONDUIT_FULL_DEVICE_E2E_PHASE=registration
 cargo test --locked -p conduit-node --test full_device_live \
   -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
@@ -275,8 +337,12 @@ grep -Eq "\"deviceId\"[[:space:]]*:[[:space:]]*\"$conduit_device_id\"" \
     echo "Control Plane approval does not bind the isolated test Device" >&2
     exit 4
   }
-grep -Eq '"freshPasskey"[[:space:]]*:[[:space:]]*true' "$conduit_registration_approval" || {
-  echo "helper registration was not approved with fresh Passkey evidence" >&2
+grep -Eq '"freshPasskey"[[:space:]]*:[[:space:]]*false' "$conduit_registration_approval" || {
+  echo "isolated cryptographic test deployment claimed unsupported Passkey evidence" >&2
+  exit 4
+}
+grep -Eq '"isolatedCryptographicTestDeployment"[[:space:]]*:[[:space:]]*true' "$conduit_registration_approval" || {
+  echo "helper registration lacks isolated cryptographic test-deployment evidence" >&2
   exit 4
 }
 grep -Eq '"status"[[:space:]]*:[[:space:]]*"active"' "$conduit_registration_approval" || {

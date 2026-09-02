@@ -173,6 +173,8 @@ fi
 DESTDIR="$conduit_stage" CONDUIT_BUILD_DIR="$conduit_release_120" \
   "$conduit_root/installers/install-privileged.sh"
 printf '0\n' > "$CONDUIT_TEST_PRIVILEGED_STATE/active-count"
+printf '' > "$CONDUIT_TEST_PRIVILEGED_STATE/authority.lock"
+chmod 0600 "$CONDUIT_TEST_PRIVILEGED_STATE/authority.lock"
 if DESTDIR="$conduit_stage" \
   "$conduit_root/installers/uninstall-privileged.sh" --purge; then
   echo "purge unexpectedly omitted the explicit confirmation phrase" >&2

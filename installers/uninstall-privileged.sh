@@ -208,6 +208,22 @@ if ((conduit_purge)); then
     done
     rmdir -- "$conduit_upgrade_root"
   fi
+
+  # Per-UID purge removes each custody directory. A base authority lock can
+  # remain after package-level diagnostics; remove only that fixed file after
+  # every Runtime is terminal and all helper state has been purged.
+  conduit_base_authority_lock="$(conduit_privileged_target "$conduit_privileged_state_dir")/authority.lock"
+  if [[ -e "$conduit_base_authority_lock" || -L "$conduit_base_authority_lock" ]]; then
+    conduit_base_lock_owner=0
+    [[ -z "$conduit_privileged_destdir" ]] || conduit_base_lock_owner="$(id -u)"
+    [[ -f "$conduit_base_authority_lock" && ! -L "$conduit_base_authority_lock" && \
+        "$(stat -c '%u' "$conduit_base_authority_lock")" = "$conduit_base_lock_owner" && \
+        "$(stat -c '%a' "$conduit_base_authority_lock")" = 600 ]] || {
+      echo "unsafe privileged package authority lock during purge" >&2
+      exit 4
+    }
+    rm -f -- "$conduit_base_authority_lock"
+  fi
 fi
 
 for conduit_target in \

@@ -1,8 +1,9 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use conduit_privileged_helper::{
-    HelperConfig, HelperEngine, HelperJournal, JOURNAL_SCHEMA_VERSION, PinnedTicketKeys,
-    PolicyChangeEvidence, SeqpacketServer, SystemdBackend, SystemdManager,
+    AuthorityLock, HelperConfig, HelperEngine, HelperJournal, JOURNAL_SCHEMA_VERSION,
+    PinnedTicketKeys, PolicyChangeEvidence, SeqpacketServer, SystemdBackend, SystemdManager,
     build_registration_bundle, load_receipt_key_root_owned, run_exec_worker,
+    runtime_identity_matches,
 };
 use conduit_privileged_protocol::{
     HelperRequest, HelperResponse, PrivilegedOperation, ResourceCeilings, RootPolicy, key_id,
@@ -21,6 +22,26 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
 };
+use zeroize::Zeroizing;
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReceiptKeyHistory {
+    schema_version: u32,
+    installation_id: String,
+    current_key_id: String,
+    keys: Vec<ReceiptKeyHistoryEntry>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ReceiptKeyHistoryEntry {
+    key_id: String,
+    public_key: String,
+    fingerprint: String,
+    activated_policy_revision: u64,
+    retired_policy_revision: Option<u64>,
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -105,7 +126,7 @@ fn serve(args: &[String]) -> conduit_privileged_helper::Result<()> {
     // Reconcile root journal custody against systemd before accepting any new
     // authority. Receipts remain in the journal for the authenticated Node to
     // fetch; a missing/ambiguous unit is never replaced automatically.
-    engine.recover_nonterminal()?;
+    engine.reconcile_before_admission()?;
     let watcher = engine.clone();
     std::thread::spawn(move || {
         loop {
@@ -130,10 +151,9 @@ fn serve(args: &[String]) -> conduit_privileged_helper::Result<()> {
         connection.set_read_timeout(std::time::Duration::from_secs(5))?;
         let engine = engine.clone();
         let node = node.clone();
-        let policy = policy.clone();
         let active_connections = active_connections.clone();
         std::thread::spawn(move || {
-            let _ = serve_connection(connection, engine, node, &policy);
+            let _ = serve_connection(connection, engine, node);
             active_connections.fetch_sub(1, Ordering::AcqRel);
         });
     }
@@ -143,7 +163,6 @@ fn serve_connection(
     connection: conduit_privileged_helper::SeqpacketConnection,
     engine: Arc<HelperEngine<SystemdBackend>>,
     node: VerifyingKey,
-    policy: &Path,
 ) -> conduit_privileged_helper::Result<()> {
     let mut authenticated = false;
     loop {
@@ -161,14 +180,7 @@ fn serve_connection(
                     {
                         Ok(request) => {
                             let response = engine
-                                .verify_current_policy(&policy)
-                                .and_then(|()| {
-                                    engine.handle_managed(
-                                        authenticated,
-                                        request,
-                                        packet.descriptors.len(),
-                                    )
-                                })
+                                .handle_managed(authenticated, request, packet.descriptors.len())
                                 .unwrap_or_else(|error| {
                                     conduit_privileged_helper::ManagedIoResponse::Error {
                                         code: error.to_string(),
@@ -201,14 +213,12 @@ fn serve_connection(
                     authenticated = true;
                     v
                 }),
-            _ => engine.verify_current_policy(&policy).and_then(|()| {
-                engine.handle(
-                    connection.peer_credentials(),
-                    authenticated,
-                    request,
-                    packet.descriptors,
-                )
-            }),
+            _ => engine.handle(
+                connection.peer_credentials(),
+                authenticated,
+                request,
+                packet.descriptors,
+            ),
         };
         match response {
             Ok(v) => send_response(&connection, &v)?,
@@ -287,9 +297,11 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             })?;
             fs::create_dir_all(&state)?;
             fs::set_permissions(&state, fs::Permissions::from_mode(0o700))?;
+            let _authority = AuthorityLock::exclusive(&state, 0)?;
             fs::create_dir_all(&config_base)?;
             fs::set_permissions(&config_base, fs::Permissions::from_mode(0o700))?;
             let installation_id = load_or_create_installation(&state)?;
+            begin_admin_update(&state, "prepare")?;
             atomic(&node_path, &node_raw, 0o644)?;
             let secret = state.join("receipt.key");
             if !secret.exists() {
@@ -334,6 +346,8 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             let policy_bytes = serde_jcs::to_vec(&policy)?;
             atomic(&policy_path, &policy_bytes, 0o600)?;
             record_policy_change(&state, &policy, None, "installation")?;
+            ensure_receipt_key_history(&state, &policy)?;
+            finish_admin_update(&state)?;
             let registration = registration_bundle(&state, &policy_path, &node_path)?;
             let bundle_digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&registration)?));
             output(
@@ -344,6 +358,7 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
         "pin-ticket-key" => {
             require_root()?;
             let uid = parse_uid(args)?;
+            let _authority = AuthorityLock::exclusive(&state, 0)?;
             let source = required_path(args, "--issuer-key-file")?;
             let expected = value_arg(args, "--expected-fingerprint")
                 .ok_or_else(|| {
@@ -414,19 +429,21 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
                     ));
                 }
             }
-            atomic(
-                &keys_path,
-                &serde_jcs::to_vec(&json!({"keys":keys}))?,
-                0o600,
-            )?;
-            atomic(&policy_path, &serde_jcs::to_vec(&policy)?, 0o600)?;
             if changed {
+                begin_admin_update(&state, "ticket_key_pin")?;
+                atomic(
+                    &keys_path,
+                    &serde_jcs::to_vec(&json!({"keys":keys}))?,
+                    0o600,
+                )?;
+                atomic(&policy_path, &serde_jcs::to_vec(&policy)?, 0o600)?;
                 record_policy_change(
                     &state,
                     &policy,
                     Some(previous_policy_digest),
                     "ticket_key_pin",
                 )?;
+                finish_admin_update(&state)?;
             }
             output(
                 json!({"pinned":true,"keyId":id,"fingerprint":fingerprint,"policyRevision":policy.revision,"registrationBundle":registration_bundle(&state,&policy_path,&node_path)?}),
@@ -436,6 +453,7 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
         "rotate-device-key" => {
             require_root()?;
             let uid = parse_uid(args)?;
+            let _authority = AuthorityLock::exclusive(&state, 0)?;
             let expected_current =
                 value_arg(args, "--expected-current-key-id").ok_or_else(|| {
                     conduit_privileged_helper::HelperError::Policy(
@@ -508,6 +526,7 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
         "enable" => {
             require_root()?;
             let uid = parse_uid(args)?;
+            let _authority = AuthorityLock::exclusive(&state, 0)?;
             let path = policy_path.clone();
             let mut policy: RootPolicy = serde_json::from_slice(&fs::read(&path)?)?;
             if policy.uid != uid {
@@ -525,16 +544,154 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             policy.revision = policy.revision.checked_add(1).ok_or_else(|| {
                 conduit_privileged_helper::HelperError::Policy("revision overflow".into())
             })?;
+            begin_admin_update(&state, "enable")?;
             atomic(&path, &serde_jcs::to_vec(&policy)?, 0o600)?;
             record_policy_change(&state, &policy, Some(previous_policy_digest), "enable")?;
+            finish_admin_update(&state)?;
             output(
                 json!({"enabled":true,"policyRevision":policy.revision,"policyDigest":policy.digest()?,"installationId":policy.installation_id,"registrationBundle":registration_bundle(&state,&policy_path,&node_path)?}),
             );
             Ok(())
         }
+        "disable" => {
+            require_root()?;
+            let uid = parse_uid(args)?;
+            let _authority = AuthorityLock::exclusive(&state, 0)?;
+            let mut policy: RootPolicy = serde_json::from_slice(&fs::read(&policy_path)?)?;
+            if policy.uid != uid {
+                return Err(conduit_privileged_helper::HelperError::Policy(
+                    "uid differs from prepared policy".into(),
+                ));
+            }
+            let stop_requested = args.iter().any(|value| value == "--stop-active");
+            let active_before = active_runtime_count(&journal)?;
+            let previous_policy_digest = policy.digest()?;
+            let changed = disable_root_policy(&mut policy)?;
+            if changed {
+                begin_admin_update(&state, "disable")?;
+                atomic(&policy_path, &serde_jcs::to_vec(&policy)?, 0o600)?;
+                record_policy_change(&state, &policy, Some(previous_policy_digest), "disable")?;
+                finish_admin_update(&state)?;
+            }
+            let (stop_attempted, receipt_count, active_after) = if stop_requested {
+                stop_active_runtimes(&state, &policy_path, &keys_path, &node_path, &journal)?
+            } else {
+                (0, 0, active_before)
+            };
+            output(json!({
+                "disabled": true,
+                "changed": changed,
+                "policyRevision": policy.revision,
+                "policyDigest": policy.digest()?,
+                "helperRestartRequired": changed,
+                "activeRuntimeCountBefore": active_before,
+                "activeRuntimeCountAfter": active_after,
+                "continuingUnderPriorAdmission": !stop_requested && active_after != 0,
+                "activeRuntimeDisposition": if stop_requested {
+                    "stop_requested"
+                } else if active_after != 0 {
+                    "preserved_under_prior_admission"
+                } else {
+                    "none"
+                },
+                "stopEvidence": {
+                    "requested": stop_requested,
+                    "attempted": stop_attempted,
+                    "signedReceiptCount": receipt_count,
+                    "terminalCustodyProven": active_after == 0
+                },
+                "registrationBundle": registration_bundle(&state, &policy_path, &node_path)?,
+            }));
+            Ok(())
+        }
+        "rotate-receipt-key" => {
+            require_root()?;
+            let uid = parse_uid(args)?;
+            let _authority = AuthorityLock::exclusive(&state, 0)?;
+            let expected_current =
+                value_arg(args, "--expected-current-key-id").ok_or_else(|| {
+                    conduit_privileged_helper::HelperError::Policy(
+                        "--expected-current-key-id required".into(),
+                    )
+                })?;
+            let mut policy: RootPolicy = serde_json::from_slice(&fs::read(&policy_path)?)?;
+            if policy.uid != uid {
+                return Err(conduit_privileged_helper::HelperError::Policy(
+                    "uid differs from prepared policy".into(),
+                ));
+            }
+            let secret_path = state.join("receipt.key");
+            let public_path = state.join("receipt.public");
+            let current_signing = load_receipt_key_root_owned(&secret_path)?;
+            validate_root_file(&public_path, 0o644)?;
+            let current_public: [u8; 32] = fs::read(&public_path)?.try_into().map_err(|_| {
+                conduit_privileged_helper::HelperError::Policy("receipt public key length".into())
+            })?;
+            if current_signing.verifying_key().as_bytes() != &current_public {
+                return Err(conduit_privileged_helper::HelperError::Policy(
+                    "receipt key pair mismatch".into(),
+                ));
+            }
+            let current_key_id = key_id("hkey", &current_public);
+            if current_key_id != expected_current {
+                return Err(conduit_privileged_helper::HelperError::Denied(
+                    "receipt_key_rotation_stale".into(),
+                ));
+            }
+            require_receipt_key_rotation_idle(|| active_runtime_count(&journal))?;
+            let history = load_receipt_key_history(&state, &policy, current_public)?;
+            let previous_policy_digest = policy.digest()?;
+            policy.revision = policy.revision.checked_add(1).ok_or_else(|| {
+                conduit_privileged_helper::HelperError::Policy("revision overflow".into())
+            })?;
+            let mut seed = Zeroizing::new([0u8; 32]);
+            getrandom::fill(seed.as_mut()).map_err(|error| {
+                conduit_privileged_helper::HelperError::Policy(error.to_string())
+            })?;
+            let replacement = ed25519_dalek::SigningKey::from_bytes(&seed);
+            let replacement_public = *replacement.verifying_key().as_bytes();
+            let replacement_key_id = key_id("hkey", &replacement_public);
+            let history = rotated_receipt_key_history(
+                history,
+                &current_key_id,
+                replacement_public,
+                policy.revision,
+            )?;
+            validate_receipt_key_history(&history, &policy, replacement_public)?;
+            begin_admin_update(&state, "receipt_key_rotation")?;
+            atomic(&secret_path, seed.as_ref(), 0o600)?;
+            atomic(&public_path, &replacement_public, 0o644)?;
+            atomic(
+                &state.join("receipt-key-history.json"),
+                &serde_jcs::to_vec(&history)?,
+                0o600,
+            )?;
+            atomic(&policy_path, &serde_jcs::to_vec(&policy)?, 0o600)?;
+            record_policy_change(
+                &state,
+                &policy,
+                Some(previous_policy_digest),
+                "receipt_key_rotation",
+            )?;
+            finish_admin_update(&state)?;
+            output(json!({
+                "rotated": true,
+                "previousReceiptKeyId": current_key_id,
+                "previousReceiptPublicKeyFingerprint": hex::encode(Sha256::digest(current_public)),
+                "receiptKeyId": replacement_key_id,
+                "receiptPublicKeyFingerprint": hex::encode(Sha256::digest(replacement_public)),
+                "policyRevision": policy.revision,
+                "policyDigest": policy.digest()?,
+                "keyHistoryEntries": history.keys.len(),
+                "helperRestartRequired": true,
+                "registrationBundle": registration_bundle(&state, &policy_path, &node_path)?,
+            }));
+            Ok(())
+        }
         "policy" => {
             require_root()?;
             let uid = parse_uid(args)?;
+            let _authority = AuthorityLock::exclusive(&state, 0)?;
             let path = policy_path.clone();
             let mut policy: RootPolicy = serde_json::from_slice(&fs::read(&path)?)?;
             if policy.uid != uid {
@@ -543,6 +700,7 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
                 ));
             }
             let previous_policy_digest = policy.digest()?;
+            let previous_policy = policy.clone();
             if let Some(value) = value_arg(args, "--allow-never") {
                 policy.allow_never = parse_bool(&value)?;
             }
@@ -571,6 +729,8 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
                 conduit_privileged_helper::HelperError::Policy("revision overflow".into())
             })?;
             let digest = policy.digest()?;
+            let change = classify_policy_change(&previous_policy, &policy);
+            begin_admin_update(&state, "local_policy_update")?;
             atomic(&path, &serde_jcs::to_vec(&policy)?, 0o600)?;
             record_policy_change(
                 &state,
@@ -578,18 +738,24 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
                 Some(previous_policy_digest),
                 "local_policy_update",
             )?;
+            finish_admin_update(&state)?;
             output(
-                json!({"updated":true,"policyRevision":policy.revision,"policyDigest":digest,"allowNever":policy.allow_never,"allowUnrestrictedLaunch":policy.allow_unrestricted_launch,"allowedAdapters":policy.allowed_adapters,"allowedLaunchProfiles":policy.allowed_launch_profiles,"launchProfileExecutableDigests":policy.launch_profile_executable_digests,"allowedCredentialProfiles":policy.allowed_credential_profiles,"registrationBundle":registration_bundle(&state,&policy_path,&node_path)?}),
+                json!({"updated":true,"policyRevision":policy.revision,"policyDigest":digest,"changeDirection":change,"helperRestartRequired":true,"allowNever":policy.allow_never,"allowUnrestrictedLaunch":policy.allow_unrestricted_launch,"allowedAdapters":policy.allowed_adapters,"allowedLaunchProfiles":policy.allowed_launch_profiles,"launchProfileExecutableDigests":policy.launch_profile_executable_digests,"allowedCredentialProfiles":policy.allowed_credential_profiles,"registrationBundle":registration_bundle(&state,&policy_path,&node_path)?}),
             );
             Ok(())
         }
         "registration-bundle" => {
             require_root()?;
+            let _authority = AuthorityLock::shared(&state, 0)?;
             output(registration_bundle(&state, &policy_path, &node_path)?);
             Ok(())
         }
         "status" => {
             require_root()?;
+            let _authority = state
+                .is_dir()
+                .then(|| AuthorityLock::shared(&state, 0))
+                .transpose()?;
             output(admin_status(
                 &state,
                 &policy_path,
@@ -602,6 +768,10 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
         }
         "doctor" => {
             require_root()?;
+            let _authority = state
+                .is_dir()
+                .then(|| AuthorityLock::shared(&state, 0))
+                .transpose()?;
             output(admin_status(
                 &state,
                 &policy_path,
@@ -649,54 +819,22 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
         }
         "stop-active" => {
             require_root()?;
-            let helper = HelperJournal::open_root_owned(&journal)?;
-            let backend = SystemdBackend::connect_system()?;
-            let mut stopped = 0;
-            let mut units = Vec::new();
-            for runtime in helper.nonterminal_runtimes()? {
-                if backend.inspect_optional(&runtime.unit_name)?.is_some() {
-                    backend.graceful_stop(&runtime.unit_name)?;
-                    units.push(runtime.unit_name);
-                    stopped += 1;
-                }
-            }
-            for unit in units {
-                for _ in 0..100 {
-                    match backend.inspect(&unit) {
-                        Ok(observation)
-                            if matches!(
-                                observation.active_state.as_str(),
-                                "inactive" | "failed" | "dead"
-                            ) =>
-                        {
-                            break;
-                        }
-                        Err(_) => break,
-                        _ => std::thread::sleep(std::time::Duration::from_millis(50)),
-                    }
-                }
-            }
-            let signing = load_receipt_key_root_owned(&state.join("receipt.key"))?;
-            let config = HelperConfig::load_policy_root_owned(
-                &policy_path,
-                &node_path,
-                key_id("hkey", signing.verifying_key().as_bytes()),
-                state.clone(),
-                env::current_exe()?,
-            )?;
-            let engine = HelperEngine::new(
-                config,
-                PinnedTicketKeys::load_root_owned(&keys_path)?,
-                signing,
-                helper,
-                SystemdBackend::connect_system()?,
-            )?;
-            let receipts = engine.recover_nonterminal()?;
-            output(json!({"stopped":stopped,"receipts":receipts.len()}));
+            let _authority = AuthorityLock::exclusive(&state, 0)?;
+            let active_before = active_runtime_count(&journal)?;
+            let (stopped, receipts, active_after) =
+                stop_active_runtimes(&state, &policy_path, &keys_path, &node_path, &journal)?;
+            output(json!({
+                "stopped": stopped,
+                "receipts": receipts,
+                "activeRuntimeCountBefore": active_before,
+                "activeRuntimeCountAfter": active_after,
+                "terminalCustodyProven": active_after == 0
+            }));
             Ok(())
         }
         "purge" => {
             require_root()?;
+            let _authority = AuthorityLock::exclusive(&state, 0)?;
             let helper = HelperJournal::open_root_owned(&journal)?;
             if helper.active_runtime_count()? != 0 {
                 return Err(conduit_privileged_helper::HelperError::Denied(
@@ -771,6 +909,7 @@ fn admin_status(
     })?;
     let receipt_key_id = key_id("hkey", &receipt_public);
     let receipt_fingerprint = hex::encode(Sha256::digest(receipt_public));
+    let receipt_key_history = load_receipt_key_history(state, &policy, receipt_public)?;
     let active_runtime_count = if journal_path.exists() {
         HelperJournal::open_root_owned(journal_path)?.active_runtime_count()?
     } else {
@@ -828,6 +967,7 @@ fn admin_status(
         "policyDigest": policy_digest,
         "receiptKeyId": receipt_key_id,
         "receiptPublicKeyFingerprint": receipt_fingerprint,
+        "receiptKeyHistoryEntries": receipt_key_history.keys.len(),
         "activeRuntimeCount": active_runtime_count,
         "recoveryState": if active_runtime_count == 0 { "clean" } else { "active_custody_present" },
         "controlPlaneRegistrationState": "not_observed_by_local_helper",
@@ -1065,12 +1205,363 @@ fn record_policy_change(
         0o600,
     )
 }
-fn begin_admin_update(state: &Path, change_class: &str) -> conduit_privileged_helper::Result<()> {
+
+fn active_runtime_count(journal_path: &Path) -> conduit_privileged_helper::Result<u64> {
+    if journal_path.exists() {
+        HelperJournal::open_root_owned(journal_path)?.active_runtime_count()
+    } else {
+        Ok(0)
+    }
+}
+
+fn disable_root_policy(policy: &mut RootPolicy) -> conduit_privileged_helper::Result<bool> {
+    if !policy.enabled {
+        return Ok(false);
+    }
+    policy.enabled = false;
+    policy.revision = policy.revision.checked_add(1).ok_or_else(|| {
+        conduit_privileged_helper::HelperError::Policy("revision overflow".into())
+    })?;
+    Ok(true)
+}
+
+fn require_receipt_key_rotation_idle(
+    active_count: impl FnOnce() -> conduit_privileged_helper::Result<u64>,
+) -> conduit_privileged_helper::Result<()> {
+    if active_count()? != 0 {
+        return Err(conduit_privileged_helper::HelperError::Denied(
+            "active_runtimes_present".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn stop_active_runtimes(
+    state: &Path,
+    policy_path: &Path,
+    keys_path: &Path,
+    node_path: &Path,
+    journal_path: &Path,
+) -> conduit_privileged_helper::Result<(u64, usize, u64)> {
+    let helper = HelperJournal::open_root_owned(journal_path)?;
+    let backend = SystemdBackend::connect_system()?;
+    let mut runtimes = Vec::new();
+    let mut after_runtime_id = None;
+    loop {
+        let page = helper.nonterminal_runtimes_after(after_runtime_id.as_deref())?;
+        if page.is_empty() {
+            break;
+        }
+        after_runtime_id = page.last().map(|runtime| runtime.runtime_id.clone());
+        runtimes.extend(page);
+    }
+    let expected_terminal_revisions = runtimes
+        .iter()
+        .map(|runtime| (runtime.runtime_id.clone(), runtime.state_revision + 1))
+        .collect::<BTreeMap<_, _>>();
+    let mut units_to_stop = Vec::new();
+    for runtime in &runtimes {
+        let observation = backend.inspect(&runtime.unit_name).map_err(|_| {
+            conduit_privileged_helper::HelperError::RecoveryRequired(
+                "active_runtime_identity_missing".into(),
+            )
+        })?;
+        if !runtime_identity_matches(runtime, &observation) {
+            return Err(conduit_privileged_helper::HelperError::RecoveryRequired(
+                "active_runtime_identity_mismatch".into(),
+            ));
+        }
+        if !matches!(
+            observation.active_state.as_str(),
+            "inactive" | "failed" | "dead"
+        ) {
+            units_to_stop.push(runtime.unit_name.clone());
+        }
+    }
+    for unit in &units_to_stop {
+        backend.graceful_stop(unit)?;
+    }
+    for unit in &units_to_stop {
+        for _ in 0..100 {
+            match backend.inspect(unit) {
+                Ok(observation)
+                    if matches!(
+                        observation.active_state.as_str(),
+                        "inactive" | "failed" | "dead"
+                    ) =>
+                {
+                    break;
+                }
+                Err(_) => break,
+                _ => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+    }
+    let signing = load_receipt_key_root_owned(&state.join("receipt.key"))?;
+    let config = HelperConfig::load_policy_root_owned(
+        policy_path,
+        node_path,
+        key_id("hkey", signing.verifying_key().as_bytes()),
+        state.to_path_buf(),
+        env::current_exe()?,
+    )?;
+    let engine = HelperEngine::new(
+        config,
+        PinnedTicketKeys::load_root_owned(keys_path)?,
+        signing,
+        helper,
+        SystemdBackend::connect_system()?,
+    )?;
+    let receipts = engine.recover_nonterminal()?;
+    let terminal_receipts = receipts
+        .iter()
+        .filter(|receipt| {
+            expected_terminal_revisions.get(&receipt.claims.runtime_id)
+                == Some(&receipt.claims.state_revision)
+                && matches!(receipt.claims.transition.as_str(), "stopped" | "failed")
+        })
+        .count();
+    let active_after = active_runtime_count(journal_path)?;
+    if active_after != 0 {
+        return Err(conduit_privileged_helper::HelperError::RecoveryRequired(
+            "active_runtime_stop_not_terminal".into(),
+        ));
+    }
+    Ok((units_to_stop.len() as u64, terminal_receipts, active_after))
+}
+
+fn receipt_key_entry(public: [u8; 32], activated_policy_revision: u64) -> ReceiptKeyHistoryEntry {
+    ReceiptKeyHistoryEntry {
+        key_id: key_id("hkey", &public),
+        public_key: URL_SAFE_NO_PAD.encode(public),
+        fingerprint: hex::encode(Sha256::digest(public)),
+        activated_policy_revision,
+        retired_policy_revision: None,
+    }
+}
+
+fn load_receipt_key_history(
+    state: &Path,
+    policy: &RootPolicy,
+    current_public: [u8; 32],
+) -> conduit_privileged_helper::Result<ReceiptKeyHistory> {
+    let path = state.join("receipt-key-history.json");
+    let history = if path.exists() {
+        validate_root_file(&path, 0o600)?;
+        serde_json::from_slice(&fs::read(path)?)?
+    } else {
+        ReceiptKeyHistory {
+            schema_version: 1,
+            installation_id: policy.installation_id.clone(),
+            current_key_id: key_id("hkey", &current_public),
+            keys: vec![receipt_key_entry(current_public, policy.revision)],
+        }
+    };
+    validate_receipt_key_history(&history, policy, current_public)?;
+    Ok(history)
+}
+
+fn ensure_receipt_key_history(
+    state: &Path,
+    policy: &RootPolicy,
+) -> conduit_privileged_helper::Result<()> {
+    let public: [u8; 32] = fs::read(state.join("receipt.public"))?
+        .try_into()
+        .map_err(|_| {
+            conduit_privileged_helper::HelperError::Policy("receipt public key length".into())
+        })?;
+    let history = load_receipt_key_history(state, policy, public)?;
     atomic(
-        &state.join("admin-update.json"),
-        &serde_jcs::to_vec(&json!({"changeClass":change_class}))?,
+        &state.join("receipt-key-history.json"),
+        &serde_jcs::to_vec(&history)?,
         0o600,
     )
+}
+
+fn validate_receipt_key_history(
+    history: &ReceiptKeyHistory,
+    policy: &RootPolicy,
+    current_public: [u8; 32],
+) -> conduit_privileged_helper::Result<()> {
+    let current_key_id = key_id("hkey", &current_public);
+    if history.schema_version != 1
+        || history.installation_id != policy.installation_id
+        || history.current_key_id != current_key_id
+        || history.keys.is_empty()
+        || history.keys.len() > 32
+        || history
+            .keys
+            .iter()
+            .filter(|entry| entry.retired_policy_revision.is_none())
+            .count()
+            != 1
+    {
+        return Err(conduit_privileged_helper::HelperError::Policy(
+            "receipt key history mismatch".into(),
+        ));
+    }
+    let mut ids = std::collections::BTreeSet::new();
+    for entry in &history.keys {
+        let public: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(&entry.public_key)
+            .map_err(|_| {
+                conduit_privileged_helper::HelperError::Policy(
+                    "receipt key history public key encoding".into(),
+                )
+            })?
+            .try_into()
+            .map_err(|_| {
+                conduit_privileged_helper::HelperError::Policy(
+                    "receipt key history public key length".into(),
+                )
+            })?;
+        if !ids.insert(entry.key_id.clone())
+            || entry.key_id != key_id("hkey", &public)
+            || entry.fingerprint != hex::encode(Sha256::digest(public))
+            || entry.activated_policy_revision == 0
+            || entry.activated_policy_revision > policy.revision
+            || entry.retired_policy_revision.is_some_and(|revision| {
+                revision < entry.activated_policy_revision || revision > policy.revision
+            })
+        {
+            return Err(conduit_privileged_helper::HelperError::Policy(
+                "receipt key history entry invalid".into(),
+            ));
+        }
+    }
+    let current = history
+        .keys
+        .iter()
+        .find(|entry| entry.key_id == current_key_id)
+        .ok_or_else(|| {
+            conduit_privileged_helper::HelperError::Policy(
+                "receipt key history missing current key".into(),
+            )
+        })?;
+    if current.public_key != URL_SAFE_NO_PAD.encode(current_public)
+        || current.fingerprint != hex::encode(Sha256::digest(current_public))
+        || current.retired_policy_revision.is_some()
+    {
+        return Err(conduit_privileged_helper::HelperError::Policy(
+            "receipt key history current key mismatch".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn rotated_receipt_key_history(
+    mut history: ReceiptKeyHistory,
+    expected_current_key_id: &str,
+    replacement_public: [u8; 32],
+    policy_revision: u64,
+) -> conduit_privileged_helper::Result<ReceiptKeyHistory> {
+    if history.current_key_id != expected_current_key_id {
+        return Err(conduit_privileged_helper::HelperError::Denied(
+            "receipt_key_rotation_stale".into(),
+        ));
+    }
+    if history.keys.len() >= 32 {
+        return Err(conduit_privileged_helper::HelperError::Denied(
+            "receipt_key_history_full".into(),
+        ));
+    }
+    let current = history
+        .keys
+        .iter_mut()
+        .find(|entry| entry.key_id == expected_current_key_id)
+        .ok_or_else(|| {
+            conduit_privileged_helper::HelperError::Policy(
+                "receipt key history missing current key".into(),
+            )
+        })?;
+    if current.retired_policy_revision.is_some() {
+        return Err(conduit_privileged_helper::HelperError::Policy(
+            "receipt key history current key already retired".into(),
+        ));
+    }
+    current.retired_policy_revision = Some(policy_revision);
+    let replacement = receipt_key_entry(replacement_public, policy_revision);
+    if history
+        .keys
+        .iter()
+        .any(|entry| entry.key_id == replacement.key_id)
+    {
+        return Err(conduit_privileged_helper::HelperError::Denied(
+            "receipt_key_rotation_conflict".into(),
+        ));
+    }
+    history.current_key_id = replacement.key_id.clone();
+    history.keys.push(replacement);
+    Ok(history)
+}
+
+fn classify_policy_change(previous: &RootPolicy, next: &RootPolicy) -> &'static str {
+    let mut narrowing = previous.enabled && !next.enabled;
+    let mut broadening = !previous.enabled && next.enabled;
+    for (before, after) in [
+        (previous.allow_never, next.allow_never),
+        (
+            previous.allow_unrestricted_launch,
+            next.allow_unrestricted_launch,
+        ),
+        (
+            previous.allow_persistent_sessions,
+            next.allow_persistent_sessions,
+        ),
+        (previous.allow_offline_control, next.allow_offline_control),
+    ] {
+        narrowing |= before && !after;
+        broadening |= !before && after;
+    }
+    for (before, after) in [
+        (&previous.allowed_adapters, &next.allowed_adapters),
+        (
+            &previous.allowed_launch_profiles,
+            &next.allowed_launch_profiles,
+        ),
+        (
+            &previous.allowed_credential_profiles,
+            &next.allowed_credential_profiles,
+        ),
+    ] {
+        narrowing |= before.iter().any(|value| !after.contains(value));
+        broadening |= after.iter().any(|value| !before.contains(value));
+    }
+    for (profile, digest) in &previous.launch_profile_executable_digests {
+        narrowing |= next.launch_profile_executable_digests.get(profile) != Some(digest);
+    }
+    for (profile, digest) in &next.launch_profile_executable_digests {
+        broadening |= previous.launch_profile_executable_digests.get(profile) != Some(digest);
+    }
+    match (narrowing, broadening) {
+        (true, true) => "mixed",
+        (true, false) => "narrowing",
+        (false, true) => "broadening",
+        (false, false) => "no_change",
+    }
+}
+
+fn begin_admin_update(state: &Path, change_class: &str) -> conduit_privileged_helper::Result<()> {
+    let path = state.join("admin-update.json");
+    let mut file = match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(conduit_privileged_helper::HelperError::RecoveryRequired(
+                "admin_update_recovery_required".into(),
+            ));
+        }
+        Err(error) => return Err(error.into()),
+    };
+    file.write_all(&serde_jcs::to_vec(&json!({"changeClass":change_class}))?)?;
+    file.sync_all()?;
+    fs::File::open(state)?.sync_all()?;
+    Ok(())
 }
 fn finish_admin_update(state: &Path) -> conduit_privileged_helper::Result<()> {
     fs::remove_file(state.join("admin-update.json"))?;
@@ -1110,6 +1601,8 @@ fn validate_managed_state(state: &Path) -> conduit_privileged_helper::Result<()>
         "installation-id",
         "receipt.key",
         "receipt.public",
+        "receipt-key-history.json",
+        "authority.lock",
         "policy-change.json",
         "admin-update.json",
         "privileged-policy.json",
@@ -1187,4 +1680,132 @@ fn all_operations() -> Vec<PrivilegedOperation> {
         PrivilegedOperation::ForceStop,
         PrivilegedOperation::Reconcile,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn policy() -> RootPolicy {
+        RootPolicy {
+            policy_version: 1,
+            installation_id: "phinst_admin0001".into(),
+            device_id: "dev_admin0001".into(),
+            uid: unsafe { libc::geteuid() },
+            revision: 7,
+            enabled: true,
+            origin: "https://example.test".into(),
+            ticket_key_ids: vec!["pkey_admin0001".into()],
+            allowed_operations: all_operations(),
+            allowed_adapters: vec!["codex".into(), "pi".into()],
+            allowed_launch_profiles: vec!["profile".into()],
+            launch_profile_executable_digests: BTreeMap::from([(
+                "profile".into(),
+                "ab".repeat(32),
+            )]),
+            allowed_credential_profiles: vec!["credential".into()],
+            ceilings: ResourceCeilings {
+                cpu_quota_per_sec_usec: None,
+                memory_max_bytes: None,
+                tasks_max: None,
+                io_weight: None,
+                runtime_max_usec: None,
+            },
+            allow_never: true,
+            allow_unrestricted_launch: true,
+            allow_persistent_sessions: true,
+            allow_offline_control: true,
+            receipt_retention_seconds: 3600,
+        }
+    }
+
+    #[test]
+    fn disable_is_explicit_and_idempotent() {
+        let mut policy = policy();
+        assert!(disable_root_policy(&mut policy).unwrap());
+        assert!(!policy.enabled);
+        assert_eq!(policy.revision, 8);
+        assert!(!disable_root_policy(&mut policy).unwrap());
+        assert_eq!(policy.revision, 8);
+    }
+
+    #[test]
+    fn policy_change_classifies_narrowing_and_mixed_changes() {
+        let previous = policy();
+        let mut narrowed = previous.clone();
+        narrowed.allow_never = false;
+        narrowed.allowed_adapters = vec!["codex".into()];
+        assert_eq!(classify_policy_change(&previous, &narrowed), "narrowing");
+        narrowed.allowed_launch_profiles.push("broader".into());
+        assert_eq!(classify_policy_change(&previous, &narrowed), "mixed");
+    }
+
+    #[test]
+    fn active_custody_aborts_receipt_rotation_without_mutating_keys() {
+        let directory = tempdir().unwrap();
+        let secret_path = directory.path().join("receipt.key");
+        let public_path = directory.path().join("receipt.public");
+        fs::write(&secret_path, [3; 32]).unwrap();
+        fs::write(&public_path, [4; 32]).unwrap();
+        let before_secret = fs::read(&secret_path).unwrap();
+        let before_public = fs::read(&public_path).unwrap();
+        assert!(matches!(
+            require_receipt_key_rotation_idle(|| Ok(1)),
+            Err(conduit_privileged_helper::HelperError::Denied(reason))
+                if reason == "active_runtimes_present"
+        ));
+        assert_eq!(fs::read(secret_path).unwrap(), before_secret);
+        assert_eq!(fs::read(public_path).unwrap(), before_public);
+        assert!(!directory.path().join("admin-update.json").exists());
+    }
+
+    #[test]
+    fn existing_admin_update_marker_cannot_be_overwritten_or_cleared() {
+        let directory = tempdir().unwrap();
+        begin_admin_update(directory.path(), "receipt_key_rotation").unwrap();
+        let marker = directory.path().join("admin-update.json");
+        let before = fs::read(&marker).unwrap();
+        assert!(matches!(
+            begin_admin_update(directory.path(), "enable"),
+            Err(conduit_privileged_helper::HelperError::RecoveryRequired(reason))
+                if reason == "admin_update_recovery_required"
+        ));
+        assert_eq!(fs::read(&marker).unwrap(), before);
+        assert!(marker.exists());
+    }
+
+    #[test]
+    fn receipt_rotation_keeps_bounded_public_key_history() {
+        let policy = policy();
+        let current_public = [9; 32];
+        let current = receipt_key_entry(current_public, policy.revision);
+        let current_key_id = current.key_id.clone();
+        let history = ReceiptKeyHistory {
+            schema_version: 1,
+            installation_id: policy.installation_id.clone(),
+            current_key_id: current_key_id.clone(),
+            keys: vec![current],
+        };
+        let replacement_public = [10; 32];
+        let rotated = rotated_receipt_key_history(
+            history,
+            &current_key_id,
+            replacement_public,
+            policy.revision + 1,
+        )
+        .unwrap();
+        assert_eq!(rotated.installation_id, policy.installation_id);
+        assert_eq!(rotated.keys.len(), 2);
+        assert_eq!(
+            rotated.keys[0].retired_policy_revision,
+            Some(policy.revision + 1)
+        );
+        assert_eq!(rotated.current_key_id, key_id("hkey", &replacement_public));
+        assert!(rotated.keys[1].retired_policy_revision.is_none());
+        assert_eq!(
+            rotated.keys[1].public_key,
+            URL_SAFE_NO_PAD.encode(replacement_public)
+        );
+    }
 }

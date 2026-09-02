@@ -343,7 +343,7 @@ impl HelperJournal {
     pub fn active_runtime_count(&self) -> Result<u64> {
         self.lock()?
             .query_row(
-                "SELECT count(*) FROM runtimes WHERE state NOT IN ('stopped','failed','terminal','recovery_required')",
+                "SELECT count(*) FROM runtimes WHERE state NOT IN ('stopped','failed','terminal')",
                 [],
                 |row| row.get(0),
             )
@@ -354,7 +354,7 @@ impl HelperJournal {
         let changed = self
             .lock()?
             .execute(
-                "DELETE FROM runtimes WHERE state IN ('stopped','failed','terminal','recovery_required')",
+                "DELETE FROM runtimes WHERE state IN ('stopped','failed','terminal')",
                 [],
             )
             .map_err(sql_error)?;
@@ -367,12 +367,19 @@ impl HelperJournal {
     }
 
     pub fn nonterminal_runtimes(&self) -> Result<Vec<RuntimeRecord>> {
+        self.nonterminal_runtimes_after(None)
+    }
+
+    pub fn nonterminal_runtimes_after(
+        &self,
+        after_runtime_id: Option<&str>,
+    ) -> Result<Vec<RuntimeRecord>> {
         let connection = self.lock()?;
         let mut statement = connection
-            .prepare("SELECT runtime_id FROM runtimes WHERE state NOT IN ('stopped','failed','terminal','recovery_required') ORDER BY updated_at,runtime_id LIMIT 256")
+            .prepare("SELECT runtime_id FROM runtimes WHERE state NOT IN ('stopped','failed','terminal') AND (?1 IS NULL OR runtime_id>?1) ORDER BY runtime_id LIMIT 256")
             .map_err(sql_error)?;
         let ids = statement
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([after_runtime_id], |row| row.get::<_, String>(0))
             .map_err(sql_error)?
             .collect::<std::result::Result<Vec<_>, _>>()
             .map_err(sql_error)?;

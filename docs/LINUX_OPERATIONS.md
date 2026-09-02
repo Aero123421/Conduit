@@ -164,6 +164,31 @@ before the Node may advertise `full_device`. Enabling the helper does not enable
 `full_device + never` or unrestricted elevated launch. Those remain separate
 root-local policy actions.
 
+Disable new privileged work without terminating already-admitted Runtimes:
+
+```sh
+sudo /usr/libexec/conduit/conduit-privileged-helper admin disable \
+  --uid "$(id -u)" --output json
+```
+
+The result reports whether prior admissions are still running. Add the explicit
+`--stop-active` option only when those Runtimes should be stopped; the result
+then reports the before/after custody counts and signed terminal-receipt count.
+
+Receipt-key rotation is bound to the currently observed key and refuses any
+nonterminal Runtime custody:
+
+```sh
+sudo /usr/libexec/conduit/conduit-privileged-helper admin rotate-receipt-key \
+  --uid "$(id -u)" --expected-current-key-id hkey_... --output json
+```
+
+Rotation retains a bounded root-owned public-key history, increments the root
+policy revision, and emits a new public registration bundle. Restart the helper
+and complete the fresh-owner registration flow before relying on the new key.
+Root policy changes fence a running helper immediately; broader or narrower
+policy becomes usable only after a service restart.
+
 Use `admin package-status --output json` before maintenance. The updater calls
 the candidate's read-only `admin package-check` against the installed journal
 and exec worker, then probes the installed files again before committing. It

@@ -31,6 +31,67 @@ use zeroize::Zeroizing;
 #[derive(Clone)]
 pub struct PinnedTicketKeys(pub BTreeMap<String, [u8; 32]>);
 
+pub struct AuthorityLock {
+    file: File,
+}
+
+impl AuthorityLock {
+    pub fn shared(state_dir: &Path, expected_uid: u32) -> Result<Self> {
+        Self::acquire(state_dir, expected_uid, libc::LOCK_SH)
+    }
+
+    pub fn exclusive(state_dir: &Path, expected_uid: u32) -> Result<Self> {
+        Self::acquire(state_dir, expected_uid, libc::LOCK_EX)
+    }
+
+    fn acquire(state_dir: &Path, expected_uid: u32, operation: libc::c_int) -> Result<Self> {
+        let state_metadata = fs::symlink_metadata(state_dir)?;
+        if !state_metadata.is_dir()
+            || state_metadata.file_type().is_symlink()
+            || state_metadata.uid() != expected_uid
+            || state_metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(HelperError::Policy(
+                "authority lock directory ownership or mode invalid".into(),
+            ));
+        }
+        let path = state_dir.join("authority.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file()
+            || metadata.uid() != expected_uid
+            || metadata.permissions().mode() & 0o777 != 0o600
+        {
+            return Err(HelperError::Policy(
+                "authority lock ownership or mode invalid".into(),
+            ));
+        }
+        loop {
+            if unsafe { libc::flock(file.as_raw_fd(), operation) } == 0 {
+                return Ok(Self { file });
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                return Err(error.into());
+            }
+        }
+    }
+}
+
+impl Drop for AuthorityLock {
+    fn drop(&mut self) {
+        unsafe {
+            libc::flock(self.file.as_raw_fd(), libc::LOCK_UN);
+        }
+    }
+}
+
 impl PinnedTicketKeys {
     pub fn load_root_owned(path: &Path) -> Result<Self> {
         validate_regular(path, 0, 0o600)?;
@@ -62,6 +123,8 @@ impl PinnedTicketKeys {
 pub struct HelperConfig {
     pub policy: RootPolicy,
     pub policy_digest: String,
+    pub policy_path: Option<PathBuf>,
+    pub policy_owner_uid: u32,
     pub receipt_key_id: String,
     pub helper_version: String,
     pub state_dir: PathBuf,
@@ -180,6 +243,8 @@ impl HelperConfig {
         Ok(Self {
             policy,
             policy_digest: digest,
+            policy_path: Some(path.to_path_buf()),
+            policy_owner_uid: 0,
             receipt_key_id,
             helper_version: env!("CARGO_PKG_VERSION").into(),
             state_dir,
@@ -237,30 +302,62 @@ impl<M: SystemdManager> HelperEngine<M> {
         })
     }
 
-    /// A root policy change immediately fences this process. Broadening only
-    /// becomes usable after a fresh service start and Control Plane approval;
-    /// narrowing therefore cannot be delayed by a long-lived socket session.
-    pub fn verify_current_policy(&self, path: &Path) -> Result<()> {
-        validate_regular(path, 0, 0o600)?;
+    pub fn recover_nonterminal(&self) -> Result<Vec<HelperReceipt>> {
+        let mut receipts = Vec::new();
+        let mut after_runtime_id = None;
+        loop {
+            let runtimes = self
+                .journal
+                .nonterminal_runtimes_after(after_runtime_id.as_deref())?;
+            if runtimes.is_empty() {
+                break;
+            }
+            after_runtime_id = runtimes.last().map(|runtime| runtime.runtime_id.clone());
+            let ids = runtimes
+                .into_iter()
+                .map(|runtime| runtime.runtime_id)
+                .collect();
+            match self.reconcile(ids)? {
+                HelperResponse::Receipts(page) => receipts.extend(page),
+                _ => unreachable!(),
+            }
+        }
+        Ok(receipts)
+    }
+
+    /// Reconcile durable root custody with systemd before the server exposes
+    /// an admission socket. Callers must treat any error as a startup failure.
+    pub fn reconcile_before_admission(&self) -> Result<Vec<HelperReceipt>> {
+        let _authority =
+            AuthorityLock::shared(&self.config.state_dir, self.config.policy_owner_uid)?;
+        self.recover_nonterminal()
+    }
+
+    fn ensure_policy_current(&self) -> Result<()> {
+        let Some(path) = &self.config.policy_path else {
+            return Ok(());
+        };
+        if self.config.state_dir.join("admin-update.json").exists() {
+            return Err(HelperError::RecoveryRequired(
+                "root_policy_update_in_progress".into(),
+            ));
+        }
+        validate_regular(path, self.config.policy_owner_uid, 0o600)?;
         let current: RootPolicy = serde_json::from_slice(&fs::read(path)?)?;
-        if current != self.config.policy || current.digest()? != self.config.policy_digest {
+        let current_digest = current.digest()?;
+        let evidence_path = self.config.state_dir.join("policy-change.json");
+        validate_regular(&evidence_path, self.config.policy_owner_uid, 0o600)?;
+        let evidence: PolicyChangeEvidence = serde_json::from_slice(&fs::read(evidence_path)?)?;
+        if current.revision != self.config.policy.revision
+            || current_digest != self.config.policy_digest
+            || evidence.revision != current.revision
+            || evidence.policy_digest != current_digest
+        {
             return Err(HelperError::Denied(
                 "privileged_helper_policy_mismatch".into(),
             ));
         }
         Ok(())
-    }
-    pub fn recover_nonterminal(&self) -> Result<Vec<HelperReceipt>> {
-        let ids = self
-            .journal
-            .nonterminal_runtimes()?
-            .into_iter()
-            .map(|v| v.runtime_id)
-            .collect();
-        match self.reconcile(ids)? {
-            HelperResponse::Receipts(receipts) => Ok(receipts),
-            _ => unreachable!(),
-        }
     }
     pub fn registration_bundle(&self) -> Result<RegistrationBundle> {
         build_registration_bundle(
@@ -278,6 +375,8 @@ impl<M: SystemdManager> HelperEngine<M> {
         request: crate::ManagedIoRequest,
         descriptor_count: usize,
     ) -> Result<crate::ManagedIoResponse> {
+        let _authority =
+            AuthorityLock::shared(&self.config.state_dir, self.config.policy_owner_uid)?;
         if !authenticated {
             return Err(HelperError::Authentication("handshake_required".into()));
         }
@@ -286,6 +385,7 @@ impl<M: SystemdManager> HelperEngine<M> {
                 "unexpected managed request descriptors".into(),
             ));
         }
+        self.ensure_policy_current()?;
         match request {
             crate::ManagedIoRequest::ReadStream(request) => self.read_stream(&request),
             crate::ManagedIoRequest::PolicyAttest => self
@@ -294,6 +394,8 @@ impl<M: SystemdManager> HelperEngine<M> {
         }
     }
     pub fn converge_terminal(&self) -> Result<Vec<HelperReceipt>> {
+        let _authority =
+            AuthorityLock::shared(&self.config.state_dir, self.config.policy_owner_uid)?;
         let mut receipts = Vec::new();
         for runtime in self.journal.nonterminal_runtimes()? {
             match self.systemd.inspect_optional(&runtime.unit_name) {
@@ -301,7 +403,7 @@ impl<M: SystemdManager> HelperEngine<M> {
                     if matches!(
                         observation.active_state.as_str(),
                         "inactive" | "dead" | "failed"
-                    ) =>
+                    ) && runtime_identity_matches(&runtime, &observation) =>
                 {
                     let ticket = runtime.authority_ticket.clone();
                     let transition = receipt_transition(&observation.active_state);
@@ -318,6 +420,24 @@ impl<M: SystemdManager> HelperEngine<M> {
                         observation.invocation_id.as_deref(),
                         observation.main_pid,
                     )?;
+                    receipts.push(receipt)
+                }
+                Ok(Some(observation))
+                    if matches!(
+                        observation.active_state.as_str(),
+                        "inactive" | "dead" | "failed"
+                    ) =>
+                {
+                    let ticket = runtime.authority_ticket.clone();
+                    let receipt = self.receipt(
+                        &ticket,
+                        "terminal_watcher_identity_mismatch",
+                        "recovery_required",
+                        None,
+                        runtime.state_revision + 1,
+                    )?;
+                    self.journal
+                        .record_observation(&receipt, "recovery_required", None, None)?;
                     receipts.push(receipt)
                 }
                 Ok(None) if matches!(runtime.state.as_str(), "starting" | "running" | "paused") => {
@@ -389,6 +509,8 @@ impl<M: SystemdManager> HelperEngine<M> {
         request: HelperRequest,
         descriptors: Vec<OwnedFd>,
     ) -> Result<HelperResponse> {
+        let _authority =
+            AuthorityLock::shared(&self.config.state_dir, self.config.policy_owner_uid)?;
         if peer.uid != self.config.policy.uid {
             return Err(HelperError::Authentication("peer uid mismatch".into()));
         }
@@ -400,6 +522,7 @@ impl<M: SystemdManager> HelperEngine<M> {
         if descriptors.len() != expected_descriptors {
             return Err(HelperError::Denied("unexpected_fd_manifest".into()));
         }
+        self.ensure_policy_current()?;
         match request {
             HelperRequest::Hello {
                 protocol_versions,
@@ -444,6 +567,9 @@ impl<M: SystemdManager> HelperEngine<M> {
         signature: &str,
         node_key: &VerifyingKey,
     ) -> Result<HelperResponse> {
+        let _authority =
+            AuthorityLock::shared(&self.config.state_dir, self.config.policy_owner_uid)?;
+        self.ensure_policy_current()?;
         let stored = self
             .challenges
             .lock()
@@ -1068,37 +1194,41 @@ impl<M: SystemdManager> HelperEngine<M> {
                 if let Some(receipt) = runtime.last_receipt.clone() {
                     receipts.push(receipt);
                 }
-                if matches!(
-                    runtime.state.as_str(),
-                    "stopped" | "failed" | "terminal" | "recovery_required"
-                ) {
+                if matches!(runtime.state.as_str(), "stopped" | "failed" | "terminal") {
                     continue;
                 }
                 let observation = self.systemd.inspect(&runtime.unit_name).ok();
+                let exact_observation = observation
+                    .as_ref()
+                    .filter(|value| runtime_identity_matches(&runtime, value));
+                if runtime.state == "recovery_required"
+                    && !exact_observation.is_some_and(|value| {
+                        matches!(value.active_state.as_str(), "inactive" | "dead" | "failed")
+                    })
+                {
+                    continue;
+                }
                 let ticket = runtime.authority_ticket.clone();
-                let transition = if observation.is_some() {
-                    receipt_transition(observation.as_ref().unwrap().active_state.as_str())
+                let transition = if let Some(observation) = exact_observation {
+                    receipt_transition(observation.active_state.as_str())
                 } else {
                     "recovery_required"
                 };
-                let state = observation
-                    .as_ref()
+                let state = exact_observation
                     .map(|v| normalize_unit_state(&v.active_state))
                     .unwrap_or("recovery_required");
                 let receipt = self.receipt(
                     &ticket,
                     "reconcile",
                     transition,
-                    observation.as_ref(),
+                    exact_observation,
                     runtime.state_revision + 1,
                 )?;
                 self.journal.record_observation(
                     &receipt,
                     state,
-                    observation
-                        .as_ref()
-                        .and_then(|v| v.invocation_id.as_deref()),
-                    observation.as_ref().and_then(|v| v.main_pid),
+                    exact_observation.and_then(|v| v.invocation_id.as_deref()),
+                    exact_observation.and_then(|v| v.main_pid),
                 )?;
                 receipts.push(receipt);
             }
@@ -1215,6 +1345,9 @@ impl<M: SystemdManager> HelperEngine<M> {
                 | PrivilegedOperation::GracefulStop
                 | PrivilegedOperation::ForceStop
         );
+        if !self.config.policy.enabled {
+            return Err(HelperError::Denied("privileged_helper_disabled".into()));
+        }
         if c.protocol != PROTOCOL
             || c.audience != "conduit-privileged-helper"
             || c.helper_installation_id != self.config.policy.installation_id
@@ -1227,7 +1360,6 @@ impl<M: SystemdManager> HelperEngine<M> {
             || c.helper_key_id != self.config.receipt_key_id
             || !self.config.policy.ticket_key_ids.contains(&ticket.key_id)
             || c.allowed_operation != operation
-            || !self.config.policy.enabled
             || !self.config.policy.allowed_operations.contains(&operation)
             || ((now < not_before || now > expires_at) && !already_admitted)
             || expires_at - not_before > time::Duration::minutes(10)
@@ -1555,6 +1687,47 @@ fn valid_sha256(value: &str) -> bool {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
+pub fn runtime_identity_matches(
+    runtime: &crate::RuntimeRecord,
+    observed: &UnitObservation,
+) -> bool {
+    let expected_invocation = runtime.invocation_id.as_deref().or_else(|| {
+        runtime
+            .last_receipt
+            .as_ref()?
+            .claims
+            .invocation_id
+            .as_deref()
+    });
+    if expected_invocation != observed.invocation_id.as_deref() {
+        return false;
+    }
+    let terminal = matches!(
+        observed.active_state.as_str(),
+        "inactive" | "dead" | "failed"
+    );
+    if terminal {
+        return true;
+    }
+    let expected_pid = runtime.main_pid.or_else(|| {
+        runtime
+            .last_receipt
+            .as_ref()
+            .and_then(|receipt| receipt.claims.main_pid)
+    });
+    let expected_cgroup = runtime
+        .last_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.claims.cgroup.as_deref());
+    let expected_process_birth = runtime
+        .last_receipt
+        .as_ref()
+        .and_then(|receipt| receipt.claims.process_birth.as_deref());
+    expected_pid.is_some_and(|value| observed.main_pid == Some(value))
+        && expected_cgroup.is_some_and(|value| observed.cgroup.as_deref() == Some(value))
+        && expected_process_birth
+            .is_some_and(|value| observed.process_birth.as_deref() == Some(value))
+}
 fn normalize_unit_state(value: &str) -> &str {
     match value {
         "inactive" | "dead" => "stopped",
@@ -1696,6 +1869,8 @@ mod tests {
         let config = HelperConfig {
             policy_digest: policy_digest.clone(),
             policy,
+            policy_path: None,
+            policy_owner_uid: uid,
             receipt_key_id: receipt_id,
             helper_version: "test".into(),
             state_dir: directory.clone(),
@@ -2268,6 +2443,258 @@ mod tests {
     }
 
     #[test]
+    fn restarted_disabled_policy_returns_specific_denial() {
+        let (mut engine, _backend, plan, issuer, _) = setup();
+        let prepare = ticket(
+            &engine,
+            &issuer,
+            &plan,
+            PrivilegedOperation::Prepare,
+            "ptkt_disabled_policy",
+        );
+        engine.config.policy.enabled = false;
+        assert!(matches!(
+            engine.validate_ticket(&prepare, PrivilegedOperation::Prepare, Some(&plan)),
+            Err(HelperError::Denied(reason)) if reason == "privileged_helper_disabled"
+        ));
+    }
+
+    #[test]
+    fn live_root_policy_change_fences_old_engine_before_more_work() {
+        let (mut engine, _backend, _plan, issuer, _) = setup();
+        let policy_path = engine.config.state_dir.join("root-policy.json");
+        fs::write(
+            &policy_path,
+            serde_jcs::to_vec(&engine.config.policy).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(&policy_path, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            engine.config.state_dir.join("policy-change.json"),
+            serde_jcs::to_vec(&engine.config.policy_change).unwrap(),
+        )
+        .unwrap();
+        fs::set_permissions(
+            engine.config.state_dir.join("policy-change.json"),
+            fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+        engine.config.policy_path = Some(policy_path.clone());
+        engine.config.policy_owner_uid = unsafe { libc::geteuid() };
+        let peer = PeerCredentials {
+            pid: std::process::id(),
+            uid: engine.config.policy.uid,
+            gid: unsafe { libc::getegid() },
+        };
+        assert!(matches!(
+            engine.handle(peer, true, HelperRequest::Probe, vec![]),
+            Ok(HelperResponse::Capability(_))
+        ));
+        let HelperResponse::Challenge(challenge) = engine
+            .handle(
+                peer,
+                false,
+                HelperRequest::Hello {
+                    protocol_versions: vec![PROTOCOL.into()],
+                    device_id: engine.config.policy.device_id.clone(),
+                    node_boot_id: "boot-policy-fence".into(),
+                    nonce: "nonce-policy-fence".into(),
+                },
+                vec![],
+            )
+            .unwrap()
+        else {
+            panic!("challenge")
+        };
+
+        let mut narrowed = engine.config.policy.clone();
+        narrowed.enabled = false;
+        narrowed.revision += 1;
+        let narrowed_digest = narrowed.digest().unwrap();
+        fs::write(&policy_path, serde_jcs::to_vec(&narrowed).unwrap()).unwrap();
+        let narrowed_evidence = PolicyChangeEvidence {
+            revision: narrowed.revision,
+            policy_digest: narrowed_digest,
+            previous_policy_digest: Some(engine.config.policy_digest.clone()),
+            change_class: "disable".into(),
+            changed_at: "2026-01-02T00:00:00Z".into(),
+        };
+        fs::write(
+            engine.config.state_dir.join("policy-change.json"),
+            serde_jcs::to_vec(&narrowed_evidence).unwrap(),
+        )
+        .unwrap();
+        assert!(matches!(
+            engine.handle(peer, true, HelperRequest::Probe, vec![]),
+            Err(HelperError::Denied(reason))
+                if reason == "privileged_helper_policy_mismatch"
+        ));
+        assert!(matches!(
+            engine.prove(peer, &challenge, "invalid", &issuer.verifying_key()),
+            Err(HelperError::Denied(reason))
+                if reason == "privileged_helper_policy_mismatch"
+        ));
+    }
+
+    #[test]
+    fn authority_mutation_lock_excludes_request_admission() {
+        let directory = tempdir().unwrap().keep();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let exclusive = AuthorityLock::exclusive(&directory, uid).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let child_directory = directory.clone();
+        let thread = std::thread::spawn(move || {
+            let _shared = AuthorityLock::shared(&child_directory, uid).unwrap();
+            sender.send(()).unwrap();
+        });
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_millis(50))
+                .is_err()
+        );
+        drop(exclusive);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn startup_reconcile_observes_root_custody_before_admission() {
+        let (engine, backend, plan, issuer, _) = setup();
+        engine
+            .prepare(
+                ticket(
+                    &engine,
+                    &issuer,
+                    &plan,
+                    PrivilegedOperation::Prepare,
+                    "ptkt_startup_reconcile_prepare",
+                ),
+                plan.clone(),
+                vec![],
+            )
+            .unwrap();
+        engine
+            .start(
+                ticket(
+                    &engine,
+                    &issuer,
+                    &plan,
+                    PrivilegedOperation::Start,
+                    "ptkt_startup_reconcile_start",
+                ),
+                plan.digest().unwrap(),
+            )
+            .unwrap();
+        let inspections_before = backend.inspection_count();
+        let receipts = engine.reconcile_before_admission().unwrap();
+        assert!(backend.inspection_count() > inspections_before);
+        assert_eq!(
+            backend
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("start:"))
+                .count(),
+            1
+        );
+        assert_eq!(engine.journal.active_runtime_count().unwrap(), 1);
+        assert_eq!(receipts.last().unwrap().claims.transition, "running");
+    }
+
+    #[test]
+    fn startup_reconcile_rejects_reused_unit_identity_without_restart() {
+        let (engine, backend, plan, issuer, _) = setup();
+        engine
+            .prepare(
+                ticket(
+                    &engine,
+                    &issuer,
+                    &plan,
+                    PrivilegedOperation::Prepare,
+                    "ptkt_startup_identity_prepare",
+                ),
+                plan.clone(),
+                vec![],
+            )
+            .unwrap();
+        engine
+            .start(
+                ticket(
+                    &engine,
+                    &issuer,
+                    &plan,
+                    PrivilegedOperation::Start,
+                    "ptkt_startup_identity_start",
+                ),
+                plan.digest().unwrap(),
+            )
+            .unwrap();
+        backend.replace_unit_identity(&plan.systemd_unit);
+        let receipts = engine.reconcile_before_admission().unwrap();
+        assert_eq!(
+            receipts.last().unwrap().claims.transition,
+            "recovery_required"
+        );
+        assert_eq!(
+            engine
+                .journal
+                .runtime(&plan.runtime_id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "recovery_required"
+        );
+        assert_eq!(
+            backend
+                .calls()
+                .iter()
+                .filter(|call| call.starts_with("start:"))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn startup_reconcile_pages_through_all_unresolved_custody() {
+        let (engine, backend, plan, issuer, _) = setup();
+        for index in 0..257 {
+            let mut candidate = plan.clone();
+            candidate.runtime_id = format!("rt_page{index:04}x");
+            candidate.run_id = format!("run_page{index:04}x");
+            candidate.operation_id = format!("op_page{index:04}x");
+            candidate.systemd_unit = format!("conduit-elevated-page{index:04}.service");
+            engine
+                .prepare(
+                    ticket(
+                        &engine,
+                        &issuer,
+                        &candidate,
+                        PrivilegedOperation::Prepare,
+                        &format!("ptkt_page{index:04}x"),
+                    ),
+                    candidate,
+                    vec![],
+                )
+                .unwrap();
+        }
+        let receipts = engine.reconcile_before_admission().unwrap();
+        assert_eq!(backend.inspection_count(), 257);
+        assert_eq!(receipts.len(), 514);
+        assert_eq!(engine.journal.active_runtime_count().unwrap(), 257);
+        assert_eq!(
+            engine
+                .journal
+                .runtime("rt_page0256x")
+                .unwrap()
+                .unwrap()
+                .state,
+            "recovery_required"
+        );
+    }
+
+    #[test]
     fn terminal_watcher_converges_missing_running_unit_once() {
         let (engine, backend, plan, issuer, receipt_key) = setup();
         engine
@@ -2302,6 +2729,8 @@ mod tests {
         assert_eq!(receipts[0].claims.state_revision, 5);
         receipts[0].verify(receipt_key.as_bytes()).unwrap();
         assert!(engine.converge_terminal().unwrap().is_empty());
+        assert_eq!(engine.journal.active_runtime_count().unwrap(), 1);
+        assert_eq!(engine.journal.purge_terminal().unwrap(), 0);
         let HelperResponse::Receipts(replayed) =
             engine.reconcile(vec![plan.runtime_id.clone()]).unwrap()
         else {

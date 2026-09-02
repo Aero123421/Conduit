@@ -266,6 +266,7 @@ pub struct FakeSystemd {
 struct FakeState {
     units: BTreeMap<String, UnitObservation>,
     calls: Vec<String>,
+    inspections: u64,
     fail_next: Option<String>,
 }
 
@@ -273,12 +274,24 @@ impl FakeSystemd {
     pub fn calls(&self) -> Vec<String> {
         self.inner.lock().unwrap().calls.clone()
     }
+    #[cfg(test)]
+    pub fn inspection_count(&self) -> u64 {
+        self.inner.lock().unwrap().inspections
+    }
     pub fn fail_next(&self, reason: impl Into<String>) {
         self.inner.lock().unwrap().fail_next = Some(reason.into());
     }
     #[cfg(test)]
     pub fn forget_unit(&self, unit_name: &str) {
         self.inner.lock().unwrap().units.remove(unit_name);
+    }
+    #[cfg(test)]
+    pub fn replace_unit_identity(&self, unit_name: &str) {
+        let mut state = self.inner.lock().unwrap();
+        let observation = state.units.get_mut(unit_name).unwrap();
+        observation.invocation_id = Some("different-invocation".into());
+        observation.main_pid = Some(9999);
+        observation.process_birth = Some("fake:9999".into());
     }
     fn mutation(&self, call: String) -> Result<()> {
         let mut state = self
@@ -320,16 +333,18 @@ impl SystemdManager for FakeSystemd {
         Ok(observation)
     }
     fn inspect(&self, unit_name: &str) -> Result<UnitObservation> {
-        self.inner
-            .lock()
-            .unwrap()
+        let mut state = self.inner.lock().unwrap();
+        state.inspections += 1;
+        state
             .units
             .get(unit_name)
             .cloned()
             .ok_or_else(|| HelperError::Systemd("unit_not_found".into()))
     }
     fn inspect_optional(&self, unit_name: &str) -> Result<Option<UnitObservation>> {
-        Ok(self.inner.lock().unwrap().units.get(unit_name).cloned())
+        let mut state = self.inner.lock().unwrap();
+        state.inspections += 1;
+        Ok(state.units.get(unit_name).cloned())
     }
     fn pause(&self, unit_name: &str) -> Result<()> {
         self.mutation(format!("pause:{unit_name}"))?;

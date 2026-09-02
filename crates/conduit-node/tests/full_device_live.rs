@@ -399,10 +399,9 @@ fn node_prepare() {
             }
         }),
     );
-    let operation_digest = hex::encode(Sha256::digest(b"node-service-live-operation-v1"));
     let manifest_digest = hex::encode(Sha256::digest(b"node-service-live-manifest-v1"));
     let now = OffsetDateTime::now_utc();
-    let operation = json!({
+    let mut operation = json!({
         "schemaVersion":1,"operationId":NODE_LIVE_OPERATION_ID,
         "idempotencyKey":"node-service-live-operation-v1",
         "actorPrincipalId":"prin_full_device_live","clientId":"conduit.cli",
@@ -414,8 +413,10 @@ fn node_prepare() {
         "sourceRevisions":[],"arguments":{"launchProfileId":"full-device-live"},
         "issuedAt":now.format(&Rfc3339).unwrap(),
         "expiresAt":(now+time::Duration::minutes(5)).format(&Rfc3339).unwrap(),
-        "validForMs":300000,"payloadDigest":operation_digest
+        "validForMs":300000
     });
+    let operation_digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&operation).unwrap()));
+    operation["payloadDigest"] = Value::String(operation_digest);
     write_json(
         &evidence.join("node-operation-intent.json"),
         &json!({"operation":operation,"runManifestDigest":manifest_digest,"dispatch":true}),

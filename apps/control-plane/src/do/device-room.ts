@@ -1296,6 +1296,17 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       runs: summary.runs.slice(0, 256),
     });
     const payload = { reconciliationId: attachment.reconciliationId, controlReplay, nodeReplay: [], eventReplay: setPlan.eventReplay, statusRunIds: setPlan.statusRunIds, cancelOperationIds: setPlan.cancelOperationIds, quarantineRunIds: setPlan.quarantineRunIds };
+    // A reconciliation plan is itself sequenced control. Replay every older
+    // unacknowledged frame first; otherwise the plan (and an eager ACK) arrives
+    // across a gap and the two peers can only exchange replay requests. The
+    // Node permits this bounded preexisting replay before new effects.
+    if (applied < BigInt(controlStored)) {
+      const replayRows = this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE sequence BETWEEN ? AND ? ORDER BY sequence", Number(applied + 1n), controlStored).toArray();
+      if (replayRows.length !== controlStored - Number(applied)) { ws.close(1011, "replay_range_unavailable"); return; }
+      for (const replayRow of replayRows) {
+        if (!await this.sendStoredFrame(replayRow, ws)) { ws.close(1011, "replay_delivery_failed"); return; }
+      }
+    }
     const delivery = await this.enqueueControlFrame("reconcile.plan", payload, attachment.reconciliationId, new Date(Date.now() + 300_000).toISOString(), ws);
     this.ctx.storage.sql.exec("UPDATE reconciliation_sessions SET state='plan_sent',summary_json=?,plan_json=? WHERE id=? AND epoch=?", JSON.stringify(summary), JSON.stringify({ payload, planSequence: delivery.sequence }), attachment.reconciliationId, Number(attachment.epoch));
     this.ctx.storage.sql.exec("UPDATE connection_state SET reconciliation_state='plan_sent',updated_at=? WHERE singleton=1", nowIso());
@@ -1678,6 +1689,8 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       await this.syncWorkMarker();
       return false;
     }
+    const earlierQueued = this.ctx.storage.sql.exec<{ sequence: number }>("SELECT sequence FROM outbound_frames WHERE sequence<? AND state='queued' ORDER BY sequence LIMIT 1", frame.sequence).toArray()[0];
+    if (earlierQueued !== undefined) return false;
     const socket = preferredSocket ?? this.eligibleSocket(frame);
     if (socket === undefined) {
       const next = new Date(Date.now() + 30_000).toISOString();

@@ -384,9 +384,12 @@ describe.sequential("control-plane contracts", () => {
       concurrentReceipts: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_message_receipts WHERE message_id='cmsg_control_replay_concurrent'").one().count,
     }))).toEqual({ controlStored: 43, concurrentFrames: 0, concurrentReceipts: 0 });
     await second.send(4, "reconcile.summary", { nodeBootId: "node-boot-control-replay-0002", journalGeneration: "1", capabilityDigest: "4".repeat(64), lastControlSequenceApplied: "3", lastNodeSequenceAcknowledged: "3", lastNodeSequenceRetained: "4", runs: [], retainedEventRanges: [], unresolvedCount: 0, truncated: false, storageHealth: "healthy" }, second.accepted.connectionId);
-    const reconnectMessages = [parseWireDocumentText(schemaIds.nodeV1, await second.next()), parseWireDocumentText(schemaIds.nodeV1, await second.next())];
+    const reconnectMessages = [];
+    for (let index = 0; index < 42; index += 1) reconnectMessages.push(parseWireDocumentText(schemaIds.nodeV1, await second.next()));
+    expect(reconnectMessages.slice(0, 40).map((frame) => "sequence" in frame ? frame.sequence : null)).toEqual(Array.from({ length: 40 }, (_, index) => String(index + 4)));
     const replayPlan = reconnectMessages.find((frame) => frame.type === "reconcile.plan");
     expect(replayPlan).toMatchObject({ type: "reconcile.plan", sequence: "44", payload: { controlReplay: [{ from: "4", through: "43" }] } });
+    expect(reconnectMessages[41]).toMatchObject({ type: "transport.ack", sequence: "45", payload: { throughSequence: "4" } });
     const planFrame = reconnectMessages.find((frame) => frame.type === "reconcile.plan");
     if (planFrame?.type !== "reconcile.plan") throw new Error("expected reconnect reconcile.plan");
     const replayPayload = { direction: "control_to_node", expectedSequence: "4", receivedSequence: "44" };

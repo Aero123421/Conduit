@@ -4360,6 +4360,7 @@ mod tests {
         CapabilityReceipt, CollectionReceipt, DestroyReceipt, ExpectedRuntime, PreparedRuntime,
         ReconciliationReceipt, RuntimeError, RuntimeProvider, RuntimeStateReceipt, SnapshotReceipt,
     };
+    use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -4379,38 +4380,70 @@ mod tests {
         path: &str,
         body: Option<&str>,
     ) -> Result<(u16, String), String> {
-        let mut command = Command::new("curl");
-        command.args([
-            "--silent",
-            "--show-error",
-            "--noproxy",
-            "*",
-            "--max-time",
-            "10",
-            "--request",
-            method,
-            "--header",
-            "Authorization: Bearer local-synthetic-idle-e2e-token",
-            "--header",
-            "Content-Type: application/json",
-            "--write-out",
-            "\n%{http_code}",
-            &format!("http://127.0.0.1:{port}{path}"),
-        ]);
-        if let Some(body) = body {
-            command.args(["--data", body]);
+        let body = body.unwrap_or("");
+        let mut stream =
+            TcpStream::connect(("127.0.0.1", port)).map_err(|error| error.to_string())?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .map_err(|error| error.to_string())?;
+        let request = format!(
+            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer local-synthetic-idle-e2e-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len(),
+        );
+        stream
+            .write_all(request.as_bytes())
+            .map_err(|error| error.to_string())?;
+        let mut response = Vec::new();
+        stream
+            .read_to_end(&mut response)
+            .map_err(|error| error.to_string())?;
+        let header_end = response
+            .windows(4)
+            .position(|window| window == b"\r\n\r\n")
+            .ok_or_else(|| "HTTP response headers missing".to_owned())?;
+        let headers = String::from_utf8(response[..header_end].to_vec())
+            .map_err(|error| error.to_string())?;
+        let status = headers
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .ok_or_else(|| "HTTP response status missing".to_owned())?
+            .parse::<u16>()
+            .map_err(|error| error.to_string())?;
+        let mut response_body = response[header_end + 4..].to_vec();
+        if headers
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
+            let mut decoded = Vec::new();
+            let mut cursor = response_body.as_slice();
+            loop {
+                let line_end = cursor
+                    .windows(2)
+                    .position(|window| window == b"\r\n")
+                    .ok_or_else(|| "HTTP chunk size missing".to_owned())?;
+                let size_text = std::str::from_utf8(&cursor[..line_end])
+                    .map_err(|error| error.to_string())?
+                    .split(';')
+                    .next()
+                    .unwrap_or("");
+                let size =
+                    usize::from_str_radix(size_text, 16).map_err(|error| error.to_string())?;
+                cursor = &cursor[line_end + 2..];
+                if size == 0 {
+                    break;
+                }
+                if cursor.len() < size + 2 || &cursor[size..size + 2] != b"\r\n" {
+                    return Err("HTTP chunk body is truncated".into());
+                }
+                decoded.extend_from_slice(&cursor[..size]);
+                cursor = &cursor[size + 2..];
+            }
+            response_body = decoded;
         }
-        let output = command.output().map_err(|error| error.to_string())?;
-        if !output.status.success() {
-            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
-        }
-        let output = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
-        let (response_body, status) = output
-            .rsplit_once('\n')
-            .ok_or_else(|| "HTTP probe status missing".to_owned())?;
         Ok((
-            status.parse::<u16>().map_err(|error| error.to_string())?,
-            response_body.to_owned(),
+            status,
+            String::from_utf8(response_body).map_err(|error| error.to_string())?,
         ))
     }
 
@@ -4966,21 +4999,10 @@ mod tests {
         assert_eq!(status, 200);
         client.reset_application_sends();
         let started = Instant::now();
-        let mut one_hour_sends = 0;
-        for tick in 1_u64..=24 * 60 * 60 * 10 {
-            if tick % (10 * 60 * 10) == 0 {
-                let now_ms = simulated_start + tick * 100;
-                let advance_path = format!("/__idle-e2e/devices/{device_id}/advance");
-                let (status, _) = loopback_http(
-                    port,
-                    "POST",
-                    &advance_path,
-                    Some(&format!("{{\"nowMs\":{now_ms}}}")),
-                )
-                .unwrap();
-                assert_eq!(status, 200);
-            }
-            service
+        // Exercise every real 100 ms service poll for the first hour. If the
+        // old eager resend loop returns, this alone observes ~36,000 sends.
+        for tick in 1_u64..=60 * 60 * 10 {
+            let health_sent = service
                 .queue_health_if_due_at(
                     &mut client,
                     false,
@@ -4994,9 +5016,31 @@ mod tests {
                     .unwrap(),
                 0
             );
-            if tick == 60 * 60 * 10 {
-                one_hour_sends = client.application_sends();
+            if health_sent {
+                client.await_idle_e2e_settled().unwrap();
             }
+        }
+        let one_hour_sends = client.application_sends();
+        // Continue the same real socket and service clock at each remaining
+        // ten-minute checkpoint through 24 hours. The regular Node unit test
+        // separately executes all 864,000 poll iterations.
+        for checkpoint in 7_u64..=144 {
+            let health_sent = service
+                .queue_health_if_due_at(
+                    &mut client,
+                    false,
+                    started + Duration::from_secs(checkpoint * 10 * 60),
+                )
+                .unwrap();
+            let positions = store.transport_positions().unwrap();
+            assert_eq!(
+                client
+                    .flush_unacknowledged(positions.node_acknowledged_through.saturating_add(1),)
+                    .unwrap(),
+                0
+            );
+            assert!(health_sent);
+            client.await_idle_e2e_settled().unwrap();
         }
         let inspect_path = format!("/__idle-e2e/devices/{device_id}/inspect");
         let (status, body) = loopback_http(port, "GET", &inspect_path, None).unwrap();

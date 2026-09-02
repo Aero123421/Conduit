@@ -607,6 +607,19 @@ impl WssClient {
         };
         result.map_err(|error| TransportError::WebSocket(error.to_string()))
     }
+    #[cfg(test)]
+    pub(crate) fn await_idle_e2e_settled(&mut self) -> Result<(), TransportError> {
+        self.set_poll_timeout(Duration::from_secs(15))?;
+        let result = self
+            .socket
+            .read()
+            .map_err(|error| TransportError::WebSocket(error.to_string()));
+        self.set_poll_timeout(SERVICE_POLL_TIMEOUT)?;
+        match result? {
+            Message::Text(value) if value.as_str() == "{\"type\":\"idle_e2e.settled\"}" => Ok(()),
+            _ => Err(TransportError::Malformed),
+        }
+    }
     /// Send a WebSocket protocol ping.  This is deliberately separate from
     /// semantic `device.health`: a keepalive proves only that the socket peer
     /// can answer the protocol control frame and never advances device state.

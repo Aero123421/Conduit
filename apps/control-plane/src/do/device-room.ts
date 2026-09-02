@@ -263,11 +263,6 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     this.idleProbeNowMs = nowMs;
   }
 
-  async advanceIdleE2EProbe(nowMs: number): Promise<void> {
-    if (this.idleProbe === null || !Number.isFinite(nowMs) || (this.idleProbeNowMs !== null && nowMs < this.idleProbeNowMs)) throw new TypeError("idle_e2e_probe_time_invalid");
-    this.idleProbeNowMs = nowMs;
-  }
-
   async inspectIdleE2EProbe(): Promise<Record<string, unknown>> {
     if (this.idleProbe === null || this.idleProbeD1 === null) throw new TypeError("idle_e2e_probe_unavailable");
     const counters = { ...this.idleProbe };
@@ -800,8 +795,15 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     if (attachment === null) { ws.close(1011, "connection_state_missing"); return; }
     if (attachment.stage === "new") { await this.hello(ws, attachment, body); return; }
     if (attachment.stage === "challenged") { await this.authenticate(ws, attachment, body); return; }
-    if (this.idleProbe !== null) this.idleProbe.incomingMessages += 1;
+    if (this.idleProbe !== null) {
+      this.idleProbe.incomingMessages += 1;
+      if (body.type === "device.health" && this.idleProbeNowMs !== null) this.idleProbeNowMs += 10 * 60_000;
+    }
     await this.acceptFrame(ws, attachment, body);
+    // Test-only application barrier: it proves the real DeviceRoom handler
+    // completed before the accelerated harness sends the next ten-minute
+    // checkpoint. It is not a transport ACK and creates no durable row.
+    if (this.idleProbe !== null && this.idleProbeNowMs !== null && body.type === "device.health") ws.send('{"type":"idle_e2e.settled"}');
   }
 
   override async webSocketClose(): Promise<void> {

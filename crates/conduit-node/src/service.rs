@@ -2492,9 +2492,13 @@ impl NodeService {
         }
         let mut receipt = json!({
             "operationId": control.operation_id,
+            "requestDigest": request_digest,
             "targetRunId": control.target_run_id,
             "targetRuntimeId": control.target_runtime_id,
+            "targetControllerEpoch": control.target_controller_epoch,
             "targetDigest": control.target_digest,
+            "expectedState": control.expected_state,
+            "expectedRevision": control.expected_revision,
             "control": control.control,
             "state": runtime_state_name(next_state),
             "revision": revision.to_string(),
@@ -4394,8 +4398,15 @@ mod tests {
             .unwrap();
         assert_eq!(record.state, "applied");
         let receipt: Value = serde_json::from_slice(record.receipt.as_deref().unwrap()).unwrap();
+        let control_request_digest =
+            hex::encode(Sha256::digest(serde_jcs::to_vec(&payload).unwrap()));
         assert_eq!(receipt["processCountDelta"], 0);
         assert_eq!(receipt["state"], "paused");
+        assert_eq!(receipt["requestDigest"], control_request_digest);
+        assert_eq!(receipt["targetControllerEpoch"], "1");
+        assert_eq!(receipt["expectedState"], "running");
+        assert_eq!(receipt["expectedRevision"], "1");
+        assert_eq!(receipt["control"], "pause");
     }
 
     #[test]

@@ -324,9 +324,27 @@ export interface OperationTargetPayload {
 }
 export interface RuntimeControlResultPayload {
   operationId: OperationId;
+  requestDigest: Sha256Hex;
   targetRunId: RunId;
   targetRuntimeId: string;
+  targetControllerEpoch: U64Decimal;
   targetDigest: Sha256Hex;
+  expectedState:
+    | "planned"
+    | "preparing"
+    | "prepared"
+    | "starting"
+    | "running"
+    | "paused"
+    | "stopping"
+    | "stopped"
+    | "failed"
+    | "lost"
+    | "uncertain"
+    | "recovery_required"
+    | "destroying"
+    | "destroyed";
+  expectedRevision: U64Decimal;
   control: "input" | "steer" | "pause" | "resume" | "cancel" | "stop" | "snapshot" | "restore" | "destroy";
   state:
     | "planned"

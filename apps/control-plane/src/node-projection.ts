@@ -21,6 +21,7 @@ interface OperationProjectionRow {
   target_digest: string | null;
   expected_target_revision: number | null;
   target_controller_epoch: string | null;
+  expected_target_state: string | null;
   result_json: string | null;
 }
 
@@ -61,13 +62,22 @@ async function rejectProjection(env: ControlPlaneEnv, frame: ProjectableFrame, o
 }
 
 async function operationFor(env: ControlPlaneEnv, operationId: string): Promise<OperationProjectionRow | null> {
-  return env.DB.prepare("SELECT id,device_id,payload_digest,run_id,assignment_id,session_id,state,node_state_revision,request_json,operation_kind,target_runtime_id,target_digest,expected_target_revision,target_controller_epoch,result_json FROM operation_journal WHERE id=?1 LIMIT 1")
+  return env.DB.prepare("SELECT id,device_id,payload_digest,run_id,assignment_id,session_id,state,node_state_revision,request_json,operation_kind,target_runtime_id,target_digest,expected_target_revision,target_controller_epoch,expected_target_state,result_json FROM operation_journal WHERE id=?1 LIMIT 1")
     .bind(operationId).first<OperationProjectionRow>();
 }
 
 function receipt(env: ControlPlaneEnv, frame: ProjectableFrame, operationId: string | null, result: unknown): D1PreparedStatement {
   return env.DB.prepare("INSERT INTO node_projection_receipts(message_id,device_id,connection_epoch,node_sequence,frame_type,correlation_id,operation_id,payload_digest,projection_state,result_json,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'applied',?9,?10)")
     .bind(frame.messageId, frame.deviceId, frame.connectionEpoch, frame.sequence, frame.type, frame.correlationId ?? null, operationId, frame.payloadDigest, canonicalJson(result), nowIso());
+}
+
+function projectionResult(frame: ProjectableFrame, data: Record<string, unknown>): string {
+  return canonicalJson({ ...data, projectionMessageId: frame.messageId });
+}
+
+function conditionalReceipt(env: ControlPlaneEnv, frame: ProjectableFrame, operationId: string, operationResultJson: string, result: unknown): D1PreparedStatement {
+  return env.DB.prepare("INSERT INTO node_projection_receipts(message_id,device_id,connection_epoch,node_sequence,frame_type,correlation_id,operation_id,payload_digest,projection_state,result_json,created_at) SELECT ?1,?2,?3,?4,?5,?6,?7,?8,'applied',?9,?10 WHERE EXISTS (SELECT 1 FROM operation_journal WHERE id=?7 AND result_json=?11)")
+    .bind(frame.messageId, frame.deviceId, frame.connectionEpoch, frame.sequence, frame.type, frame.correlationId ?? null, operationId, frame.payloadDigest, canonicalJson(result), nowIso(), operationResultJson);
 }
 
 function operationSharedState(nodeState: string): string {
@@ -150,16 +160,21 @@ async function projectAdmission(env: ControlPlaneEnv, frame: Extract<Projectable
     return [];
   }
   const now = nowIso();
+  const resultJson = projectionResult(frame, data);
   const statements: D1PreparedStatement[] = [
-    env.DB.prepare(`UPDATE operation_journal SET state=?1,result_json=?2,updated_at=?3 WHERE id=?4 AND state IN (${currentAllowed.map(() => "?").join(",")})`)
-      .bind(next, canonicalJson(data), now, operation.id, ...currentAllowed),
-    env.DB.prepare("UPDATE idempotency_records SET state=?1,response_json=?2 WHERE operation_id=?3").bind(next, canonicalJson({ operationId: operation.id, state: next, admission: data }), operation.id),
-    receipt(env, frame, operation.id, { state: next }),
+    env.DB.prepare("UPDATE operation_journal SET state=?1,result_json=?2,updated_at=?3 WHERE id=?4 AND state=?5 AND node_state_revision=?6 AND result_json IS ?7")
+      .bind(next, resultJson, now, operation.id, operation.state, operation.node_state_revision, operation.result_json),
+    env.DB.prepare("UPDATE idempotency_records SET state=?1,response_json=?2 WHERE operation_id=?3 AND EXISTS (SELECT 1 FROM operation_journal WHERE id=?3 AND result_json=?4)").bind(next, canonicalJson({ operationId: operation.id, state: next, admission: data }), operation.id, resultJson),
+    conditionalReceipt(env, frame, operation.id, resultJson, { state: next }),
   ];
   const assignmentNext = assignmentState(next);
-  if (operation.run_id !== null) statements.push(env.DB.prepare("UPDATE runs SET state=?1,revision=revision+1,updated_at=?2 WHERE id=?3 AND state NOT IN ('completed','cancelled','failed','ready_for_review','accepted')").bind(runState(next), now, operation.run_id));
-  if (operation.assignment_id !== null && assignmentNext !== null) statements.push(env.DB.prepare("UPDATE assignments SET state=?1,revision=revision+1,updated_at=?2 WHERE id=?3 AND state IN ('queued','active','waiting_input','waiting_approval')").bind(assignmentNext, now, operation.assignment_id));
-  await env.DB.batch(statements);
+  if (operation.run_id !== null) statements.push(env.DB.prepare("UPDATE runs SET state=?1,revision=revision+1,updated_at=?2 WHERE id=?3 AND state NOT IN ('completed','cancelled','failed','ready_for_review','accepted') AND EXISTS (SELECT 1 FROM operation_journal WHERE id=?4 AND result_json=?5)").bind(runState(next), now, operation.run_id, operation.id, resultJson));
+  if (operation.assignment_id !== null && assignmentNext !== null) statements.push(env.DB.prepare("UPDATE assignments SET state=?1,revision=revision+1,updated_at=?2 WHERE id=?3 AND state IN ('queued','active','waiting_input','waiting_approval') AND EXISTS (SELECT 1 FROM operation_journal WHERE id=?4 AND result_json=?5)").bind(assignmentNext, now, operation.assignment_id, operation.id, resultJson));
+  const results = await env.DB.batch(statements);
+  if (results[0]?.meta.changes !== 1) {
+    await rejectProjection(env, frame, operation.id, "admission_projection_lost_race");
+    return [];
+  }
   if (["rejected", "expired", "uncertain"].includes(next)) await ensureOperationConcurrencyReleased(env, operation.id);
   return realtime(frame, operation, `operation.${next}`, 1);
 }
@@ -210,13 +225,14 @@ async function projectStatus(env: ControlPlaneEnv, frame: Extract<ProjectableFra
     return [];
   }
   const now = nowIso();
+  const resultJson = projectionResult(frame, data);
   const statements: D1PreparedStatement[] = [
-    env.DB.prepare("UPDATE operation_journal SET state=?1,node_state_revision=?2,result_json=?3,updated_at=?4 WHERE id=?5 AND node_state_revision<?2 AND state NOT IN ('completed','failed','cancelled','expired','rejected','uncertain')").bind(shared, revision, canonicalJson(data), now, operation.id),
-    receipt(env, frame, operation.id, { state, revision }),
+    env.DB.prepare("UPDATE operation_journal SET state=?1,node_state_revision=?2,result_json=?3,updated_at=?4 WHERE id=?5 AND node_state_revision=?6 AND state=?7 AND result_json IS ?8 AND state NOT IN ('completed','failed','cancelled','expired','rejected','uncertain')").bind(shared, revision, resultJson, now, operation.id, operation.node_state_revision, operation.state, operation.result_json),
+    conditionalReceipt(env, frame, operation.id, resultJson, { state, revision }),
   ];
-  if (operation.run_id !== null) statements.push(env.DB.prepare("UPDATE runs SET state=?1,revision=revision+1,controller_epoch=?2,updated_at=?3 WHERE id=?4 AND state NOT IN ('completed','cancelled','failed','ready_for_review','accepted')").bind(runState(state), String(controllerEpoch), now, operation.run_id));
+  if (operation.run_id !== null) statements.push(env.DB.prepare("UPDATE runs SET state=?1,revision=revision+1,controller_epoch=?2,updated_at=?3 WHERE id=?4 AND state NOT IN ('completed','cancelled','failed','ready_for_review','accepted') AND EXISTS (SELECT 1 FROM operation_journal WHERE id=?5 AND result_json=?6)").bind(runState(state), String(controllerEpoch), now, operation.run_id, operation.id, resultJson));
   const assignmentNext = assignmentState(state);
-  if (operation.assignment_id !== null && assignmentNext !== null) statements.push(env.DB.prepare("UPDATE assignments SET state=?1,revision=revision+1,updated_at=?2 WHERE id=?3 AND state IN ('queued','active','waiting_input','waiting_approval')").bind(assignmentNext, now, operation.assignment_id));
+  if (operation.assignment_id !== null && assignmentNext !== null) statements.push(env.DB.prepare("UPDATE assignments SET state=?1,revision=revision+1,updated_at=?2 WHERE id=?3 AND state IN ('queued','active','waiting_input','waiting_approval') AND EXISTS (SELECT 1 FROM operation_journal WHERE id=?4 AND result_json=?5)").bind(assignmentNext, now, operation.assignment_id, operation.id, resultJson));
 
   const request = JSON.parse(operation.request_json) as { capability?: unknown; arguments?: Record<string, unknown> };
   const runtimeId = typeof data.targetRuntimeId === "string" ? data.targetRuntimeId : null;
@@ -248,7 +264,11 @@ async function projectStatus(env: ControlPlaneEnv, frame: Extract<ProjectableFra
       env.DB.prepare("UPDATE runs SET agent_session_id=?1 WHERE id=?2 AND (agent_session_id IS NULL OR agent_session_id=?1)").bind(agentSessionId, operation.run_id),
     );
   }
-  await env.DB.batch(statements);
+  const results = await env.DB.batch(statements);
+  if (results[0]?.meta.changes !== 1) {
+    await rejectProjection(env, frame, operation.id, "status_projection_lost_race");
+    return [];
+  }
   return realtime(frame, operation, `run.${state}`, revision);
 }
 
@@ -257,19 +277,56 @@ async function projectRuntimeControl(env: ControlPlaneEnv, frame: Extract<Projec
   const operationId = typeof data.operationId === "string" ? data.operationId : "";
   const operation = operationId === "" ? null : await operationFor(env, operationId);
   const revision = safeRevision(data.revision);
-  if (operation === null || operation.operation_kind !== "runtime_control" || frame.correlationId !== operationId || operation.device_id !== frame.deviceId || data.targetRunId !== operation.run_id || data.targetRuntimeId !== operation.target_runtime_id || data.targetDigest !== operation.target_digest || revision === null || operation.expected_target_revision === null || revision !== operation.expected_target_revision + 1) {
+  const expectedRevision = safeRevision(data.expectedRevision);
+  let request: Record<string, unknown> | null = null;
+  try { request = operation === null ? null : JSON.parse(operation.request_json) as Record<string, unknown>; } catch { request = null; }
+  if (operation === null
+    || operation.operation_kind !== "runtime_control"
+    || frame.correlationId !== operationId
+    || operation.device_id !== frame.deviceId
+    || data.requestDigest !== operation.payload_digest
+    || data.targetRunId !== operation.run_id
+    || data.targetRuntimeId !== operation.target_runtime_id
+    || data.targetControllerEpoch !== operation.target_controller_epoch
+    || data.targetDigest !== operation.target_digest
+    || data.expectedState !== operation.expected_target_state
+    || expectedRevision === null
+    || expectedRevision !== operation.expected_target_revision
+    || revision === null
+    || operation.expected_target_revision === null
+    || revision !== operation.expected_target_revision + 1
+    || request === null
+    || request.operationId !== operation.id
+    || request.targetRunId !== data.targetRunId
+    || request.targetRuntimeId !== data.targetRuntimeId
+    || request.targetControllerEpoch !== data.targetControllerEpoch
+    || request.targetDigest !== data.targetDigest
+    || request.expectedState !== data.expectedState
+    || request.expectedRevision !== data.expectedRevision
+    || request.control !== data.control) {
     await rejectProjection(env, frame, operation?.id ?? null, "runtime_control_custody_mismatch");
+    return [];
+  }
+  const device = await env.DB.prepare("SELECT connection_epoch FROM devices WHERE id=?1 AND status='active' LIMIT 1").bind(frame.deviceId).first<{ connection_epoch: string }>();
+  if (device?.connection_epoch !== frame.connectionEpoch) {
+    await rejectProjection(env, frame, operation.id, "stale_connection_epoch");
     return [];
   }
   const now = nowIso();
   const state = String(data.state ?? "uncertain");
+  const resultJson = projectionResult(frame, data);
   const results = await env.DB.batch([
-    env.DB.prepare("UPDATE runtime_custody SET state=?1,revision=?2,updated_at=?3 WHERE runtime_id=?4 AND target_digest=?5 AND revision<?2").bind(state, revision, now, operation.target_runtime_id, operation.target_digest),
-    env.DB.prepare("UPDATE operation_journal SET state='completed',node_state_revision=?1,result_json=?2,updated_at=?3 WHERE id=?4 AND state IN ('queued','offered','admitted','claimed')").bind(revision, canonicalJson(data), now, operation.id),
-    env.DB.prepare("UPDATE idempotency_records SET state='completed',response_json=?1 WHERE operation_id=?2").bind(canonicalJson({ operationId: operation.id, state: "completed", result: data }), operation.id),
-    receipt(env, frame, operation.id, { state, revision }),
+    env.DB.prepare("UPDATE operation_journal SET state='completed',node_state_revision=?1,result_json=?2,updated_at=?3 WHERE id=?4 AND state=?5 AND node_state_revision=?6 AND result_json IS ?7 AND state IN ('queued','offered','admitted','claimed') AND EXISTS (SELECT 1 FROM runtime_custody WHERE runtime_id=?8 AND run_id=?9 AND device_id=?10 AND target_digest=?11 AND controller_epoch=?12 AND state=?13 AND revision=?14)")
+      .bind(revision, resultJson, now, operation.id, operation.state, operation.node_state_revision, operation.result_json, operation.target_runtime_id, operation.run_id, operation.device_id, operation.target_digest, operation.target_controller_epoch, operation.expected_target_state, operation.expected_target_revision),
+    env.DB.prepare("UPDATE runtime_custody SET state=?1,revision=?2,updated_at=?3 WHERE runtime_id=?4 AND run_id=?5 AND device_id=?6 AND target_digest=?7 AND controller_epoch=?8 AND state=?9 AND revision=?10 AND EXISTS (SELECT 1 FROM operation_journal WHERE id=?11 AND result_json=?12)")
+      .bind(state, revision, now, operation.target_runtime_id, operation.run_id, operation.device_id, operation.target_digest, operation.target_controller_epoch, operation.expected_target_state, operation.expected_target_revision, operation.id, resultJson),
+    env.DB.prepare("UPDATE idempotency_records SET state='completed',response_json=?1 WHERE operation_id=?2 AND EXISTS (SELECT 1 FROM operation_journal WHERE id=?2 AND result_json=?3)").bind(canonicalJson({ operationId: operation.id, state: "completed", result: data }), operation.id, resultJson),
+    conditionalReceipt(env, frame, operation.id, resultJson, { state, revision }),
   ]);
-  if (results[1]?.meta.changes !== 1) throw new TypeError("runtime control operation changed before result projection");
+  if (results[0]?.meta.changes !== 1 || results[1]?.meta.changes !== 1) {
+    await rejectProjection(env, frame, operation.id, "runtime_control_projection_lost_race");
+    return [];
+  }
   return realtime(frame, operation, `runtime.${String(data.control ?? "control")}.${state}`, revision);
 }
 

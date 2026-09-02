@@ -447,12 +447,16 @@
     "RuntimeControlResultPayload": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["operationId", "targetRunId", "targetRuntimeId", "targetDigest", "control", "state", "revision", "processCountDelta", "receiptDigest", "observedAt"],
+      "required": ["operationId", "requestDigest", "targetRunId", "targetRuntimeId", "targetControllerEpoch", "targetDigest", "expectedState", "expectedRevision", "control", "state", "revision", "processCountDelta", "receiptDigest", "observedAt"],
       "properties": {
         "operationId": { "$ref": "#/$defs/OperationId" },
+        "requestDigest": { "$ref": "#/$defs/Sha256Hex" },
         "targetRunId": { "$ref": "#/$defs/RunId" },
         "targetRuntimeId": { "type": "string", "pattern": "^rt_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" },
+        "targetControllerEpoch": { "$ref": "#/$defs/U64Decimal" },
         "targetDigest": { "$ref": "#/$defs/Sha256Hex" },
+        "expectedState": { "enum": ["planned", "preparing", "prepared", "starting", "running", "paused", "stopping", "stopped", "failed", "lost", "uncertain", "recovery_required", "destroying", "destroyed"] },
+        "expectedRevision": { "$ref": "#/$defs/U64Decimal" },
         "control": { "enum": ["input", "steer", "pause", "resume", "cancel", "stop", "snapshot", "restore", "destroy"] },
         "state": { "enum": ["planned", "preparing", "prepared", "starting", "running", "paused", "stopping", "stopped", "failed", "lost", "uncertain", "recovery_required", "destroying", "destroyed"] },
         "revision": { "$ref": "#/$defs/U64Decimal" },

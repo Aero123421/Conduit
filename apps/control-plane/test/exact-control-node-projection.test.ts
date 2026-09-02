@@ -135,6 +135,25 @@ describe.sequential("exact existing-target controls and node projections", () =>
       ["msg_exact_status_reordered", "rejected"], ["msg_exact_status_digest", "rejected"], ["msg_exact_status_epoch", "rejected"],
     ]);
     expect(receipts.results.slice(3).map((row) => JSON.parse(row.result_json).reason)).toEqual(["status_revision_reordered", "status_custody_mismatch", "stale_connection_epoch"]);
+
+    const competing = [
+      frame("msg_exact_status_competing_wait", "106", "operation.status", projectionOperation, { ...running.payload, revision: "4", state: "waiting_input" }),
+      frame("msg_exact_status_competing_finish", "107", "operation.status", projectionOperation, { ...running.payload, revision: "4", state: "finishing" }),
+    ] as const;
+    await Promise.all(competing.map((candidate) => projectNodeState(env, candidate)));
+    const competingReceipts = await env.DB.prepare("SELECT message_id,projection_state FROM node_projection_receipts WHERE message_id IN (?1,?2) ORDER BY message_id").bind(competing[0].messageId, competing[1].messageId).all<{ message_id: string; projection_state: string }>();
+    expect(competingReceipts.results.map((row) => row.projection_state).sort()).toEqual(["applied", "rejected"]);
+    const winner = competingReceipts.results.find((row) => row.projection_state === "applied")!.message_id;
+    const expectedNodeState = winner === competing[0].messageId ? "waiting_input" : "finishing";
+    const projection = await env.DB.prepare("SELECT journal.node_state_revision,journal.result_json,run.state AS run_state,run.revision AS run_revision,assignment.state AS assignment_state,assignment.revision AS assignment_revision FROM operation_journal AS journal JOIN runs AS run ON run.id=journal.run_id JOIN assignments AS assignment ON assignment.id=journal.assignment_id WHERE journal.id=?1").bind(projectionOperation).first<{ node_state_revision: number; result_json: string; run_state: string; run_revision: number; assignment_state: string; assignment_revision: number }>();
+    expect(projection).toMatchObject({
+      node_state_revision: 4,
+      run_state: expectedNodeState,
+      run_revision: 4,
+      assignment_state: expectedNodeState === "waiting_input" ? "waiting_input" : "active",
+      assignment_revision: 4,
+    });
+    expect(JSON.parse(projection!.result_json)).toMatchObject({ state: expectedNodeState, projectionMessageId: winner });
   });
 
   it("releases terminal admission concurrency and projects monotonic Device health", async () => {
@@ -158,13 +177,32 @@ describe.sequential("exact existing-target controls and node projections", () =>
   it("projects a Runtime control result once without creating a process representation", async () => {
     const operationId = createdControls.get("runtime.pause")!;
     const now = new Date().toISOString();
-    const result = frame("msg_exact_runtime_pause", "300", "runtime.control_result", operationId, {
-      operationId, targetRunId: runId, targetRuntimeId: runtimeId, targetDigest: runtimeDigest, control: "pause", state: "paused", revision: "4", processCountDelta: 0, result: { signal: "pause" }, receiptDigest: "0".repeat(64), observedAt: now,
-    });
+    const controlOperation = await env.DB.prepare("SELECT payload_digest FROM operation_journal WHERE id=?1").bind(operationId).first<{ payload_digest: string }>();
+    const payload = {
+      operationId, requestDigest: controlOperation!.payload_digest, targetRunId: runId, targetRuntimeId: runtimeId,
+      targetControllerEpoch: "11", targetDigest: runtimeDigest, expectedState: "running" as const, expectedRevision: "3",
+      control: "pause" as const, state: "paused" as const, revision: "4", processCountDelta: 0 as const,
+      result: { signal: "pause" }, receiptDigest: "0".repeat(64), observedAt: now,
+    };
+    await projectNodeState(env, frame("msg_exact_runtime_stale_epoch", "296", "runtime.control_result", operationId, payload, "6"));
+    await projectNodeState(env, frame("msg_exact_runtime_wrong_control", "297", "runtime.control_result", operationId, { ...payload, control: "resume" }));
+    await projectNodeState(env, frame("msg_exact_runtime_wrong_request", "298", "runtime.control_result", operationId, { ...payload, requestDigest: "f".repeat(64) }));
+    await projectNodeState(env, frame("msg_exact_runtime_wrong_expected", "299", "runtime.control_result", operationId, { ...payload, expectedRevision: "2" }));
+    const beforeApplied = await env.DB.prepare("SELECT state,revision FROM runtime_custody WHERE runtime_id=?1").bind(runtimeId).first<{ state: string; revision: number }>();
+    expect(beforeApplied).toEqual({ state: "running", revision: 3 });
+
+    const result = frame("msg_exact_runtime_pause", "300", "runtime.control_result", operationId, payload);
     await projectNodeState(env, result);
     await projectNodeState(env, result);
     const projected = await env.DB.prepare("SELECT journal.state AS operation_state,journal.node_state_revision,custody.state AS runtime_state,custody.revision,(SELECT COUNT(*) FROM operation_journal WHERE run_id=?1 AND operation_kind='start') AS starts,(SELECT COUNT(*) FROM runtime_custody WHERE run_id=?1) AS runtimes FROM operation_journal AS journal JOIN runtime_custody AS custody ON custody.runtime_id=journal.target_runtime_id WHERE journal.id=?2").bind(runId, operationId).first<Record<string, unknown>>();
     expect(projected).toMatchObject({ operation_state: "completed", node_state_revision: 4, runtime_state: "paused", revision: 4, starts: 1, runtimes: 1 });
+    const rejected = await env.DB.prepare("SELECT message_id,result_json FROM node_projection_receipts WHERE message_id LIKE 'msg_exact_runtime_%' AND projection_state='rejected' ORDER BY node_sequence").all<{ message_id: string; result_json: string }>();
+    expect(rejected.results.map((row) => [row.message_id, JSON.parse(row.result_json).reason])).toEqual([
+      ["msg_exact_runtime_stale_epoch", "stale_connection_epoch"],
+      ["msg_exact_runtime_wrong_control", "runtime_control_custody_mismatch"],
+      ["msg_exact_runtime_wrong_request", "runtime_control_custody_mismatch"],
+      ["msg_exact_runtime_wrong_expected", "runtime_control_custody_mismatch"],
+    ]);
   });
 });
 

@@ -2222,8 +2222,9 @@ fn worker_post(path: &str, value: &Value) -> Value {
     let output = child.wait_with_output().unwrap();
     assert!(
         output.status.success(),
-        "isolated Control Plane request failed: {}",
-        String::from_utf8_lossy(&output.stderr)
+        "isolated Control Plane request failed: {}; response: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
     );
     serde_json::from_slice(&output.stdout).unwrap()
 }

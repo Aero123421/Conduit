@@ -59,11 +59,20 @@ interface OperationAuthorityRow {
   payload_digest: string;
   request_json: string;
   operation_kind: string;
+  operation_state: string;
+  operation_expires_at: string;
+  target_operation_id: string | null;
+  target_runtime_id: string | null;
+  target_digest: string | null;
+  target_controller_epoch: string | null;
+  expected_target_state: string | null;
+  expected_target_revision: number | null;
   run_manifest_digest: string | null;
   run_access_scope: string | null;
   run_approval_mode: string | null;
   run_runtime_kind: string | null;
   run_device_id: string | null;
+  run_state: string | null;
   project_agent_id: string | null;
   project_agent_revision: number | null;
   adapter_id: string | null;
@@ -315,32 +324,40 @@ async function projectInstallation(env: ControlPlaneEnv, frame: PrivilegeTranspo
   const existing = await env.DB.prepare("SELECT device_id,expected_uid,public_origin,active_key_id,active_policy_revision,active_policy_digest,status,device_attestation_digest FROM device_privilege_installations WHERE installation_id=?1 LIMIT 1")
     .bind(installationId).first<{ device_id: string; expected_uid: number; public_origin: string; active_key_id: string | null; active_policy_revision: number | null; active_policy_digest: string | null; status: string; device_attestation_digest: string }>();
   if (existing !== null && (existing.device_id !== frame.deviceId || existing.expected_uid !== expectedUid || existing.public_origin !== origin)) throw new PublicError("privilege_ticket_conflict", 409, "Helper installation identity is already bound");
+  const existingKey = await env.DB.prepare("SELECT public_jwk_json,fingerprint FROM privilege_installation_keys WHERE installation_id=?1 AND key_id=?2 LIMIT 1")
+    .bind(installationId, helperKeyId).first<{ public_jwk_json: string; fingerprint: string }>();
+  if (existingKey !== null && (existingKey.public_jwk_json !== canonicalJson(receiptJwk) || existingKey.fingerprint !== fingerprint)) {
+    throw new PublicError("privilege_ticket_conflict", 409, "Helper key ID is bound to different key material");
+  }
   const previousPolicyDigest = existing?.active_policy_digest ?? null;
   const currentRootPolicy = existing?.active_policy_revision === null || existing?.active_policy_revision === undefined ? null : await env.DB.prepare("SELECT public_summary_json FROM privilege_policy_attestations WHERE installation_id=?1 AND revision=?2 AND status='active' LIMIT 1").bind(installationId, existing.active_policy_revision).first<{ public_summary_json: string }>();
   const actualChangeClass = existing === null || existing.active_policy_digest === null ? "initial" : existing.active_policy_digest === policyDigest ? "same" : currentRootPolicy !== null && isPolicyNarrower(JSON.parse(currentRootPolicy.public_summary_json) as Record<string, unknown>, publicSummary) ? "narrowed" : "broadened";
   const policyStatus = actualChangeClass === "same" || actualChangeClass === "narrowed" && existing?.active_key_id === helperKeyId ? "active" : "pending_owner";
   const policyInsertStatus = actualChangeClass === "narrowed" ? "pending_owner" : policyStatus;
+  const predecessorKeyId = existing?.active_key_id !== undefined && existing.active_key_id !== null && existing.active_key_id !== helperKeyId ? existing.active_key_id : null;
   const currentDevicePolicy = await env.DB.prepare("SELECT revision,policy_digest,public_summary_json FROM device_user_policy_attestations WHERE device_id=?1 AND status='active' ORDER BY revision DESC LIMIT 1").bind(frame.deviceId).first<{ revision: number; policy_digest: string; public_summary_json: string }>();
   const devicePolicyNarrowed = currentDevicePolicy !== null && currentDevicePolicy.policy_digest !== devicePolicyDigest && isPolicyNarrower(JSON.parse(currentDevicePolicy.public_summary_json) as Record<string, unknown>, devicePolicySummary);
   const devicePolicyStatus = currentDevicePolicy?.policy_digest === devicePolicyDigest || devicePolicyNarrowed ? "active" : "pending_owner";
   await env.DB.batch([
     env.DB.prepare("INSERT INTO device_privilege_installations(installation_id,device_id,expected_uid,public_origin,helper_version,protocol_version,active_key_id,active_policy_revision,active_policy_digest,capability_digest,capability_summary_json,device_attestation_digest,device_key_id,status,last_observed_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,'conduit.privileged/1',NULL,NULL,NULL,?6,?7,?8,?9,'pending_owner',?10,?11,?11) ON CONFLICT(installation_id) DO UPDATE SET helper_version=excluded.helper_version,capability_digest=excluded.capability_digest,capability_summary_json=excluded.capability_summary_json,device_attestation_digest=excluded.device_attestation_digest,device_key_id=excluded.device_key_id,status=CASE WHEN device_privilege_installations.active_policy_digest IS NOT NULL AND device_privilege_installations.active_policy_digest<>?12 THEN 'policy_review' ELSE device_privilege_installations.status END,last_observed_at=excluded.last_observed_at,updated_at=excluded.updated_at WHERE device_privilege_installations.status<>'revoked'")
       .bind(installationId, frame.deviceId, expectedUid, origin, String(claims.helperVersion), capabilityDigest, canonicalJson(capabilitySummary(claims)), attestationDigest, deviceKeyId, observedAt, now, policyDigest),
-    env.DB.prepare("INSERT OR IGNORE INTO privilege_installation_keys(installation_id,key_id,public_jwk_json,fingerprint,status,valid_from,self_signature,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")
-      .bind(installationId, helperKeyId, canonicalJson(receiptJwk), fingerprint, existing?.active_key_id === helperKeyId ? "active" : "pending_owner", observedAt, capability.signature, now),
+    env.DB.prepare("INSERT OR IGNORE INTO privilege_installation_keys(installation_id,key_id,public_jwk_json,fingerprint,status,valid_from,predecessor_key_id,self_signature,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)")
+      .bind(installationId, helperKeyId, canonicalJson(receiptJwk), fingerprint, existing?.active_key_id === helperKeyId ? "active" : "pending_owner", observedAt, predecessorKeyId, capability.signature, now),
     env.DB.prepare("INSERT OR IGNORE INTO privilege_policy_attestations(installation_id,revision,policy_digest,previous_policy_digest,public_summary_json,change_class,helper_key_id,helper_signature,attestation_digest,status,observed_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)")
       .bind(installationId, policyRevision, policyDigest, previousPolicyDigest, canonicalJson(publicSummary), actualChangeClass, helperKeyId, policy.signature, await sha256Hex(canonicalJson(bundle.signedPolicyAttestation)), policyInsertStatus, observedAt, now),
     env.DB.prepare("INSERT OR IGNORE INTO device_user_policy_attestations(device_id,revision,policy_digest,previous_policy_digest,public_summary_json,device_key_id,device_signature,attestation_digest,status,observed_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")
       .bind(frame.deviceId, devicePolicyRevision, devicePolicyDigest, previousDevicePolicyDigest, canonicalJson(devicePolicySummary), deviceKeyId, String(devicePolicy.signature), await sha256Hex(canonicalJson(devicePolicy)), devicePolicyStatus, observedAt, now),
     env.DB.prepare("INSERT OR IGNORE INTO privilege_registration_attestations(request_id,device_id,installation_id,attestation_kind,request_digest,device_key_id,device_signature,observed_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)")
       .bind(registrationRequestId, frame.deviceId, installationId, existing === null ? "initial" : existing.active_key_id !== helperKeyId && existing.active_policy_digest !== policyDigest ? "combined_update" : existing.active_key_id !== helperKeyId ? "key_rotation" : existing.active_policy_digest !== policyDigest ? "policy_update" : "device_policy_update", registrationRequestDigest, deviceKeyId, String(payload.deviceSignature), observedAt, now),
+    ...(actualChangeClass === "narrowed" ? [
+      env.DB.prepare("UPDATE privilege_policy_attestations SET status='superseded' WHERE installation_id=?1 AND status='active' AND revision<?2").bind(installationId, policyRevision),
+      env.DB.prepare("UPDATE privilege_policy_attestations SET status='active' WHERE installation_id=?1 AND revision=?2 AND status='pending_owner'").bind(installationId, policyRevision),
+      env.DB.prepare("UPDATE device_privilege_installations SET active_policy_revision=?1,active_policy_digest=?2,status='active',updated_at=?3 WHERE installation_id=?4 AND active_key_id=?5 AND status IN ('active','policy_review')").bind(policyRevision, policyDigest, now, installationId, helperKeyId),
+    ] : []),
+    ...(devicePolicyNarrowed ? [
+      env.DB.prepare("UPDATE device_user_policy_attestations SET status='superseded' WHERE device_id=?1 AND status='active' AND revision<?2").bind(frame.deviceId, devicePolicyRevision),
+    ] : []),
   ]);
-  if (actualChangeClass === "narrowed") await env.DB.batch([
-    env.DB.prepare("UPDATE privilege_policy_attestations SET status='superseded' WHERE installation_id=?1 AND status='active' AND revision<?2").bind(installationId, policyRevision),
-    env.DB.prepare("UPDATE privilege_policy_attestations SET status='active' WHERE installation_id=?1 AND revision=?2 AND status='pending_owner'").bind(installationId, policyRevision),
-    env.DB.prepare("UPDATE device_privilege_installations SET active_policy_revision=?1,active_policy_digest=?2,status='active',updated_at=?3 WHERE installation_id=?4 AND active_key_id=?5 AND status IN ('active','policy_review')").bind(policyRevision, policyDigest, now, installationId, helperKeyId),
-  ]);
-  if (devicePolicyNarrowed) await env.DB.prepare("UPDATE device_user_policy_attestations SET status='superseded' WHERE device_id=?1 AND status='active' AND revision<?2").bind(frame.deviceId, devicePolicyRevision).run();
   return { installationId, state: existing?.status === "active" && policyStatus === "active" ? "active" : "pending_owner", attestationDigest };
 }
 
@@ -401,9 +418,12 @@ async function operationAuthority(env: ControlPlaneEnv, operationId: string): Pr
   return env.DB.prepare(`
     SELECT operation.id,operation.actor_principal_id,operation.device_id,operation.project_id,operation.assignment_id,operation.run_id,
            operation.connector_policy_id,operation.connector_policy_revision,operation.connector_grant_id,
-           operation.payload_digest,operation.request_json,operation.operation_kind,
+           operation.payload_digest,operation.request_json,operation.operation_kind,operation.state AS operation_state,
+           operation.expires_at AS operation_expires_at,operation.target_operation_id,operation.target_runtime_id,
+           operation.target_digest,operation.target_controller_epoch,operation.expected_target_state,operation.expected_target_revision,
            run.manifest_digest AS run_manifest_digest,run.access_scope AS run_access_scope,
            run.approval_mode AS run_approval_mode,run.runtime_kind AS run_runtime_kind,run.device_id AS run_device_id,
+           run.state AS run_state,
            binding.project_agent_id,binding.project_agent_revision,binding.adapter_id,binding.project_revision AS binding_project_revision,
            binding.device_id AS binding_device_id,binding.device_revision AS binding_device_revision,binding.runtime_kind AS binding_runtime_kind,
            binding.runtime_provider_id AS binding_runtime_provider_id,binding.runtime_configuration_revision AS binding_runtime_configuration_revision,
@@ -439,6 +459,107 @@ function summaryAllows(summaryJson: string, request: Record<string, unknown>, ca
   if (approvalMode === "never" && (policy.allowNever !== true || capability.neverOptIn !== true)) throw new PublicError("full_device_never_local_opt_in_required", 409, "Never approval requires both root-policy and effective helper opt-in");
 }
 
+function devicePolicyAllows(summaryJson: string, request: Record<string, unknown>, resourceCeilings: Record<string, unknown>): void {
+  const policy = JSON.parse(summaryJson) as Record<string, unknown>;
+  const runtime = request.runtime !== null && typeof request.runtime === "object" && !Array.isArray(request.runtime) ? request.runtime as Record<string, unknown> : {};
+  const argumentsValue = request.arguments !== null && typeof request.arguments === "object" && !Array.isArray(request.arguments) ? request.arguments as Record<string, unknown> : {};
+  const includes = (field: string, expected: unknown): boolean => Array.isArray(policy[field]) && policy[field].includes(expected);
+  if (!includes("capabilities", request.capability) || !includes("providers", runtime.providerId) || !includes("accessScopes", "full_device") || !includes("approvalModes", request.approvalMode)) {
+    throw new PublicError("privileged_helper_policy_mismatch", 409, "Device policy does not allow this exact Full Device operation");
+  }
+  const launchProfileId = argumentsValue.launchProfileId;
+  if (typeof launchProfileId === "string" && !includes("launchProfiles", launchProfileId)) {
+    throw new PublicError("privileged_helper_policy_mismatch", 409, "Device policy does not allow this launch profile");
+  }
+  if (request.approvalMode === "never" && policy.allowFullAccessWithoutApproval !== true) {
+    throw new PublicError("full_device_never_local_opt_in_required", 409, "Never approval requires Device user policy opt-in");
+  }
+  const cpuQuota = resourceCeilings.cpuQuotaPerSecUsec;
+  const memoryMax = resourceCeilings.memoryMaxBytes;
+  if (typeof policy.maxCpu === "number" && (typeof cpuQuota !== "number" || cpuQuota > policy.maxCpu * 1_000_000)) {
+    throw new PublicError("privileged_helper_policy_mismatch", 409, "Requested CPU ceiling exceeds Device policy");
+  }
+  if (typeof policy.maxMemoryBytes === "number" && (typeof memoryMax !== "number" || memoryMax > policy.maxMemoryBytes)) {
+    throw new PublicError("privileged_helper_policy_mismatch", 409, "Requested memory ceiling exceeds Device policy");
+  }
+}
+
+const CONTROL_ACTIONS = new Set(["input", "resize_pty", "pause", "resume", "graceful_stop", "force_stop"]);
+const TERMINAL_OPERATION_STATES = new Set(["completed", "failed", "cancelled", "expired", "rejected", "uncertain"]);
+const TERMINAL_RUN_STATES = new Set(["ready_for_review", "accepted", "rejected", "cancelled", "failed", "completed"]);
+
+function expectedControlAction(authority: OperationAuthorityRow, request: Record<string, unknown>): string | null {
+  if (authority.operation_kind === "agent_control") {
+    if (authority.target_runtime_id !== null) return null;
+    const mode = request.mode;
+    if (mode === "input" || mode === "follow_up" || mode === "steer") return "input";
+    if (mode === "cancel" || mode === "close") return "force_stop";
+    return null;
+  }
+  if (authority.operation_kind === "runtime_control") {
+    const control = request.control;
+    if (control === "input" || control === "steer") return "input";
+    if (control === "pause") return "pause";
+    if (control === "resume") return "resume";
+    if (control === "stop") return "graceful_stop";
+    if (control === "cancel") return "force_stop";
+  }
+  return null;
+}
+
+async function verifyControlTicketBinding(
+  env: ControlPlaneEnv,
+  authority: OperationAuthorityRow,
+  controlRequest: Record<string, unknown>,
+  allowedOperation: string,
+  controlDigest: string | null,
+  runtimeId: string,
+  payload: Record<string, unknown>,
+): Promise<OperationAuthorityRow> {
+  if (!CONTROL_ACTIONS.has(allowedOperation) || controlDigest === null || controlDigest !== authority.payload_digest || expectedControlAction(authority, controlRequest) !== allowedOperation) {
+    throw new PublicError("privilege_ticket_invalid", 409, "Privilege control ticket is not bound to the exact Control Plane operation");
+  }
+  if (authority.target_operation_id === null || authority.target_digest === null || authority.target_controller_epoch === null || authority.expected_target_state === null || authority.expected_target_revision === null) {
+    throw new PublicError("privilege_ticket_invalid", 409, "Privilege control target custody is incomplete");
+  }
+  if (controlRequest.operationId !== authority.id || controlRequest.targetRunId !== authority.run_id || controlRequest.targetDigest !== authority.target_digest || controlRequest.targetControllerEpoch !== authority.target_controller_epoch || controlRequest.expectedState !== authority.expected_target_state || String(controlRequest.expectedRevision) !== String(authority.expected_target_revision)) {
+    throw new PublicError("privilege_ticket_invalid", 409, "Privilege control request differs from durable target custody");
+  }
+  if (authority.operation_kind === "runtime_control" && (authority.target_runtime_id !== runtimeId || controlRequest.targetRuntimeId !== runtimeId)) {
+    throw new PublicError("privilege_ticket_invalid", 409, "Privilege runtime control targets another Runtime");
+  }
+  const custody = await env.DB.prepare(`
+    SELECT runtime_id,run_id,start_operation_id,device_id,target_digest,controller_epoch,state,revision
+    FROM runtime_custody WHERE runtime_id=?1 AND run_id=?2 AND start_operation_id=?3 AND device_id=?4 LIMIT 1
+  `).bind(runtimeId, authority.run_id, authority.target_operation_id, authority.device_id).first<{ runtime_id: string; run_id: string; start_operation_id: string; device_id: string; target_digest: string; controller_epoch: string; state: string; revision: number }>();
+  if (custody === null || (authority.operation_kind === "runtime_control" && (custody.target_digest !== authority.target_digest || custody.controller_epoch !== authority.target_controller_epoch || custody.state !== authority.expected_target_state || custody.revision !== authority.expected_target_revision))) {
+    throw new PublicError("privilege_ticket_invalid", 409, "Privilege control target custody changed before ticket issuance");
+  }
+  if (authority.operation_kind === "agent_control") {
+    const agent = await env.DB.prepare("SELECT target_digest,controller_epoch,state,revision FROM agent_sessions WHERE run_id=?1 AND start_operation_id=?2 AND device_id=?3 LIMIT 1")
+      .bind(authority.run_id, authority.target_operation_id, authority.device_id).first<{ target_digest: string; controller_epoch: string; state: string; revision: number }>();
+    if (agent === null || agent.target_digest !== authority.target_digest || agent.controller_epoch !== authority.target_controller_epoch || agent.state !== authority.expected_target_state || agent.revision !== authority.expected_target_revision) {
+      throw new PublicError("privilege_ticket_invalid", 409, "Privilege Agent control target custody changed before ticket issuance");
+    }
+  }
+  const startAuthority = await operationAuthority(env, authority.target_operation_id);
+  if (startAuthority === null || startAuthority.operation_kind !== "start" || startAuthority.device_id !== authority.device_id || startAuthority.run_id !== authority.run_id || startAuthority.assignment_id !== authority.assignment_id || startAuthority.project_id !== authority.project_id) {
+    throw new PublicError("privilege_ticket_invalid", 409, "Privilege control is not bound to its immutable start operation");
+  }
+  const startTicket = await env.DB.prepare(`
+    SELECT request.runtime_spec_digest,request.launch_plan_digest,request.local_execution_plan_digest
+    FROM privilege_ticket_requests AS request
+    JOIN privilege_ticket_issuance AS ticket ON ticket.request_id=request.request_id
+    WHERE request.operation_id=?1 AND request.runtime_id=?2 AND request.status='issued'
+      AND request.allowed_operation IN ('prepare','start')
+    ORDER BY request.requested_at DESC,request.request_id DESC LIMIT 1
+  `).bind(startAuthority.id, runtimeId).first<{ runtime_spec_digest: string; launch_plan_digest: string; local_execution_plan_digest: string }>();
+  if (startTicket === null || startTicket.runtime_spec_digest !== payload.runtimeSpecDigest || startTicket.launch_plan_digest !== payload.launchPlanDigest || startTicket.local_execution_plan_digest !== payload.localExecutionPlanDigest) {
+    throw new PublicError("privilege_ticket_invalid", 409, "Privilege control plan differs from the immutable start ticket");
+  }
+  return startAuthority;
+}
+
 async function issueTicket(env: ControlPlaneEnv, frame: PrivilegeTransportFrame): Promise<Record<string, unknown>> {
   const payload = frame.payload;
   exactKeys(payload, ["requestId", "idempotencyKey", "installationId", "deviceKeyId", "operationId", "runId", "runtimeId", "runtimeSpecDigest", "launchPlanDigest", "localExecutionPlanDigest", "controlRequestDigest", "runManifestDigest", "helperPolicyRevision", "helperPolicyDigest", "devicePolicyRevision", "approvalReceiptDigest", "approvalEnforcement", "allowedOperation", "resourceCeilings", "redactedSummary", "requestedAt", "expiresAt", "deviceSignature"], "ticket request");
@@ -454,13 +575,33 @@ async function issueTicket(env: ControlPlaneEnv, frame: PrivilegeTransportFrame)
   const requestedExpiresAt = parseDate(payload.expiresAt, "expiresAt");
   if (requestedExpiresAt <= Date.now() || requestedAt > Date.now() + 30_000 || requestedExpiresAt - requestedAt > 300_000) throw new PublicError("privilege_ticket_expired", 409, "Privilege ticket request validity is invalid");
   const deviceKeyId = await verifyDeviceSignedPayload(env, frame, payload);
+  const unsignedPayload = { ...payload };
+  delete unsignedPayload.deviceSignature;
+  const requestDigest = await sha256Hex(canonicalJson(unsignedPayload));
+  const prior = await env.DB.prepare("SELECT request_id,device_id,idempotency_key,request_digest,status FROM privilege_ticket_requests WHERE request_id=?1 OR (device_id=?2 AND idempotency_key=?3) LIMIT 1").bind(requestId, frame.deviceId, idempotencyKey).first<{ request_id: string; device_id: string; idempotency_key: string; request_digest: string; status: string }>();
+  if (prior !== null && (prior.request_digest !== requestDigest || prior.request_id !== requestId || prior.device_id !== frame.deviceId || prior.idempotency_key !== idempotencyKey)) {
+    throw new PublicError("privilege_ticket_conflict", 409, "Privilege ticket request identity is bound to another request");
+  }
   const authority = await operationAuthority(env, operationId);
+  let operationRequest: Record<string, unknown>;
+  try { operationRequest = authority === null ? {} : JSON.parse(authority.request_json) as Record<string, unknown>; } catch { operationRequest = {}; }
+  if (authority === null || TERMINAL_OPERATION_STATES.has(authority.operation_state) || Date.parse(authority.operation_expires_at) <= Date.now() || authority.run_state === null || TERMINAL_RUN_STATES.has(authority.run_state)) {
+    throw new PublicError("privilege_ticket_expired", 409, "Privilege ticket operation is no longer active");
+  }
+  const allowedOperation = stringField(payload, "allowedOperation", 32);
+  const controlDigest = digestField(payload, "controlRequestDigest", true);
+  const executionAuthority = CONTROL_ACTIONS.has(allowedOperation)
+    ? await verifyControlTicketBinding(env, authority, operationRequest, allowedOperation, controlDigest, runtimeId, payload)
+    : authority;
   let request: Record<string, unknown>;
-  try { request = authority === null ? {} : JSON.parse(authority.request_json) as Record<string, unknown>; } catch { request = {}; }
+  try { request = JSON.parse(executionAuthority.request_json) as Record<string, unknown>; } catch { request = {}; }
+  if (!CONTROL_ACTIONS.has(allowedOperation) && (authority.operation_kind !== "start" || controlDigest !== null)) {
+    throw new PublicError("privilege_ticket_invalid", 409, "Privilege launch ticket is not bound to a start operation");
+  }
   const runtime = request.runtime === null || typeof request.runtime !== "object" || Array.isArray(request.runtime) ? {} : request.runtime as Record<string, unknown>;
-  if (authority === null || authority.device_id !== frame.deviceId || authority.run_id !== runId || authority.run_device_id !== frame.deviceId || authority.run_access_scope !== "full_device" || authority.run_runtime_kind !== "native" || request.accessScope !== "full_device" || runtime.kind !== "native" || runtime.providerId !== "privileged-native") throw new PublicError("full_device_capability_unavailable", 409, "Operation is not an exact privileged-native Full Device Run");
-  if (authority.run_manifest_digest === null || authority.run_manifest_digest !== digestField(payload, "runManifestDigest") || authority.payload_digest !== request.payloadDigest) throw new PublicError("privilege_ticket_invalid", 409, "Immutable operation or Run Manifest binding differs");
-  if (authority.connector_policy_id === null || authority.connector_policy_revision === null || request.connectorPolicyId !== authority.connector_policy_id || request.connectorPolicyRevision !== authority.connector_policy_revision) throw new PublicError("privilege_ticket_invalid", 409, "Connector policy binding differs");
+  if (authority.device_id !== frame.deviceId || authority.run_id !== runId || executionAuthority.run_device_id !== frame.deviceId || executionAuthority.run_access_scope !== "full_device" || executionAuthority.run_runtime_kind !== "native" || request.accessScope !== "full_device" || runtime.kind !== "native" || runtime.providerId !== "privileged-native") throw new PublicError("full_device_capability_unavailable", 409, "Operation is not an exact privileged-native Full Device Run");
+  if (executionAuthority.run_manifest_digest === null || executionAuthority.run_manifest_digest !== digestField(payload, "runManifestDigest") || executionAuthority.payload_digest !== request.payloadDigest) throw new PublicError("privilege_ticket_invalid", 409, "Immutable operation or Run Manifest binding differs");
+  if (authority.connector_policy_id === null || authority.connector_policy_revision === null || (!CONTROL_ACTIONS.has(allowedOperation) && (request.connectorPolicyId !== authority.connector_policy_id || request.connectorPolicyRevision !== authority.connector_policy_revision))) throw new PublicError("privilege_ticket_invalid", 409, "Connector policy binding differs");
   if (authority.connector_grant_id !== null) {
     const connector = await env.DB.prepare("SELECT grant.id FROM oauth_grants AS grant JOIN connector_policies AS policy ON policy.id=grant.connector_policy_id AND policy.revision=grant.connector_policy_revision WHERE grant.id=?1 AND grant.status='active' AND policy.status='active' AND policy.id=?2 AND policy.revision=?3 AND grant.principal_id=?4 LIMIT 1")
       .bind(authority.connector_grant_id, authority.connector_policy_id, authority.connector_policy_revision, authority.actor_principal_id).first<{ id: string }>();
@@ -496,8 +637,6 @@ async function issueTicket(env: ControlPlaneEnv, frame: PrivilegeTransportFrame)
   const approvalEnforcement = stringField(payload, "approvalEnforcement", 32);
   if (!['exact_command','adapter_mediated','unavailable'].includes(approvalEnforcement) || approvalEnforcement === "unavailable") throw new PublicError("full_device_approval_enforcement_unavailable", 409, "Full Device approval enforcement is unavailable");
   if (request.capability === "agent.run.start" && approvalEnforcement !== "adapter_mediated" || request.capability === "command.start" && approvalEnforcement !== "exact_command") throw new PublicError("full_device_approval_enforcement_unavailable", 409, "Approval enforcement does not match the operation adapter");
-  const allowedOperation = stringField(payload, "allowedOperation", 32);
-  const controlDigest = digestField(payload, "controlRequestDigest", true);
   if (["input", "resize_pty", "pause", "resume", "graceful_stop", "force_stop"].includes(allowedOperation) && controlDigest === null) {
     throw new PublicError("privilege_ticket_invalid", 409, "An effectful control ticket requires an exact control request digest");
   }
@@ -508,13 +647,10 @@ async function issueTicket(env: ControlPlaneEnv, frame: PrivilegeTransportFrame)
       .bind(approvalDigest, frame.deviceId, operationId, runId).first<{ commitment_digest: string; decision: string | null; expires_at: string; device_id: string; operation_id: string; run_id: string | null }>();
     if (approval === null || approval.decision !== "approved" || Date.parse(approval.expires_at) <= Date.now()) throw new PublicError("approval_required", 409, "Exact approval is absent or expired");
   }
+  const resourceCeilings = record(payload.resourceCeilings, "resourceCeilings");
   summaryAllows(installation.root_policy_json, payload, installation.capability_summary_json, approvalMode, adapterId);
-  summaryAllows(installation.device_policy_json, payload, installation.capability_summary_json, approvalMode, adapterId);
-  const prior = await env.DB.prepare("SELECT request_id,request_digest,status FROM privilege_ticket_requests WHERE device_id=?1 AND idempotency_key=?2 LIMIT 1").bind(frame.deviceId, idempotencyKey).first<{ request_id: string; request_digest: string; status: string }>();
-  const unsignedPayload = { ...payload }; delete unsignedPayload.deviceSignature;
-  const requestDigest = await sha256Hex(canonicalJson(unsignedPayload));
+  devicePolicyAllows(installation.device_policy_json, request, resourceCeilings);
   if (prior !== null) {
-    if (prior.request_digest !== requestDigest || prior.request_id !== requestId) throw new PublicError("privilege_ticket_conflict", 409, "Privilege ticket idempotency key is bound to another request");
     const issuance = await env.DB.prepare("SELECT canonical_ticket_json FROM privilege_ticket_issuance WHERE request_id=?1 LIMIT 1").bind(requestId).first<{ canonical_ticket_json: string }>();
     if (issuance !== null) return { requestId, status: "issued", ticket: JSON.parse(issuance.canonical_ticket_json), replay: true };
   }
@@ -522,12 +658,11 @@ async function issueTicket(env: ControlPlaneEnv, frame: PrivilegeTransportFrame)
   const publicRow = await env.DB.prepare("SELECT revision,public_jwk_json,fingerprint FROM privilege_issuer_keys WHERE key_id=?1 AND status='active' LIMIT 1").bind(active.config.keyId).first<{ revision: number; public_jwk_json: string; fingerprint: string }>();
   if (publicRow === null || publicRow.revision !== active.config.revision || publicRow.public_jwk_json !== canonicalJson(active.publicJwk) || publicRow.fingerprint !== active.fingerprint) throw new PublicError("full_device_capability_unavailable", 503, "Active privilege issuer key is not Owner-activated");
   const now = new Date();
-  const ticketExpiresAt = new Date(Math.min(requestedExpiresAt, now.getTime() + 120_000, Date.parse(String(request.expiresAt)))).toISOString();
+  const ticketExpiresAt = new Date(Math.min(requestedExpiresAt, now.getTime() + 120_000, Date.parse(authority.operation_expires_at))).toISOString();
   const ticketId = newId("ptkt");
   const idempotencyKeyDigest = await sha256Hex(idempotencyKey);
-  const resourceCeilings = record(payload.resourceCeilings, "resourceCeilings");
   const operationRequestDigest = authority.payload_digest;
-  const runManifestDigest = authority.run_manifest_digest;
+  const runManifestDigest = executionAuthority.run_manifest_digest;
   if (runManifestDigest === null) throw new PublicError("privilege_ticket_invalid", 409, "Immutable Run Manifest is unavailable");
   const issuedAt = now.toISOString();
   const claims = {

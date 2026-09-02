@@ -21,14 +21,14 @@ async function sign(key: CryptoKey, value: unknown): Promise<string> {
   return base64url(new Uint8Array(await crypto.subtle.sign("Ed25519", key, new TextEncoder().encode(canonicalJson(value)))));
 }
 
-async function deviceSignedFrame(type: PrivilegeTransportFrame["type"], messageId: string, sequence: string, payload: Record<string, unknown>, deviceKey: CryptoKey, courierEpoch = "7"): Promise<PrivilegeTransportFrame> {
+async function deviceSignedFrame(type: PrivilegeTransportFrame["type"], messageId: string, sequence: string, payload: Record<string, unknown>, deviceKey: CryptoKey, courierEpoch = "7", deviceId = "dev_privilegeflow01"): Promise<PrivilegeTransportFrame> {
   const unsigned = { ...payload };
-  const deviceSignature = await sign(deviceKey, { domain: `conduit.${type}.v1`, deviceId: "dev_privilegeflow01", connectionEpoch: courierEpoch, payload: unsigned });
+  const deviceSignature = await sign(deviceKey, { domain: `conduit.${type}.v1`, deviceId, connectionEpoch: courierEpoch, payload: unsigned });
   const complete = { ...unsigned, deviceSignature };
   const receipt = payload.receipt !== null && typeof payload.receipt === "object" && !Array.isArray(payload.receipt) ? payload.receipt as Record<string, unknown> : undefined;
   const receiptClaims = receipt?.claims !== null && typeof receipt?.claims === "object" && !Array.isArray(receipt.claims) ? receipt.claims as Record<string, unknown> : undefined;
   const correlationId = type === "privilege.ticket_request" || type === "privilege.installation_attestation" ? String(payload.requestId) : String(receiptClaims?.operationId);
-  const wire = { protocol: "conduit.node/1", messageId, deviceId: "dev_privilegeflow01", connectionEpoch: courierEpoch, direction: "node_to_control", sequence, type, correlationId, payloadDigest: await sha256Hex(canonicalJson(complete)), payload: complete };
+  const wire = { protocol: "conduit.node/1", messageId, deviceId, connectionEpoch: courierEpoch, direction: "node_to_control", sequence, type, correlationId, payloadDigest: await sha256Hex(canonicalJson(complete)), payload: complete };
   return parsePrivilegeTransportFrame(parseWireDocument(schemaIds.nodeV1, wire));
 }
 
@@ -90,8 +90,10 @@ describe.sequential("privileged helper Control Plane", () => {
       enabled: true, observedAt: new Date().toISOString(), systemdSystemManager: true, socketPeerCredentials: true, transientUnits: true, cgroupV2: true,
       freeze: true, pidfd: true, openat2: true, execveat: true, pty: true, streamReplay: true, neverOptIn: true, unrestrictedLaunchOptIn: true, unavailableReason: null,
     };
-    const policySummary = { enabled: true, allowedOperations: rootPolicy.allowedOperations, allowedAdapters: [], approvalEnforcements: ["exact_command"], allowNever: true, allowUnrestrictedLaunch: true };
-    const devicePolicySummary = { ...policySummary };
+    const devicePolicySummary = {
+      revision: 1, capabilities: ["command.start"], providers: ["privileged-native"], accessScopes: ["full_device"], approvalModes: ["never"],
+      requiredApprovalRiskClasses: [], launchProfiles: [], maxCpu: null, maxMemoryBytes: null, maxStorageBytes: null, allowFullAccessWithoutApproval: true,
+    };
     const devicePolicy = { revision: 1, policyDigest: devicePolicyDigest, previousPolicyDigest: null, publicSummary: devicePolicySummary, signature: await sign(devicePrivate, { deviceId: "dev_privilegeflow01", revision: 1, policyDigest: devicePolicyDigest, previousPolicyDigest: null, publicSummary: devicePolicySummary }) };
     const registration = await deviceSignedFrame("privilege.installation_attestation", "nmsg_privinstall001", "1", {
       requestId: "phreq_privilegeflow01", registrationBundle: {
@@ -158,6 +160,49 @@ describe.sequential("privileged helper Control Plane", () => {
     await expect(projectPrivilegeFrame(env, unauthorized)).rejects.toMatchObject({ code: "privilege_ticket_invalid" });
   });
 
+  it("binds control tickets to their own operation and rejects terminal or cross-Device request reuse", async () => {
+    const requestPayload = (overrides: Record<string, unknown> = {}) => ({
+      requestId: "ptreq_privcontrol001", idempotencyKey: "privilege-runtime-control-0001", installationId: "phinst_privilegeflow01", deviceKeyId: "dkey_privilegeflow01",
+      operationId: "op_privcontrol001", runId: "run_privilegeflow01", runtimeId: "rt_privilegeflow01", runtimeSpecDigest, launchPlanDigest, localExecutionPlanDigest: localPlanDigest,
+      controlRequestDigest: "8".repeat(64), runManifestDigest: manifestDigest, helperPolicyRevision: 1, helperPolicyDigest: rootPolicyDigest, devicePolicyRevision: 1,
+      approvalReceiptDigest: null, approvalEnforcement: "exact_command", allowedOperation: "pause",
+      resourceCeilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null }, redactedSummary: { operation: "pause" },
+      requestedAt: new Date().toISOString(), expiresAt: new Date(Date.now() + 120_000).toISOString(), ...overrides,
+    });
+    const control = {
+      operationId: "op_privcontrol001", idempotencyKey: "runtime-control-operation-0001", targetRunId: "run_privilegeflow01", targetRuntimeId: "rt_privilegeflow01",
+      targetHandleDigest: "9".repeat(64), targetControllerEpoch: "7", targetDigest: "8".repeat(64), expectedState: "running", expectedRevision: "1", control: "pause",
+    };
+    const controlDigest = await sha256Hex(canonicalJson(control));
+    const expiresAt = new Date(Date.now() + 600_000).toISOString();
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO runtime_custody(runtime_id,run_id,start_operation_id,device_id,provider_id,handle_digest,target_digest,controller_epoch,state,revision,created_at,updated_at) VALUES ('rt_privilegeflow01','run_privilegeflow01','op_privilegeflow01','dev_privilegeflow01','privileged-native',?1,?2,'7','running',1,?3,?3)").bind("9".repeat(64), "8".repeat(64), now),
+      env.DB.prepare("INSERT INTO operation_journal(id,idempotency_key,actor_principal_id,client_id,device_id,run_id,connector_policy_id,connector_policy_revision,capability,payload_digest,request_json,state,expires_at,created_at,updated_at,operation_kind,target_operation_id,target_runtime_id,target_digest,target_controller_epoch,expected_target_state,expected_target_revision,node_state_revision) VALUES ('op_privcontrol001','runtime-control-operation-0001','prin_privilegeflow01','conduit.cli','dev_privilegeflow01','run_privilegeflow01','cpol_owner_first_party_v1',1,'runtime.control',?1,?2,'offered',?3,?4,?4,'runtime_control','op_privilegeflow01','rt_privilegeflow01',?5,'7','running',1,0)").bind(controlDigest, canonicalJson(control), expiresAt, now, "8".repeat(64)),
+    ]);
+
+    const legacyStartId = await deviceSignedFrame("privilege.ticket_request", "nmsg_privcontrolold1", "7", requestPayload({ requestId: "ptreq_privcontrolold1", idempotencyKey: "privilege-control-old-start-0001", operationId: "op_privilegeflow01", controlRequestDigest: controlDigest }), devicePrivate);
+    await expect(projectPrivilegeFrame(env, legacyStartId)).rejects.toMatchObject({ code: "privilege_ticket_invalid" });
+
+    const valid = await deviceSignedFrame("privilege.ticket_request", "nmsg_privcontrol001", "7", requestPayload({ controlRequestDigest: controlDigest }), devicePrivate);
+    const issued = await projectPrivilegeFrame(env, valid) as { ticket: { claims: Record<string, unknown> } };
+    expect(issued.ticket.claims).toMatchObject({ operationId: "op_privcontrol001", operationRequestDigest: controlDigest, controlDigest, allowedOperation: "pause" });
+
+    await env.DB.prepare("UPDATE operation_journal SET state='failed' WHERE id='op_privcontrol001'").run();
+    const terminal = await deviceSignedFrame("privilege.ticket_request", "nmsg_privcontrolterm", "8", requestPayload({ requestId: "ptreq_privcontrolterm", idempotencyKey: "privilege-control-terminal-0001", controlRequestDigest: controlDigest }), devicePrivate);
+    await expect(projectPrivilegeFrame(env, terminal)).rejects.toMatchObject({ code: "privilege_ticket_expired" });
+
+    const other = await keyPair();
+    const otherFingerprint = await sha256Hex(String(other.publicJwk.x));
+    await env.DB.batch([
+      env.DB.prepare("INSERT INTO device_enrollments(id,state,device_code_hash,user_code_hash,claims_json,requested_key_id,requested_public_jwk_json,requested_fingerprint,possession_challenge,possession_signature,approved_by,assigned_device_id,created_at,expires_at,terminal_at) VALUES ('enroll_privilegeother1','completed','dch_privilegeother1','uch_privilegeother1','{}','dkey_privilegeother1',?1,?2,'challenge','signature','prin_privilegeflow01','dev_privilegeother1',?3,?4,?3)").bind(canonicalJson(other.publicJwk), otherFingerprint, now, expiresAt),
+      env.DB.prepare("INSERT INTO devices(id,enrollment_id,display_label,os,arch,node_version,protocol_version,status,revision,connection_epoch,created_at,updated_at) VALUES ('dev_privilegeother1','enroll_privilegeother1','other-device','linux','x86_64','test','conduit.node/1','active',1,'1',?1,?1)").bind(now),
+      env.DB.prepare("INSERT INTO device_keys(id,device_id,public_jwk_json,fingerprint,status,created_at) VALUES ('dkey_privilegeother1','dev_privilegeother1',?1,?2,'active',?3)").bind(canonicalJson(other.publicJwk), otherFingerprint, now),
+    ]);
+    const collisionPayload = requestPayload({ idempotencyKey: "privilege-cross-device-collision-1", deviceKeyId: "dkey_privilegeother1" });
+    const collision = await deviceSignedFrame("privilege.ticket_request", "nmsg_privcrossdevice1", "1", collisionPayload, other.privateKey, "1", "dev_privilegeother1");
+    await expect(projectPrivilegeFrame(env, collision)).rejects.toMatchObject({ code: "privilege_ticket_conflict" });
+  });
+
   it("activates signed narrowing immediately and holds post-enable broadening for fresh Owner approval", async () => {
     const allOperations = ["prepare", "start", "input", "resize_pty", "pause", "resume", "graceful_stop", "force_stop", "reconcile"];
     const policyClaims = (revision: number, narrowed: boolean) => ({
@@ -166,7 +211,10 @@ describe.sequential("privileged helper Control Plane", () => {
       allowedAdapters: [], allowedLaunchProfiles: [], ceilings: { cpuQuotaPerSecUsec: null, memoryMaxBytes: null, tasksMax: null, ioWeight: null, runtimeMaxUsec: null },
       allowNever: true, allowUnrestrictedLaunch: !narrowed, allowPersistentSessions: false, allowOfflineControl: false, receiptRetentionSeconds: 86400,
     });
-    const initialSummary = { enabled: true, allowedOperations: allOperations, allowedAdapters: [], approvalEnforcements: ["exact_command"], allowNever: true, allowUnrestrictedLaunch: true };
+    const initialSummary = {
+      revision: 1, capabilities: ["command.start"], providers: ["privileged-native"], accessScopes: ["full_device"], approvalModes: ["never"],
+      requiredApprovalRiskClasses: [], launchProfiles: [], maxCpu: null, maxMemoryBytes: null, maxStorageBytes: null, allowFullAccessWithoutApproval: true,
+    };
     const devicePolicy = {
       revision: 1, policyDigest: devicePolicyDigest, previousPolicyDigest: null, publicSummary: initialSummary,
       signature: await sign(devicePrivate, { deviceId: "dev_privilegeflow01", revision: 1, policyDigest: devicePolicyDigest, previousPolicyDigest: null, publicSummary: initialSummary }),
@@ -268,7 +316,10 @@ describe.sequential("privileged helper Control Plane", () => {
       const frame = parseWireDocumentText(schemaIds.nodeV1, await next());
       expect(frame).toMatchObject({ type: "transport.ack", payload: { throughSequence: through } });
     };
-    const devicePolicySummary = { enabled: true, allowedOperations: ["prepare", "start", "input", "resize_pty", "pause", "resume", "graceful_stop", "force_stop", "reconcile"], allowedAdapters: [], approvalEnforcements: ["exact_command"], allowNever: true, allowUnrestrictedLaunch: true };
+    const devicePolicySummary = {
+      revision: 1, capabilities: ["command.start"], providers: ["privileged-native"], accessScopes: ["full_device"], approvalModes: ["never"],
+      requiredApprovalRiskClasses: [], launchProfiles: [], maxCpu: null, maxMemoryBytes: null, maxStorageBytes: null, allowFullAccessWithoutApproval: true,
+    };
     const devicePolicy = { revision: 1, policyDigest: devicePolicyDigest, previousPolicyDigest: null, publicSummary: devicePolicySummary, signature: await sign(devicePrivate, { deviceId, revision: 1, policyDigest: devicePolicyDigest, previousPolicyDigest: null, publicSummary: devicePolicySummary }) };
     const bundleFor = async (installationId: string, revision: number, operations: string[], uid = 1000) => {
       const root = {

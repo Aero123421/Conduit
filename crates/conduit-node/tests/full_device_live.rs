@@ -639,7 +639,12 @@ fn root_marker(
             &create_plan,
         )
         .unwrap();
-    thread::sleep(Duration::from_millis(300));
+    for _ in 0..100 {
+        if marker.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
     let marker_owner = fs::metadata(&marker).unwrap().uid();
     assert_eq!(marker_owner, 0);
     let _ = provider

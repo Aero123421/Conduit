@@ -90,6 +90,14 @@ Examples are under `examples/trace/`.
 
 The prose contract is `docs/TRACE_FORMAT.md`.
 
+## Privileged helper v1
+
+`schemas/privileged-helper-v1.schema.json` contains exact signed privilege
+tickets, root-owned policy attestations, local execution plans, capability
+claims, helper requests, and helper-signed receipt chains. Encoded helper
+packets are limited to 65,536 bytes before JSON decoding. The prose contract is
+`docs/FULL_DEVICE_ACCESS.md` and ADR 0013.
+
 ## Runtime v1
 
 `schemas/runtime-v1.schema.json` contains:

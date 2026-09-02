@@ -23,6 +23,7 @@ INVALID_FIXTURE_DIR = FIXTURE_DIR / "invalid"
 EXAMPLE_SCHEMAS = {
     "auth": "https://conduit.dev/spec/schemas/auth-v1.schema.json",
     "node-protocol": "https://conduit.dev/spec/schemas/node-protocol-v1.schema.json",
+    "privileged-helper": "https://conduit.dev/spec/schemas/privileged-helper-v1.schema.json",
     "trace": "https://conduit.dev/spec/schemas/trace-v1.schema.json",
     "runtime": "https://conduit.dev/spec/schemas/runtime-v1.schema.json",
     "changeset": "https://conduit.dev/spec/schemas/changeset-v1.schema.json",

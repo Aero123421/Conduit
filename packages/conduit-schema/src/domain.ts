@@ -139,6 +139,8 @@ export function canonicalSha256(value: unknown): Sha256Digest {
 export const schemaIds = {
   authV1: "https://conduit.dev/spec/schemas/auth-v1.schema.json",
   nodeV1: "https://conduit.dev/spec/schemas/node-protocol-v1.schema.json",
+  privilegedV1:
+    "https://conduit.dev/spec/schemas/privileged-helper-v1.schema.json",
   traceV1: "https://conduit.dev/spec/schemas/trace-v1.schema.json",
   runtimeV1: "https://conduit.dev/spec/schemas/runtime-v1.schema.json",
   changeSetV1: "https://conduit.dev/spec/schemas/changeset-v1.schema.json",

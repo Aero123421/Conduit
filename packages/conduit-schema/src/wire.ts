@@ -7,11 +7,13 @@ import type {
 } from "./generated/node-protocol-v1.generated.js";
 import type { NodeProtocolPayloadCatalogV1 } from "./generated/node-protocol-v1.payloads.generated.js";
 import type { ConduitRuntimeProviderContractV1 } from "./generated/runtime-v1.generated.js";
+import type { ConduitPrivilegedHelperProtocolV1 } from "./generated/privileged-helper-v1.generated.js";
 import type { ConduitRunManifestAndTraceRecordsV1 } from "./generated/trace-v1.generated.js";
 import {
   authV1 as authV1DomainValidator,
   changeSetV1 as changeSetV1DomainValidator,
   nodeV1 as nodeV1DomainValidator,
+  privilegedV1 as privilegedV1DomainValidator,
   runtimeV1 as runtimeV1DomainValidator,
   traceV1 as traceV1DomainValidator,
 } from "./generated/wire-domain-validators.generated.js";
@@ -19,6 +21,7 @@ import {
   authV1 as authV1SchemaValidator,
   changeSetV1 as changeSetV1SchemaValidator,
   nodeV1 as nodeV1SchemaValidator,
+  privilegedV1 as privilegedV1SchemaValidator,
   runtimeV1 as runtimeV1SchemaValidator,
   traceV1 as traceV1SchemaValidator,
 } from "./generated/wire-schema-validators.generated.js";
@@ -40,6 +43,7 @@ export type NodeV1WireDocument =
   | NodeV1PostAuthFrame;
 export type TraceV1WireDocument = ConduitRunManifestAndTraceRecordsV1;
 export type RuntimeV1WireDocument = ConduitRuntimeProviderContractV1;
+export type PrivilegedV1WireDocument = ConduitPrivilegedHelperProtocolV1;
 export type ChangeSetV1WireDocument =
   ConduitSessionBaselineAndChangeSetContractV1;
 
@@ -47,6 +51,7 @@ export type ChangeSetV1WireDocument =
 export interface WireDocumentMap {
   [schemaIds.authV1]: AuthV1WireDocument;
   [schemaIds.nodeV1]: NodeV1WireDocument;
+  [schemaIds.privilegedV1]: PrivilegedV1WireDocument;
   [schemaIds.traceV1]: TraceV1WireDocument;
   [schemaIds.runtimeV1]: RuntimeV1WireDocument;
   [schemaIds.changeSetV1]: ChangeSetV1WireDocument;
@@ -62,6 +67,7 @@ export type WireDocumentDecodeErrorCode =
   | "malformed_json";
 
 export const MAX_NODE_PROTOCOL_DOCUMENT_BYTES = 65_536;
+export const MAX_PRIVILEGED_PROTOCOL_DOCUMENT_BYTES = 65_536;
 
 const MAX_VALIDATION_ISSUES = 16;
 const MAX_VALIDATION_PATH_BYTES = 512;
@@ -214,6 +220,7 @@ export function parseWireDocumentText<SchemaId extends WireSchemaId>(
 
 const maxDocumentBytes: Partial<Record<WireSchemaId, number>> = {
   [schemaIds.nodeV1]: MAX_NODE_PROTOCOL_DOCUMENT_BYTES,
+  [schemaIds.privilegedV1]: MAX_PRIVILEGED_PROTOCOL_DOCUMENT_BYTES,
 };
 
 // Ajv standalone output preserves the exact checked-in JSON Schema and domain
@@ -222,6 +229,7 @@ const schemaValidators = new Map<WireSchemaId, WireValidator>([
   [schemaIds.authV1, authV1SchemaValidator],
   [schemaIds.changeSetV1, changeSetV1SchemaValidator],
   [schemaIds.nodeV1, nodeV1SchemaValidator],
+  [schemaIds.privilegedV1, privilegedV1SchemaValidator],
   [schemaIds.runtimeV1, runtimeV1SchemaValidator],
   [schemaIds.traceV1, traceV1SchemaValidator],
 ]);
@@ -229,6 +237,7 @@ const domainValidators = new Map<WireSchemaId, WireValidator>([
   [schemaIds.authV1, authV1DomainValidator],
   [schemaIds.changeSetV1, changeSetV1DomainValidator],
   [schemaIds.nodeV1, nodeV1DomainValidator],
+  [schemaIds.privilegedV1, privilegedV1DomainValidator],
   [schemaIds.runtimeV1, runtimeV1DomainValidator],
   [schemaIds.traceV1, traceV1DomainValidator],
 ]);

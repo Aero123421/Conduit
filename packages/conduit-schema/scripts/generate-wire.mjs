@@ -23,6 +23,7 @@ const schemaFiles = [
   "auth-v1.schema.json",
   "changeset-v1.schema.json",
   "node-protocol-v1.schema.json",
+  "privileged-helper-v1.schema.json",
   "runtime-v1.schema.json",
   "trace-v1.schema.json",
 ];
@@ -31,6 +32,7 @@ const schemaExports = {
   authV1: "auth-v1.schema.json",
   changeSetV1: "changeset-v1.schema.json",
   nodeV1: "node-protocol-v1.schema.json",
+  privilegedV1: "privileged-helper-v1.schema.json",
   runtimeV1: "runtime-v1.schema.json",
   traceV1: "trace-v1.schema.json",
 };

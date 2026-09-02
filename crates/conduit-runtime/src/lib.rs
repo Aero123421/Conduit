@@ -11,6 +11,7 @@ pub use incus::IncusProvider;
 pub use native::{NativeProvider, ProcessSupervisor};
 pub use restricted::RestrictedNativeProvider;
 
+use conduit_privileged_protocol::{LocalExecutionPlan, PrivilegeTicket};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -171,6 +172,47 @@ pub struct InteractiveRuntime {
     pub child: Child,
     pub receipt: RuntimeStateReceipt,
 }
+
+/// Exact elevated authority supplied only after both Control Plane ticket
+/// verification and Device-local plan commitment. Ordinary Providers never
+/// receive this material through their legacy methods.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrivilegedAuthority {
+    pub ticket: PrivilegeTicket,
+    pub plan: LocalExecutionPlan,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum RuntimeAuthority {
+    Ordinary,
+    Privileged(PrivilegedAuthority),
+}
+
+/// Provider-owned I/O for a process that cannot be represented by a local
+/// `std::process::Child`, such as a root systemd unit supervised by the helper.
+/// Runtime lifecycle and signalling remain Provider responsibilities.
+pub trait ManagedProcessIo: Send {
+    fn write_input(&mut self, bytes: &[u8]) -> Result<(), RuntimeError>;
+    fn close_input(&mut self) -> Result<(), RuntimeError>;
+    fn read_stdout(&mut self, cursor: u64, max_bytes: usize)
+    -> Result<ManagedIoPage, RuntimeError>;
+    fn read_stderr(&mut self, cursor: u64, max_bytes: usize)
+    -> Result<ManagedIoPage, RuntimeError>;
+    fn resize_pty(&mut self, rows: u16, columns: u16) -> Result<(), RuntimeError>;
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ManagedIoPage {
+    pub bytes: Vec<u8>,
+    pub next_cursor: u64,
+    pub eof: bool,
+}
+
+pub struct ManagedInteractiveRuntime {
+    pub io: Box<dyn ManagedProcessIo>,
+    pub receipt: RuntimeStateReceipt,
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotReceipt {
     pub runtime_id: String,
@@ -272,6 +314,71 @@ pub trait RuntimeProvider: Send + Sync {
         &self,
         records: &[ExpectedRuntime],
     ) -> Result<Vec<ReconciliationReceipt>, RuntimeError>;
+
+    fn prepare_authorized(
+        &self,
+        request: &RuntimeRequest,
+        authority: &RuntimeAuthority,
+    ) -> Result<PreparedRuntime, RuntimeError> {
+        match authority {
+            RuntimeAuthority::Ordinary => self.prepare(request),
+            RuntimeAuthority::Privileged(_) => Err(RuntimeError::CapabilityUnavailable(
+                "privileged Runtime authority".into(),
+            )),
+        }
+    }
+
+    fn start_authorized(
+        &self,
+        prepared: &PreparedRuntime,
+        launch: &LaunchPlan,
+        authority: &RuntimeAuthority,
+    ) -> Result<RuntimeStateReceipt, RuntimeError> {
+        match authority {
+            RuntimeAuthority::Ordinary => self.start(prepared, launch),
+            RuntimeAuthority::Privileged(_) => Err(RuntimeError::CapabilityUnavailable(
+                "privileged Runtime authority".into(),
+            )),
+        }
+    }
+
+    fn start_managed_interactive(
+        &self,
+        _prepared: &PreparedRuntime,
+        _launch: &LaunchPlan,
+        _authority: &RuntimeAuthority,
+    ) -> Result<ManagedInteractiveRuntime, RuntimeError> {
+        Err(RuntimeError::CapabilityUnavailable(
+            "managed interactive Runtime I/O boundary".into(),
+        ))
+    }
+
+    fn inspect_authorized(
+        &self,
+        handle: &RuntimeHandle,
+        authority: &RuntimeAuthority,
+    ) -> Result<RuntimeStateReceipt, RuntimeError> {
+        match authority {
+            RuntimeAuthority::Ordinary => self.inspect(handle),
+            RuntimeAuthority::Privileged(_) => Err(RuntimeError::CapabilityUnavailable(
+                "privileged Runtime inspect authority".into(),
+            )),
+        }
+    }
+
+    fn signal_authorized(
+        &self,
+        handle: &RuntimeHandle,
+        signal: RuntimeSignal,
+        authority: &RuntimeAuthority,
+    ) -> Result<RuntimeStateReceipt, RuntimeError> {
+        match authority {
+            RuntimeAuthority::Ordinary => self.signal(handle, signal),
+            RuntimeAuthority::Privileged(_) => Err(RuntimeError::CapabilityUnavailable(
+                "privileged Runtime control authority".into(),
+            )),
+        }
+    }
 }
 #[derive(Debug, Clone, Copy)]
 pub enum RuntimeSignal {

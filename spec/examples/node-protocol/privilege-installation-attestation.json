@@ -39,6 +39,7 @@
           "allowedOperations": ["prepare", "start", "inspect", "input", "resize_pty", "pause", "resume", "graceful_stop", "force_stop", "reconcile"],
           "allowedAdapters": ["codex"],
           "allowedLaunchProfiles": ["native.root.agent"],
+          "launchProfileExecutableDigests": {},
           "allowedCredentialProfiles": [],
           "ceilings": {
             "cpuQuotaPerSecUsec": 200000,

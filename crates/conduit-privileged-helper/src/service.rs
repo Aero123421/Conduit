@@ -89,6 +89,7 @@ pub struct PublicPolicySummary {
     pub allowed_operations: Vec<PrivilegedOperation>,
     pub allowed_adapters: Vec<String>,
     pub allowed_launch_profiles: Vec<String>,
+    pub launch_profile_executable_digests: BTreeMap<String, String>,
     pub allowed_credential_profiles: Vec<String>,
     pub ceilings: conduit_privileged_protocol::ResourceCeilings,
     pub allow_never: bool,
@@ -1264,21 +1265,22 @@ impl<M: SystemdManager> HelperEngine<M> {
             {
                 return Err(HelperError::Denied("approval_enforcement_mismatch".into()));
             }
-            // Adapter/profile labels are not executable identities. Until a
-            // root-owned profile carries an exact executable commitment, they
-            // may narrow an explicitly unrestricted grant but must never turn
-            // into a generic root-exec grant by themselves.
-            if !self.config.policy.allow_unrestricted_launch {
-                return Err(HelperError::Denied(
-                    "unrestricted_launch_not_allowed".into(),
-                ));
-            }
             if let Some(adapter) = &plan.adapter_id {
-                if !self.config.policy.allowed_adapters.contains(adapter) {
+                if !self.config.policy.allow_unrestricted_launch
+                    || !self.config.policy.allowed_adapters.contains(adapter)
+                {
                     return Err(HelperError::Denied("adapter_not_allowed".into()));
                 }
             } else if let Some(profile) = &plan.launch_profile_id {
-                if !self.config.policy.allowed_launch_profiles.contains(profile) {
+                let registered = self
+                    .config
+                    .policy
+                    .launch_profile_executable_digests
+                    .get(profile)
+                    .is_some_and(|digest| digest == &plan.executable.sha256);
+                let unrestricted_named = self.config.policy.allow_unrestricted_launch
+                    && self.config.policy.allowed_launch_profiles.contains(profile);
+                if !registered && !unrestricted_named {
                     return Err(HelperError::Denied("launch_profile_not_allowed".into()));
                 }
             } else {
@@ -1675,6 +1677,12 @@ mod tests {
             ],
             allowed_adapters: vec!["codex".into()],
             allowed_launch_profiles: vec!["service-test".into()],
+            launch_profile_executable_digests: BTreeMap::from([(
+                "service-test".into(),
+                capture_file_identity(Path::new("/bin/true"), true)
+                    .unwrap()
+                    .sha256,
+            )]),
             allowed_credential_profiles: vec!["cred_test".into()],
             ceilings: resources(),
             allow_never: false,
@@ -1855,6 +1863,45 @@ mod tests {
         }
         let replay = engine.start(start, plan.digest().unwrap()).unwrap();
         assert_eq!(replay, HelperResponse::Receipts(started));
+    }
+
+    #[test]
+    fn registered_launch_profile_does_not_require_unrestricted_root_opt_in() {
+        let (mut engine, _backend, plan, issuer, _) = setup();
+        engine.config.policy.allow_unrestricted_launch = false;
+        engine.config.policy_digest = engine.config.policy.digest().unwrap();
+        engine
+            .prepare(
+                ticket(
+                    &engine,
+                    &issuer,
+                    &plan,
+                    PrivilegedOperation::Prepare,
+                    "ptkt_profileok01",
+                ),
+                plan.clone(),
+                vec![],
+            )
+            .unwrap();
+
+        let mut changed = plan;
+        changed.runtime_id = "rt_profilebad0001".into();
+        changed.systemd_unit = "conduit-elevated-rt_profilebad0001.service".into();
+        changed.executable.sha256 = "fe".repeat(32);
+        assert!(matches!(
+            engine.prepare(
+                ticket(
+                    &engine,
+                    &issuer,
+                    &changed,
+                    PrivilegedOperation::Prepare,
+                    "ptkt_profilebad01",
+                ),
+                changed,
+                vec![]
+            ),
+            Err(HelperError::Denied(reason)) if reason == "launch_profile_not_allowed"
+        ));
     }
 
     #[test]

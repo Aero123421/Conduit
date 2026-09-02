@@ -389,6 +389,8 @@ pub struct RootPolicy {
     pub allowed_adapters: Vec<String>,
     pub allowed_launch_profiles: Vec<String>,
     #[serde(default)]
+    pub launch_profile_executable_digests: BTreeMap<String, String>,
+    #[serde(default)]
     pub allowed_credential_profiles: Vec<String>,
     pub ceilings: ResourceCeilings,
     pub allow_never: bool,

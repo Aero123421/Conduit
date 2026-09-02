@@ -316,6 +316,7 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
                 allowed_operations: all_operations(),
                 allowed_adapters: vec![],
                 allowed_launch_profiles: vec![],
+                launch_profile_executable_digests: BTreeMap::new(),
                 allowed_credential_profiles: vec![],
                 ceilings: ResourceCeilings {
                     cpu_quota_per_sec_usec: None,
@@ -560,6 +561,9 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             if let Some(value) = value_arg(args, "--allowed-launch-profiles") {
                 policy.allowed_launch_profiles = parse_csv(&value)?;
             }
+            if let Some(value) = value_arg(args, "--launch-profile-executable-digests") {
+                policy.launch_profile_executable_digests = parse_digest_map(&value)?;
+            }
             if let Some(value) = value_arg(args, "--allowed-credential-profiles") {
                 policy.allowed_credential_profiles = parse_csv(&value)?;
             }
@@ -575,7 +579,7 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
                 "local_policy_update",
             )?;
             output(
-                json!({"updated":true,"policyRevision":policy.revision,"policyDigest":digest,"allowNever":policy.allow_never,"allowUnrestrictedLaunch":policy.allow_unrestricted_launch,"allowedAdapters":policy.allowed_adapters,"allowedLaunchProfiles":policy.allowed_launch_profiles,"allowedCredentialProfiles":policy.allowed_credential_profiles,"registrationBundle":registration_bundle(&state,&policy_path,&node_path)?}),
+                json!({"updated":true,"policyRevision":policy.revision,"policyDigest":digest,"allowNever":policy.allow_never,"allowUnrestrictedLaunch":policy.allow_unrestricted_launch,"allowedAdapters":policy.allowed_adapters,"allowedLaunchProfiles":policy.allowed_launch_profiles,"launchProfileExecutableDigests":policy.launch_profile_executable_digests,"allowedCredentialProfiles":policy.allowed_credential_profiles,"registrationBundle":registration_bundle(&state,&policy_path,&node_path)?}),
             );
             Ok(())
         }
@@ -943,6 +947,36 @@ fn parse_csv(value: &str) -> conduit_privileged_helper::Result<Vec<String>> {
     values.sort();
     values.dedup();
     Ok(values)
+}
+
+fn parse_digest_map(value: &str) -> conduit_privileged_helper::Result<BTreeMap<String, String>> {
+    let mut result = BTreeMap::new();
+    if value.is_empty() {
+        return Ok(result);
+    }
+    for item in value.split(',') {
+        let (profile, digest) = item.split_once('=').ok_or_else(|| {
+            conduit_privileged_helper::HelperError::Policy(
+                "launch profile digest must use profile=sha256".into(),
+            )
+        })?;
+        if profile.is_empty()
+            || profile.len() > 128
+            || !profile
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            || digest.len() != 64
+            || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            || result
+                .insert(profile.to_owned(), digest.to_ascii_lowercase())
+                .is_some()
+        {
+            return Err(conduit_privileged_helper::HelperError::Policy(
+                "invalid or duplicate launch profile executable digest".into(),
+            ));
+        }
+    }
+    Ok(result)
 }
 struct DecodedPublicKey {
     raw: [u8; 32],

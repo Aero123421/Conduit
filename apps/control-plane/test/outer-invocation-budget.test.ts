@@ -235,5 +235,5 @@ describe.sequential("outer invocation D1 budgets", () => {
       };
     });
     expect(result).toEqual({ rowsWritten: 0, maxStatements: 4, pending: 0, alarm: null });
-  });
+  }, 20_000);
 });

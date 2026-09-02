@@ -193,10 +193,12 @@ openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 1 \
   >/dev/null 2>&1
 chmod 0600 "$conduit_control_tls_key" "$conduit_control_tls_cert"
 conduit_node_path="$conduit_node_bin_dir:$(dirname "$conduit_corepack"):$PATH"
+env PATH="$conduit_node_path" "$conduit_corepack" pnpm --filter @conduit/schema build \
+  > "$conduit_control_log" 2>&1
 env PATH="$conduit_node_path" "$conduit_corepack" pnpm --filter @conduit/control-plane exec wrangler \
   d1 migrations apply conduit-full-device-live --local \
   --config wrangler.full-device-live.jsonc --persist-to "$conduit_control_state" \
-  > "$conduit_control_log" 2>&1
+  >> "$conduit_control_log" 2>&1
 env PATH="$conduit_node_path" "$conduit_corepack" pnpm --filter @conduit/control-plane exec wrangler dev \
   --config wrangler.full-device-live.jsonc --local --ip 127.0.0.1 \
   --port "$conduit_control_port" --local-protocol https \

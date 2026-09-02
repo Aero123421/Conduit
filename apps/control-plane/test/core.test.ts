@@ -743,6 +743,13 @@ describe.sequential("control-plane contracts", () => {
       const denied = await call(20 + offset, "tools/call", { name: forbidden, arguments: { idempotencyKey: `remote-root-admin-denied-${offset}` } });
       expect(denied).toMatchObject({ error: { code: -32602, message: `Tool ${forbidden} not found` } });
     }
+    for (const action of ["install", "enable", "root-policy"]) {
+      const denied = await exports.default.fetch(new Request(`https://conduit.example.com/api/v1/privileged/helper/${action}`, {
+        method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: "{}",
+      }));
+      expect(denied.status).toBe(404);
+      await expect(denied.json()).resolves.toMatchObject({ error: { code: "not_found" } });
+    }
     await expect(env.DB.prepare("SELECT (SELECT COUNT(*) FROM device_privilege_installations) AS installations,(SELECT COUNT(*) FROM privilege_policy_attestations) AS policies").first()).resolves.toEqual(privilegeCountsBefore);
     const project = await call(3, "tools/call", { name: "project_get", arguments: { projectId: "prj_board_contract", requestKey: "mcp-project-read-000001" } });
     expect(project).toMatchObject({ result: { structuredContent: { id: "prj_board_contract", name: "Board" } } });

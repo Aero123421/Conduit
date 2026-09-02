@@ -4794,6 +4794,14 @@ mod tests {
     #[test]
     #[ignore = "invoked by scripts/e2e-node-worker-idle.sh after Wrangler dependencies are installed"]
     fn node_service_wss_worker_route_device_room_accelerated_idle_e2e() {
+        let test_started = Instant::now();
+        let stage = |name: &str| {
+            eprintln!(
+                "CONDUIT_NODE_WORKER_IDLE_E2E_STAGE={name} elapsed_ms={}",
+                test_started.elapsed().as_millis()
+            );
+        };
+        stage("started");
         let directory = tempfile::tempdir().unwrap();
         let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/control-plane");
         let persist = directory.path().join("wrangler-state");
@@ -4812,6 +4820,7 @@ mod tests {
                 persist_text,
             ],
         );
+        stage("migrations_applied");
 
         let identity = Arc::new(
             DeviceIdentity::load_or_create(directory.path().join("identity/device.ed25519"))
@@ -4855,6 +4864,7 @@ mod tests {
                 &sql,
             ],
         );
+        stage("device_seeded");
 
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -4898,6 +4908,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(100));
         }
         assert!(ready, "Wrangler idle E2E worker did not become ready");
+        stage("worker_ready");
 
         let store = NodeStore::open(directory.path().join("store")).unwrap();
         let node = Arc::new(Node::new(store.clone()));
@@ -4939,6 +4950,7 @@ mod tests {
             &service.node_boot_id,
         )
         .unwrap();
+        stage("socket_authenticated");
 
         let positions = store.transport_positions().unwrap();
         client
@@ -4985,6 +4997,7 @@ mod tests {
             }
         }
         assert!(reconciled, "real Node/Worker reconciliation did not settle");
+        stage("reconciliation_settled");
         let node_sent_before_idle = store.transport_positions().unwrap().node_sent_through;
 
         let simulated_start = 1_788_307_200_000_u64;
@@ -4997,6 +5010,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(status, 200);
+        stage("idle_probe_reset");
         client.reset_application_sends();
         let started = Instant::now();
         let next_unacknowledged_sequence = store
@@ -5022,6 +5036,7 @@ mod tests {
             );
         }
         let one_hour_sends = client.application_sends();
+        stage("first_hour_polled");
         // Continue the same real socket and service clock at each remaining
         // ten-minute checkpoint through 24 hours. The regular Node unit test
         // separately executes all 864,000 poll iterations.
@@ -5041,14 +5056,17 @@ mod tests {
             );
             assert!(health_sent);
         }
+        stage("twenty_four_hours_sent");
         // All 144 application frames still cross the real socket and
         // production DeviceRoom handler. Collect the test-only completion
         // barriers as a batch so hosted-runner binding latency is not
         // multiplied by 144 sequential network round trips.
         client.await_idle_e2e_settled(144).unwrap();
+        stage("device_room_settled");
         let inspect_path = format!("/__idle-e2e/devices/{device_id}/inspect");
         let (status, body) = loopback_http(port, "GET", &inspect_path, None).unwrap();
         assert_eq!(status, 200);
+        stage("probe_inspected");
         let probe: Value = serde_json::from_str(&body).unwrap();
         println!(
             "CONDUIT_NODE_WORKER_IDLE_E2E={}",

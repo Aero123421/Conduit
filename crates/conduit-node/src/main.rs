@@ -137,11 +137,11 @@ fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(device_id) = opts.device_id.as_ref() {
         local.bind_device(DeviceId::parse(device_id.clone())?)?;
     }
-    let _credentials = CredentialStore::open(
+    let credentials = Arc::new(CredentialStore::open(
         store.clone(),
         data_root.join("credentials/master.dek"),
         data_root.join("credentials/projections"),
-    )?;
+    )?);
     let supervisor = ProcessSupervisor::open(data_root.join("supervisor"))?;
     let boot = fs_text("/proc/sys/kernel/random/boot_id").unwrap_or_else(|| {
         format!(
@@ -208,7 +208,8 @@ fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             config,
             local.clone(),
             supervisor.clone(),
-        )?;
+        )?
+        .with_credential_store(credentials.clone());
         if let Some(privileged) = privileged {
             service = service.with_privileged(privileged);
         }

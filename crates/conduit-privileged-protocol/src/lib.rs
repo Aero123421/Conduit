@@ -388,6 +388,8 @@ pub struct RootPolicy {
     pub allowed_operations: Vec<PrivilegedOperation>,
     pub allowed_adapters: Vec<String>,
     pub allowed_launch_profiles: Vec<String>,
+    #[serde(default)]
+    pub allowed_credential_profiles: Vec<String>,
     pub ceilings: ResourceCeilings,
     pub allow_never: bool,
     pub allow_unrestricted_launch: bool,

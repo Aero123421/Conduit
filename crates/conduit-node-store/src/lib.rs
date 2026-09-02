@@ -8,7 +8,10 @@ mod credential;
 mod identity;
 mod storage;
 
-pub use credential::{CredentialMetadata, CredentialProjection, CredentialStore, ProjectionKind};
+pub use credential::{
+    CredentialMetadata, CredentialProjection, CredentialStore, ProjectionKind,
+    SealedCredentialProjection,
+};
 pub use identity::DeviceIdentity;
 pub use storage::{StorageClass, StorageManager, StorageObject};
 

@@ -89,6 +89,7 @@ pub struct PublicPolicySummary {
     pub allowed_operations: Vec<PrivilegedOperation>,
     pub allowed_adapters: Vec<String>,
     pub allowed_launch_profiles: Vec<String>,
+    pub allowed_credential_profiles: Vec<String>,
     pub ceilings: conduit_privileged_protocol::ResourceCeilings,
     pub allow_never: bool,
     pub allow_unrestricted_launch: bool,
@@ -600,11 +601,12 @@ impl<M: SystemdManager> HelperEngine<M> {
         fs::create_dir_all(&managed_home)?;
         fs::set_permissions(&managed_home, fs::Permissions::from_mode(0o700))?;
         if !plan.credentials.is_empty() {
-            let credential_dir = runtime_dir.join("credentials");
-            fs::create_dir_all(&credential_dir)?;
-            fs::set_permissions(&credential_dir, fs::Permissions::from_mode(0o700))?;
             for (credential, bytes) in &credential_payloads {
-                let path = credential_dir.join(&credential.target_name);
+                let path = managed_home.join(&credential.target_name);
+                if let Some(parent) = path.parent() {
+                    fs::create_dir_all(parent)?;
+                    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+                }
                 let mut file = OpenOptions::new()
                     .write(true)
                     .create_new(true)
@@ -1253,6 +1255,15 @@ impl<M: SystemdManager> HelperEngine<M> {
             {
                 return Err(HelperError::Denied("ticket_plan_mismatch".into()));
             }
+            if (plan.adapter_id.is_some()
+                && c.approval_enforcement
+                    != conduit_privileged_protocol::ApprovalEnforcement::AdapterMediated)
+                || (plan.adapter_id.is_none()
+                    && c.approval_enforcement
+                        != conduit_privileged_protocol::ApprovalEnforcement::ExactCommand)
+            {
+                return Err(HelperError::Denied("approval_enforcement_mismatch".into()));
+            }
             // Adapter/profile labels are not executable identities. Until a
             // root-owned profile carries an exact executable commitment, they
             // may narrow an explicitly unrestricted grant but must never turn
@@ -1272,6 +1283,19 @@ impl<M: SystemdManager> HelperEngine<M> {
                 }
             } else {
                 return Err(HelperError::Denied("launch_authority_missing".into()));
+            }
+            if (!plan.credentials.is_empty() && plan.adapter_id.is_none())
+                || plan.credentials.iter().any(|credential| {
+                    !self
+                        .config
+                        .policy
+                        .allowed_credential_profiles
+                        .contains(&credential.projection_id)
+                })
+            {
+                return Err(HelperError::Denied(
+                    "credential_projection_not_allowed".into(),
+                ));
             }
             if plan.resources.runtime_max_usec.is_none()
                 && !self.config.policy.allow_persistent_sessions
@@ -1457,13 +1481,7 @@ fn validate_credential_descriptors(
             || credential.revision == 0
             || credential.size > 1024 * 1024
             || !valid_sha256(&credential.sha256)
-            || credential.target_name.is_empty()
-            || credential.target_name.len() > 128
-            || !credential
-                .target_name
-                .bytes()
-                .all(|value| value.is_ascii_alphanumeric() || matches!(value, b'_' | b'-' | b'.'))
-            || matches!(credential.target_name.as_str(), "." | "..")
+            || !safe_credential_target(&credential.target_name)
         {
             return Err(HelperError::Denied("credential_descriptor_invalid".into()));
         }
@@ -1502,6 +1520,31 @@ fn validate_credential_descriptors(
         payloads.push((credential.clone(), bytes));
     }
     Ok(payloads)
+}
+
+fn safe_credential_target(value: &str) -> bool {
+    use std::path::Component;
+    if value.is_empty() || value.len() > 128 || value.starts_with('/') {
+        return false;
+    }
+    let mut count = 0usize;
+    for component in Path::new(value).components() {
+        let Component::Normal(name) = component else {
+            return false;
+        };
+        let bytes = name.as_encoded_bytes();
+        if bytes.is_empty()
+            || !bytes
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            || name == "."
+            || name == ".."
+        {
+            return false;
+        }
+        count += 1;
+    }
+    count > 0 && count <= 8
 }
 
 fn valid_sha256(value: &str) -> bool {
@@ -1630,8 +1673,9 @@ mod tests {
                 PrivilegedOperation::GracefulStop,
                 PrivilegedOperation::ForceStop,
             ],
-            allowed_adapters: vec![],
+            allowed_adapters: vec!["codex".into()],
             allowed_launch_profiles: vec!["service-test".into()],
+            allowed_credential_profiles: vec!["cred_test".into()],
             ceilings: resources(),
             allow_never: false,
             allow_unrestricted_launch: true,
@@ -1742,7 +1786,11 @@ mod tests {
                 access_scope: "full_device".into(),
                 approval_mode: "always".into(),
                 approval_receipt_digest: Some("55".repeat(32)),
-                approval_enforcement: ApprovalEnforcement::ExactCommand,
+                approval_enforcement: if plan.adapter_id.is_some() {
+                    ApprovalEnforcement::AdapterMediated
+                } else {
+                    ApprovalEnforcement::ExactCommand
+                },
                 required_approval_risk_classes: vec![],
                 allowed_operation: operation,
                 resource_ceilings: resources(),
@@ -1866,7 +1914,7 @@ mod tests {
     fn credential_projection_requires_exact_sealed_memfd() {
         use std::os::fd::FromRawFd;
 
-        let (_engine, _backend, mut plan, _issuer, _receipt_key) = setup();
+        let (engine, _backend, mut plan, issuer, _receipt_key) = setup();
         let secret = b"bounded-test-secret";
         let name = std::ffi::CString::new("conduit-credential-test").unwrap();
         let raw = unsafe {
@@ -1879,7 +1927,7 @@ mod tests {
         plan.credentials = vec![CredentialDescriptor {
             projection_id: "cred_test".into(),
             revision: 1,
-            target_name: "token.json".into(),
+            target_name: ".codex/auth.json".into(),
             descriptor_index: 0,
             size: secret.len() as u64,
             sha256: hex::encode(Sha256::digest(secret)),
@@ -1898,6 +1946,30 @@ mod tests {
         let payloads =
             validate_credential_descriptors(&plan, &[file.try_clone().unwrap().into()]).unwrap();
         assert_eq!(payloads[0].1.as_slice(), secret);
+
+        plan.adapter_id = Some("codex".into());
+        plan.launch_profile_id = None;
+        file.seek(SeekFrom::Start(0)).unwrap();
+        engine
+            .prepare(
+                ticket(
+                    &engine,
+                    &issuer,
+                    &plan,
+                    PrivilegedOperation::Prepare,
+                    "ptkt_credential01",
+                ),
+                plan.clone(),
+                vec![file.try_clone().unwrap().into()],
+            )
+            .unwrap();
+        let projected = engine
+            .config
+            .state_dir
+            .join("runtimes")
+            .join(&plan.runtime_id)
+            .join("home/.codex/auth.json");
+        assert_eq!(fs::read(projected).unwrap(), secret);
 
         file.seek(SeekFrom::End(0)).unwrap();
         assert!(matches!(

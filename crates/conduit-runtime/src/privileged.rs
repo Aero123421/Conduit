@@ -16,7 +16,7 @@ use std::{
     collections::BTreeMap,
     fs::File,
     io::{Seek, SeekFrom, Write},
-    os::fd::{AsRawFd, FromRawFd},
+    os::fd::{AsRawFd, FromRawFd, RawFd},
     sync::{Arc, Mutex},
 };
 
@@ -150,6 +150,16 @@ impl PrivilegedNativeProvider {
         ticket: PrivilegeTicket,
         plan: LocalExecutionPlan,
     ) -> Result<PrivilegedPreparedRuntime, RuntimeError> {
+        self.prepare_privileged_with_descriptors(request, ticket, plan, &[])
+    }
+
+    pub fn prepare_privileged_with_descriptors(
+        &self,
+        request: &RuntimeRequest,
+        ticket: PrivilegeTicket,
+        plan: LocalExecutionPlan,
+        descriptors: &[RawFd],
+    ) -> Result<PrivilegedPreparedRuntime, RuntimeError> {
         validate_request(request, RuntimeKind::Native, &["privileged-native"])?;
         if ticket.claims.allowed_operation != PrivilegedOperation::Prepare
             || plan.runtime_id != request.runtime_id
@@ -164,7 +174,7 @@ impl PrivilegedNativeProvider {
             .client
             .lock()
             .map_err(lock)?
-            .prepare_chain(ticket, plan.clone(), &[])
+            .prepare_chain(ticket, plan.clone(), descriptors)
             .map_err(helper)?;
         self.verify_chain(&receipts, None, &["admitted", "prepared"])?;
         let receipt = receipts

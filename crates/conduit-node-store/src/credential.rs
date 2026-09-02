@@ -5,8 +5,13 @@ use chacha20poly1305::{
 };
 use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::{
+    ffi::CString,
     fs,
+    fs::File,
+    io::{Seek, SeekFrom, Write},
+    os::fd::{AsRawFd, FromRawFd},
     os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
 };
@@ -81,6 +86,13 @@ pub struct CredentialStore {
     store: NodeStore,
     key: Zeroizing<[u8; 32]>,
     projection_root: PathBuf,
+}
+
+pub struct SealedCredentialProjection {
+    pub metadata: CredentialMetadata,
+    pub file: File,
+    pub size: u64,
+    pub sha256: String,
 }
 type EncryptedCredentialRow = (Vec<u8>, Vec<u8>, Vec<u8>, String);
 impl CredentialStore {
@@ -264,6 +276,52 @@ impl CredentialStore {
             )),
         }
     }
+
+    /// Decrypts one adapter-bound profile directly into a sealed anonymous
+    /// descriptor. The cleartext is never written into the Node filesystem or
+    /// serialized into its journal; the privileged helper receives only this
+    /// descriptor plus the independently signed descriptor commitment.
+    pub fn sealed_read_only(
+        &self,
+        id: &str,
+        adapter: &str,
+        expected_revision: u64,
+    ) -> Result<SealedCredentialProjection, StoreError> {
+        let (metadata, secret) = self.decrypt(id, adapter)?;
+        if metadata.revision != expected_revision
+            || !matches!(
+                metadata.kind,
+                ProjectionKind::ReadOnlyFile | ProjectionKind::EphemeralFile
+            )
+        {
+            return Err(StoreError::Invalid(
+                "credential projection revision or kind is not authorized".into(),
+            ));
+        }
+        let name = CString::new("conduit-credential")
+            .map_err(|_| StoreError::Invalid("credential descriptor name".into()))?;
+        let raw = unsafe {
+            libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING)
+        };
+        if raw < 0 {
+            return Err(StoreError::Io(std::io::Error::last_os_error()));
+        }
+        let mut file = unsafe { File::from_raw_fd(raw) };
+        file.write_all(&secret)?;
+        file.sync_all()?;
+        file.seek(SeekFrom::Start(0))?;
+        let seals =
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE;
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_ADD_SEALS, seals) } < 0 {
+            return Err(StoreError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(SealedCredentialProjection {
+            metadata,
+            size: secret.len() as u64,
+            sha256: hex::encode(Sha256::digest(&*secret)),
+            file,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -345,5 +403,47 @@ mod tests {
             assert_eq!(fs::read(&target).unwrap(), b"TEMPSECRET");
         }
         assert!(!target.exists());
+    }
+
+    #[test]
+    fn privileged_projection_is_sealed_revision_and_adapter_bound() {
+        let d = tempdir().unwrap();
+        let store = NodeStore::open(d.path()).unwrap();
+        let cs = CredentialStore::open(
+            store,
+            d.path().join("credential.dek"),
+            d.path().join("projections"),
+        )
+        .unwrap();
+        let metadata = CredentialMetadata {
+            profile_id: "cred_privileged_01".into(),
+            revision: 3,
+            adapter_id: "codex".into(),
+            kind: ProjectionKind::ReadOnlyFile,
+            label: "root agent auth".into(),
+        };
+        cs.put(&metadata, b"sealed-secret").unwrap();
+        assert!(
+            cs.sealed_read_only(&metadata.profile_id, "codex", 2)
+                .is_err()
+        );
+        assert!(cs.sealed_read_only(&metadata.profile_id, "pi", 3).is_err());
+        let projection = cs
+            .sealed_read_only(&metadata.profile_id, "codex", 3)
+            .unwrap();
+        assert_eq!(projection.size, 13);
+        assert_eq!(
+            projection.sha256,
+            hex::encode(Sha256::digest(b"sealed-secret"))
+        );
+        let seals = unsafe { libc::fcntl(projection.file.as_raw_fd(), libc::F_GET_SEALS) };
+        assert_eq!(
+            seals
+                & (libc::F_SEAL_SEAL
+                    | libc::F_SEAL_SHRINK
+                    | libc::F_SEAL_GROW
+                    | libc::F_SEAL_WRITE),
+            libc::F_SEAL_SEAL | libc::F_SEAL_SHRINK | libc::F_SEAL_GROW | libc::F_SEAL_WRITE
+        );
     }
 }

@@ -316,6 +316,7 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
                 allowed_operations: all_operations(),
                 allowed_adapters: vec![],
                 allowed_launch_profiles: vec![],
+                allowed_credential_profiles: vec![],
                 ceilings: ResourceCeilings {
                     cpu_quota_per_sec_usec: None,
                     memory_max_bytes: None,
@@ -559,6 +560,9 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             if let Some(value) = value_arg(args, "--allowed-launch-profiles") {
                 policy.allowed_launch_profiles = parse_csv(&value)?;
             }
+            if let Some(value) = value_arg(args, "--allowed-credential-profiles") {
+                policy.allowed_credential_profiles = parse_csv(&value)?;
+            }
             policy.revision = policy.revision.checked_add(1).ok_or_else(|| {
                 conduit_privileged_helper::HelperError::Policy("revision overflow".into())
             })?;
@@ -571,7 +575,7 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
                 "local_policy_update",
             )?;
             output(
-                json!({"updated":true,"policyRevision":policy.revision,"policyDigest":digest,"allowNever":policy.allow_never,"allowUnrestrictedLaunch":policy.allow_unrestricted_launch,"allowedAdapters":policy.allowed_adapters,"allowedLaunchProfiles":policy.allowed_launch_profiles,"registrationBundle":registration_bundle(&state,&policy_path,&node_path)?}),
+                json!({"updated":true,"policyRevision":policy.revision,"policyDigest":digest,"allowNever":policy.allow_never,"allowUnrestrictedLaunch":policy.allow_unrestricted_launch,"allowedAdapters":policy.allowed_adapters,"allowedLaunchProfiles":policy.allowed_launch_profiles,"allowedCredentialProfiles":policy.allowed_credential_profiles,"registrationBundle":registration_bundle(&state,&policy_path,&node_path)?}),
             );
             Ok(())
         }

@@ -17,7 +17,8 @@ use conduit_adapters::{
 };
 use conduit_domain::{DeviceId, Sha256Digest};
 use conduit_node_store::{
-    ControlEffectResult, DeviceIdentity, Direction, OperationState, ReceiveResult, StoreError,
+    ControlEffectResult, CredentialStore, DeviceIdentity, Direction, OperationState, ReceiveResult,
+    StoreError,
 };
 use conduit_observability::RawRecord;
 use conduit_privileged_protocol::{PrivilegeTicket, PrivilegedOperation};
@@ -32,6 +33,8 @@ use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
     fs,
+    fs::File,
+    os::fd::AsRawFd,
     os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
@@ -87,6 +90,8 @@ pub struct LocalPolicy {
     pub required_approval_risk_classes: Vec<String>,
     #[serde(default)]
     pub launch_profiles: Vec<String>,
+    #[serde(default)]
+    pub credential_profiles: Vec<String>,
     pub max_cpu: Option<f64>,
     pub max_memory_bytes: Option<u64>,
     pub max_storage_bytes: Option<u64>,
@@ -338,6 +343,14 @@ struct WireRuntimeControl {
     discard_authorized: Option<bool>,
     #[serde(default)]
     custody_complete: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WireCredentialProjection {
+    profile_id: String,
+    revision: u64,
+    target_name: String,
 }
 fn default_actor_id() -> String {
     "local-owner".into()
@@ -611,6 +624,7 @@ pub struct NodeService {
     health_frontier_dirty: bool,
     health_fault: Option<String>,
     privileged: Option<Arc<PrivilegedNodeRuntime>>,
+    credential_store: Option<Arc<CredentialStore>>,
     pending_privileged: HashMap<String, PendingPrivilegedStart>,
     privileged_custody: HashMap<String, PrivilegedCustodyContext>,
     pending_privilege_requests: HashMap<String, PendingPrivilegeRequest>,
@@ -647,6 +661,7 @@ struct PendingPrivilegedStart {
     parent_baseline_id: Value,
     source_baseline_revisions: BTreeMap<String, Value>,
     verification_policy: Value,
+    credential_descriptors: Vec<File>,
 }
 
 #[derive(Clone)]
@@ -807,6 +822,7 @@ impl NodeService {
             health_frontier_dirty: false,
             health_fault: None,
             privileged: None,
+            credential_store: None,
             pending_privileged: HashMap::new(),
             privileged_custody: HashMap::new(),
             pending_privilege_requests: HashMap::new(),
@@ -816,6 +832,11 @@ impl NodeService {
 
     pub fn with_privileged(mut self, privileged: Arc<PrivilegedNodeRuntime>) -> Self {
         self.privileged = Some(privileged);
+        self
+    }
+
+    pub fn with_credential_store(mut self, credentials: Arc<CredentialStore>) -> Self {
+        self.credential_store = Some(credentials);
         self
     }
     fn message_id(&mut self) -> String {
@@ -1556,7 +1577,11 @@ impl NodeService {
                 "adapter": context.plan.adapter_id,
                 "runtimeKind": "native",
                 "reasonCodes": [],
-                "resourceProfile": "root-policy-bounded"
+                "resourceProfile": "root-policy-bounded",
+                "credentialProfiles": context.plan.credentials.iter().map(|credential| json!({
+                    "profileId": credential.projection_id,
+                    "revision": credential.revision
+                })).collect::<Vec<_>>()
             },
             "requestedAt": requested_at,
             "expiresAt": expires_at,
@@ -1701,7 +1726,11 @@ impl NodeService {
                 "adapter": context.plan.adapter_id,
                 "runtimeKind": "native",
                 "reasonCodes": [],
-                "resourceProfile": "root-policy-bounded"
+                "resourceProfile": "root-policy-bounded",
+                "credentialProfiles": context.plan.credentials.iter().map(|credential| json!({
+                    "profileId": credential.projection_id,
+                    "revision": credential.revision
+                })).collect::<Vec<_>>()
             },
             "requestedAt": requested_at,
             "expiresAt": expires_at,
@@ -2425,7 +2454,13 @@ impl NodeService {
             PrivilegedStartPhase::StartTicket => PrivilegedOperation::Start,
             PrivilegedStartPhase::InitialInputTicket => PrivilegedOperation::Input,
         };
-        let (pending_offer, pending_approval_mode, pending_plan, pending_run_manifest_digest) = {
+        let (
+            pending_offer,
+            pending_approval_mode,
+            pending_plan,
+            pending_run_manifest_digest,
+            pending_credential_descriptors,
+        ) = {
             let pending = self
                 .pending_privileged
                 .get(&request.operation_id)
@@ -2435,6 +2470,11 @@ impl NodeService {
                 pending.op.approval_mode.clone(),
                 pending.plan.clone(),
                 pending.run_manifest_digest.clone(),
+                pending
+                    .credential_descriptors
+                    .iter()
+                    .map(AsRawFd::as_raw_fd)
+                    .collect::<Vec<_>>(),
             )
         };
         let expected_origin = ticket.claims.public_origin.clone();
@@ -2478,10 +2518,11 @@ impl NodeService {
                     .bind_privileged_authority(&pending_offer, &authority)?;
                 let result = privileged
                     .provider()
-                    .prepare_privileged(
+                    .prepare_privileged_with_descriptors(
                         &pending_offer.runtime,
                         authority.ticket().clone(),
                         pending_plan,
+                        &pending_credential_descriptors,
                     )
                     .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
                 let offer = pending_offer;
@@ -3360,11 +3401,18 @@ impl NodeService {
                 .filter(|value| value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit()))
                 .ok_or_else(|| ServiceError::Unavailable("privilege_ticket_invalid".into()))?
                 .to_owned();
+            let (credential_bindings, credential_descriptors) = privileged_credential_projections(
+                &op,
+                is_agent.then_some(profile_id),
+                &self.local_policy,
+                self.credential_store.as_deref(),
+            )?;
             let plan = privileged_local_plan(
                 &offer,
                 &prepared_sources,
                 is_agent.then_some(profile_id),
                 (!is_agent).then_some(profile_id),
+                credential_bindings,
             )?;
             let privileged = self.privileged.as_ref().ok_or_else(|| {
                 ServiceError::Unavailable("privileged_helper_not_installed".into())
@@ -3406,6 +3454,7 @@ impl NodeService {
                     parent_baseline_id,
                     source_baseline_revisions,
                     verification_policy,
+                    credential_descriptors,
                 },
             );
             self.queue_privilege_ticket_request(
@@ -6326,6 +6375,7 @@ fn privileged_local_plan(
     prepared_sources: &[PreparedSource],
     adapter_id: Option<&str>,
     launch_profile_id: Option<&str>,
+    credentials: Vec<conduit_privileged_protocol::CredentialDescriptor>,
 ) -> Result<conduit_privileged_protocol::LocalExecutionPlan, ServiceError> {
     use conduit_privileged_protocol::{ResourceCeilings, StdioMode, WorkspaceBinding};
     let executable =
@@ -6388,7 +6438,7 @@ fn privileged_local_plan(
         environment: offer.launch.environment.clone(),
         environment_value_digests,
         workspaces,
-        credentials: Vec::new(),
+        credentials,
         stdio: match offer.launch.io_mode {
             IoMode::Pipes => StdioMode::Pipes,
             IoMode::Pty => StdioMode::Pty,
@@ -6400,6 +6450,77 @@ fn privileged_local_plan(
     plan.validate()
         .map_err(|error| ServiceError::Unavailable(error.to_string()))?;
     Ok(plan)
+}
+
+fn privileged_credential_projections(
+    operation: &WireOperation,
+    adapter_id: Option<&str>,
+    local_policy: &LocalPolicy,
+    store: Option<&CredentialStore>,
+) -> Result<
+    (
+        Vec<conduit_privileged_protocol::CredentialDescriptor>,
+        Vec<File>,
+    ),
+    ServiceError,
+> {
+    let Some(value) = operation.arguments.get("credentialProjections") else {
+        return Ok((Vec::new(), Vec::new()));
+    };
+    let projections: Vec<WireCredentialProjection> = serde_json::from_value(value.clone())
+        .map_err(|_| ServiceError::Unavailable("credential_projection_invalid".into()))?;
+    if projections.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if projections.len() > conduit_privileged_protocol::MAX_DESCRIPTORS
+        || operation.assignment_id.is_none()
+        || operation
+            .arguments
+            .get("projectAgentId")
+            .and_then(Value::as_str)
+            .is_none()
+    {
+        return Err(ServiceError::Unavailable(
+            "credential_projection_assignment_required".into(),
+        ));
+    }
+    let adapter_id = adapter_id.ok_or_else(|| {
+        ServiceError::Unavailable("credential_projection_adapter_required".into())
+    })?;
+    let store = store.ok_or_else(|| {
+        ServiceError::Unavailable("credential_projection_store_unavailable".into())
+    })?;
+    let mut profile_ids = BTreeSet::new();
+    let mut targets = BTreeSet::new();
+    let mut descriptors = Vec::with_capacity(projections.len());
+    let mut files = Vec::with_capacity(projections.len());
+    for (index, projection) in projections.into_iter().enumerate() {
+        if projection.revision == 0
+            || !profile_ids.insert(projection.profile_id.clone())
+            || !targets.insert(projection.target_name.clone())
+            || !local_policy
+                .credential_profiles
+                .contains(&projection.profile_id)
+        {
+            return Err(ServiceError::Unavailable(
+                "credential_projection_policy_mismatch".into(),
+            ));
+        }
+        let sealed = store
+            .sealed_read_only(&projection.profile_id, adapter_id, projection.revision)
+            .map_err(|_| ServiceError::Unavailable("credential_projection_unavailable".into()))?;
+        descriptors.push(conduit_privileged_protocol::CredentialDescriptor {
+            projection_id: sealed.metadata.profile_id,
+            revision: sealed.metadata.revision,
+            target_name: projection.target_name,
+            descriptor_index: index as u16,
+            size: sealed.size,
+            sha256: sealed.sha256,
+            read_only: true,
+        });
+        files.push(sealed.file);
+    }
+    Ok((descriptors, files))
 }
 
 fn privileged_operation_name(operation: &PrivilegedOperation) -> &'static str {
@@ -6565,7 +6686,7 @@ fn agent_settlement_policy_name(policy: AgentSettlementPolicy) -> &'static str {
 mod tests {
     use super::*;
     use conduit_domain::{LocationId, SourceId};
-    use conduit_node_store::NodeStore;
+    use conduit_node_store::{CredentialMetadata, NodeStore, ProjectionKind};
     use conduit_runtime::{
         CapabilityReceipt, CollectionReceipt, DestroyReceipt, ExpectedRuntime, PreparedRuntime,
         ReconciliationReceipt, RuntimeError, RuntimeProvider, RuntimeStateReceipt, SnapshotReceipt,
@@ -6975,11 +7096,83 @@ mod tests {
             approval_modes: vec!["never".into()],
             required_approval_risk_classes: vec![],
             launch_profiles: vec!["safe".into()],
+            credential_profiles: vec![],
             max_cpu: Some(4.0),
             max_memory_bytes: Some(1024 * 1024),
             max_storage_bytes: Some(1024 * 1024),
             allow_full_access_without_approval: explicit_full_never,
         }
+    }
+
+    #[test]
+    fn privileged_credentials_require_assignment_adapter_and_both_local_bindings() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = NodeStore::open(directory.path().join("store")).unwrap();
+        let credentials = CredentialStore::open(
+            store,
+            directory.path().join("credential.dek"),
+            directory.path().join("projections"),
+        )
+        .unwrap();
+        let metadata = CredentialMetadata {
+            profile_id: "cred_full_device_01".into(),
+            revision: 2,
+            adapter_id: "codex".into(),
+            kind: ProjectionKind::ReadOnlyFile,
+            label: "test".into(),
+        };
+        credentials.put(&metadata, b"local-only-secret").unwrap();
+        let mut operation = operation("full_device", "always", 1.0);
+        operation.assignment_id = Some("asn_credential_01".into());
+        operation.arguments = json!({
+            "launchProfileId": "codex",
+            "projectAgentId": "pagent_credential_01",
+            "credentialProjections": [{
+                "profileId": metadata.profile_id,
+                "revision": 2,
+                "targetName": ".codex/auth.json"
+            }]
+        });
+        let mut local_policy = policy(false);
+        local_policy.credential_profiles = vec!["cred_full_device_01".into()];
+        let (descriptors, files) = privileged_credential_projections(
+            &operation,
+            Some("codex"),
+            &local_policy,
+            Some(&credentials),
+        )
+        .unwrap();
+        assert_eq!(descriptors.len(), 1);
+        assert_eq!(descriptors[0].target_name, ".codex/auth.json");
+        assert_eq!(files.len(), 1);
+        assert!(
+            !serde_jcs::to_vec(&descriptors)
+                .unwrap()
+                .windows(b"local-only-secret".len())
+                .any(|value| value == b"local-only-secret")
+        );
+
+        local_policy.credential_profiles.clear();
+        assert!(matches!(
+            privileged_credential_projections(
+                &operation,
+                Some("codex"),
+                &local_policy,
+                Some(&credentials)
+            ),
+            Err(ServiceError::Unavailable(reason)) if reason == "credential_projection_policy_mismatch"
+        ));
+        local_policy.credential_profiles = vec!["cred_full_device_01".into()];
+        operation.assignment_id = None;
+        assert!(matches!(
+            privileged_credential_projections(
+                &operation,
+                Some("codex"),
+                &local_policy,
+                Some(&credentials)
+            ),
+            Err(ServiceError::Unavailable(reason)) if reason == "credential_projection_assignment_required"
+        ));
     }
 
     #[test]
@@ -7009,6 +7202,7 @@ mod tests {
                     approval_modes: vec![],
                     required_approval_risk_classes: vec![],
                     launch_profiles: vec![],
+                    credential_profiles: vec![],
                     max_cpu: None,
                     max_memory_bytes: None,
                     max_storage_bytes: None,
@@ -7237,6 +7431,7 @@ mod tests {
                     approval_modes: vec![],
                     required_approval_risk_classes: vec![],
                     launch_profiles: vec![],
+                    credential_profiles: vec![],
                     max_cpu: None,
                     max_memory_bytes: None,
                     max_storage_bytes: None,
@@ -7505,6 +7700,7 @@ mod tests {
                     approval_modes: vec![],
                     required_approval_risk_classes: vec![],
                     launch_profiles: vec![],
+                    credential_profiles: vec![],
                     max_cpu: None,
                     max_memory_bytes: None,
                     max_storage_bytes: None,
@@ -7626,6 +7822,7 @@ mod tests {
                         approval_modes: vec![],
                         required_approval_risk_classes: vec![],
                         launch_profiles: vec![],
+                        credential_profiles: vec![],
                         max_cpu: None,
                         max_memory_bytes: None,
                         max_storage_bytes: None,
@@ -7990,6 +8187,7 @@ mod tests {
                     approval_modes: vec![],
                     required_approval_risk_classes: vec![],
                     launch_profiles: vec![],
+                    credential_profiles: vec![],
                     max_cpu: None,
                     max_memory_bytes: None,
                     max_storage_bytes: None,
@@ -8223,6 +8421,7 @@ mod tests {
                     approval_modes: vec![],
                     required_approval_risk_classes: vec![],
                     launch_profiles: vec![],
+                    credential_profiles: vec![],
                     max_cpu: None,
                     max_memory_bytes: None,
                     max_storage_bytes: None,
@@ -8458,6 +8657,7 @@ mod tests {
                     approval_modes: vec![],
                     required_approval_risk_classes: vec![],
                     launch_profiles: vec![],
+                    credential_profiles: vec![],
                     max_cpu: None,
                     max_memory_bytes: None,
                     max_storage_bytes: None,

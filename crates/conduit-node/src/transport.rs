@@ -302,6 +302,16 @@ pub struct WssClient {
     socket: WebSocket<MaybeTlsStream<TcpStream>>,
     pub session: TransportSession,
     reconciliation_required: bool,
+    /// Highest Node sequence written successfully on this live socket.
+    ///
+    /// TCP/WebSocket already provides reliable ordered delivery while the
+    /// connection remains open. Re-sending every durable-but-not-yet-ACKed
+    /// frame on each 100 ms service poll only creates an application-level
+    /// replay loop. A new connection starts at the peer's durable custody
+    /// frontier, so disconnect/restart recovery still replays everything the
+    /// peer did not report as stored.
+    socket_sent_through: u64,
+    application_sends: u64,
 }
 impl WssClient {
     #[cfg(test)]
@@ -310,6 +320,11 @@ impl WssClient {
         session: TransportSession,
         reconciliation_required: bool,
     ) -> Self {
+        let socket_sent_through = session
+            .store
+            .transport_positions()
+            .map(|positions| positions.node_acknowledged_through)
+            .unwrap_or(0);
         Self {
             socket: WebSocket::from_raw_socket(
                 MaybeTlsStream::Plain(stream),
@@ -318,6 +333,8 @@ impl WssClient {
             ),
             session,
             reconciliation_required,
+            socket_sent_through,
+            application_sends: 0,
         }
     }
 
@@ -371,8 +388,76 @@ impl WssClient {
             .as_str()
             .into_client_request()
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
-        let (mut socket, _) = client_tls_with_config(request, stream, Some(config), None)
+        let (socket, _) = client_tls_with_config(request, stream, Some(config), None)
             .map_err(|e| TransportError::WebSocket(e.to_string()))?;
+        Self::authenticate(
+            socket,
+            &url,
+            store,
+            identity,
+            device_id,
+            capability_digest,
+            node_boot_id,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn connect_loopback(
+        url: &str,
+        store: NodeStore,
+        identity: &DeviceIdentity,
+        device_id: &str,
+        capability_digest: &str,
+        node_boot_id: &str,
+    ) -> Result<Self, TransportError> {
+        use tungstenite::client::client_with_config;
+        let url = Url::parse(url).map_err(|_| TransportError::Malformed)?;
+        if url.scheme() != "ws" || !matches!(url.host_str(), Some("127.0.0.1" | "localhost")) {
+            return Err(TransportError::WebSocket(
+                "test endpoint must be loopback ws".into(),
+            ));
+        }
+        let stream = TcpStream::connect((
+            url.host_str().ok_or(TransportError::Malformed)?,
+            url.port_or_known_default()
+                .ok_or(TransportError::Malformed)?,
+        ))
+        .map_err(|error| TransportError::WebSocket(error.to_string()))?;
+        stream
+            .set_read_timeout(Some(Duration::from_secs(15)))
+            .map_err(|error| TransportError::WebSocket(error.to_string()))?;
+        stream
+            .set_write_timeout(Some(Duration::from_secs(15)))
+            .map_err(|error| TransportError::WebSocket(error.to_string()))?;
+        let mut config = tungstenite::protocol::WebSocketConfig::default();
+        config.max_message_size = Some(MAX_FRAME_BYTES);
+        config.max_frame_size = Some(MAX_FRAME_BYTES);
+        let request = url
+            .as_str()
+            .into_client_request()
+            .map_err(|error| TransportError::WebSocket(error.to_string()))?;
+        let (socket, _) = client_with_config(request, MaybeTlsStream::Plain(stream), Some(config))
+            .map_err(|error| TransportError::WebSocket(error.to_string()))?;
+        Self::authenticate(
+            socket,
+            &url,
+            store,
+            identity,
+            device_id,
+            capability_digest,
+            node_boot_id,
+        )
+    }
+
+    fn authenticate(
+        mut socket: WebSocket<MaybeTlsStream<TcpStream>>,
+        url: &Url,
+        store: NodeStore,
+        identity: &DeviceIdentity,
+        device_id: &str,
+        capability_digest: &str,
+        node_boot_id: &str,
+    ) -> Result<Self, TransportError> {
         set_timeouts(&mut socket);
         let mut nonce = [0u8; 24];
         getrandom_fill(&mut nonce)?;
@@ -396,7 +481,7 @@ impl WssClient {
         {
             return Err(TransportError::Malformed);
         }
-        let transcript=serde_jcs::to_vec(&serde_json::json!({"domain":"conduit.device-auth.v1","origin":url.origin().ascii_serialization(),"clientNonce":URL_SAFE_NO_PAD.encode(nonce),"connectionId":challenge.connection_id,"deviceId":device_id,"keyId":identity.key_id(),"protocol":PROTOCOL,"serverNonce":challenge.server_nonce,"serverTime":challenge.server_time})).map_err(|_|TransportError::Malformed)?;
+        let transcript=serde_jcs::to_vec(&serde_json::json!({"domain":"conduit.device-auth.v1","origin":web_origin(url)?,"clientNonce":URL_SAFE_NO_PAD.encode(nonce),"connectionId":challenge.connection_id,"deviceId":device_id,"keyId":identity.key_id(),"protocol":PROTOCOL,"serverNonce":challenge.server_nonce,"serverTime":challenge.server_time})).map_err(|_|TransportError::Malformed)?;
         let proof = Proof {
             kind: "device.proof",
             connection_id: &challenge.connection_id,
@@ -442,6 +527,8 @@ impl WssClient {
             socket,
             session,
             reconciliation_required: accepted.reconciliation_required,
+            socket_sent_through: node_stored,
+            application_sends: 0,
         };
         client.set_poll_timeout(SERVICE_POLL_TIMEOUT)?;
         Ok(client)
@@ -453,7 +540,19 @@ impl WssClient {
                     .map_err(|_| TransportError::Malformed)?
                     .into(),
             ))
-            .map_err(|e| TransportError::WebSocket(e.to_string()))
+            .map_err(|e| TransportError::WebSocket(e.to_string()))?;
+        self.application_sends = self.application_sends.saturating_add(1);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn application_sends(&self) -> u64 {
+        self.application_sends
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_application_sends(&mut self) {
+        self.application_sends = 0;
     }
 
     /// Replay an already durable application envelope without allocating a
@@ -477,9 +576,11 @@ impl WssClient {
         self.send_durable(&bytes)
     }
     pub fn flush_unacknowledged(&mut self, from: u64) -> Result<usize, TransportError> {
+        let from = from.max(self.socket_sent_through.saturating_add(1));
         let frames = self.session.store.unacknowledged_outbound(from, 512)?;
         for frame in &frames {
-            self.send_durable(&frame.frame)?
+            self.send_durable(&frame.frame)?;
+            self.socket_sent_through = frame.sequence;
         }
         Ok(frames.len())
     }
@@ -572,6 +673,19 @@ fn validate_accepted_positions(
     }
     Ok(control_next - 1)
 }
+
+fn web_origin(url: &Url) -> Result<String, TransportError> {
+    let mut origin = url.clone();
+    let scheme = match url.scheme() {
+        "wss" => "https",
+        "ws" => "http",
+        _ => return Err(TransportError::Malformed),
+    };
+    origin
+        .set_scheme(scheme)
+        .map_err(|_| TransportError::Malformed)?;
+    Ok(origin.origin().ascii_serialization())
+}
 use tungstenite::client::IntoClientRequest;
 fn set_timeouts(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
     match socket.get_mut() {
@@ -662,6 +776,20 @@ mod tests {
             payload,
         }
     }
+
+    #[test]
+    fn websocket_origin_uses_the_matching_http_scheme() {
+        assert_eq!(
+            web_origin(&Url::parse("wss://control.example/devices/connect?token=ignored").unwrap())
+                .unwrap(),
+            "https://control.example"
+        );
+        assert_eq!(
+            web_origin(&Url::parse("ws://127.0.0.1:8787/devices/connect").unwrap()).unwrap(),
+            "http://127.0.0.1:8787"
+        );
+    }
+
     #[test]
     fn fences_epoch_and_sequences() {
         let d = tempdir().unwrap();

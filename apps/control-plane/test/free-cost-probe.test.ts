@@ -54,7 +54,19 @@ describe("Free tier before/after cost probe", () => {
     for (let index = 0; index < 10; index += 1) await authenticateBearer(new Request("https://conduit.example.com/mcp", { headers: { authorization: `Bearer ${oauthToken}` } }), oauthEnv);
 
     const limiter = env.CONNECTOR_LIMITERS.getByName("grant-cost-probe");
+    const limiterSql = { statements: 0, rowsWritten: 0 };
+    await runInDurableObject(limiter, (_instance, state) => {
+      const sql = state.storage.sql;
+      const originalExec = sql.exec.bind(sql);
+      sql.exec = ((query: string, ...bindings: unknown[]) => {
+        limiterSql.statements += query.split(";").filter((part) => part.trim().length > 0).length;
+        const cursor = originalExec(query, ...bindings as SqlStorageValue[]);
+        limiterSql.rowsWritten += cursor.rowsWritten;
+        return cursor;
+      }) as typeof sql.exec;
+    });
     for (let index = 0; index < 100; index += 1) await limiter.admit({ operationId: `op_cost_probe_${index.toString().padStart(8, "0")}`, idempotencyKey: `read-${index}`, payloadDigest: index.toString(16).padStart(64, "0"), family: "read", weight: 1, requestLimit: 1000, windowSeconds: 60, capacity: 1000, refillPerSecond: 100, responseBytes: 0, normalizedLogBytes: 0, rawLogBytes: 0, artifactUploadBytes: 0, byteLimits: { response: 1048576, normalizedDaily: 1048576, rawDaily: 0, artifactDaily: 0 }, nowMs: now.getTime() });
+    const limiterSqlAfterAdmissions = { ...limiterSql };
     const limiterRows = await runInDurableObject(limiter, (_instance, state) => ({
       idempotency: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM idempotency").one().count,
       requestWindows: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM request_windows").one().count,
@@ -62,10 +74,11 @@ describe("Free tier before/after cost probe", () => {
       byteUsage: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM byte_usage").one().count,
       leases: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM concurrency_leases").one().count,
     }));
-    const metrics = { browser10: { statements: browser.statements(), rowsWritten: browser.rowsWritten() }, oauth10: { statements: oauth.statements(), rowsWritten: oauth.rowsWritten() }, limiterRead100: limiterRows };
+    const metrics = { browser10: { statements: browser.statements(), rowsWritten: browser.rowsWritten() }, oauth10: { statements: oauth.statements(), rowsWritten: oauth.rowsWritten() }, limiterRead100: { cardinality: limiterRows, sql: limiterSqlAfterAdmissions } };
     expect(metrics.browser10).toEqual({ statements: 11, rowsWritten: 1 });
     expect(metrics.oauth10).toEqual({ statements: 11, rowsWritten: 1 });
-    expect(metrics.limiterRead100).toEqual({ idempotency: 0, requestWindows: 0, tokenBucket: 0, byteUsage: 0, leases: 0 });
+    expect(metrics.limiterRead100.cardinality).toEqual({ idempotency: 0, requestWindows: 0, tokenBucket: 0, byteUsage: 0, leases: 0 });
+    expect(metrics.limiterRead100.sql).toEqual({ statements: 300, rowsWritten: 100 });
     console.log("CLOUDFLARE_COST_PROBE=" + JSON.stringify(metrics));
   });
 });

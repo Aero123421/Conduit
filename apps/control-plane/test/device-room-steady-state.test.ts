@@ -269,7 +269,7 @@ describe.sequential("DeviceRoom steady-state custody", () => {
     expect(immediateReplay.position).toBe(4);
     expect(immediateReplay.inbound).toBe(firstInbound);
     expect(immediateReplay.marker).not.toBeNull();
-    expect(immediateReplay.alarm).not.toBeNull(); // the first durable ACK owns one 24h retention wake-up.
+    expect(immediateReplay.alarm).toBeNull(); // future retention alone must not reserve an idle alarm.
     expect(probe.sqlRowsWritten - afterFirst.sqlRowsWritten).toBe(0);
     expect(probe.setAlarm - afterFirst.setAlarm).toBe(0);
 
@@ -296,7 +296,7 @@ describe.sequential("DeviceRoom steady-state custody", () => {
     expect(checkpointState.inbound).toBe(firstInbound);
     expect(checkpointState.outboundAcks).toBe(firstOutboundAcks);
     expect(checkpointState.marker).not.toBeNull();
-    expect(checkpointState.alarm).not.toBeNull();
+    expect(checkpointState.alarm).toBeNull();
     expect(probe.sqlRowsWritten - beforeCheckpoint.sqlRowsWritten).toBeLessThanOrEqual(1);
     expect(probe.setAlarm - beforeCheckpoint.setAlarm).toBe(0);
 

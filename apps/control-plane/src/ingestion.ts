@@ -4,6 +4,13 @@ import type { ControlPlaneEnv, QueueEventMessage } from "./types.ts";
 /** Keep enough headroom below Queue's 64 KiB message limit for provider framing. */
 export const MAX_EVENT_QUEUE_MESSAGE_BYTES = 60_000;
 export const MAX_EVENT_BATCH_EVENTS = 32;
+/**
+ * One hostile Queue message can consume five D1 statements (poison evidence,
+ * identity probe, bulk insert, trace update, and a commit-time conflict
+ * receipt). Six messages therefore leave ten statements of headroom below
+ * the release ceiling for the outer Queue invocation.
+ */
+export const MAX_QUEUE_MESSAGES_PER_INVOCATION = 6;
 
 const U64 = /^(0|[1-9][0-9]{0,19})$/u;
 const SHA256 = /^[a-f0-9]{64}$/u;
@@ -627,7 +634,14 @@ export async function enqueueEventBatch(env: ControlPlaneEnv, input: EventBatchM
 
 /** Queue consumer: one Queue message is one bounded event.batch commit. */
 export async function consumeEvents(batch: MessageBatch<unknown>, env: ControlPlaneEnv): Promise<void> {
-  for (const message of batch.messages) {
+  for (const [index, message] of batch.messages.entries()) {
+    if (index >= MAX_QUEUE_MESSAGES_PER_INVOCATION) {
+      // The deployment binding also caps max_batch_size. Keep this fail-safe
+      // so a test harness or future configuration drift cannot make one
+      // invocation exceed its D1 budget.
+      message.retry({ delaySeconds: 1 });
+      continue;
+    }
     const parsed = normalizeBatch(message.body, message.id);
     if (parsed === null) {
       await securityEvidence(env, [{ event: null, reason: "queue_message_invalid", fingerprint: "", messageId: message.id }], nowIso());

@@ -40,7 +40,7 @@
     "consumers": [
       {
         "queue": "conduit-event-ingestion",
-        "max_batch_size": 32,
+        "max_batch_size": 6,
         "max_batch_timeout": 5,
         "max_retries": 5,
         "dead_letter_queue": "conduit-event-ingestion-dead-letter"

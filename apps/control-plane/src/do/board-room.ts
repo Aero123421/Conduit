@@ -8,6 +8,8 @@ interface PublishedBoardEvent extends BoardProjectionEvent { sequence: number; }
 
 const FANOUT_RETENTION_MS = 24 * 60 * 60 * 1_000;
 const MAX_BATCH_EVENTS = 32;
+const MAX_FANOUT_ROWS = 2_048;
+const FANOUT_DELETE_BATCH = 250;
 
 export class BoardRoom extends DurableObject<ControlPlaneEnv> {
   constructor(ctx: DurableObjectState, env: ControlPlaneEnv) {
@@ -22,7 +24,34 @@ export class BoardRoom extends DurableObject<ControlPlaneEnv> {
       if (!columns.some((column) => column.name === "expires_at")) this.ctx.storage.sql.exec("ALTER TABLE fanout_events ADD COLUMN expires_at TEXT");
       this.ctx.storage.sql.exec("CREATE INDEX IF NOT EXISTS idx_fanout_events_expiry ON fanout_events(expires_at,sequence); UPDATE fanout_events SET expires_at=datetime(created_at,'+1 day') WHERE expires_at IS NULL; INSERT OR IGNORE INTO _sql_schema_migrations(id,applied_at) VALUES (2,datetime('now'));");
       this.ctx.setWebSocketAutoResponse(new WebSocketRequestResponsePair("ping", "pong"));
+      await this.armRetention();
     });
+  }
+
+  private async armRetention(): Promise<void> {
+    const oldest = this.ctx.storage.sql.exec<{ expires_at: string }>("SELECT expires_at FROM fanout_events ORDER BY expires_at,sequence LIMIT 1").toArray()[0];
+    const scheduled = await this.ctx.storage.getAlarm();
+    if (oldest === undefined) {
+      if (scheduled !== null) await this.ctx.storage.deleteAlarm();
+      return;
+    }
+    const dueAt = Date.parse(oldest.expires_at);
+    if (!Number.isFinite(dueAt)) throw new TypeError("Board fanout expiry is invalid");
+    const boundedDueAt = Math.max(Date.now() + 1, dueAt);
+    if (scheduled === null || Math.abs(scheduled - boundedDueAt) > 1_000) await this.ctx.storage.setAlarm(boundedDueAt);
+  }
+
+  private compactFanout(now: string): void {
+    this.ctx.storage.sql.exec(
+      "DELETE FROM fanout_events WHERE sequence IN (SELECT sequence FROM fanout_events WHERE expires_at<=? ORDER BY expires_at,sequence LIMIT ?)",
+      now,
+      FANOUT_DELETE_BATCH,
+    );
+    this.ctx.storage.sql.exec(
+      "DELETE FROM fanout_events WHERE sequence IN (SELECT sequence FROM fanout_events ORDER BY sequence LIMIT (SELECT CASE WHEN COUNT(*)>? THEN COUNT(*)-? ELSE 0 END FROM fanout_events))",
+      MAX_FANOUT_ROWS,
+      MAX_FANOUT_ROWS,
+    );
   }
 
   override async fetch(request: Request): Promise<Response> {
@@ -51,6 +80,8 @@ export class BoardRoom extends DurableObject<ControlPlaneEnv> {
     const canonicalEvents = events.map((event) => ({ ...event, json: canonicalJson(event) }));
     if (new Set(canonicalEvents.map((event) => event.eventId)).size !== canonicalEvents.length) throw new TypeError("Board event batch contains duplicate IDs");
     const input = canonicalJson(canonicalEvents.map(({ json: _json, ...event }) => event));
+    const createdAt = nowIso();
+    this.compactFanout(createdAt);
     const existing = this.ctx.storage.sql.exec<{ sequence: number; event_id: string; session_id: string; event_json: string }>(
       "SELECT sequence,event_id,session_id,event_json FROM fanout_events WHERE event_id IN (SELECT json_extract(value,'$.eventId') FROM json_each(?))",
       input,
@@ -61,7 +92,6 @@ export class BoardRoom extends DurableObject<ControlPlaneEnv> {
       if (prior !== undefined && (prior.session_id !== event.sessionId || canonicalJson(JSON.parse(prior.event_json) as unknown) !== event.json)) throw new TypeError("Board event ID is bound to another projection");
     }
     const fresh = canonicalEvents.filter((event) => !byId.has(event.eventId));
-    const createdAt = nowIso();
     const expiresAt = new Date(Date.parse(createdAt) + FANOUT_RETENTION_MS).toISOString();
     if (fresh.length > 0) {
       this.ctx.storage.sql.exec(
@@ -87,8 +117,14 @@ export class BoardRoom extends DurableObject<ControlPlaneEnv> {
       const attachment = ws.deserializeAttachment() as BoardAttachment | null;
       if (attachment?.sessionId === sessionId && outgoing.length > 0) ws.send(canonicalJson({ type: "events.batch", events: outgoing }));
     }
-    this.ctx.storage.sql.exec("DELETE FROM fanout_events WHERE sequence IN (SELECT sequence FROM fanout_events WHERE expires_at<=? ORDER BY expires_at,sequence LIMIT 250)", createdAt);
+    this.compactFanout(createdAt);
+    await this.armRetention();
     return published;
+  }
+
+  override async alarm(): Promise<void> {
+    this.compactFanout(nowIso());
+    await this.armRetention();
   }
 
   override async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer): Promise<void> {

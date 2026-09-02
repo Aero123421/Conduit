@@ -53,7 +53,7 @@ Production requests do not write usage counters to D1. Measurements use:
 - Worker invocation, measured CPU time, sampled log-event, and trace-span projection;
 - Cloudflare Analytics or GraphQL for isolated remote E2E confirmation.
 
-`apps/control-plane/src/usage-instrumentation.ts` is not called by the production request path. Tests fail above 40 D1 statements or 90 parameters.
+`apps/control-plane/src/usage-instrumentation.ts` is not called by the production request path. Tests install it around the complete exported Queue handler or Durable Object alarm, not just an inner helper, and fail above 40 D1 statements, 40 binding calls, or 90 parameters.
 
 ## Required simulations
 
@@ -99,20 +99,32 @@ fleet model below uses the configured ten-minute Node checkpoint (49 active
 health observations including the initial observation) and the fifteen-minute
 Free-profile Control Plane projection throttle (33 active projections).
 
-The DeviceRoom owner counter contract used by the estimate is: a fresh
-semantic health projection is charged at the measured nine-row upper bound;
-an unchanged exact-envelope replay is charged only the one-row marker update
-at the fifteen-minute D1 checkpoint; and the replay path creates no ACK or
-alarm. These are conservative local counters, not Cloudflare account usage.
-For one idle Device this produces 145 application health observations (one
-fresh frame plus 144 exact replays), 97 D1 health projections including the
-initial frame, 195 D1 rows written including one connection touch, 113
-Durable Object base-row mutations including connection custody, and zero alarm
-invocations. Each is asserted independently against the review limits of 300
-D1 rows, 1,000 Durable Object rows, and 10 alarms per idle Device per day.
-Control ACKs can advance the Node's applied-control frontier without forcing a
-new health allocation; a subsequent non-ACK control application, ordinary
-receipt, or reconciliation frame carries the newer frontier.
+The accelerated integration probe connects the real Rust `NodeService` and
+`WssClient` through the production Worker route to `DeviceRoom`. After the
+authenticated reconciliation setup is complete, it advances 864,000 service
+polls of 100 ms each. The measured steady-state window has 144 actual socket
+sends (6 in the first hour), 144 DeviceRoom application receives, 72 D1 health
+row mutations, 72 Durable Object base-row mutations, one retained cumulative
+ACK row, six bounded inbound rows, and zero alarm scheduling or invocations.
+The corresponding aggregate counters are 144 D1 statements/binding calls,
+maximum 5 bound parameters, 1,152 Durable Object SQL statements, and 8,784
+Durable Object rows read. The setup's fresh health frame is intentionally
+outside that reset measurement; the separate allocation test observes one
+fresh send plus 144 exact replays and only one Node outbox sequence.
+
+For the conservative fleet gate, an idle Device is charged one fresh
+two-row D1 projection, 72 one-row exact checkpoints, one connection row, 89
+Durable Object row mutations including connection custody, and zero alarms:
+75 D1 rows and 89 Durable Object rows per day. The connected probe above is
+the measured steady-state evidence; these slightly larger blended values keep
+setup cost in the quota estimate.
+
+The same-socket transport frontier is the reason a 100 ms poll does not become
+a 100 ms retransmission loop. A reconnect starts from the authenticated peer
+custody frontier, so the optimization does not remove disconnect or restart
+replay. Control ACKs can advance the Node's applied-control frontier without
+forcing a new health allocation; a subsequent non-ACK control application,
+ordinary receipt, or reconciliation frame carries the newer frontier.
 
 `batching::tests::free_profile_fleet_budget_stays_below_quarter_daily_quotas`
 is a conservative arithmetic assertion for each fleet of 1, 5, and 10 idle
@@ -129,9 +141,9 @@ operations per batch.
 
 | Idle Devices | Worker requests (estimate) | D1 rows read (estimate) | D1 rows written (estimate) | DO requests (estimate) | DO rows read (estimate) | DO rows written (estimate) | Free Queue ops | Queue-mode ops (estimate) | Logs + traces (estimate) |
 |---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 1,301 | 34,737 | 11,579 | 1,301 | 6,058 | 7,879 | 0 | 2,439 | 2,480 |
-| 5 | 1,893 | 37,077 | 12,359 | 1,893 | 9,570 | 8,331 | 0 | 2,439 | 2,603 |
-| 10 | 2,633 | 40,002 | 13,334 | 2,633 | 13,960 | 8,896 | 0 | 2,439 | 2,759 |
+| 1 | 1,301 | 34,377 | 11,459 | 1,301 | 6,058 | 7,855 | 0 | 2,439 | 2,480 |
+| 5 | 1,893 | 35,277 | 11,759 | 1,893 | 9,570 | 8,211 | 0 | 2,439 | 2,603 |
+| 10 | 2,633 | 36,402 | 12,134 | 2,633 | 13,960 | 8,656 | 0 | 2,439 | 2,759 |
 | 25% daily target | 25,000 | 1,250,000 | 25,000 | 25,000 | 1,250,000 | 25,000 | 2,500 | 2,500 | 50,000 |
 
 All rows in this table pass the corresponding 25% target. The model does not
@@ -160,7 +172,7 @@ Device-local and are therefore not counted as a Cloudflare R2 write.
 - limiter windows, idempotency, and released/expired leases
 - coalescible normalized streaming deltas
 
-Hot records carry an indexed expiry or archival state. Cleanup operates in pages of 100–500 and continues only while backlog exists. Raw trace remains Device-local. `security_events` remains immutable; any future archive-and-prune requires a verified hash-chained R2 Standard segment receipt before a restrictive database trigger permits pruning.
+Hot records carry an indexed expiry or archival state. Cleanup operates in pages of 100–500 and continues only while backlog exists. The Cron backstop registers retention work only when the cleanup continuation or an indexed expiry is actually due; 288 empty probes over 24 hours produce no D1 writes, scheduler rows, or alarms. BoardRoom keeps at most 2,048 fanout rows and uses one oldest-expiry alarm with 250-row pages, so a quiet Room converges without another publish. Raw trace remains Device-local. `security_events` remains immutable; any future archive-and-prune requires a verified hash-chained R2 Standard segment receipt before a restrictive database trigger permits pruning.
 
 ## Public endpoints and assets
 
@@ -180,11 +192,11 @@ The before probe is pinned to PR head `885b44b`; the after probe uses this optim
 
 | Scenario | Before (`885b44b`) | After | Counter source |
 |---|---:|---:|---|
-| Unchanged idle Device over 24 hours | 2,880 newly allocated health frames; at least 5,760 D1 writes and about 23,000--26,000 DO base-row mutations (`model`) | 1 fresh frame + 144 exact replays; 195 D1 writes, 113 DO mutations, 0 alarms (`conservative asserted model`); one measured due replay used 1 D1 write, 1 DO marker mutation, 0 new ACK rows, and 0 alarms | Baseline 30-second source cadence + old frame mutation model; after Rust allocation probe and instrumented DeviceRoom |
+| Unchanged idle Device over 24 hours | 2,880 newly allocated health frames; at least 5,760 D1 writes and about 23,000--26,000 DO base-row mutations (`model`) | Connected steady-state measurement: 144 actual socket sends/DO receives, 72 D1 row mutations, 72 DO base-row mutations, 1 retained ACK row, 6 retained inbound rows, 0 alarms; separate allocation probe: 1 fresh frame + 144 exact replays and 1 Node outbox sequence | Baseline 30-second source cadence + old frame mutation model; after real NodeService/WssClient/Worker route/DeviceRoom accelerated E2E |
 | 10,000 visible assistant deltas | 10,000 cloud frames / Queue messages and 30,000 normal Queue operations (`model`) | 313 batches, maximum 6,889 bytes, exact visible reconstruction; 939 normal Queue operations (`deterministic chunk model`) or 0 in Free `durable_inbox` | Rust batch measurement + serialized Queue chunk accounting |
 | 10 Browser session validations | 20 D1 statements / 10 rows written | 11 D1 statements / 1 row written | D1 result metadata |
 | 10 OAuth access-token validations | 20 D1 statements / 10 rows written | 11 D1 statements / 1 row written | D1 result metadata |
-| 100 read-only limiter admissions | 100 idempotency rows, 1 request-window row, 1 token row, 1 zero-byte row | 0 idempotency/window/token/zero-byte rows; 1 fixed compact budget row | Durable Object SQL row counts |
+| 100 read-only limiter admissions | 100 idempotency rows, 1 request-window row, 1 token row, 1 zero-byte row | Retained cardinality: 1 compact `budget_state` row and 0 rows in the five legacy tables; measured admission cost: 300 SQL statements and 100 rows written | Instrumented Durable Object SQL plus independent table cardinality |
 | 32 due realtime projections in one Session | 32 BoardRoom RPCs | 1 `publishBatch` RPC; 4 D1 statements, max 5 parameters | Miniflare publisher counter + D1 proxy metadata |
 | Artifact retry after R2 PUT / lost D1 response | 0 HEAD / 2 PUT | 2 HEAD / 1 PUT | Instrumented Miniflare R2 binding |
 | Warm MCP registration + canonical JSON + wire validation | median 2 ms / p95 2 ms / max 4 ms | median 2 ms / p95 2 ms / max 4 ms | 100-sample Miniflare CPU probe after 20 warmups |
@@ -197,6 +209,12 @@ Additional after-only release gates exercise the production bindings and fault p
 | Gate | Measured after result |
 |---|---:|
 | Empty DeviceRoom fleet, 1 / 5 / 10 rooms | 0 application messages, 0 SQL base-row mutations, 0 alarms; respectively 3 / 15 / 30 read-only SQL statements |
+| Real NodeService + WssClient + Worker route + DeviceRoom, accelerated 24h idle | 144 socket sends and incoming messages; D1 144 statements / 72 rows written / max 5 parameters; DO SQL 1,152 statements / 72 rows written; 1 ACK row, 6 inbound rows, 0 alarms |
+| Maximum configured Queue consumer batch (6 poison-plus-valid messages), one outer invocation | 24 D1 statements / 24 binding calls / max 6 parameters / 66 rows written |
+| DeviceRoom alarm with 32 due `event.batch` frames | 8 D1 statements / 8 binding calls / max 2 parameters / 12 rows written; 4 projected and 28 durably pending for the next invocation |
+| RetryScheduler alarm with 32 due work rows | 16 D1 statements / 16 binding calls / max 3 parameters / 1 row written; 1 work item processed and 31 rearmed |
+| Empty five-minute backstop over 24 hours | 288 invocations; max 4 D1 statements per invocation, 0 D1 rows written, 0 scheduler rows, 0 alarms |
+| Quiet BoardRoom after a 2,100-event burst | At most 2,048 retained rows; 250-row alarm pages; at most 9 alarm invocations converge to 0 rows and no alarm without another publish |
 | One Worker-route `event.batch` including handshake, custody, projection, and ACK | 261 DO SQL statements, 1 alarm invocation; the subsequent auto-response probe added 0 SQL writes and 0 alarms |
 | Queue poison retry | 6 D1 statements/binding calls, max 6 parameters, 3 rows written; 1 message, 1 chunk, 1 retry, 4 modeled Queue operations; valid siblings committed and one poison item isolated |
 | Committed D1 response loss and replay | 4 D1 statements/binding calls, max 6 parameters; exact final event and trace-index cardinality retained |
@@ -208,4 +226,4 @@ Additional after-only release gates exercise the production bindings and fault p
 | R2 PUT-success / D1-response-loss retry | 2 HEAD, 1 PUT |
 | Warm CPU probe | 100 samples; median 2 ms, p95 2 ms, max 4 ms |
 
-The exact probes are `apps/control-plane/test/device-room-steady-state.test.ts`, `free-cost-probe.test.ts`, `cost-fault-scenarios.test.ts`, `realtime-batch-budget.test.ts`, `r2-budget.test.ts`, `retention.test.ts`, and `cpu-budget.test.ts`. Baseline copies were run in a detached `885b44b` worktree with the same Miniflare runtime and fixtures. Queue operations are calculated from the measured serialized byte lengths and retry count because Miniflare does not expose Cloudflare billing operations. The fleet table above remains explicitly estimated; it is not presented as Cloudflare account analytics.
+The exact probes are `scripts/e2e-node-worker-idle.sh`, `apps/control-plane/test/outer-invocation-budget.test.ts`, `board-room-retention.test.ts`, `device-room-steady-state.test.ts`, `free-cost-probe.test.ts`, `cost-fault-scenarios.test.ts`, `realtime-batch-budget.test.ts`, `r2-budget.test.ts`, `retention.test.ts`, and `cpu-budget.test.ts`. Baseline copies were run in a detached `885b44b` worktree with the same Miniflare runtime and fixtures. Queue operations are calculated from the measured serialized byte lengths and retry count because Miniflare does not expose Cloudflare billing operations. The fleet table above remains explicitly estimated; it is not presented as Cloudflare account analytics.

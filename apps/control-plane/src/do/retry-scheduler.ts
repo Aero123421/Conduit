@@ -12,7 +12,12 @@ interface DueWorkRow extends Record<string, SqlStorageValue> {
   due_at: string;
 }
 
-const MAX_DUE_PER_ALARM = 32;
+const OUTER_D1_STATEMENT_BUDGET = 40;
+// Dispatch/approval/realtime helpers may evolve independently. Reserve a
+// conservative 32 statements for each external work item and spend that
+// reservation before starting it. This makes the alarm stop after one item;
+// remaining due rows cause armNext() to schedule an immediate continuation.
+const D1_STATEMENT_RESERVATION_PER_WORK = 32;
 
 export class RetryScheduler extends DurableObject<ControlPlaneEnv> {
   constructor(ctx: DurableObjectState, env: ControlPlaneEnv) {
@@ -85,9 +90,14 @@ export class RetryScheduler extends DurableObject<ControlPlaneEnv> {
     const rows = this.ctx.storage.sql.exec<DueWorkRow>(
       "SELECT kind,target_id,due_at FROM due_work WHERE due_at<=? ORDER BY due_at,kind,target_id LIMIT ?",
       now.toISOString(),
-      MAX_DUE_PER_ALARM,
+      32,
     ).toArray();
-    for (const row of rows) await this.runWork(row, now);
+    let remainingD1Statements = OUTER_D1_STATEMENT_BUDGET;
+    for (const row of rows) {
+      if (remainingD1Statements < D1_STATEMENT_RESERVATION_PER_WORK) break;
+      remainingD1Statements -= D1_STATEMENT_RESERVATION_PER_WORK;
+      await this.runWork(row, now);
+    }
     await this.armNext();
   }
 
@@ -138,7 +148,10 @@ export class RetryScheduler extends DurableObject<ControlPlaneEnv> {
       if (await this.ctx.storage.getAlarm() !== null) await this.ctx.storage.deleteAlarm();
       return;
     }
-    const due = Math.max(Date.now() + 1, Date.parse(row.due_at));
+    // A one-second continuation is operationally immediate while preventing
+    // a due backlog from collapsing several outer alarm invocations into one
+    // platform turn and defeating the per-invocation D1 reservation.
+    const due = Math.max(Date.now() + 1_000, Date.parse(row.due_at));
     const alarm = await this.ctx.storage.getAlarm();
     if (alarm === null || Math.abs(alarm - due) > 1_000) await this.ctx.storage.setAlarm(due);
   }
@@ -149,16 +162,37 @@ export class RetryScheduler extends DurableObject<ControlPlaneEnv> {
       this.env.DB.prepare("SELECT operation_id AS target_id,MIN(CASE WHEN state='dispatching' THEN lease_expires_at ELSE next_attempt_at END) AS due_at FROM operation_dispatch_outbox WHERE state IN ('pending','dispatching') GROUP BY operation_id ORDER BY due_at LIMIT 32"),
       this.env.DB.prepare("SELECT approval_id AS target_id,MIN(CASE WHEN state='dispatching' THEN lease_expires_at ELSE next_attempt_at END) AS due_at FROM approval_dispatch_outbox WHERE state IN ('pending','dispatching') GROUP BY approval_id ORDER BY due_at LIMIT 32"),
       this.env.DB.prepare("SELECT device_id AS target_id,MIN(CASE WHEN state='publishing' THEN lease_expires_at ELSE next_attempt_at END) AS due_at FROM realtime_projection_outbox WHERE state IN ('pending','publishing') GROUP BY device_id ORDER BY due_at LIMIT 32"),
+      this.env.DB.prepare(`
+        SELECT CASE WHEN
+          EXISTS(SELECT 1 FROM retention_cleanup_state WHERE continuation_due_at<=?1)
+          OR EXISTS(SELECT 1 FROM realtime_projection_outbox WHERE state='published' AND published_at<=?2)
+          OR EXISTS(SELECT 1 FROM node_projection_receipts WHERE frame_type='device.health' AND created_at<=?2)
+          OR EXISTS(SELECT 1 FROM auth_challenges WHERE expires_at<=?1 OR consumed_at<=?2)
+          OR EXISTS(SELECT 1 FROM oauth_authorization_codes WHERE expires_at<=?1 OR consumed_at<=?2)
+          OR EXISTS(SELECT 1 FROM oauth_tokens WHERE expires_at<=?1 OR consumed_at<=?2 OR revoked_at<=?2)
+          OR EXISTS(SELECT 1 FROM oauth_consent_transactions WHERE expires_at<=?1 OR consumed_at<=?2)
+          OR EXISTS(SELECT 1 FROM oauth_clients WHERE registration_mechanism='dynamic' AND status='pending_owner' AND expires_at<=?1)
+          OR EXISTS(SELECT 1 FROM device_enrollments WHERE state IN ('denied','expired','cancelled') AND COALESCE(terminal_at,expires_at)<=?2 AND assigned_device_id IS NULL)
+          OR EXISTS(SELECT 1 FROM effect_idempotency_records WHERE expires_at<=?1)
+          OR EXISTS(SELECT 1 FROM idempotency_records WHERE expires_at<=?1)
+          OR EXISTS(SELECT 1 FROM normalized_events WHERE retention_class='streaming_delta' AND expires_at<=?1)
+          OR EXISTS(SELECT 1 FROM realtime_delivery_receipts WHERE expires_at<=?1)
+          OR EXISTS(SELECT 1 FROM operation_dispatch_outbox WHERE state='expired' AND expires_at<=?3)
+          OR EXISTS(SELECT 1 FROM approval_dispatch_outbox WHERE state IN ('offered','expired') AND expires_at<=?3)
+        THEN ?1 ELSE NULL END AS due_at
+      `).bind(at, new Date(now.getTime() - 86_400_000).toISOString(), new Date(now.getTime() - 7 * 86_400_000).toISOString()),
     ]);
     const operations = results[0];
     const approvals = results[1];
     const realtime = results[2];
-    if (operations === undefined || approvals === undefined || realtime === undefined) throw new TypeError("scheduler backstop query result is incomplete");
+    const retention = results[3];
+    if (operations === undefined || approvals === undefined || realtime === undefined || retention === undefined) throw new TypeError("scheduler backstop query result is incomplete");
     const work: RetryWork[] = [];
     for (const row of operations.results as Array<{ target_id: string; due_at: string }>) work.push({ kind: "operation", targetId: row.target_id, dueAt: row.due_at });
     for (const row of approvals.results as Array<{ target_id: string; due_at: string }>) work.push({ kind: "approval", targetId: row.target_id, dueAt: row.due_at });
     for (const row of realtime.results as Array<{ target_id: string; due_at: string }>) work.push({ kind: "realtime", targetId: row.target_id, dueAt: row.due_at });
-    work.push({ kind: "retention", targetId: "hot-data", dueAt: at });
+    const retentionDue = (retention.results as Array<{ due_at: string | null }>)[0]?.due_at;
+    if (retentionDue !== null && retentionDue !== undefined) work.push({ kind: "retention", targetId: "hot-data", dueAt: retentionDue });
     return work;
   }
 }

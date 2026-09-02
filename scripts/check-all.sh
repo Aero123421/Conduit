@@ -13,6 +13,7 @@ corepack pnpm --filter @conduit/schema check:wire
 corepack pnpm -r typecheck
 corepack pnpm -r test
 corepack pnpm -r build
+"$conduit_root/scripts/e2e-node-worker-idle.sh"
 
 if command -v python3 >/dev/null 2>&1 && python3 -c 'import jsonschema, referencing' >/dev/null 2>&1; then
   conduit_python="$(command -v python3)"

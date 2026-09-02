@@ -478,7 +478,8 @@ mod tests {
     // takes the existing nine-row upper bound; an exact unchanged-health
     // replay only updates the health marker at the 15-minute D1 checkpoint.
     // The replay path does not create an ACK or an alarm.
-    const DEVICE_ROOM_D1_ROWS_PER_HEALTH_PROJECTION: u64 = 2;
+    const DEVICE_ROOM_D1_ROWS_PER_NEW_HEALTH: u64 = 2;
+    const DEVICE_ROOM_D1_ROWS_PER_HEALTH_CHECKPOINT: u64 = 1;
     const DEVICE_ROOM_D1_ROWS_PER_CONNECTION: u64 = 1;
     const DEVICE_ROOM_DO_ROWS_PER_NEW_HEALTH: u64 = 9;
     const DEVICE_ROOM_DO_ROWS_PER_HEALTH_CHECKPOINT: u64 = 1;
@@ -565,12 +566,23 @@ mod tests {
 
     fn idle_device_estimate() -> IdleDeviceEstimate {
         let health_frames = 1 + ceil_div(DAY_SECONDS, DEFAULT_HEALTH_CHECKPOINT.as_secs());
-        let health_projections = 1 + ceil_div(DAY_SECONDS, CONTROL_PLANE_HEALTH_CHECKPOINT_SECONDS);
+        // D1's 15-minute throttle is observed only when the Node sends its
+        // ten-minute exact checkpoint, so unchanged state projects every
+        // second checkpoint (20 minutes), not on an independent timer.
+        let observable_projection_seconds = ceil_div(
+            CONTROL_PLANE_HEALTH_CHECKPOINT_SECONDS,
+            DEFAULT_HEALTH_CHECKPOINT.as_secs(),
+        ) * DEFAULT_HEALTH_CHECKPOINT.as_secs();
+        let health_projections = 1 + ceil_div(DAY_SECONDS, observable_projection_seconds);
         IdleDeviceEstimate {
             health_frames,
             health_projections,
-            d1_rows_written: health_projections
-                .saturating_mul(DEVICE_ROOM_D1_ROWS_PER_HEALTH_PROJECTION)
+            d1_rows_written: DEVICE_ROOM_D1_ROWS_PER_NEW_HEALTH
+                .saturating_add(
+                    health_projections
+                        .saturating_sub(1)
+                        .saturating_mul(DEVICE_ROOM_D1_ROWS_PER_HEALTH_CHECKPOINT),
+                )
                 .saturating_add(DEVICE_ROOM_D1_ROWS_PER_CONNECTION),
             durable_object_rows_written: DEVICE_ROOM_DO_ROWS_PER_NEW_HEALTH
                 .saturating_add(
@@ -607,19 +619,18 @@ mod tests {
         let application_frames = idle_health_frames + active_health_frames + active_event_batches;
         let connection_count = idle_devices + 1;
         let normalized_events = DELTA_COUNT + PRIORITY_EVENT_COUNT;
-        let idle_health_projections = idle_devices.saturating_mul(idle_device.health_projections);
         let active_health_projections =
             1 + ceil_div(ACTIVE_RUN_SECONDS, CONTROL_PLANE_HEALTH_CHECKPOINT_SECONDS);
-        let health_projections = idle_health_projections + active_health_projections;
         let worker_requests = application_frames
             .saturating_add(288)
             .saturating_add(connection_count.saturating_mul(3));
         let d1_rows_written = normalized_events
             .saturating_add(active_event_batches)
+            .saturating_add(idle_devices.saturating_mul(idle_device.d1_rows_written))
             .saturating_add(
-                health_projections.saturating_mul(DEVICE_ROOM_D1_ROWS_PER_HEALTH_PROJECTION),
+                active_health_projections.saturating_mul(DEVICE_ROOM_D1_ROWS_PER_NEW_HEALTH),
             )
-            .saturating_add(connection_count.saturating_mul(DEVICE_ROOM_D1_ROWS_PER_CONNECTION))
+            .saturating_add(DEVICE_ROOM_D1_ROWS_PER_CONNECTION)
             .saturating_add(4);
         let d1_rows_read = d1_rows_written.saturating_mul(3);
         let durable_object_requests = worker_requests;
@@ -813,9 +824,9 @@ mod tests {
 
         let idle_device = idle_device_estimate();
         assert_eq!(idle_device.health_frames, 145);
-        assert_eq!(idle_device.health_projections, 97);
-        assert_eq!(idle_device.d1_rows_written, 195);
-        assert_eq!(idle_device.durable_object_rows_written, 113);
+        assert_eq!(idle_device.health_projections, 73);
+        assert_eq!(idle_device.d1_rows_written, 75);
+        assert_eq!(idle_device.durable_object_rows_written, 89);
         assert_eq!(idle_device.alarm_invocations, 0);
         assert!(
             idle_device.d1_rows_written <= 300,
@@ -849,11 +860,11 @@ mod tests {
                 1,
                 DailyFreeEstimate {
                     worker_requests: 1_301,
-                    d1_rows_read: 34_737,
-                    d1_rows_written: 11_579,
+                    d1_rows_read: 34_377,
+                    d1_rows_written: 11_459,
                     durable_object_requests: 1_301,
                     durable_object_rows_read: 6_058,
-                    durable_object_rows_written: 7_879,
+                    durable_object_rows_written: 7_855,
                     free_queue_operations: 0,
                     queue_mode_operations: 2_439,
                     log_trace_events: 2_480,
@@ -863,11 +874,11 @@ mod tests {
                 5,
                 DailyFreeEstimate {
                     worker_requests: 1_893,
-                    d1_rows_read: 37_077,
-                    d1_rows_written: 12_359,
+                    d1_rows_read: 35_277,
+                    d1_rows_written: 11_759,
                     durable_object_requests: 1_893,
                     durable_object_rows_read: 9_570,
-                    durable_object_rows_written: 8_331,
+                    durable_object_rows_written: 8_211,
                     free_queue_operations: 0,
                     queue_mode_operations: 2_439,
                     log_trace_events: 2_603,
@@ -877,11 +888,11 @@ mod tests {
                 10,
                 DailyFreeEstimate {
                     worker_requests: 2_633,
-                    d1_rows_read: 40_002,
-                    d1_rows_written: 13_334,
+                    d1_rows_read: 36_402,
+                    d1_rows_written: 12_134,
                     durable_object_requests: 2_633,
                     durable_object_rows_read: 13_960,
-                    durable_object_rows_written: 8_896,
+                    durable_object_rows_written: 8_656,
                     free_queue_operations: 0,
                     queue_mode_operations: 2_439,
                     log_trace_events: 2_759,

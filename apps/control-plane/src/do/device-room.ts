@@ -10,6 +10,7 @@ import { projectDeviceTerminalSubmission } from "../review-workflow.ts";
 import { commitDurableInboxBatch, enqueueEventBatch, eventIngestionMode, parseEventBatch } from "../ingestion.ts";
 import { planReconciliationSets } from "../reconciliation-set.ts";
 import { usageProfileForEnv } from "../usage-profile.ts";
+import { instrumentD1, type InstrumentedD1 } from "../usage-instrumentation.ts";
 import type { ControlPlaneEnv } from "../types.ts";
 
 interface SocketAttachment {
@@ -110,6 +111,11 @@ interface OutboundMessageTombstone {
 }
 
 const MAX_CONTROL_REPLAY_FRAMES = 32;
+// One event.batch projection uses up to four D1 statements. Keeping a
+// four-frame outer-alarm page leaves substantial headroom for realtime or
+// terminal follow-up before the 40-statement release ceiling. Remaining
+// custody rows immediately re-arm the same alarm.
+const MAX_D1_PROJECTIONS_PER_ALARM = 4;
 const MAX_INBOUND_FRAMES = 512;
 const MAX_OUTBOUND_TOMBSTONES = 512;
 const MAX_AUTH_CHALLENGES = 128;
@@ -144,9 +150,49 @@ const ACK_IMMEDIATE_TYPES = new Set<NodeV1PostAuthFrame["type"]>([
 
 export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
   private alarmActive = false;
+  private idleProbe: {
+    incomingMessages: number;
+    sqlStatements: number;
+    sqlRowsRead: number;
+    sqlRowsWritten: number;
+    setAlarm: number;
+    deleteAlarm: number;
+    alarmInvocations: number;
+  } | null = null;
+  private idleProbeD1: InstrumentedD1 | null = null;
+  private idleProbeNowMs: number | null = null;
 
   constructor(ctx: DurableObjectState, env: ControlPlaneEnv) {
     super(ctx, env);
+    const probeEnabled = (env as ControlPlaneEnv & { CLOUDFLARE_IDLE_E2E_PROBE?: string }).CLOUDFLARE_IDLE_E2E_PROBE === "enabled";
+    if (probeEnabled) {
+      this.idleProbe = { incomingMessages: 0, sqlStatements: 0, sqlRowsRead: 0, sqlRowsWritten: 0, setAlarm: 0, deleteAlarm: 0, alarmInvocations: 0 };
+      this.idleProbeD1 = instrumentD1(env.DB);
+      const instrumentedEnv = new Proxy(env, {
+        get: (target, property, receiver) => property === "DB" ? this.idleProbeD1!.db : Reflect.get(target, property, receiver),
+      });
+      Object.defineProperty(this, "env", { value: instrumentedEnv, configurable: true });
+      const sql = ctx.storage.sql;
+      const originalExec = sql.exec.bind(sql);
+      sql.exec = ((query: string, ...bindings: SqlStorageValue[]) => {
+        const probe = this.idleProbe!;
+        probe.sqlStatements += query.split(";").filter((part) => part.trim().length > 0).length;
+        const cursor = originalExec(query, ...bindings);
+        probe.sqlRowsRead += cursor.rowsRead;
+        probe.sqlRowsWritten += cursor.rowsWritten;
+        return cursor;
+      }) as typeof sql.exec;
+      const originalSetAlarm = ctx.storage.setAlarm.bind(ctx.storage);
+      ctx.storage.setAlarm = (async (scheduledTime: number | Date, options?: DurableObjectSetAlarmOptions) => {
+        this.idleProbe!.setAlarm += 1;
+        await originalSetAlarm(scheduledTime, options);
+      }) as typeof ctx.storage.setAlarm;
+      const originalDeleteAlarm = ctx.storage.deleteAlarm.bind(ctx.storage);
+      ctx.storage.deleteAlarm = (async (options?: DurableObjectSetAlarmOptions) => {
+        this.idleProbe!.deleteAlarm += 1;
+        await originalDeleteAlarm(options);
+      }) as typeof ctx.storage.deleteAlarm;
+    }
     ctx.blockConcurrencyWhile(async () => {
       this.ctx.storage.sql.exec(`
         CREATE TABLE IF NOT EXISTS _sql_schema_migrations(id INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
@@ -202,6 +248,35 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
 
   private workMarker(): RoomWorkMarker {
     return this.ctx.storage.sql.exec<RoomWorkMarker>("SELECT * FROM room_work_marker WHERE singleton=1").one();
+  }
+
+  private healthClockNow(): number {
+    return this.idleProbeNowMs ?? Date.now();
+  }
+
+  /** Loopback E2E-only counters. No production deployment enables the flag. */
+  async resetIdleE2EProbe(nowMs: number): Promise<void> {
+    if (this.idleProbe === null || this.idleProbeD1 === null || !Number.isFinite(nowMs)) throw new TypeError("idle_e2e_probe_unavailable");
+    this.ctx.storage.sql.exec("UPDATE room_work_marker SET health_last_projected_at=? WHERE singleton=1 AND health_semantic_json IS NOT NULL", nowMs);
+    Object.assign(this.idleProbe, { incomingMessages: 0, sqlStatements: 0, sqlRowsRead: 0, sqlRowsWritten: 0, setAlarm: 0, deleteAlarm: 0, alarmInvocations: 0 });
+    this.idleProbeD1.reset();
+    this.idleProbeNowMs = nowMs;
+  }
+
+  async advanceIdleE2EProbe(nowMs: number): Promise<void> {
+    if (this.idleProbe === null || !Number.isFinite(nowMs) || (this.idleProbeNowMs !== null && nowMs < this.idleProbeNowMs)) throw new TypeError("idle_e2e_probe_time_invalid");
+    this.idleProbeNowMs = nowMs;
+  }
+
+  async inspectIdleE2EProbe(): Promise<Record<string, unknown>> {
+    if (this.idleProbe === null || this.idleProbeD1 === null) throw new TypeError("idle_e2e_probe_unavailable");
+    const counters = { ...this.idleProbe };
+    const d1 = this.idleProbeD1.snapshot();
+    const rows = this.ctx.storage.sql.exec<{ inbound: number; ack_rows: number }>("SELECT (SELECT COUNT(*) FROM inbound_frames) AS inbound,(SELECT COUNT(*) FROM outbound_message_receipts WHERE kind='ack') AS ack_rows").one();
+    const alarmAt = await this.ctx.storage.getAlarm();
+    // Inspection must not perturb the next sample.
+    Object.assign(this.idleProbe, counters);
+    return { ...counters, d1, inboundRows: rows.inbound, ackRows: rows.ack_rows, alarmAt, nowMs: this.idleProbeNowMs };
   }
 
   /**
@@ -322,7 +397,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     });
   }
 
-  private shouldProjectHealth(frame: Extract<NodeV1PostAuthFrame, { type: "device.health" }>, now = Date.now()): boolean {
+  private shouldProjectHealth(frame: Extract<NodeV1PostAuthFrame, { type: "device.health" }>, now = this.healthClockNow()): boolean {
     const marker = this.workMarker();
     const semantic = this.healthSemantic(frame);
     if (marker.health_semantic_json !== semantic) return true;
@@ -330,7 +405,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     return marker.health_last_projected_at === null || now - marker.health_last_projected_at >= Math.max(HEALTH_CHECKPOINT_MS, d1HealthTouchMs);
   }
 
-  private async syncWorkMarker(): Promise<void> {
+  private async syncWorkMarker(minimumAlarmDelayMs = 1): Promise<void> {
     const marker = this.workMarker();
     const nowMs = Date.now();
     const now = new Date(nowMs).toISOString();
@@ -388,19 +463,11 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
 
     const hasAuthenticatedSocket = this.hasCurrentAuthenticatedSocket();
     const replayPending = status.replay_due !== null && !hasAuthenticatedSocket;
-    const retentionDueCandidates: number[] = [];
-    if (status.retention_pending !== 0) retentionDueCandidates.push(nowMs);
-    const addRetentionDue = (value: string | null, retentionMs: number): void => {
-      if (value === null) return;
-      const parsed = Date.parse(value);
-      if (Number.isFinite(parsed)) retentionDueCandidates.push(parsed + retentionMs);
-    };
-    addRetentionDue(status.inbound_retention_from, HOT_RETENTION_MS);
-    addRetentionDue(status.receipt_retention_due, 0);
-    addRetentionDue(status.auth_retention_due, 0);
-    addRetentionDue(status.reconciliation_retention_from, HOT_RETENTION_MS);
-    addRetentionDue(status.terminal_retention_from, RECEIPT_RETENTION_MS);
-    const retentionDueAt = retentionDueCandidates.length > 0 ? Math.min(...retentionDueCandidates) : null;
+    // Do not reserve an alarm merely because a retained proof will become old
+    // in the future. A later connection/message detects expired rows, and all
+    // local tables also have hard cardinality bounds. Alarms are demand-driven
+    // only once retention work is actually due or over its bound.
+    const retentionDueAt = status.retention_pending !== 0 ? nowMs : null;
     const retentionScheduled = retentionDueAt !== null;
     const dueCandidates: number[] = [];
     if (status.inbound_pending !== 0) dueCandidates.push(nowMs);
@@ -444,7 +511,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       return;
     }
     if (minDueAt === null) return;
-    if (scheduled === null || minDueAt < scheduled) await this.ctx.storage.setAlarm(Math.max(Date.now() + 1, minDueAt));
+    if (scheduled === null || minDueAt < scheduled) await this.ctx.storage.setAlarm(Math.max(Date.now() + minimumAlarmDelayMs, minDueAt));
   }
 
   private async projectAndSync(frame: NodeV1PostAuthFrame): Promise<void> {
@@ -488,10 +555,10 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     if (device === null || device.connection_epoch !== frame.connectionEpoch) {
       throw new TypeError("stale_connection_epoch");
     }
-    if (BigInt(device.health_sequence) !== BigInt(frame.sequence)) return;
+    if (BigInt(device.health_sequence) > BigInt(frame.sequence)) return;
     const observedAt = nowIso();
-    await this.env.DB.prepare("UPDATE devices SET last_observed_at=?1,updated_at=?1 WHERE id=?2 AND status='active' AND connection_epoch=?3 AND health_sequence=?4")
-      .bind(observedAt, frame.deviceId, frame.connectionEpoch, frame.sequence)
+    await this.env.DB.prepare("UPDATE devices SET health_sequence=?1,last_observed_at=?2,updated_at=?2 WHERE id=?3 AND status='active' AND connection_epoch=?4 AND health_sequence=?5")
+      .bind(frame.sequence, observedAt, frame.deviceId, frame.connectionEpoch, device.health_sequence)
       .run();
   }
 
@@ -733,6 +800,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     if (attachment === null) { ws.close(1011, "connection_state_missing"); return; }
     if (attachment.stage === "new") { await this.hello(ws, attachment, body); return; }
     if (attachment.stage === "challenged") { await this.authenticate(ws, attachment, body); return; }
+    if (this.idleProbe !== null) this.idleProbe.incomingMessages += 1;
     await this.acceptFrame(ws, attachment, body);
   }
 
@@ -798,7 +866,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     if (body.protocol !== "conduit.node/1" || body.deviceId !== attachment.deviceId || body.connectionEpoch !== attachment.epoch || body.direction !== "node_to_control" || typeof body.sequence !== "string" || !/^\d+$/.test(body.sequence) || typeof body.messageId !== "string" || typeof body.type !== "string" || typeof body.payloadDigest !== "string" || body.payload === null || typeof body.payload !== "object" || Array.isArray(body.payload)) {
       ws.close(1008, "frame_malformed"); return;
     }
-    if (attachment.reconciling && body.type !== "reconcile.summary" && body.type !== "reconcile.complete" && body.type !== "transport.ack" && body.type !== "transport.replay_required") { await this.enqueueControlFrame("transport.error", { code: "reconciliation_required", retryable: true }, undefined, new Date(Date.now() + 300_000).toISOString(), ws); return; }
+    if (attachment.reconciling && body.type !== "reconcile.summary" && body.type !== "reconcile.complete" && body.type !== "transport.ack" && body.type !== "transport.replay_required" && body.type !== "device.health") { await this.enqueueControlFrame("transport.error", { code: "reconciliation_required", retryable: true }, undefined, new Date(Date.now() + 300_000).toISOString(), ws); return; }
     const digest = await sha256Hex(canonicalJson(body.payload));
     if (digest !== body.payloadDigest) { ws.close(1008, "payload_digest_mismatch"); return; }
     const sequence = BigInt(body.sequence);
@@ -830,7 +898,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
               await this.projectAndSync(persistedHealth);
             } else if (this.shouldProjectHealth(persistedHealth)) {
               await this.projectExactHealthCheckpoint(persistedHealth);
-              this.setHealthMarker(this.healthSemantic(persistedHealth), Date.now());
+              this.setHealthMarker(this.healthSemantic(persistedHealth), this.healthClockNow());
             }
           } else if (prior.projected === 0 || prior.projected === 3) {
             this.notePending(Date.now());
@@ -893,7 +961,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     if (frame.type === "operation.terminal") await this.projectAndSync(frame);
     if (frame.type === "device.health" && healthProject) {
       await this.projectAndSync(frame);
-      this.setHealthMarker(this.healthSemantic(frame), Date.now());
+      this.setHealthMarker(this.healthSemantic(frame), this.healthClockNow());
     }
     if (controlAppliedThrough !== undefined) {
       try { await this.acknowledgeControlThrough(BigInt(controlAppliedThrough)); }
@@ -1481,6 +1549,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
   }
 
   override async alarm(): Promise<void> {
+    if (this.idleProbe !== null) this.idleProbe.alarmInvocations += 1;
     this.alarmActive = true;
     try {
       // Alarm delivery consumes the platform reservation. Recompute from the
@@ -1495,7 +1564,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
         await this.flushPendingAck(undefined, false);
       }
       const projectionStaleAt = new Date(now - PROJECTION_LEASE_MS).toISOString();
-      const unprojected = this.ctx.storage.sql.exec<{ frame_json: string }>("SELECT frame_json FROM inbound_frames WHERE projected=0 OR (projected=3 AND (projection_claimed_at IS NULL OR projection_claimed_at<=?)) ORDER BY sequence LIMIT 32", projectionStaleAt).toArray();
+      const unprojected = this.ctx.storage.sql.exec<{ frame_json: string }>("SELECT frame_json FROM inbound_frames WHERE projected=0 OR (projected=3 AND (projection_claimed_at IS NULL OR projection_claimed_at<=?)) ORDER BY sequence LIMIT ?", projectionStaleAt, MAX_D1_PROJECTIONS_PER_ALARM).toArray();
       for (const row of unprojected) {
         const frame = JSON.parse(row.frame_json) as NodeV1PostAuthFrame;
         await this.projectAndSync(frame);
@@ -1510,7 +1579,9 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       await this.dispatchQueuedFrames();
     } finally {
       this.alarmActive = false;
-      await this.syncWorkMarker();
+      // Keep the next bounded projection page in a distinct platform
+      // invocation so its D1 reservation cannot merge into this alarm turn.
+      await this.syncWorkMarker(1_000);
     }
   }
 

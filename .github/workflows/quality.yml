@@ -63,6 +63,25 @@ jobs:
       - run: python -m pip install --disable-pip-version-check -r requirements-spec.txt
       - run: python scripts/validate_spec.py
 
+  node-worker-idle-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.92.0
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9.15.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22.12.0"
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: ./scripts/e2e-node-worker-idle.sh
+
   packaging:
     runs-on: ubuntu-latest
     timeout-minutes: 15

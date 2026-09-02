@@ -617,8 +617,16 @@ impl NodeService {
         client: &mut WssClient,
         force: bool,
     ) -> Result<bool, ServiceError> {
+        self.queue_health_if_due_at(client, force, Instant::now())
+    }
+
+    fn queue_health_if_due_at(
+        &mut self,
+        client: &mut WssClient,
+        force: bool,
+        at: Instant,
+    ) -> Result<bool, ServiceError> {
         let state = self.health_state(client.session.remote_work_allowed());
-        let at = Instant::now();
         let force = force || self.health_frontier_dirty;
         if !self.health_tracker.should_emit(&state, at, force) {
             return Ok(false);
@@ -4353,7 +4361,71 @@ mod tests {
         ReconciliationReceipt, RuntimeError, RuntimeProvider, RuntimeStateReceipt, SnapshotReceipt,
     };
     use std::net::{TcpListener, TcpStream};
+    use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct ChildGuard(Child);
+
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn loopback_http(
+        port: u16,
+        method: &str,
+        path: &str,
+        body: Option<&str>,
+    ) -> Result<(u16, String), String> {
+        let mut command = Command::new("curl");
+        command.args([
+            "--silent",
+            "--show-error",
+            "--noproxy",
+            "*",
+            "--max-time",
+            "10",
+            "--request",
+            method,
+            "--header",
+            "Authorization: Bearer local-synthetic-idle-e2e-token",
+            "--header",
+            "Content-Type: application/json",
+            "--write-out",
+            "\n%{http_code}",
+            &format!("http://127.0.0.1:{port}{path}"),
+        ]);
+        if let Some(body) = body {
+            command.args(["--data", body]);
+        }
+        let output = command.output().map_err(|error| error.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stderr).into_owned());
+        }
+        let output = String::from_utf8(output.stdout).map_err(|error| error.to_string())?;
+        let (response_body, status) = output
+            .rsplit_once('\n')
+            .ok_or_else(|| "HTTP probe status missing".to_owned())?;
+        Ok((
+            status.parse::<u16>().map_err(|error| error.to_string())?,
+            response_body.to_owned(),
+        ))
+    }
+
+    fn run_wrangler(app: &Path, arguments: &[&str]) {
+        let status = Command::new("corepack")
+            .args(["pnpm", "exec", "wrangler"])
+            .args(arguments)
+            .current_dir(app)
+            .env("CI", "true")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("wrangler must start");
+        assert!(status.success(), "wrangler command failed: {arguments:?}");
+    }
 
     struct ControlOnlyProvider {
         prepare_calls: AtomicUsize,
@@ -4570,6 +4642,392 @@ mod tests {
             allow_full_access_without_approval: explicit_full_never,
         }
     }
+
+    #[test]
+    fn node_service_and_wss_client_accelerated_idle_do_not_eagerly_resend_health() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = NodeStore::open(directory.path().join("store")).unwrap();
+        let identity = Arc::new(
+            DeviceIdentity::load_or_create(directory.path().join("identity/device.ed25519"))
+                .unwrap(),
+        );
+        let node = Arc::new(Node::new(store.clone()));
+        let local = Arc::new(LocalServices::open(directory.path().join("local"), [9; 32]).unwrap());
+        let supervisor = ProcessSupervisor::open(directory.path().join("supervisor")).unwrap();
+        let mut service = NodeService::new(
+            node,
+            identity,
+            "wss://control.example.invalid/connect".into(),
+            "dev_idle_socket_01".into(),
+            "aa".repeat(32),
+            "node-boot-idle-socket-0001".into(),
+            NodePolicyConfig {
+                local_policy: LocalPolicy {
+                    revision: 1,
+                    capabilities: vec![],
+                    providers: vec![],
+                    access_scopes: vec![],
+                    approval_modes: vec![],
+                    required_approval_risk_classes: vec![],
+                    launch_profiles: vec![],
+                    max_cpu: None,
+                    max_memory_bytes: None,
+                    max_storage_bytes: None,
+                    allow_full_access_without_approval: false,
+                },
+                profiles: HashMap::new(),
+            },
+            local,
+            supervisor,
+        )
+        .unwrap();
+        let mut session =
+            crate::transport::TransportSession::new(store.clone(), "dev_idle_socket_01".into(), 1)
+                .unwrap();
+        session.mark_reconciliation_complete();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        peer.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut server = tungstenite::WebSocket::from_raw_socket(
+            peer,
+            tungstenite::protocol::Role::Server,
+            None,
+        );
+        let mut client = WssClient::from_test_stream(stream, session, false);
+        let started = Instant::now();
+
+        assert!(
+            service
+                .queue_health_if_due_at(&mut client, true, started)
+                .unwrap()
+        );
+        assert_eq!(client.flush_unacknowledged(1).unwrap(), 1);
+
+        let mut sends_after_one_hour = 0_u64;
+        for tick in 1_u64..=24 * 60 * 60 * 10 {
+            let at = started + Duration::from_millis(tick * 100);
+            service
+                .queue_health_if_due_at(&mut client, false, at)
+                .unwrap();
+            assert_eq!(
+                client.flush_unacknowledged(1).unwrap(),
+                0,
+                "a live socket must not eagerly resend durable unacknowledged frames"
+            );
+            if tick == 60 * 60 * 10 {
+                sends_after_one_hour = 1 + tick / (10 * 60 * 10);
+            }
+        }
+
+        let mut socket_sends = 0_u64;
+        loop {
+            match server.read() {
+                Ok(tungstenite::Message::Text(_)) => socket_sends += 1,
+                Ok(other) => panic!("unexpected idle socket message: {other:?}"),
+                Err(tungstenite::Error::Io(error))
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    break;
+                }
+                Err(error) => panic!("idle socket read failed: {error}"),
+            }
+        }
+        let positions = store.transport_positions().unwrap();
+        assert_eq!(
+            sends_after_one_hour, 7,
+            "initial health plus six checkpoints"
+        );
+        assert_eq!(
+            socket_sends, 145,
+            "initial health plus 144 exact 10-minute replays"
+        );
+        assert_eq!(
+            positions.node_sent_through, 1,
+            "exact checkpoints allocate no rows"
+        );
+        assert_eq!(
+            positions.node_acknowledged_through, 0,
+            "the peer intentionally sent no ACK"
+        );
+    }
+
+    #[test]
+    #[ignore = "invoked by scripts/e2e-node-worker-idle.sh after Wrangler dependencies are installed"]
+    fn node_service_wss_worker_route_device_room_accelerated_idle_e2e() {
+        let directory = tempfile::tempdir().unwrap();
+        let app = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../apps/control-plane");
+        let persist = directory.path().join("wrangler-state");
+        let persist_text = persist.to_str().unwrap();
+        run_wrangler(
+            &app,
+            &[
+                "d1",
+                "migrations",
+                "apply",
+                "conduit-idle-e2e",
+                "--config",
+                "wrangler.idle-e2e.jsonc",
+                "--local",
+                "--persist-to",
+                persist_text,
+            ],
+        );
+
+        let identity = Arc::new(
+            DeviceIdentity::load_or_create(directory.path().join("identity/device.ed25519"))
+                .unwrap(),
+        );
+        let device_id = "dev_idle_route_e2e01";
+        let public_jwk = serde_json::json!({
+            "kty": "OKP",
+            "crv": "Ed25519",
+            "x": identity.public_key_base64url(),
+        });
+        let fingerprint = hex::encode(Sha256::digest(identity.verifying_key().as_bytes()));
+        let sql = format!(
+            "INSERT INTO device_enrollments(id,state,device_code_hash,user_code_hash,claims_json,requested_key_id,requested_public_jwk_json,requested_fingerprint,possession_challenge,possession_signature,assigned_device_id,created_at,expires_at,terminal_at) VALUES ('enroll_idle_route_e2e01','completed','{}','{}','{{}}','{}','{}','{}','challenge','signature','{}','2026-09-02T00:00:00.000Z','2026-09-03T00:00:00.000Z','2026-09-02T00:00:00.000Z');\
+             INSERT INTO devices(id,enrollment_id,display_label,os,arch,node_version,protocol_version,status,created_at,updated_at) VALUES ('{}','enroll_idle_route_e2e01','Synthetic idle E2E','linux','x86_64','0.1.0','conduit.node/1','active','2026-09-02T00:00:00.000Z','2026-09-02T00:00:00.000Z');\
+             INSERT INTO device_keys(id,device_id,public_jwk_json,fingerprint,status,created_at) VALUES ('{}','{}','{}','{}','active','2026-09-02T00:00:00.000Z');",
+            "11".repeat(32),
+            "22".repeat(32),
+            identity.key_id(),
+            public_jwk,
+            fingerprint,
+            device_id,
+            device_id,
+            identity.key_id(),
+            device_id,
+            public_jwk,
+            fingerprint,
+        );
+        run_wrangler(
+            &app,
+            &[
+                "d1",
+                "execute",
+                "conduit-idle-e2e",
+                "--config",
+                "wrangler.idle-e2e.jsonc",
+                "--local",
+                "--persist-to",
+                persist_text,
+                "--command",
+                &sql,
+            ],
+        );
+
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let origin = format!("http://127.0.0.1:{port}");
+        let child = Command::new("corepack")
+            .args([
+                "pnpm",
+                "exec",
+                "wrangler",
+                "dev",
+                "--config",
+                "wrangler.idle-e2e.jsonc",
+                "--local",
+                "--ip",
+                "127.0.0.1",
+                "--port",
+                &port.to_string(),
+                "--persist-to",
+                persist_text,
+                "--var",
+                &format!("PUBLIC_ORIGIN:{origin}"),
+                "--var",
+                &format!("OAUTH_ISSUER:{origin}"),
+                "--var",
+                "WEBAUTHN_RP_ID:127.0.0.1",
+            ])
+            .current_dir(&app)
+            .env("CI", "true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("Wrangler dev must start");
+        let _worker = ChildGuard(child);
+        let mut ready = false;
+        for _ in 0..300 {
+            if loopback_http(port, "GET", "/healthz", None).is_ok_and(|(status, _)| status == 200) {
+                ready = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        assert!(ready, "Wrangler idle E2E worker did not become ready");
+
+        let store = NodeStore::open(directory.path().join("store")).unwrap();
+        let node = Arc::new(Node::new(store.clone()));
+        let local = Arc::new(LocalServices::open(directory.path().join("local"), [7; 32]).unwrap());
+        let supervisor = ProcessSupervisor::open(directory.path().join("supervisor")).unwrap();
+        let mut service = NodeService::new(
+            node,
+            identity.clone(),
+            format!("ws://127.0.0.1:{port}/v1/devices/{device_id}/connect"),
+            device_id.into(),
+            "aa".repeat(32),
+            "node-boot-idle-route-e2e-0001".into(),
+            NodePolicyConfig {
+                local_policy: LocalPolicy {
+                    revision: 1,
+                    capabilities: vec![],
+                    providers: vec![],
+                    access_scopes: vec![],
+                    approval_modes: vec![],
+                    required_approval_risk_classes: vec![],
+                    launch_profiles: vec![],
+                    max_cpu: None,
+                    max_memory_bytes: None,
+                    max_storage_bytes: None,
+                    allow_full_access_without_approval: false,
+                },
+                profiles: HashMap::new(),
+            },
+            local,
+            supervisor,
+        )
+        .unwrap();
+        let mut client = WssClient::connect_loopback(
+            &service.control_url,
+            store.clone(),
+            &identity,
+            device_id,
+            &service.capability_digest,
+            &service.node_boot_id,
+        )
+        .unwrap();
+
+        let positions = store.transport_positions().unwrap();
+        client
+            .flush_unacknowledged(positions.node_acknowledged_through.saturating_add(1))
+            .unwrap();
+        let payload = json!({
+            "nodeBootId": service.node_boot_id,
+            "journalGeneration": store.journal_generation().unwrap().to_string(),
+            "capabilityDigest": service.capability_digest,
+            "lastControlSequenceApplied": "0",
+            "controlAppliedThrough": "0",
+            "lastNodeSequenceAcknowledged": "0",
+            "lastNodeSequenceRetained": "0",
+            "runs": [],
+            "retainedEventRanges": [],
+            "unresolvedCount": 0,
+            "truncated": false,
+            "storageHealth": "healthy"
+        });
+        let message_id = service.message_id();
+        client
+            .session
+            .queue_outbound(&message_id, "reconcile.summary", None, payload, 0)
+            .unwrap();
+        service.queue_health_if_due(&mut client, true).unwrap();
+        client.flush_unacknowledged(1).unwrap();
+
+        let mut reconciled = false;
+        for _ in 0..200 {
+            if let Some((frame, result)) = client.poll().unwrap() {
+                service.dispatch(&mut client, frame, result).unwrap();
+            }
+            service.flush_ack_if_due(&mut client, true).unwrap();
+            let positions = store.transport_positions().unwrap();
+            client
+                .flush_unacknowledged(positions.node_acknowledged_through.saturating_add(1))
+                .unwrap();
+            if client.session.remote_work_allowed() {
+                let positions = store.transport_positions().unwrap();
+                if positions.node_acknowledged_through == positions.node_sent_through {
+                    reconciled = true;
+                    break;
+                }
+            }
+        }
+        assert!(reconciled, "real Node/Worker reconciliation did not settle");
+        let node_sent_before_idle = store.transport_positions().unwrap().node_sent_through;
+
+        let simulated_start = 1_788_307_200_000_u64;
+        let reset_path = format!("/__idle-e2e/devices/{device_id}/reset");
+        let (status, _) = loopback_http(
+            port,
+            "POST",
+            &reset_path,
+            Some(&format!("{{\"nowMs\":{simulated_start}}}")),
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+        client.reset_application_sends();
+        let started = Instant::now();
+        let mut one_hour_sends = 0;
+        for tick in 1_u64..=24 * 60 * 60 * 10 {
+            if tick % (10 * 60 * 10) == 0 {
+                let now_ms = simulated_start + tick * 100;
+                let advance_path = format!("/__idle-e2e/devices/{device_id}/advance");
+                let (status, _) = loopback_http(
+                    port,
+                    "POST",
+                    &advance_path,
+                    Some(&format!("{{\"nowMs\":{now_ms}}}")),
+                )
+                .unwrap();
+                assert_eq!(status, 200);
+            }
+            service
+                .queue_health_if_due_at(
+                    &mut client,
+                    false,
+                    started + Duration::from_millis(tick * 100),
+                )
+                .unwrap();
+            let positions = store.transport_positions().unwrap();
+            assert_eq!(
+                client
+                    .flush_unacknowledged(positions.node_acknowledged_through.saturating_add(1),)
+                    .unwrap(),
+                0
+            );
+            if tick == 60 * 60 * 10 {
+                one_hour_sends = client.application_sends();
+            }
+        }
+        let inspect_path = format!("/__idle-e2e/devices/{device_id}/inspect");
+        let (status, body) = loopback_http(port, "GET", &inspect_path, None).unwrap();
+        assert_eq!(status, 200);
+        let probe: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(one_hour_sends, 6);
+        assert_eq!(client.application_sends(), 144);
+        assert_eq!(probe["incomingMessages"], 144);
+        assert_eq!(probe["inboundRows"], 6);
+        assert_eq!(probe["ackRows"], 1);
+        assert_eq!(probe["setAlarm"], 0);
+        assert_eq!(probe["alarmInvocations"], 0);
+        assert!(probe["alarmAt"].is_null());
+        assert_eq!(probe["d1"]["rowsWritten"], 72);
+        assert_eq!(probe["sqlRowsWritten"], 72);
+        assert_eq!(
+            store.transport_positions().unwrap().node_sent_through,
+            node_sent_before_idle,
+            "exact idle checkpoints must not allocate Node outbox rows"
+        );
+        println!(
+            "CONDUIT_NODE_WORKER_IDLE_E2E={}",
+            serde_json::json!({
+                "oneHourSocketSends": one_hour_sends,
+                "twentyFourHourSocketSends": client.application_sends(),
+                "deviceRoom": probe,
+            })
+        );
+    }
+
     #[test]
     fn local_policy_revision_is_independent_and_deny_precedes_connector() {
         let denied = policy(false);

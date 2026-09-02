@@ -576,13 +576,6 @@
         "deviceSignature": { "$ref": "#/$defs/Base64Url" }
       }
     },
-    "PrivilegePolicyAttestationPayload": {
-      "type": "object", "additionalProperties": false,
-      "required": ["requestId", "installationId", "revision", "previousRevision", "policyDigest", "previousPolicyDigest", "changeClass", "enabled", "allowNever", "allowUnrestrictedLaunch", "capabilityDigest", "helperKeyId", "helperSignature", "deviceKeyId", "deviceSignature", "observedAt"],
-      "properties": {
-        "requestId": { "type": "string", "pattern": "^phreq_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "installationId": { "type": "string", "pattern": "^phinst_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "revision": { "$ref": "#/$defs/U64Decimal" }, "previousRevision": { "$ref": "#/$defs/U64Decimal" }, "policyDigest": { "$ref": "#/$defs/Sha256Hex" }, "previousPolicyDigest": { "$ref": "#/$defs/Sha256Hex" }, "changeClass": { "enum": ["same", "narrowed", "broadened"] }, "enabled": { "type": "boolean" }, "allowNever": { "type": "boolean" }, "allowUnrestrictedLaunch": { "type": "boolean" }, "capabilityDigest": { "$ref": "#/$defs/Sha256Hex" }, "helperKeyId": { "type": "string", "pattern": "^hkey_[A-Za-z0-9][A-Za-z0-9_-]{7,127}$" }, "helperSignature": { "$ref": "#/$defs/Base64Url" }, "deviceKeyId": { "$ref": "#/$defs/DeviceKeyId" }, "deviceSignature": { "$ref": "#/$defs/Base64Url" }, "observedAt": { "$ref": "#/$defs/Timestamp" }
-      }
-    },
     "PrivilegeTicketRequestPayload": {
       "type": "object", "additionalProperties": false,
       "required": ["requestId", "idempotencyKey", "installationId", "deviceKeyId", "operationId", "runId", "runtimeId", "runtimeSpecDigest", "launchPlanDigest", "localExecutionPlanDigest", "controlRequestDigest", "runManifestDigest", "helperPolicyRevision", "helperPolicyDigest", "devicePolicyRevision", "approvalReceiptDigest", "approvalEnforcement", "allowedOperation", "resourceCeilings", "redactedSummary", "requestedAt", "expiresAt", "deviceSignature"],
@@ -991,7 +984,6 @@
             "device.health",
             "privilege.installation_attestation",
             "privilege.registration_result",
-            "privilege.policy_attestation",
             "privilege.ticket_request",
             "privilege.ticket_result",
             "privilege.receipt"
@@ -1082,10 +1074,6 @@
         {
           "if": { "properties": { "type": { "const": "privilege.registration_result" } }, "required": ["type"] },
           "then": { "properties": { "payload": { "$ref": "#/$defs/PrivilegeRegistrationResultPayload" } } }
-        },
-        {
-          "if": { "properties": { "type": { "const": "privilege.policy_attestation" } }, "required": ["type"] },
-          "then": { "properties": { "payload": { "$ref": "#/$defs/PrivilegePolicyAttestationPayload" } } }
         },
         {
           "if": { "properties": { "type": { "const": "privilege.ticket_request" } }, "required": ["type"] },

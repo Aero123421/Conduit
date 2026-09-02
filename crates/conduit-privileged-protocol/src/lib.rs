@@ -93,12 +93,9 @@ pub struct PrivilegeTicketClaims {
     pub ticket_id: String,
     pub issuer_kind: String,
     pub issuer_key_id: String,
-    pub issuer: String,
     pub audience: String,
     pub public_origin: String,
-    pub origin: String,
     pub helper_installation_id: String,
-    pub installation_id: String,
     pub helper_key_id: String,
     pub helper_policy_revision: u64,
     pub helper_policy_digest: String,
@@ -107,11 +104,9 @@ pub struct PrivilegeTicketClaims {
     pub device_policy_revision: u64,
     pub device_revision: u64,
     pub expected_uid: u32,
-    pub uid: u32,
     pub operation_id: String,
     pub idempotency_key_digest: String,
     pub operation_request_digest: String,
-    pub request_digest: String,
     pub run_manifest_digest: String,
     pub run_id: String,
     pub runtime_id: String,
@@ -133,30 +128,22 @@ pub struct PrivilegeTicketClaims {
     pub approval_receipt_digest: Option<String>,
     pub approval_enforcement: ApprovalEnforcement,
     pub required_approval_risk_classes: Vec<String>,
-    pub required_risk_classes: Vec<String>,
     pub allowed_operation: PrivilegedOperation,
     pub resource_ceilings: ResourceCeilings,
     pub issued_at: String,
-    pub not_before: String,
     pub expires_at: String,
     pub nonce: String,
     pub max_use_count: u16,
 }
 
 impl PrivilegeTicketClaims {
-    /// Enforce the canonical fields and their compatibility aliases before a
-    /// caller evaluates any action-specific authority.
+    /// Enforce the canonical claims before a caller evaluates any
+    /// action-specific authority.
     pub fn validate(&self, envelope_key_id: &str) -> Result<(), ProtocolError> {
         if self.schema_version != 1
             || self.protocol != PROTOCOL
             || self.issuer_kind != "control_plane"
             || self.issuer_key_id != envelope_key_id
-            || self.public_origin != self.origin
-            || self.helper_installation_id != self.installation_id
-            || self.expected_uid != self.uid
-            || self.operation_request_digest != self.request_digest
-            || self.required_approval_risk_classes != self.required_risk_classes
-            || self.issued_at != self.not_before
             || self.max_use_count != 1
             || self.device_revision == 0
             || self.device_policy_revision == 0

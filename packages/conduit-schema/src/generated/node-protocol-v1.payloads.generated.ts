@@ -151,7 +151,6 @@ export interface NodeProtocolPayloadCatalogV1 {
   "device.health": DeviceHealthPayload;
   "privilege.installation_attestation": PrivilegeInstallationAttestationPayload;
   "privilege.registration_result": PrivilegeRegistrationResultPayload;
-  "privilege.policy_attestation": PrivilegePolicyAttestationPayload;
   "privilege.ticket_request": PrivilegeTicketRequestPayload;
   "privilege.ticket_result": PrivilegeTicketResultPayload;
   "privilege.receipt": PrivilegeReceiptPayload;
@@ -603,24 +602,6 @@ export interface Ed25519PublicJwk {
   kty: "OKP";
   crv: "Ed25519";
   x: Base64Url;
-}
-export interface PrivilegePolicyAttestationPayload {
-  requestId: string;
-  installationId: string;
-  revision: U64Decimal;
-  previousRevision: U64Decimal;
-  policyDigest: Sha256Hex;
-  previousPolicyDigest: Sha256Hex;
-  changeClass: "same" | "narrowed" | "broadened";
-  enabled: boolean;
-  allowNever: boolean;
-  allowUnrestrictedLaunch: boolean;
-  capabilityDigest: Sha256Hex;
-  helperKeyId: string;
-  helperSignature: Base64Url;
-  deviceKeyId: DeviceKeyId;
-  deviceSignature: Base64Url;
-  observedAt: Timestamp;
 }
 export interface PrivilegeTicketRequestPayload {
   requestId: string;

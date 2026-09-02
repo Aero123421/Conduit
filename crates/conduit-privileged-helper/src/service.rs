@@ -980,15 +980,15 @@ impl<M: SystemdManager> HelperEngine<M> {
         let c = &ticket.claims;
         c.validate(&ticket.key_id)?;
         let now = OffsetDateTime::now_utc();
-        let not_before = parse_time(&c.not_before)?;
+        let not_before = parse_time(&c.issued_at)?;
         let expires_at = parse_time(&c.expires_at)?;
         if c.protocol != PROTOCOL
             || c.audience != "conduit-privileged-helper"
-            || c.installation_id != self.config.policy.installation_id
+            || c.helper_installation_id != self.config.policy.installation_id
             || c.device_id != self.config.policy.device_id
             || c.device_key_id != self.config.device_key_id
-            || c.uid != self.config.policy.uid
-            || c.origin != self.config.policy.origin
+            || c.expected_uid != self.config.policy.uid
+            || c.public_origin != self.config.policy.origin
             || c.helper_policy_revision != self.config.policy.revision
             || c.helper_policy_digest != self.config.policy_digest
             || c.helper_key_id != self.config.receipt_key_id
@@ -1007,7 +1007,8 @@ impl<M: SystemdManager> HelperEngine<M> {
             ) && c.approval_mode != "never"
                 && c.approval_receipt_digest.is_none())
             || (c.approval_mode == "never"
-                && (!c.required_risk_classes.is_empty() || c.approval_receipt_digest.is_some()))
+                && (!c.required_approval_risk_classes.is_empty()
+                    || c.approval_receipt_digest.is_some()))
             || !within_ceilings(&c.resource_ceilings, &self.config.policy.ceilings)
         {
             return Err(HelperError::Denied("privilege_ticket_invalid".into()));
@@ -1070,7 +1071,7 @@ impl<M: SystemdManager> HelperEngine<M> {
             ticket_id: c.ticket_id.clone(),
             ticket_digest: ticket.digest()?,
             operation_id: c.operation_id.clone(),
-            request_digest: c.request_digest.clone(),
+            request_digest: c.operation_request_digest.clone(),
             run_id: c.run_id.clone(),
             runtime_id: c.runtime_id.clone(),
             runtime_spec_digest: c.runtime_spec_digest.clone(),
@@ -1307,12 +1308,9 @@ mod tests {
                 ticket_id: id.into(),
                 issuer_kind: "control_plane".into(),
                 issuer_key_id: engine.config.policy.ticket_key_ids[0].clone(),
-                issuer: "https://issuer.test".into(),
                 audience: "conduit-privileged-helper".into(),
                 public_origin: engine.config.policy.origin.clone(),
-                origin: engine.config.policy.origin.clone(),
                 helper_installation_id: engine.config.policy.installation_id.clone(),
-                installation_id: engine.config.policy.installation_id.clone(),
                 helper_key_id: engine.config.receipt_key_id.clone(),
                 helper_policy_revision: engine.config.policy.revision,
                 helper_policy_digest: engine.config.policy_digest.clone(),
@@ -1321,11 +1319,9 @@ mod tests {
                 device_policy_revision: 1,
                 device_revision: 1,
                 expected_uid: engine.config.policy.uid,
-                uid: engine.config.policy.uid,
                 operation_id: plan.operation_id.clone(),
                 idempotency_key_digest: "11".repeat(32),
                 operation_request_digest: "22".repeat(32),
-                request_digest: "22".repeat(32),
                 run_manifest_digest: "66".repeat(32),
                 run_id: plan.run_id.clone(),
                 runtime_id: plan.runtime_id.clone(),
@@ -1354,11 +1350,9 @@ mod tests {
                 approval_receipt_digest: Some("55".repeat(32)),
                 approval_enforcement: ApprovalEnforcement::ExactCommand,
                 required_approval_risk_classes: vec![],
-                required_risk_classes: vec![],
                 allowed_operation: operation,
                 resource_ceilings: resources(),
                 issued_at: (now - time::Duration::seconds(5)).format(&Rfc3339).unwrap(),
-                not_before: (now - time::Duration::seconds(5)).format(&Rfc3339).unwrap(),
                 expires_at: (now + time::Duration::minutes(5)).format(&Rfc3339).unwrap(),
                 nonce: "nonce".into(),
                 max_use_count: 1,

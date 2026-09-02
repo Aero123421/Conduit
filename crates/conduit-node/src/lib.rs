@@ -152,7 +152,7 @@ impl VerifiedPrivilegedAdmission {
         let launch_digest = digest_jcs(&offer.launch)?;
         let idempotency_key_digest = hex::encode(Sha256::digest(offer.idempotency_key.as_bytes()));
         let now = OffsetDateTime::now_utc();
-        let not_before = OffsetDateTime::parse(&ticket.claims.not_before, &Rfc3339)
+        let not_before = OffsetDateTime::parse(&ticket.claims.issued_at, &Rfc3339)
             .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
         let expires_at = OffsetDateTime::parse(&ticket.claims.expires_at, &Rfc3339)
             .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
@@ -170,17 +170,15 @@ impl VerifiedPrivilegedAdmission {
             && helper.systemd_system_manager
             && helper.socket_peer_credentials
             && helper.transient_units
-            && claims.origin == expected_origin
             && claims.public_origin == expected_origin
-            && claims.installation_id == helper.installation_id
+            && claims.helper_installation_id == helper.installation_id
             && claims.helper_key_id == helper.receipt_key_id
             && claims.helper_policy_revision == helper.policy_revision
             && claims.helper_policy_digest == helper.policy_digest
             && claims.device_id == expected_device_id
-            && claims.uid == unsafe { libc::geteuid() }
+            && claims.expected_uid == unsafe { libc::geteuid() }
             && claims.operation_id == offer.operation_id
             && claims.idempotency_key_digest == idempotency_key_digest
-            && claims.request_digest == offer.request_digest
             && claims.operation_request_digest == offer.request_digest
             && claims.run_id == offer.runtime.run_id
             && claims.runtime_id == offer.runtime.runtime_id
@@ -315,7 +313,7 @@ impl Node {
             .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
         self.store.bind_privileged_operation(
             &offer.idempotency_key,
-            &ticket.claims.installation_id,
+            &ticket.claims.helper_installation_id,
             ticket.claims.helper_policy_revision,
             &ticket.claims.helper_policy_digest,
             &capability.claims.receipt_key_id,
@@ -1232,12 +1230,9 @@ mod tests {
                 ticket_id: "ptkt_test0001".into(),
                 issuer_kind: "control_plane".into(),
                 issuer_key_id: "pkey_test0001".into(),
-                issuer: "https://control.invalid".into(),
                 audience: "conduit-privileged-helper".into(),
                 public_origin: "https://control.invalid".into(),
-                origin: "https://control.invalid".into(),
                 helper_installation_id: "phinst_test0001".into(),
-                installation_id: "phinst_test0001".into(),
                 helper_key_id: "hkey_test0001".into(),
                 helper_policy_revision: 3,
                 helper_policy_digest: "22".repeat(32),
@@ -1246,13 +1241,11 @@ mod tests {
                 device_policy_revision: request.local_policy_revision,
                 device_revision: 1,
                 expected_uid: unsafe { libc::geteuid() },
-                uid: unsafe { libc::geteuid() },
                 operation_id: request.operation_id.clone(),
                 idempotency_key_digest: hex::encode(Sha256::digest(
                     request.idempotency_key.as_bytes(),
                 )),
                 operation_request_digest: request.request_digest.clone(),
-                request_digest: request.request_digest.clone(),
                 run_manifest_digest: "99".repeat(32),
                 run_id: request.runtime.run_id.clone(),
                 runtime_id: request.runtime.runtime_id.clone(),
@@ -1274,13 +1267,9 @@ mod tests {
                 approval_receipt_digest: None,
                 approval_enforcement: ApprovalEnforcement::ExactCommand,
                 required_approval_risk_classes: vec![],
-                required_risk_classes: vec![],
                 allowed_operation: PrivilegedOperation::Start,
                 resource_ceilings: resources,
                 issued_at: (observed - time::Duration::seconds(1))
-                    .format(&Rfc3339)
-                    .unwrap(),
-                not_before: (observed - time::Duration::seconds(1))
                     .format(&Rfc3339)
                     .unwrap(),
                 expires_at: (observed + time::Duration::minutes(1))

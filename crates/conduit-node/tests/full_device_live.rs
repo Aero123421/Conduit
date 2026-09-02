@@ -5,7 +5,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use conduit_adapters::{
     AdapterEventKind, AdapterKind, AdapterState, ApprovalBridgeOwnership, ApprovalContext,
     ApprovalRiskClassSet, EffectiveAccessScope, EffectiveApprovalPolicy, EffectiveSandboxPolicy,
-    LaunchRequest, ProtocolDriver, ProtocolFrame,
+    LaunchRequest, ProtocolDriver,
 };
 use conduit_node::privileged::PrivilegedNodeRuntime;
 use conduit_node_store::DeviceIdentity;
@@ -713,8 +713,6 @@ for line in sys.stdin:
         print(json.dumps({"method":"item/completed","params":{"item":{"id":"codex-item-live","type":"agentMessage","text":"bounded live fixture response"}}}),flush=True)
         print(json.dumps({"method":"turn/completed","params":{"turn":{"id":"codex-turn-live","status":{"type":"completed"}}}}),flush=True)
         print("bounded-live-stderr",file=sys.stderr,flush=True)
-    elif method == "test/exit":
-        break
 "#;
     let (mut plan, request) = case_plan(
         "codex_agent",
@@ -825,15 +823,6 @@ for line in sys.stdin:
     assert!(completed);
     assert_eq!(driver.state(), AdapterState::Completed);
 
-    queue_adapter_input(runtime, issuer, bundle, &plan, &request, 100);
-    managed
-        .io
-        .write_input(
-            &ProtocolFrame::json(&json!({"method":"test/exit"}))
-                .unwrap()
-                .0,
-        )
-        .unwrap();
     let mut stderr = Vec::new();
     for _ in 0..100 {
         let page = managed.io.read_stderr(stderr_cursor, 16 * 1024).unwrap();
@@ -845,29 +834,25 @@ for line in sys.stdin:
         thread::sleep(Duration::from_millis(20));
     }
     assert!(String::from_utf8_lossy(&stderr).contains("bounded-live-stderr"));
-    let mut terminal_signed = false;
-    for _ in 0..100 {
-        let reconciled = provider
-            .attach_reconciled_privileged(plan.clone(), request.spec_digest.clone())
-            .unwrap();
-        for receipt in &reconciled.helper_receipts {
-            receipt.verify(runtime.receipt_key()).unwrap();
-        }
-        if matches!(
-            reconciled.runtime.state,
-            RuntimeState::Stopped | RuntimeState::Failed
-        ) {
-            terminal_signed = true;
-            break;
-        }
-        thread::sleep(Duration::from_millis(20));
+    let stopped = stop(
+        provider,
+        issuer,
+        bundle,
+        &plan,
+        &request,
+        &managed.receipt.runtime.handle,
+        RuntimeSignal::GracefulStop,
+        "ptkt_live_codex_stop",
+    );
+    for receipt in &stopped.helper_receipts {
+        receipt.verify(runtime.receipt_key()).unwrap();
     }
-    assert!(terminal_signed);
     json!({
         "passed":true,"adapter":"codex","effectiveUid":0,
         "rootLivenessBeforePromptAcceptance":root_liveness_before_prompt,
         "promptAccepted":prompt_accepted,"assistantOutput":assistant_observed,
-        "agentSettled":completed,"stderr":true,"terminalReceiptVerified":terminal_signed
+        "agentSettled":completed,"explicitSessionClose":true,"stderr":true,
+        "terminalReceiptVerified":true
     })
 }
 

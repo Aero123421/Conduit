@@ -1,25 +1,4 @@
-import {
-  Ajv2020,
-  type ErrorObject,
-  type ValidateFunction,
-} from "ajv/dist/2020.js";
-import addFormatsModule from "ajv-formats";
-
-import authV1Schema from "./generated/auth-v1.schema.json" with {
-  type: "json",
-};
-import changeSetV1Schema from "./generated/changeset-v1.schema.json" with {
-  type: "json",
-};
-import nodeV1Schema from "./generated/node-protocol-v1.schema.json" with {
-  type: "json",
-};
-import runtimeV1Schema from "./generated/runtime-v1.schema.json" with {
-  type: "json",
-};
-import traceV1Schema from "./generated/trace-v1.schema.json" with {
-  type: "json",
-};
+import type { ErrorObject } from "ajv";
 import type { ConduitAuthenticationAndAuthorizationRecordsV1 } from "./generated/auth-v1.generated.js";
 import type { ConduitSessionBaselineAndChangeSetContractV1 } from "./generated/changeset-v1.generated.js";
 import type {
@@ -30,22 +9,20 @@ import type { NodeProtocolPayloadCatalogV1 } from "./generated/node-protocol-v1.
 import type { ConduitRuntimeProviderContractV1 } from "./generated/runtime-v1.generated.js";
 import type { ConduitRunManifestAndTraceRecordsV1 } from "./generated/trace-v1.generated.js";
 import {
-  parseAssignmentId,
-  parseAnyRunId,
-  parseBaselineId,
-  parseChangeSetId,
-  parseCollaborationSessionId,
-  parseDeviceId,
-  parseLocationId,
-  parseOperationId,
-  parseProjectId,
-  parseRuntimeId,
-  parseSha256Digest,
-  parseSourceId,
-  parseU64Decimal,
-  parseUtcTimestamp,
-  schemaIds,
-} from "./domain.js";
+  authV1 as authV1DomainValidator,
+  changeSetV1 as changeSetV1DomainValidator,
+  nodeV1 as nodeV1DomainValidator,
+  runtimeV1 as runtimeV1DomainValidator,
+  traceV1 as traceV1DomainValidator,
+} from "./generated/wire-domain-validators.generated.js";
+import {
+  authV1 as authV1SchemaValidator,
+  changeSetV1 as changeSetV1SchemaValidator,
+  nodeV1 as nodeV1SchemaValidator,
+  runtimeV1 as runtimeV1SchemaValidator,
+  traceV1 as traceV1SchemaValidator,
+} from "./generated/wire-schema-validators.generated.js";
+import { schemaIds } from "./domain.js";
 
 export type AuthV1WireDocument =
   ConduitAuthenticationAndAuthorizationRecordsV1;
@@ -100,6 +77,10 @@ export interface WireValidationIssue {
   readonly message: string;
 }
 
+type WireValidator = ((value: unknown) => boolean) & {
+  errors?: readonly ErrorObject[] | null;
+};
+
 export class WireValidationError extends TypeError {
   readonly schemaId: string;
   readonly layer: WireValidationLayer;
@@ -153,21 +134,10 @@ export class WireDocumentDecodeError extends TypeError {
   }
 }
 
-type JsonSchemaObject = {
-  $defs?: Record<string, JsonSchemaObject>;
-  format?: string;
-};
-
-const schemas = {
-  [schemaIds.authV1]: authV1Schema,
-  [schemaIds.nodeV1]: nodeV1Schema,
-  [schemaIds.traceV1]: traceV1Schema,
-  [schemaIds.runtimeV1]: runtimeV1Schema,
-  [schemaIds.changeSetV1]: changeSetV1Schema,
-} satisfies Record<WireSchemaId, unknown>;
+const wireSchemaIds = new Set<string>(Object.values(schemaIds));
 
 export function isWireSchemaId(value: string): value is WireSchemaId {
-  return Object.hasOwn(schemas, value);
+  return wireSchemaIds.has(value);
 }
 
 /** Runs only the checked-in JSON Schema, without the domain parser overlay. */
@@ -246,122 +216,35 @@ const maxDocumentBytes: Partial<Record<WireSchemaId, number>> = {
   [schemaIds.nodeV1]: MAX_NODE_PROTOCOL_DOCUMENT_BYTES,
 };
 
-function compileValidators(
-  withDomainFormats: boolean,
-): ReadonlyMap<WireSchemaId, ValidateFunction> {
-  const ajv = new Ajv2020({
-    allErrors: true,
-    allowUnionTypes: true,
-    strict: true,
-    strictRequired: false,
-  });
-  const addFormats = addFormatsModule as unknown as (
-    instance: Ajv2020,
-  ) => Ajv2020;
-  addFormats(ajv);
+// Ajv standalone output preserves the exact checked-in JSON Schema and domain
+// format validation without compiling dynamic functions inside a Worker.
+const schemaValidators = new Map<WireSchemaId, WireValidator>([
+  [schemaIds.authV1, authV1SchemaValidator],
+  [schemaIds.changeSetV1, changeSetV1SchemaValidator],
+  [schemaIds.nodeV1, nodeV1SchemaValidator],
+  [schemaIds.runtimeV1, runtimeV1SchemaValidator],
+  [schemaIds.traceV1, traceV1SchemaValidator],
+]);
+const domainValidators = new Map<WireSchemaId, WireValidator>([
+  [schemaIds.authV1, authV1DomainValidator],
+  [schemaIds.changeSetV1, changeSetV1DomainValidator],
+  [schemaIds.nodeV1, nodeV1DomainValidator],
+  [schemaIds.runtimeV1, runtimeV1DomainValidator],
+  [schemaIds.traceV1, traceV1DomainValidator],
+]);
 
-  if (withDomainFormats) {
-    for (const [format, parser] of Object.entries(domainFormats)) {
-      ajv.addFormat(format, {
-        type: "string",
-        validate: (value: string) => accepts(parser, value),
-      });
-    }
-  }
-
-  const preparedSchemas = new Map<WireSchemaId, JsonSchemaObject>();
-  for (const schemaId of Object.keys(schemas) as WireSchemaId[]) {
-    const schema = structuredClone(schemas[schemaId]) as JsonSchemaObject;
-    if (withDomainFormats) {
-      applyDomainFormats(schema);
-    }
-    preparedSchemas.set(schemaId, schema);
-    ajv.addSchema(schema, schemaId);
-  }
-
-  const validators = new Map<WireSchemaId, ValidateFunction>();
-  for (const schemaId of preparedSchemas.keys()) {
-    const validator = ajv.getSchema(schemaId);
-    if (validator === undefined) {
-      throw new TypeError(`failed to compile wire schema: ${schemaId}`);
-    }
-    validators.set(schemaId, validator);
-  }
-  return validators;
+function getSchemaValidators(): ReadonlyMap<WireSchemaId, WireValidator> {
+  return schemaValidators;
 }
 
-const domainFormats: Readonly<
-  Record<string, (value: unknown) => unknown>
-> = {
-  "conduit-assignment-id": parseAssignmentId,
-  "conduit-baseline-id": parseBaselineId,
-  "conduit-change-set-id": parseChangeSetId,
-  "conduit-collaboration-session-id": parseCollaborationSessionId,
-  "conduit-device-id": parseDeviceId,
-  "conduit-location-id": parseLocationId,
-  "conduit-operation-id": parseOperationId,
-  "conduit-project-id": parseProjectId,
-  "conduit-run-id": parseAnyRunId,
-  "conduit-runtime-id": parseRuntimeId,
-  "conduit-sha256": parseSha256Digest,
-  "conduit-source-id": parseSourceId,
-  "conduit-u64-decimal": parseU64Decimal,
-  "conduit-utc-timestamp": parseUtcTimestamp,
-};
-
-const formatByDefinition: Readonly<Record<string, string>> = {
-  AssignmentId: "conduit-assignment-id",
-  BaselineId: "conduit-baseline-id",
-  ChangeSetId: "conduit-change-set-id",
-  DeviceId: "conduit-device-id",
-  LocationId: "conduit-location-id",
-  OperationId: "conduit-operation-id",
-  ProjectId: "conduit-project-id",
-  RunId: "conduit-run-id",
-  RuntimeId: "conduit-runtime-id",
-  SessionId: "conduit-collaboration-session-id",
-  Sha256Hex: "conduit-sha256",
-  SourceId: "conduit-source-id",
-  Timestamp: "conduit-utc-timestamp",
-  U64Decimal: "conduit-u64-decimal",
-};
-
-let schemaValidators: ReadonlyMap<WireSchemaId, ValidateFunction> | undefined;
-let domainValidators: ReadonlyMap<WireSchemaId, ValidateFunction> | undefined;
-
-function getSchemaValidators(): ReadonlyMap<WireSchemaId, ValidateFunction> {
-  return (schemaValidators ??= compileValidators(false));
-}
-
-function getDomainValidators(): ReadonlyMap<WireSchemaId, ValidateFunction> {
-  return (domainValidators ??= compileValidators(true));
-}
-
-function applyDomainFormats(schema: JsonSchemaObject): void {
-  for (const [definitionName, format] of Object.entries(formatByDefinition)) {
-    const definition = schema.$defs?.[definitionName];
-    if (definition !== undefined) {
-      definition.format = format;
-    }
-  }
-}
-
-function accepts(
-  parser: (value: unknown) => unknown,
-  value: string,
-): boolean {
-  try {
-    parser(value);
-    return true;
-  } catch {
-    return false;
-  }
+function getDomainValidators(): ReadonlyMap<WireSchemaId, WireValidator> {
+  return domainValidators;
 }
 
 function getValidator(
-  validators: ReadonlyMap<WireSchemaId, ValidateFunction>,
+  validators: ReadonlyMap<WireSchemaId, WireValidator>,
   schemaId: WireSchemaId,
-): ValidateFunction {
+): WireValidator {
   const validator = validators.get(schemaId);
   if (validator === undefined) {
     throw new TypeError(`unknown wire schema: ${schemaId}`);

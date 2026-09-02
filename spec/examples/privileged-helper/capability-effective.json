@@ -1,0 +1,27 @@
+{
+  "keyId": "hkey_example0001",
+  "claims": {
+    "protocol": "conduit.privileged/1",
+    "helperVersion": "0.1.0",
+    "installationId": "phinst_example0001",
+    "receiptKeyId": "hkey_example0001",
+    "policyRevision": 1,
+    "policyDigest": "1111111111111111111111111111111111111111111111111111111111111111",
+    "enabled": true,
+    "observedAt": "2026-09-03T00:00:00Z",
+    "systemdSystemManager": true,
+    "socketPeerCredentials": true,
+    "transientUnits": true,
+    "cgroupV2": true,
+    "freeze": true,
+    "pidfd": true,
+    "openat2": true,
+    "execveat": true,
+    "pty": true,
+    "streamReplay": true,
+    "neverOptIn": false,
+    "unrestrictedLaunchOptIn": false,
+    "unavailableReason": null
+  },
+  "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+}

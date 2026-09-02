@@ -103,7 +103,34 @@ pub enum Commands {
         #[command(subcommand)]
         command: BackupCommand,
     },
+    /// Inspect or prepare the separately installed, root-owned Full Device helper.
+    Privileged {
+        #[command(subcommand)]
+        command: PrivilegedCommand,
+    },
     Doctor,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PrivilegedCommand {
+    /// Report the installed helper's public state without enabling authority.
+    Status,
+    /// Create a disabled helper identity and root-owned policy for this Device user.
+    Prepare(PrivilegedPrepareArgs),
+    /// Run bounded, secret-free installation and capability diagnostics.
+    Doctor,
+    /// Emit the public signed registration bundle for Owner approval.
+    RegistrationBundle,
+}
+
+#[derive(Debug, Args)]
+pub struct PrivilegedPrepareArgs {
+    #[arg(long)]
+    pub device_id: String,
+    #[arg(long)]
+    pub public_origin: String,
+    #[arg(long, value_name = "PATH")]
+    pub node_public_key_file: PathBuf,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -482,6 +509,9 @@ impl Commands {
             Self::Artifact { command } => artifact(command)?,
             Self::Storage { command } => storage(command)?,
             Self::Backup { command } => backup(command)?,
+            Self::Privileged { .. } => {
+                unreachable!("privileged commands are handled by the local helper dispatcher")
+            }
             Self::Doctor => unreachable!("doctor is handled before routing"),
         };
         Ok(invocation)
@@ -986,6 +1016,21 @@ mod tests {
             ["conduit", "connector", "list"].as_slice(),
             ["conduit", "storage", "list"].as_slice(),
             ["conduit", "backup", "verify"].as_slice(),
+            ["conduit", "privileged", "status"].as_slice(),
+            ["conduit", "privileged", "doctor"].as_slice(),
+            ["conduit", "privileged", "registration-bundle"].as_slice(),
+            [
+                "conduit",
+                "privileged",
+                "prepare",
+                "--device-id",
+                "dev_abcdefgh",
+                "--public-origin",
+                "https://control.example.test",
+                "--node-public-key-file",
+                "/tmp/node-public.key",
+            ]
+            .as_slice(),
             ["conduit", "doctor"].as_slice(),
         ] {
             Cli::try_parse_from(args).unwrap_or_else(|error| panic!("{args:?}: {error}"));

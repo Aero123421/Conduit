@@ -4,6 +4,7 @@ import { PublicError } from "../errors.ts";
 import type { ControlPlaneEnv } from "../types.ts";
 import { requireBrowserSession } from "./browser.ts";
 import { requestSourceHash } from "../abuse.ts";
+import { revokeDevicePrivileges } from "../privilege.ts";
 
 interface EnrollmentRow {
   id: string;
@@ -148,6 +149,7 @@ async function revokeDevice(request: Request, env: ControlPlaneEnv, deviceId: st
   const result = await env.DB.prepare("UPDATE devices SET status='revoked',revoked_at=?1,updated_at=?1,revision=revision+1 WHERE id=?2 AND status<>'revoked'").bind(now, deviceId).run();
   if (result.meta.changes !== 1) throw new PublicError("not_found", 404, "Active Device not found");
   await env.DB.prepare("UPDATE device_keys SET status='revoked',revoked_at=?1 WHERE device_id=?2 AND status<>'revoked'").bind(now, deviceId).run();
+  await revokeDevicePrivileges(env, deviceId, now);
   await env.DEVICE_ROOMS.getByName(deviceId).revoke("device_revoked");
   await repo.audit("device.revoked", { terminateManagedRunsRequested: record(await readJsonBounded(request)).terminateManagedRuns === true }, session.principal_id, undefined, deviceId);
   return new Response(null, { status: 204 });

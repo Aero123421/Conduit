@@ -8,7 +8,7 @@ use conduit_adapters::AdapterCatalog;
 use conduit_core::{CONFIG_SCHEMA_VERSION, FEATURE_REGISTRY_VERSION};
 use serde_json::{Value, json};
 
-use crate::CliError;
+use crate::{CliError, privileged};
 
 const MAX_PROBE_OUTPUT_BYTES: usize = 16 * 1024;
 
@@ -43,6 +43,7 @@ pub(crate) fn collect() -> Result<Value, CliError> {
         },
         "hostPrerequisites": providers,
         "agentAdapters": AdapterCatalog::discover_all(),
+        "privilegedHelper": privileged::doctor_probe(),
         "liveVerification": {
             "performed": false,
             "reason": "doctor probes binaries and versions only; provider lifecycle and paid Agent inference are opt-in"

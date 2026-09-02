@@ -4,6 +4,7 @@ use conduit_node::{
     ipc::IpcServer,
     local::LocalServices,
     local_ipc::LocalIpcService,
+    privileged::PrivilegedNodeRuntime,
     service::{NodeService, load_launch_profiles},
     startup::{open_store_with_pending_restore, prepare_data_root},
 };
@@ -24,6 +25,8 @@ struct Options {
     launch_profiles: PathBuf,
     control_url: Option<String>,
     device_id: Option<String>,
+    privileged_socket: Option<PathBuf>,
+    privileged_registration_bundle: Option<PathBuf>,
 }
 fn main() {
     if let Err(e) = run() {
@@ -49,6 +52,8 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut profiles = None;
     let mut control = None;
     let mut device = None;
+    let mut privileged_socket = None;
+    let mut privileged_registration_bundle = None;
     while let Some(a) = args.next() {
         match a.to_str() {
             Some("--data-dir") => data = args.next().map(PathBuf::from),
@@ -56,6 +61,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             Some("--launch-profiles") => profiles = args.next().map(PathBuf::from),
             Some("--control-url") => control = args.next().and_then(|v| v.into_string().ok()),
             Some("--device-id") => device = args.next().and_then(|v| v.into_string().ok()),
+            Some("--privileged-socket") => privileged_socket = args.next().map(PathBuf::from),
+            Some("--privileged-registration-bundle") => {
+                privileged_registration_bundle = args.next().map(PathBuf::from)
+            }
             Some("--help") => {
                 print_help();
                 return Ok(());
@@ -63,7 +72,12 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err("unknown or incomplete serve argument".into()),
         }
     }
-    let opts = defaults(data, socket, profiles, control, device)?;
+    let mut opts = defaults(data, socket, profiles, control, device)?;
+    if privileged_socket.is_some() != privileged_registration_bundle.is_some() {
+        return Err("privileged socket and registration bundle must be configured together".into());
+    }
+    opts.privileged_socket = privileged_socket;
+    opts.privileged_registration_bundle = privileged_registration_bundle;
     serve(opts)
 }
 fn defaults(
@@ -93,6 +107,8 @@ fn defaults(
         launch_profiles,
         control_url,
         device_id,
+        privileged_socket: None,
+        privileged_registration_bundle: None,
     })
 }
 fn xdg(primary: &str, fallback: Option<(&str, &str)>) -> PathBuf {
@@ -121,12 +137,19 @@ fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
     if let Some(device_id) = opts.device_id.as_ref() {
         local.bind_device(DeviceId::parse(device_id.clone())?)?;
     }
-    let _credentials = CredentialStore::open(
+    let credentials = Arc::new(CredentialStore::open(
         store.clone(),
         data_root.join("credentials/master.dek"),
         data_root.join("credentials/projections"),
-    )?;
+    )?);
     let supervisor = ProcessSupervisor::open(data_root.join("supervisor"))?;
+    let boot = fs_text("/proc/sys/kernel/random/boot_id").unwrap_or_else(|| {
+        format!(
+            "node-{}-{}",
+            std::process::id(),
+            &hex::encode(Sha256::digest(identity.sign(b"conduit.node.boot.v1")))[..16]
+        )
+    });
     let native: Arc<dyn RuntimeProvider> = Arc::new(NativeProvider::new(supervisor.clone()));
     let restricted: Arc<dyn RuntimeProvider> = Arc::new(RestrictedNativeProvider::new(
         supervisor.clone(),
@@ -145,7 +168,27 @@ fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         "conduit",
         data_root.join("runtime/incus"),
     )?);
-    let providers = vec![native, restricted, docker, podman, incus];
+    let mut providers = vec![native, restricted, docker, podman, incus];
+    let privileged = match (
+        opts.privileged_socket.as_deref(),
+        opts.privileged_registration_bundle.as_deref(),
+        opts.device_id.as_deref(),
+    ) {
+        (Some(socket), Some(bundle), Some(device_id)) => {
+            match PrivilegedNodeRuntime::connect(socket, bundle, device_id, &boot, &identity) {
+                Ok(runtime) => {
+                    let provider: Arc<dyn RuntimeProvider> = runtime.provider();
+                    providers.push(provider);
+                    Some(runtime)
+                }
+                Err(error) => {
+                    eprintln!("conduit-node privileged capability unavailable: {error}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
     let mut node = Node::new(store.clone());
     for p in &providers {
         node.register_provider(p.clone())
@@ -155,9 +198,7 @@ fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
         let config = load_launch_profiles(&opts.launch_profiles)?;
         let receipts = providers.iter().map(|p| p.probe().ok()).collect::<Vec<_>>();
         let capability_digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&receipts)?));
-        let boot = fs_text("/proc/sys/kernel/random/boot_id")
-            .unwrap_or_else(|| format!("node-{}-{}", std::process::id(), capability_digest));
-        let service = NodeService::new(
+        let mut service = NodeService::new(
             node.clone(),
             identity.clone(),
             url,
@@ -167,7 +208,11 @@ fn serve(opts: Options) -> Result<(), Box<dyn std::error::Error>> {
             config,
             local.clone(),
             supervisor.clone(),
-        )?;
+        )?
+        .with_credential_store(credentials.clone());
+        if let Some(privileged) = privileged {
+            service = service.with_privileged(privileged);
+        }
         std::thread::spawn(move || service.run_forever());
     }
     let server = IpcServer::bind(opts.socket)?;
@@ -189,6 +234,6 @@ fn fs_text(path: impl AsRef<Path>) -> Option<String> {
 }
 fn print_help() {
     println!(
-        "usage: conduit-node serve [--data-dir PATH] [--socket PATH] [--launch-profiles PATH] [--control-url WSS_URL --device-id DEVICE_ID]"
+        "usage: conduit-node serve [--data-dir PATH] [--socket PATH] [--launch-profiles PATH] [--control-url WSS_URL --device-id DEVICE_ID] [--privileged-socket PATH --privileged-registration-bundle PATH]"
     )
 }

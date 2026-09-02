@@ -93,3 +93,5 @@ jobs:
           toolchain: 1.92.0
       - uses: Swatinem/rust-cache@v2
       - run: ./scripts/test-packaging.sh
+      - run: cargo build --locked --release -p conduit-privileged-helper --bins
+      - run: ./scripts/test-privileged-packaging.sh

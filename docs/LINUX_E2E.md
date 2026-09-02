@@ -80,8 +80,10 @@ account.
     storage and offline network prerequisites effective.
 15. **Broad access:** local-policy tests require `full_user + never` to be
     explicitly enabled and retain admission and audit receipts. `full_device`
-    must return `full_device_capability_unavailable` until the privileged helper
-    is implemented and packaged. The Device-local deny remains final.
+    returns `full_device_capability_unavailable` unless the installed helper,
+    root policy, active registration, exact ticket, systemd custody and verified
+    receipt chain are effective. The Device-local and root-local denials remain
+    final, and no Full User fallback is permitted.
 16. **MCP parity and ceilings:** Miniflare negotiates the strict modern MCP
     envelope over authenticated HTTP, lists the typed long-operation tools and
     invokes a read tool through OAuth resource binding, immutable policy
@@ -119,6 +121,79 @@ Record these separately for each host and deployment:
 
 Do not attach Device databases, canonical private paths, credentials, raw
 prompts, hidden reasoning or unredacted logs to public evidence.
+
+## Full Device live root E2E
+
+`scripts/e2e-full-device-live.sh` is separate from ordinary CI. It runs reviewed
+code as root and is restricted by default to the dedicated `sahur-pc` host. It
+refuses a dirty checkout, commit mismatch, existing privileged-helper
+installation, missing systemd/cgroup-v2 support, or unavailable non-interactive
+local root authorization. It never substitutes a fake helper for a missing
+prerequisite.
+
+The test requires an HTTPS public-origin identity for the isolated per-run
+Control Plane fixture and an isolated Device ID:
+
+```sh
+export CONDUIT_FULL_DEVICE_E2E_CONTROL_URL=https://isolated-test.example
+export CONDUIT_FULL_DEVICE_E2E_DEVICE_ID=dev_...
+export CONDUIT_FULL_DEVICE_E2E_EXPECTED_COMMIT="$(git rev-parse HEAD)"
+./scripts/e2e-full-device-live.sh \
+  --i-understand-this-runs-reviewed-code-as-root
+```
+
+An optional `CONDUIT_FULL_DEVICE_E2E_CONTROL_CREDENTIAL_FILE` must be an
+absolute regular file owned by the Device user with mode `0600`. The script does
+not print or copy its contents.
+
+The orchestrator builds the exact commit, copies package inputs into a new
+root-owned staging directory, installs production paths, creates a helper
+installation through the installed admin binary, and then runs the ignored
+integration target in two mandatory phases:
+
+```sh
+cargo test --locked -p conduit-node --test full_device_live -- \
+  --ignored --exact full_device_live_systemd_root_e2e --nocapture
+```
+
+The script starts a per-run loopback Wrangler fixture with its own Worker
+isolate, D1 files, and DeviceRoom storage. The `registration` phase activates
+the fixture issuer through the production privilege-admin implementation,
+approves the exact helper registration under the fixture's isolated test
+authority, and writes the bounded public issuer key. It records
+`freshPasskey=false`; this path is the explicitly isolated cryptographic test
+deployment allowed by the implementation task, not evidence that a browser
+Passkey ceremony occurred. The script then invokes the
+installed root-owned helper to pin that exact key and, as a separate command,
+enable the root policy. Only after both root receipts are checked does it enable
+the real sequential-packet socket and enter the `exercise` phase. Remote routes
+cannot perform either root action.
+
+The driver receives only the documented `CONDUIT_FULL_DEVICE_E2E_*` paths,
+identifiers, and phase values. One exact-command case uses tickets issued by
+the Worker from durable D1 authority, crosses a token-gated DeviceRoom RPC with
+the Device-signed frames, executes through the installed helper and real system
+systemd, and projects the signed helper receipt chain back into D1. This proves
+the Worker/D1/DeviceRoom/helper/systemd integration, but it does not claim the
+production DeviceRoom WebSocket handshake was exercised; that remains a
+separate transport test. The remaining cases exercise signed tickets and
+receipts, exact argv and I/O, PTY, controls, root
+marker confinement, same-user denial, Node/helper restart, response-loss replay,
+the root-owned `never` opt-in plus a Control-Plane-issued `never` launch after
+server policy permits it, structured Agent separation, update/rollback with
+live custody, and active-run uninstall refusal. It writes a bounded sanitized
+`driver-summary.json` and leaves zero active elevated Runtimes.
+
+After the driver returns, the orchestrator records bounded package-status and
+`systemd-analyze security` evidence, verifies preservation uninstall, reinstalls,
+performs the explicit E2E purge, and checks every managed path is absent. If
+terminal custody cannot be proven during failure cleanup, it retains root-owned
+staging for explicit recovery instead of blindly deleting custody state.
+
+Public PR evidence may include the commit, generic host label, OS/kernel/systemd
+versions, protocol versions, counts, bounded reason codes, and receipt digests.
+It must omit user names, home paths, machine/boot IDs, hardware serials, IP
+addresses, credentials, local canonical paths, raw prompts, and private state.
 
 A sanitized remote Cloudflare execution record is available in
 [`CLOUDFLARE_E2E_REPORT.md`](CLOUDFLARE_E2E_REPORT.md).

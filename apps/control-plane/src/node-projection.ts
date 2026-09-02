@@ -2,6 +2,7 @@ import type { NodeV1PostAuthFrame } from "@conduit/schema";
 import { canonicalJson, newId, nowIso } from "./crypto.ts";
 import { ensureOperationConcurrencyReleased } from "./dispatch.ts";
 import type { ControlPlaneEnv } from "./types.ts";
+import { requireVerifiedPrivilegeReceipt } from "./privilege.ts";
 
 type ProjectedType = "operation.admission" | "operation.status" | "runtime.control_result" | "device.health";
 type ProjectableFrame = Extract<NodeV1PostAuthFrame, { type: ProjectedType }>;
@@ -154,6 +155,7 @@ async function projectAdmission(env: ControlPlaneEnv, frame: Extract<Projectable
     await rejectProjection(env, frame, operation.id, "admission_decision_invalid");
     return [];
   }
+  if (next === "admitted") await requireVerifiedPrivilegeReceipt(env, { operationId: operation.id, deviceId: frame.deviceId, runId: operation.run_id, requestDigest: operation.payload_digest, receiptDigest: data.privilegeReceiptDigest, transition: "admission", runtimeId: data.targetRuntimeId, controllerEpoch: data.controllerEpoch });
   const currentAllowed = next === "admitted" ? ["queued", "offered", "admitted"] : ["queued", "offered", "admitted", "claimed"];
   if (!currentAllowed.includes(operation.state) && operation.state !== next) {
     await rejectProjection(env, frame, operation.id, "admission_transition_reordered");
@@ -224,6 +226,8 @@ async function projectStatus(env: ControlPlaneEnv, frame: Extract<ProjectableFra
     await rejectProjection(env, frame, operation.id, "status_transition_reordered");
     return [];
   }
+  const privilegeTransition = ["completed", "failed", "cancelled", "timed_out", "lost", "uncertain", "recovery_required"].includes(state) ? "terminal" : ["starting", "reserved", "admitted"].includes(state) ? "admission" : "running";
+  await requireVerifiedPrivilegeReceipt(env, { operationId: operation.id, deviceId: frame.deviceId, runId: operation.run_id, requestDigest: operation.payload_digest, receiptDigest: data.privilegeReceiptDigest, transition: privilegeTransition, runtimeId: data.targetRuntimeId, controllerEpoch });
   const now = nowIso();
   const resultJson = projectionResult(frame, data);
   const statements: D1PreparedStatement[] = [
@@ -312,6 +316,7 @@ async function projectRuntimeControl(env: ControlPlaneEnv, frame: Extract<Projec
     await rejectProjection(env, frame, operation.id, "stale_connection_epoch");
     return [];
   }
+  await requireVerifiedPrivilegeReceipt(env, { operationId: operation.id, deviceId: frame.deviceId, runId: operation.run_id, requestDigest: operation.payload_digest, receiptDigest: data.privilegeReceiptDigest, transition: "control", runtimeId: data.targetRuntimeId, controllerEpoch: data.targetControllerEpoch });
   const now = nowIso();
   const state = String(data.state ?? "uncertain");
   const resultJson = projectionResult(frame, data);

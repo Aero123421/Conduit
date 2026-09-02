@@ -179,6 +179,7 @@ export class RetryScheduler extends DurableObject<ControlPlaneEnv> {
           OR EXISTS(SELECT 1 FROM realtime_delivery_receipts WHERE expires_at<=?1)
           OR EXISTS(SELECT 1 FROM operation_dispatch_outbox WHERE state='expired' AND expires_at<=?3)
           OR EXISTS(SELECT 1 FROM approval_dispatch_outbox WHERE state IN ('offered','expired') AND expires_at<=?3)
+          OR EXISTS(SELECT 1 FROM privilege_ticket_requests WHERE status IN ('denied','expired','conflict') AND COALESCE(terminal_at,expires_at)<=?3)
         THEN ?1 ELSE NULL END AS due_at
       `).bind(at, new Date(now.getTime() - 86_400_000).toISOString(), new Date(now.getTime() - 7 * 86_400_000).toISOString()),
     ]);

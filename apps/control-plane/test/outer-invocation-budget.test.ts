@@ -138,7 +138,8 @@ describe.sequential("outer invocation D1 budgets", () => {
     const room = env.DEVICE_ROOMS.getByName(deviceId);
     const frames = await Promise.all(Array.from({ length: 32 }, async (_, offset) => {
       const sequence = offset + 1;
-      const payload = await eventBatch(runId, deviceId, sequence);
+      const queuePayload = await eventBatch(runId, deviceId, sequence);
+      const { deviceId: _queueRoutingDeviceId, ...payload } = queuePayload;
       return {
         protocol: "conduit.node/1",
         messageId: `nmsg_outer_alarm_${sequence.toString().padStart(8, "0")}`,

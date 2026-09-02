@@ -376,6 +376,31 @@ The MCP client cannot raise its own ceiling. Granting a connector `full_device` 
 
 Enabling host elevation on a device is a separate local setup step. A remote grant cannot install or enable the elevation helper by itself.
 
+Native host `full_device` adds two independent authorization authorities. The
+Control Plane issues a short-lived, one-use `conduit.privilege-ticket/1` only
+after resolving the stored Operation, Run, Assignment, Project Agent, Device,
+Connector Policy, Device policy, helper registration, and approval records. The
+root helper independently evaluates its root-owned policy. Either authority may
+deny; neither can broaden the other.
+
+The ticket is not a bearer grant for a Runtime family. It commits the public
+origin, signing key, helper installation and receipt key, expected UID, Device
+and Device key, Operation and idempotency digests, Run Manifest, Run and Runtime,
+Runtime Spec and launch plan, Device/Connector/Project/Agent/runtime-policy
+revisions, controller epoch, exact allowed operation, resource ceilings, and
+approval evidence. Input, PTY resize, pause, resume, graceful stop, and force
+stop additionally commit the exact control-request digest. The helper durably
+consumes the ticket before asking systemd to act. A same-ID/same-digest retry
+replays the stored result; a conflicting digest is denied.
+
+Helper registration is a fresh-owner-Passkey action over an already-installed
+local helper. The submitted Device-signed bundle contains the root-policy
+attestation, signed capability probe, and receipt public key. The Control Plane
+does not accept a Node capability assertion in their place. Policy broadening
+returns the installation to owner review; narrowing or revocation prevents new
+tickets immediately. OAuth tokens, browser cookies, Device keys, privilege
+ticket keys, and helper receipt keys remain separate identities.
+
 ## Effective authorization
 
 The effective authority for an operation is the intersection of:

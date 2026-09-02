@@ -42,6 +42,9 @@ describe("Cloudflare usage profile and measurement harness", () => {
     expect(() => assertFreeD1Ceilings({ ...snapshot, statements: 41 })).toThrow(/statement budget/);
     expect(() => assertFreeD1Ceilings({ ...snapshot, bindingCalls: 41 })).toThrow(/binding-call budget/);
     expect(() => assertFreeD1Ceilings({ ...snapshot, maxBoundParameters: 91 })).toThrow(/parameter budget/);
+    expect(() => assertFreeD1Ceilings({ ...snapshot, rowsRead: 11 }, { rowsRead: 10, rowsWritten: 10 })).toThrow(/row-read budget/);
+    expect(() => assertFreeD1Ceilings({ ...snapshot, rowsWritten: 11 }, { rowsRead: 10, rowsWritten: 10 })).toThrow(/row-write budget/);
+    expect(() => assertFreeD1Ceilings(snapshot, { rowsRead: -1, rowsWritten: 10 })).toThrow(/finite non-negative/);
   });
 
   it("counts Queue 64 KiB chunks, retries, and DLQ operations", () => {

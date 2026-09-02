@@ -1,0 +1,58 @@
+[Unit]
+Description=Conduit networkless privileged helper for UID %i
+Documentation=https://github.com/Aero123421/Conduit
+Requires=conduit-privileged-helper@%i.socket
+After=conduit-privileged-helper@%i.socket dbus.service
+StartLimitIntervalSec=30
+StartLimitBurst=5
+
+[Service]
+Type=exec
+User=root
+Group=root
+ExecStart=@LIBEXECDIR@/conduit-privileged-helper serve --expected-uid %i
+Restart=on-failure
+RestartSec=2s
+TimeoutStartSec=30s
+TimeoutStopSec=30s
+KillMode=control-group
+UMask=0077
+
+# The helper receives local AF_UNIX records and uses the system D-Bus socket.
+# It never needs an IP network namespace.
+PrivateNetwork=yes
+RestrictAddressFamilies=AF_UNIX
+NoNewPrivileges=yes
+
+# Root-owned code and policy are read-only. Only helper custody directories are
+# writable; elevated target units are separate and intentionally do not inherit
+# this helper-service sandbox.
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+# systemd 255 implements RestrictSUIDSGID with a syscall filter that also
+# returns ENOSYS for openat2 on supported kernels. The helper requires openat2
+# for fail-closed path resolution, so keep this setting disabled and verify the
+# effective sandbox plus helper capabilities in the live root E2E.
+LockPersonality=yes
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+ConfigurationDirectory=conduit/privileged-helper.d
+ConfigurationDirectoryMode=0700
+StateDirectory=conduit/privileged-helper
+StateDirectoryMode=0700
+ReadOnlyPaths=/etc/conduit/privileged-helper.d
+ReadWritePaths=/var/lib/conduit/privileged-helper /run/conduit/privileged
+
+LimitNOFILE=1024
+TasksMax=64
+MemoryMax=256M

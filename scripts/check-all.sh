@@ -39,4 +39,6 @@ fi
 
 cargo metadata --locked --format-version 1 >/dev/null
 "$conduit_root/scripts/test-packaging.sh"
+cargo build --locked --release -p conduit-privileged-helper --bins
+"$conduit_root/scripts/test-privileged-packaging.sh"
 "$conduit_root/scripts/e2e-linux.sh"

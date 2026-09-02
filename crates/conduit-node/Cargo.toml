@@ -12,10 +12,13 @@ conduit-domain = { path = "../conduit-domain" }
 conduit-node-store = { path = "../conduit-node-store" }
 conduit-observability = { path = "../conduit-observability" }
 conduit-protocol = { path = "../conduit-protocol" }
+conduit-privileged-helper = { path = "../conduit-privileged-helper" }
+conduit-privileged-protocol = { path = "../conduit-privileged-protocol" }
 conduit-runtime = { path = "../conduit-runtime" }
 conduit-workspace = { path = "../conduit-workspace" }
 hex = "=0.4.3"
 libc = "=0.2.189"
+ed25519-dalek = "=2.2.0"
 serde = { version = "=1.0.229", features = ["derive"] }
 serde_jcs = "=0.2.0"
 serde_json = "=1.0.151"
@@ -26,5 +29,6 @@ tungstenite = { version = "=0.28.0", features = ["rustls-tls-native-roots"] }
 url = "=2.5.7"
 
 [dev-dependencies]
+getrandom = "=0.3.4"
 rusqlite = { version = "=0.37.0", features = ["bundled"] }
 tempfile = "=3.23.0"

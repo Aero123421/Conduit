@@ -32,10 +32,10 @@ describe.sequential("control-plane contracts", () => {
 
   it("applies forward D1 migrations", async () => {
     const version = await env.DB.prepare("SELECT version FROM schema_versions WHERE component='control_plane'").first<{ version: number }>();
-    expect(version?.version).toBe(13);
+    expect(version?.version).toBe(14);
     const tables = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table'").all<{ name: string }>();
     const names = new Set(tables.results.map((row) => row.name));
-    for (const required of ["owner_principals", "oauth_grants", "connector_policies", "devices", "projects", "collaboration_sessions", "runs", "operation_journal", "operation_dispatch_outbox", "approval_dispatch_outbox", "assignment_run_bindings", "context_snapshots", "runtime_custody", "agent_sessions", "node_projection_receipts", "realtime_projection_outbox", "realtime_delivery_receipts", "retention_cleanup_state", "change_sets", "reviews", "baseline_revisions", "artifacts", "normalized_events", "security_events"]) expect(names.has(required)).toBe(true);
+    for (const required of ["owner_principals", "oauth_grants", "connector_policies", "devices", "projects", "collaboration_sessions", "runs", "operation_journal", "operation_dispatch_outbox", "approval_dispatch_outbox", "assignment_run_bindings", "context_snapshots", "runtime_custody", "agent_sessions", "node_projection_receipts", "realtime_projection_outbox", "realtime_delivery_receipts", "retention_cleanup_state", "device_privilege_installations", "privilege_registration_attestations", "privilege_installation_keys", "privilege_policy_attestations", "device_user_policy_attestations", "privilege_ticket_requests", "privilege_ticket_issuance", "privilege_receipt_projections", "privilege_issuer_keys", "change_sets", "reviews", "baseline_revisions", "artifacts", "normalized_events", "security_events"]) expect(names.has(required)).toBe(true);
   });
 
   it("keeps security events immutable", async () => {
@@ -130,7 +130,7 @@ describe.sequential("control-plane contracts", () => {
       env.DB.prepare("INSERT INTO devices(id,enrollment_id,display_label,os,arch,node_version,protocol_version,status,created_at,updated_at) VALUES (?1,?2,'test','linux','x86_64','0.1.0','conduit.node/1','active',?3,?3)").bind(deviceId, enrollmentId, now),
       env.DB.prepare("INSERT INTO device_keys(id,device_id,public_jwk_json,fingerprint,status,created_at) VALUES (?1,?2,?3,?4,'active',?5)").bind(keyId, deviceId, JSON.stringify(publicJwk), "c".repeat(64), now),
     ]);
-    const response = await exports.default.fetch(new Request(`https://conduit.example.com/v1/devices/${deviceId}/connect`, { headers: { upgrade: "websocket" } }));
+    const response = await exports.default.fetch(new Request(`https://conduit.example.com/api/v1/devices/${deviceId}/connect`, { headers: { upgrade: "websocket" } }));
     expect(response.status).toBe(101);
     const socket = response.webSocket!;
     socket.accept();
@@ -384,9 +384,12 @@ describe.sequential("control-plane contracts", () => {
       concurrentReceipts: state.storage.sql.exec<{ count: number }>("SELECT COUNT(*) AS count FROM outbound_message_receipts WHERE message_id='cmsg_control_replay_concurrent'").one().count,
     }))).toEqual({ controlStored: 43, concurrentFrames: 0, concurrentReceipts: 0 });
     await second.send(4, "reconcile.summary", { nodeBootId: "node-boot-control-replay-0002", journalGeneration: "1", capabilityDigest: "4".repeat(64), lastControlSequenceApplied: "3", lastNodeSequenceAcknowledged: "3", lastNodeSequenceRetained: "4", runs: [], retainedEventRanges: [], unresolvedCount: 0, truncated: false, storageHealth: "healthy" }, second.accepted.connectionId);
-    const reconnectMessages = [parseWireDocumentText(schemaIds.nodeV1, await second.next()), parseWireDocumentText(schemaIds.nodeV1, await second.next())];
+    const reconnectMessages = [];
+    for (let index = 0; index < 42; index += 1) reconnectMessages.push(parseWireDocumentText(schemaIds.nodeV1, await second.next()));
+    expect(reconnectMessages.slice(0, 40).map((frame) => "sequence" in frame ? frame.sequence : null)).toEqual(Array.from({ length: 40 }, (_, index) => String(index + 4)));
     const replayPlan = reconnectMessages.find((frame) => frame.type === "reconcile.plan");
     expect(replayPlan).toMatchObject({ type: "reconcile.plan", sequence: "44", payload: { controlReplay: [{ from: "4", through: "43" }] } });
+    expect(reconnectMessages[41]).toMatchObject({ type: "transport.ack", sequence: "45", payload: { throughSequence: "4" } });
     const planFrame = reconnectMessages.find((frame) => frame.type === "reconcile.plan");
     if (planFrame?.type !== "reconcile.plan") throw new Error("expected reconnect reconcile.plan");
     const replayPayload = { direction: "control_to_node", expectedSequence: "4", receivedSequence: "44" };
@@ -735,6 +738,22 @@ describe.sequential("control-plane contracts", () => {
     const tools = await call(2, "tools/list", {});
     expect(tools).toMatchObject({ result: { tools: expect.arrayContaining([expect.objectContaining({ name: "project_get" }), expect.objectContaining({ name: "quick_command_start" }), expect.objectContaining({ name: "runtime_vm_lifecycle" })]) } });
     expect(JSON.stringify(tools)).not.toContain("requiredApprovalRiskClasses");
+    for (const forbidden of ["privileged_helper_install", "privileged_helper_enable", "privileged_helper_policy_update"]) {
+      expect(JSON.stringify(tools)).not.toContain(`\"name\":\"${forbidden}\"`);
+    }
+    const privilegeCountsBefore = await env.DB.prepare("SELECT (SELECT COUNT(*) FROM device_privilege_installations) AS installations,(SELECT COUNT(*) FROM privilege_policy_attestations) AS policies").first();
+    for (const [offset, forbidden] of ["privileged_helper_install", "privileged_helper_enable", "privileged_helper_policy_update"].entries()) {
+      const denied = await call(20 + offset, "tools/call", { name: forbidden, arguments: { idempotencyKey: `remote-root-admin-denied-${offset}` } });
+      expect(denied).toMatchObject({ error: { code: -32602, message: `Tool ${forbidden} not found` } });
+    }
+    for (const action of ["install", "enable", "root-policy"]) {
+      const denied = await exports.default.fetch(new Request(`https://conduit.example.com/api/v1/privileged/helper/${action}`, {
+        method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: "{}",
+      }));
+      expect(denied.status).toBe(404);
+      await expect(denied.json()).resolves.toMatchObject({ error: { code: "not_found" } });
+    }
+    await expect(env.DB.prepare("SELECT (SELECT COUNT(*) FROM device_privilege_installations) AS installations,(SELECT COUNT(*) FROM privilege_policy_attestations) AS policies").first()).resolves.toEqual(privilegeCountsBefore);
     const project = await call(3, "tools/call", { name: "project_get", arguments: { projectId: "prj_board_contract", requestKey: "mcp-project-read-000001" } });
     expect(project).toMatchObject({ result: { structuredContent: { id: "prj_board_contract", name: "Board" } } });
     const injected = await call(4, "tools/call", { name: "quick_command_start", arguments: { idempotencyKey: "mcp-risk-injection-000001", deviceId: "dev_handshake01", runtime: { kind: "native", providerId: "native.linux", configurationRevision: 1 }, accessScope: "read_only", approvalMode: "always", sourceRevisions: [], arguments: {}, requiredApprovalRiskClasses: [] } });

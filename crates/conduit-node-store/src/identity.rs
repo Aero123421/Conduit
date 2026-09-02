@@ -74,6 +74,12 @@ impl DeviceIdentity {
     pub fn sign(&self, transcript: &[u8]) -> String {
         URL_SAFE_NO_PAD.encode(self.signing.sign(transcript).to_bytes())
     }
+    /// Raw signature bytes are exposed only for authenticated local protocols
+    /// that apply their own bounded encoding (for example the root-helper
+    /// challenge). The private key remains inside this identity object.
+    pub fn sign_bytes(&self, transcript: &[u8]) -> Vec<u8> {
+        self.signing.sign(transcript).to_bytes().to_vec()
+    }
     pub fn verify(&self, transcript: &[u8], signature: &str) -> Result<(), StoreError> {
         let raw = URL_SAFE_NO_PAD
             .decode(signature)

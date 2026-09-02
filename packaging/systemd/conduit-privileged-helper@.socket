@@ -1,0 +1,20 @@
+[Unit]
+Description=Conduit privileged helper socket for UID %i
+Documentation=https://github.com/Aero123421/Conduit
+Before=conduit-privileged-helper@%i.service
+
+[Socket]
+ListenSequentialPacket=/run/conduit/privileged/%i.sock
+Accept=no
+FileDescriptorName=privileged
+SocketMode=0600
+SocketUser=%i
+DirectoryMode=0755
+PassCredentials=yes
+RemoveOnStop=yes
+FlushPending=yes
+Backlog=32
+Service=conduit-privileged-helper@%i.service
+
+[Install]
+WantedBy=sockets.target

@@ -32,6 +32,16 @@ export interface OperationTransactionContext {
   createdAt: string;
 }
 
+export interface OperationTransactionContribution {
+  statements: D1PreparedStatement[];
+  /**
+   * Digest of the immutable Run Manifest inserted by these statements. Full
+   * Device offers carry this Control Plane value so the Node never derives or
+   * accepts a manifest binding from the privileged request itself.
+   */
+  runManifestDigest?: string;
+}
+
 export interface CreateOperationOptions {
   dispatcher?: OperationDispatcher;
   /** Reserve an ID so related immutable records can commit with the operation. */
@@ -40,7 +50,7 @@ export interface CreateOperationOptions {
    * Statements returned here are committed in the same D1 batch as operation
    * custody, idempotency, and the dispatch outbox, before dispatch is attempted.
    */
-  transactionStatements?: (context: OperationTransactionContext) => D1PreparedStatement[] | Promise<D1PreparedStatement[]>;
+  transactionStatements?: (context: OperationTransactionContext) => D1PreparedStatement[] | OperationTransactionContribution | Promise<D1PreparedStatement[] | OperationTransactionContribution>;
 }
 
 const OWNER_FIRST_PARTY_POLICY_ID = "cpol_owner_first_party_v1";
@@ -182,7 +192,6 @@ export async function createOperation(
   };
   const digest = await operationDigest(requestWithoutDigest);
   const request: OperationRequest = { ...requestWithoutDigest, payloadDigest: digest };
-  parseWireDocument(schemaIds.nodeV1, { protocol: "conduit.node/1", messageId: "cmsg_contract0001", deviceId: input.deviceId, connectionEpoch: "0", direction: "control_to_node", sequence: "1", type: "operation.offer", correlationId: operationId, payloadDigest: await sha256Hex(canonicalJson({ operation: request })), payload: { operation: request } });
   const idempotencyScope = effectiveActor.grantId ?? `owner:${effectiveActor.principalId}:${effectiveActor.clientId}`;
   const existing = await env.DB.prepare("SELECT operation_id,payload_digest,response_json,state FROM idempotency_records WHERE scope=?1 AND idempotency_key=?2 LIMIT 1").bind(idempotencyScope, input.idempotencyKey).first<{ operation_id: string; payload_digest: string; response_json: string | null; state: string }>();
   if (existing !== null) {
@@ -193,13 +202,24 @@ export async function createOperation(
   }
   const row = { operationId, state: "queued", payloadDigest: digest, expiresAt: request.expiresAt };
   const createdAt = nowIso();
-  const dispatchMessageId = newId("cmsg");
-  const dispatchPayload = { operation: request };
-  const dispatchPayloadDigest = await sha256Hex(canonicalJson(dispatchPayload));
   try {
-    const transactionStatements = options.transactionStatements === undefined
+    const contribution = options.transactionStatements === undefined
       ? []
       : await options.transactionStatements({ operationId, request, createdAt });
+    const transactionStatements = Array.isArray(contribution) ? contribution : contribution.statements;
+    let runManifestDigest = Array.isArray(contribution) ? undefined : contribution.runManifestDigest;
+    if (input.accessScope === "full_device" && runManifestDigest === undefined) {
+      if (input.runId === undefined) throw new PublicError("full_device_capability_unavailable", 409, "Full Device operation requires an immutable Run Manifest");
+      const run = await env.DB.prepare("SELECT manifest_digest FROM runs WHERE id=?1 AND device_id=?2 AND access_scope='full_device' LIMIT 1")
+        .bind(input.runId, input.deviceId).first<{ manifest_digest: string }>();
+      if (run === null) throw new PublicError("full_device_capability_unavailable", 409, "Full Device operation requires an authoritative Run Manifest");
+      runManifestDigest = run.manifest_digest;
+    }
+    if (runManifestDigest !== undefined && !/^[a-f0-9]{64}$/.test(runManifestDigest)) throw new PublicError("invalid_request", 400, "Run Manifest digest is invalid");
+    const dispatchPayload = { operation: request, ...(runManifestDigest === undefined ? {} : { runManifestDigest }) };
+    parseWireDocument(schemaIds.nodeV1, { protocol: "conduit.node/1", messageId: "cmsg_contract0001", deviceId: input.deviceId, connectionEpoch: "0", direction: "control_to_node", sequence: "1", type: "operation.offer", correlationId: operationId, payloadDigest: await sha256Hex(canonicalJson(dispatchPayload)), payload: dispatchPayload });
+    const dispatchMessageId = newId("cmsg");
+    const dispatchPayloadDigest = await sha256Hex(canonicalJson(dispatchPayload));
     await env.DB.batch([
       ...transactionStatements,
       env.DB.prepare("INSERT INTO operation_journal(id,idempotency_key,actor_principal_id,client_id,device_id,project_id,session_id,assignment_id,run_id,connector_policy_id,connector_policy_revision,connector_grant_id,concurrency_class,capability,payload_digest,request_json,state,expires_at,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,'queued',?17,?18,?18)").bind(operationId, input.idempotencyKey, effectiveActor.principalId, effectiveActor.clientId, input.deviceId, input.projectId ?? null, input.sessionId ?? null, input.assignmentId ?? null, input.runId ?? null, effectiveActor.policyId, effectiveActor.policyRevision, effectiveActor.grantId ?? null, limitClass ?? null, input.capability, digest, canonicalJson(request), request.expiresAt, createdAt),

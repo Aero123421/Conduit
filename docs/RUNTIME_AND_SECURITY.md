@@ -117,6 +117,36 @@ Optionally owns Docker, Podman, Incus, or another management connection. It acce
 
 Optional networkless root service with a narrow typed protocol. It does not accept arbitrary shell text, arbitrary environment maps, OAuth tokens, or Agent credentials.
 
+The packaged Linux implementation is `conduit-privileged-helper` plus the fixed
+`conduit-privileged-exec` worker. `conduit-node` remains an unprivileged user
+service. It authenticates to the per-UID AF_UNIX `SOCK_SEQPACKET` endpoint with
+kernel peer credentials and a Device-key challenge proof. Authentication proves
+the courier identity; every effectful request still needs an exact signed
+privilege ticket and must pass the root-owned local policy.
+
+The helper validates typed argv, executable/interpreter/cwd identities,
+Workspace bindings, resource ceilings, Adapter allowance, descriptor count and
+descriptor content before launch. Credential bytes use bounded sealed file
+descriptors and are written only to the managed Runtime directory; they do not
+enter a ticket, journal row, receipt, event, or log. Environment loader hooks
+such as `LD_PRELOAD`, `BASH_ENV`, and `NODE_OPTIONS` are rejected. Agent
+Runtimes never receive the helper socket or systemd D-Bus.
+
+The root-owned SQLite journal reserves the one-use ticket and exact request
+digest before the typed systemd D-Bus call. The fixed worker executes the
+already-committed plan in a transient system service and spools bounded I/O for
+cursor replay. Admission, prepared, unit-created, running, control, and terminal
+boundaries are separate Ed25519-signed receipts. If a crash window cannot prove
+whether systemd accepted an effect, the helper records `uncertain` or
+`recovery_required`; it does not launch a replacement.
+
+An effective Native host `full_device` capability requires a matching signed
+probe, active Control Plane helper registration, pinned ticket key, root policy,
+systemd system manager, and receipt-verification key. Executable presence alone
+is not capability. `full_device + never` also requires the root-policy opt-in,
+an empty/satisfied mandatory risk set, and an Adapter with a pre-execution
+approval bridge where structured Agent actions require it.
+
 ### Guest Agent
 
 Optional service inside a VM or Container. It has no implicit host authority.

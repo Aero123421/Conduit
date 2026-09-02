@@ -6,6 +6,9 @@ rust-version = "1.92"
 license = "Apache-2.0"
 
 [dependencies]
+conduit-privileged-protocol = { path = "../conduit-privileged-protocol" }
+conduit-privileged-helper = { path = "../conduit-privileged-helper" }
+ed25519-dalek = "=2.2.0"
 hex = "=0.4.3"
 libc = "=0.2.189"
 serde = { version = "=1.0.229", features = ["derive"] }

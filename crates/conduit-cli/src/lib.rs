@@ -1,5 +1,6 @@
 mod command;
 mod doctor;
+mod privileged;
 mod transport;
 
 use std::{fs, path::Path};
@@ -60,8 +61,12 @@ pub fn run() -> Result<(), CliError> {
 }
 
 pub fn run_cli(cli: Cli) -> Result<(), CliError> {
-    if matches!(cli.command, Commands::Doctor) {
-        return print_value(cli.output, &doctor::collect()?);
+    match &cli.command {
+        Commands::Doctor => return print_value(cli.output, &doctor::collect()?),
+        Commands::Privileged { command } => {
+            return print_value(cli.output, &privileged::execute(command)?);
+        }
+        _ => {}
     }
     let mut invocation = cli.command.into_invocation()?;
     if let Some(input) = invocation.input.take() {

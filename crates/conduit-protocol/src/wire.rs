@@ -12,7 +12,8 @@ use serde_json::Value;
 use thiserror::Error;
 
 use crate::{
-    AUTH_SCHEMA_V1, CHANGESET_SCHEMA_V1, NODE_SCHEMA_V1, RUNTIME_SCHEMA_V1, TRACE_SCHEMA_V1,
+    AUTH_SCHEMA_V1, CHANGESET_SCHEMA_V1, NODE_SCHEMA_V1, PRIVILEGED_SCHEMA_V1, RUNTIME_SCHEMA_V1,
+    TRACE_SCHEMA_V1,
 };
 
 const MAX_REPORTED_ISSUES: usize = 64;
@@ -61,6 +62,12 @@ define_wire_schema!(
     NodeProtocolV1,
     NODE_SCHEMA_V1,
     "../../../spec/schemas/node-protocol-v1.schema.json",
+    Some(65_536)
+);
+define_wire_schema!(
+    PrivilegedHelperV1,
+    PRIVILEGED_SCHEMA_V1,
+    "../../../spec/schemas/privileged-helper-v1.schema.json",
     Some(65_536)
 );
 define_wire_schema!(
@@ -638,7 +645,7 @@ mod tests {
         assert_eq!(validate_example_directory::<AuthV1>("auth"), 5);
         assert_eq!(
             validate_example_directory::<NodeProtocolV1>("node-protocol"),
-            4
+            5
         );
         assert_eq!(validate_example_directory::<TraceV1>("trace"), 5);
         assert_eq!(validate_example_directory::<RuntimeV1>("runtime"), 4);

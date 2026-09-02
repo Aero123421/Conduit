@@ -76,7 +76,29 @@ Responsibilities are deliberately narrow:
 - selected host-administration operations defined by versioned capability
 - ownership and permission repair for Conduit-managed paths
 
-It does not accept arbitrary shell text, arbitrary environment maps, arbitrary file paths, OAuth tokens, or Cloudflare connections.
+It does not accept arbitrary shell text, arbitrary environment maps, arbitrary
+file paths, OAuth tokens, Cloudflare connections, or a provider-management
+socket. The Linux `privileged-native` Provider talks to it over an authenticated
+per-UID `SOCK_SEQPACKET` connection. Effectful calls carry a one-use signed
+ticket for `prepare`, `start`, `input`, `resize_pty`, `pause`, `resume`,
+`graceful_stop`, or `force_stop`. Read-only inspect/stream replay still requires
+the authenticated peer and an exact Runtime handle.
+
+Prepare binds the immutable local execution plan and passed descriptor manifest,
+then returns durable `admitted` and `prepared` receipts. Start creates a
+deterministically named transient systemd service through the fixed exec worker
+and returns distinct `unit_created` and `running` receipts. Controls bind Runtime,
+unit, Invocation ID, controller epoch, expected helper state revision, Runtime
+handle digest, and control-request digest. The Provider preserves the entire
+helper receipt chain; it does not translate root evidence into an unsigned
+generic Provider claim.
+
+After helper or Node restart, reconciliation compares the root journal with the
+systemd unit, Invocation ID, cgroup, PID/process-birth identity, stream cursors,
+and last signed receipt. A matching object may be reattached only when Adapter
+protocol custody is also recoverable. Otherwise the Runtime is retained under
+explicit `recovery_required` custody and no prompt, start, or effectful control
+is repeated automatically.
 
 Installing or enabling the helper is a local Device setup action. Remote MCP authority cannot install it.
 
@@ -97,7 +119,7 @@ The provider reports whether Guest Agent communication uses provider exec, vsock
 
 ## Provider interface
 
-The Rust interface will expose typed requests and receipts equivalent to:
+The Rust interface exposes typed requests and receipts equivalent to:
 
 ```rust
 pub trait RuntimeProvider: Send + Sync {
@@ -799,7 +821,12 @@ Agent receives the ordinary signed-in user authority. No filesystem isolation is
 
 ### Native `full_device`
 
-Agent can use configured host elevation. This requires the optional privileged helper or an equivalent locally configured mechanism.
+Agent can use configured host elevation. The implemented Linux path requires
+the optional privileged helper, a Control Plane-approved helper installation,
+an exact signed ticket, matching root-owned policy, systemd process custody,
+and a helper-signed receipt chain verified independently by Node and Control
+Plane. Missing or mismatched evidence is a fail-closed capability error; Native
+`full_user` is not substituted.
 
 ### Container Full Access
 

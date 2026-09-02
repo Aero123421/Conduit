@@ -98,6 +98,23 @@ The manifest does not use one `sandboxed` boolean. It records individual capabil
 
 ### Authority
 
+For Native host `full_device`, immutable/local authority evidence additionally
+binds the helper installation ID, helper policy revision and digest, privilege
+ticket ID/digest and issuer key ID, receipt key ID, local execution-plan digest,
+controller epoch, exact privileged operation, control-request digest when
+applicable, and approval-enforcement mode. Cloud evidence contains opaque IDs,
+digests, bounded state and timestamps only. Canonical local paths, argv content,
+environment values, credential bytes, prompt text, and raw elevated streams
+remain Device-local under their existing sensitivity and opt-in rules.
+
+The following are distinct evidence boundaries and are not collapsed into one
+"started" event: Device operation admission, ticket issuance, helper durable
+admission, plan preparation, systemd unit creation, root liveness, Agent prompt
+acceptance, each effectful control, helper terminal observation, Node terminal
+submission, and Control Plane receipt acceptance. Helper receipts are Ed25519
+signed and chained by monotonic state revision and previous-receipt digest. The
+Node and Control Plane retain their independent verification results.
+
 - requested and effective access scope
 - requested and effective approval mode
 - Connector Policy ID and revision
@@ -387,6 +404,9 @@ A `secret` payload is not serialized into a normalized event. The event contains
 - source and runtime commitments
 - Change Set and verification commitments
 - uncertainty and recovery records
+- helper registration and root-policy attestation digests
+- privilege-ticket issuance and one-use admission commitments
+- helper-signed admission, start, control, and terminal receipt-chain metadata
 
 R0 is not silently discarded while the associated Run identity or control-plane idempotency tombstone is retained.
 

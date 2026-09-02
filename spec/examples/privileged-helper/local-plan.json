@@ -1,0 +1,46 @@
+{
+  "planVersion": 1,
+  "runtimeId": "rt_example0001",
+  "runId": "run_example0001",
+  "operationId": "op_example0001",
+  "executable": {
+    "opaquePathId": "path_example0001",
+    "device": 8,
+    "inode": 101,
+    "mode": 33261,
+    "uid": 0,
+    "size": 12345,
+    "sha256": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "interpreter": null,
+  "argv": ["conduit-full-device-fixture", "--uid"],
+  "cwd": {
+    "opaquePathId": "path_example0002",
+    "device": 8,
+    "inode": 102,
+    "mode": 16832,
+    "uid": 0,
+    "size": 4096,
+    "sha256": "3333333333333333333333333333333333333333333333333333333333333333"
+  },
+  "systemdUnit": "conduit-elevated-rt_example0001.service",
+  "adapterId": null,
+  "launchProfileId": "full-device-example",
+  "environment": {"LANG": "C.UTF-8", "PATH": "/usr/bin:/bin"},
+  "environmentValueDigests": {
+    "LANG": "4444444444444444444444444444444444444444444444444444444444444444",
+    "PATH": "5555555555555555555555555555555555555555555555555555555555555555"
+  },
+  "workspaces": [],
+  "credentials": [],
+  "stdio": "pipes",
+  "resources": {
+    "cpuQuotaPerSecUsec": 1000000,
+    "memoryMaxBytes": 268435456,
+    "tasksMax": 64,
+    "ioWeight": 100,
+    "runtimeMaxUsec": 60000000
+  },
+  "helperProtocol": "conduit.privileged/1",
+  "helperMinVersion": "0.1.0"
+}

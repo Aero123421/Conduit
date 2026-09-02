@@ -15,6 +15,7 @@ declare global {
       BOOTSTRAP_VERIFIER: string;
       TOKEN_PEPPER: string;
       RECEIPT_SIGNING_KEY: string;
+      PRIVILEGE_TICKET_SIGNING_KEYS_JSON: string;
     }
   }
 }

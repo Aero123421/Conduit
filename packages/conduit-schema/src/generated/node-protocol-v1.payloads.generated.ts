@@ -27,6 +27,10 @@ export type OperationState =
   | "recovery_required"
   | "rejected"
   | "expired";
+export type OperationOfferPayload = {
+  operation: OperationEnvelope;
+  runManifestDigest?: Sha256Hex;
+};
 export type PrincipalId = string;
 export type DeviceId = string;
 export type ProjectId = string;
@@ -107,8 +111,8 @@ export type RuntimeControlPayload = {
   custodyComplete?: boolean;
 };
 export type ApprovalId = string;
-export type Base64Url = string;
 export type DeviceKeyId = string;
+export type Base64Url = string;
 export type PrivilegeTicketResultPayload =
   | {
       requestId: string;
@@ -254,9 +258,6 @@ export interface ReconcileCompletePayload {
    * @maxItems 256
    */
   unresolvedRunIds: RunId[];
-}
-export interface OperationOfferPayload {
-  operation: OperationEnvelope;
 }
 export interface OperationEnvelope {
   schemaVersion: 1;
@@ -527,36 +528,34 @@ export interface DeviceHealthPayload {
 }
 export interface PrivilegeInstallationAttestationPayload {
   requestId: string;
-  installationId: string;
-  expectedUid: number;
-  publicOrigin: string;
-  receiptPublicJwk: Ed25519PublicJwk;
-  signedCapability: SignedPrivilegeDocument;
-  policy: PrivilegePolicyAttestation;
+  registrationBundle: {
+    protocol: "conduit.privileged/1";
+    installationId: string;
+    deviceId: DeviceId;
+    deviceKeyId: DeviceKeyId;
+    uid: number;
+    origin: string;
+    policyRevision: number;
+    policyDigest: Sha256Hex;
+    receiptPublicJwk: Ed25519ReceiptPublicJwk;
+    signedPolicyAttestation: SignedPrivilegeDocument;
+    signedCapability: SignedPrivilegeDocument;
+  };
   devicePolicy: DevicePrivilegePolicyAttestation;
   deviceKeyId: DeviceKeyId;
   deviceSignature: Base64Url;
 }
-export interface Ed25519PublicJwk {
+export interface Ed25519ReceiptPublicJwk {
   kty: "OKP";
   crv: "Ed25519";
   x: Base64Url;
+  kid: string;
 }
 export interface SignedPrivilegeDocument {
   keyId: string;
   claims: {
     [k: string]: unknown;
   };
-  signature: Base64Url;
-}
-export interface PrivilegePolicyAttestation {
-  revision: number;
-  policyDigest: Sha256Hex;
-  previousPolicyDigest: Sha256Hex | null;
-  publicSummary: {
-    [k: string]: unknown;
-  };
-  changeClass: "initial" | "same" | "narrowed" | "broadened";
   signature: Base64Url;
 }
 export interface DevicePrivilegePolicyAttestation {
@@ -572,7 +571,7 @@ export interface PrivilegeRegistrationResultPayload {
   installationId: string;
   status: "active";
   helperKeyId: string;
-  helperPublicJwk: Ed25519PublicJwk;
+  helperPublicJwk: Ed25519ReceiptPublicJwk;
   helperKeyFingerprint: Sha256Hex;
   helperPolicyRevision: number;
   helperPolicyDigest: Sha256Hex;
@@ -599,6 +598,11 @@ export interface PrivilegeIssuerKey {
   predecessorKeyId: string | null;
   rotationStatementDigest: Sha256Hex | null;
   rotationSignature: Base64Url | null;
+}
+export interface Ed25519PublicJwk {
+  kty: "OKP";
+  crv: "Ed25519";
+  x: Base64Url;
 }
 export interface PrivilegePolicyAttestationPayload {
   requestId: string;

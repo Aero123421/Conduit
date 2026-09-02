@@ -111,18 +111,20 @@ function positiveInteger(value: Record<string, unknown>, key: string, maximum = 
   return item;
 }
 
-function publicJwk(value: unknown): JsonWebKey {
+function publicJwk(value: unknown, expectedKid?: string): JsonWebKey {
   const item = record(value, "publicJwk");
-  exactKeys(item, ["kty", "crv", "x"], "publicJwk");
+  exactKeys(item, expectedKid === undefined ? ["kty", "crv", "x"] : ["kty", "crv", "x", "kid"], "publicJwk");
   if (item.kty !== "OKP" || item.crv !== "Ed25519" || typeof item.x !== "string" || item.x.length < 16 || item.x.length > 128) throw new TypeError("Ed25519 public JWK is invalid");
-  return { kty: "OKP", crv: "Ed25519", x: item.x };
+  if (expectedKid !== undefined && item.kid !== expectedKid) throw new TypeError("Ed25519 public JWK kid is invalid");
+  return { kty: "OKP", crv: "Ed25519", x: item.x, ...(expectedKid === undefined ? {} : { kid: expectedKid }) };
 }
 
-function signedDocument(value: unknown, kind: "capability" | "receipt"): SignedDocument {
+function signedDocument(value: unknown, kind: "capability" | "policy" | "receipt"): SignedDocument {
   const parsed = parseWireDocument(schemaIds.privilegedV1, value) as PrivilegedV1WireDocument;
   if (parsed === null || typeof parsed !== "object" || !("keyId" in parsed) || !("claims" in parsed) || !("signature" in parsed)) throw new TypeError(`signed ${kind} is invalid`);
   const claims = record(parsed.claims, `${kind}.claims`);
   if (kind === "capability" && !("receiptKeyId" in claims)) throw new TypeError("signed capability is invalid");
+  if (kind === "policy" && !("policyVersion" in claims)) throw new TypeError("signed policy is invalid");
   if (kind === "receipt" && !("receiptId" in claims)) throw new TypeError("signed receipt is invalid");
   return { keyId: String(parsed.keyId), claims, signature: String(parsed.signature) };
 }
@@ -153,7 +155,9 @@ export function parsePrivilegeTransportFrame(value: unknown): PrivilegeTransport
   // Parse the signed helper documents before custody; other exact payload
   // fields are validated during projection where D1 authority is available.
   if (frame.type === "privilege.installation_attestation") {
-    signedDocument(payload.signedCapability, "capability");
+    const bundle = record(payload.registrationBundle, "registrationBundle");
+    signedDocument(bundle.signedCapability, "capability");
+    signedDocument(bundle.signedPolicyAttestation, "policy");
     if (frame.correlationId !== payload.requestId) throw new TypeError("installation attestation correlation is invalid");
   }
   if (frame.type === "privilege.ticket_request" && frame.correlationId !== payload.requestId) throw new TypeError("ticket request correlation is invalid");
@@ -202,6 +206,38 @@ function capabilitySummary(claims: Record<string, unknown>): Record<string, unkn
   };
 }
 
+function rootPolicySummary(claims: Record<string, unknown>): Record<string, unknown> {
+  return {
+    enabled: claims.enabled === true,
+    ticketKeyIds: claims.ticketKeyIds,
+    allowedOperations: claims.allowedOperations,
+    allowedAdapters: claims.allowedAdapters,
+    allowedLaunchProfiles: claims.allowedLaunchProfiles,
+    ceilings: claims.ceilings,
+    allowNever: claims.allowNever === true,
+    allowUnrestrictedLaunch: claims.allowUnrestrictedLaunch === true,
+    allowPersistentSessions: claims.allowPersistentSessions === true,
+    allowOfflineControl: claims.allowOfflineControl === true,
+    receiptRetentionSeconds: claims.receiptRetentionSeconds,
+  };
+}
+
+function safeRedactedSummary(value: unknown): Record<string, unknown> {
+  const summary = record(value, "redactedSummary");
+  exactKeys(summary, ["operation", "adapter", "runtimeKind", "reasonCodes", "resourceProfile"], "redactedSummary");
+  const safeLabel = (item: unknown, key: string): void => {
+    if (item === null || item === undefined) return;
+    if (typeof item !== "string" || !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(item)) throw new TypeError(`${key} is not safe metadata`);
+  };
+  safeLabel(summary.operation, "redactedSummary.operation");
+  safeLabel(summary.adapter, "redactedSummary.adapter");
+  safeLabel(summary.runtimeKind, "redactedSummary.runtimeKind");
+  safeLabel(summary.resourceProfile, "redactedSummary.resourceProfile");
+  if (summary.reasonCodes !== undefined && (!Array.isArray(summary.reasonCodes) || summary.reasonCodes.length > 16 || summary.reasonCodes.some((item) => typeof item !== "string" || !/^[a-z][a-z0-9_.-]{0,127}$/.test(item)))) throw new TypeError("redactedSummary.reasonCodes is not safe metadata");
+  if (new TextEncoder().encode(canonicalJson(summary)).byteLength > 2048) throw new TypeError("redacted summary is too large");
+  return summary;
+}
+
 function isPolicyNarrower(previous: Record<string, unknown>, next: Record<string, unknown>): boolean {
   const keys = new Set([...Object.keys(previous), ...Object.keys(next)]);
   for (const key of keys) {
@@ -229,31 +265,33 @@ function isPolicyNarrower(previous: Record<string, unknown>, next: Record<string
 
 async function projectInstallation(env: ControlPlaneEnv, frame: PrivilegeTransportFrame): Promise<Record<string, unknown>> {
   const payload = frame.payload;
-  exactKeys(payload, ["requestId", "installationId", "expectedUid", "publicOrigin", "receiptPublicJwk", "signedCapability", "policy", "devicePolicy", "deviceKeyId", "deviceSignature"], "installation attestation");
+  exactKeys(payload, ["requestId", "registrationBundle", "devicePolicy", "deviceKeyId", "deviceSignature"], "installation attestation");
   const registrationRequestId = idField(payload, "requestId");
-  const installationId = idField(payload, "installationId");
-  const expectedUid = positiveInteger(payload, "expectedUid", 4_294_967_294);
-  const origin = stringField(payload, "publicOrigin", 512);
+  const bundle = record(payload.registrationBundle, "registrationBundle");
+  exactKeys(bundle, ["protocol", "installationId", "deviceId", "deviceKeyId", "uid", "origin", "policyRevision", "policyDigest", "receiptPublicJwk", "signedPolicyAttestation", "signedCapability"], "registration bundle");
+  if (bundle.protocol !== "conduit.privileged/1" || bundle.deviceId !== frame.deviceId) throw new PublicError("privileged_helper_protocol_unsupported", 409, "Helper registration bundle binding is invalid");
+  const installationId = idField(bundle, "installationId");
+  const expectedUid = positiveInteger(bundle, "uid", 4_294_967_294);
+  const origin = stringField(bundle, "origin", 512);
   if (origin !== env.PUBLIC_ORIGIN) throw new PublicError("privileged_helper_registration_missing", 409, "Helper origin does not match this Control Plane");
-  const receiptJwk = publicJwk(payload.receiptPublicJwk);
-  const capability = signedDocument(payload.signedCapability, "capability");
+  const capability = signedDocument(bundle.signedCapability, "capability");
   const claims = capability.claims;
   if (claims.protocol !== "conduit.privileged/1" || claims.installationId !== installationId || claims.receiptKeyId !== capability.keyId) throw new PublicError("privileged_helper_protocol_unsupported", 409, "Helper capability binding is invalid");
+  const receiptJwk = publicJwk(bundle.receiptPublicJwk, capability.keyId);
   if (!await verifyEd25519(receiptJwk, capability.signature, canonicalJson(claims))) throw new PublicError("privilege_ticket_invalid", 403, "Helper capability signature is invalid");
   const helperKeyId = capability.keyId;
   const fingerprint = await sha256Hex(String(receiptJwk.x));
-  const capabilityDigest = await sha256Hex(canonicalJson(payload.signedCapability));
-  const policy = record(payload.policy, "policy");
-  exactKeys(policy, ["revision", "policyDigest", "previousPolicyDigest", "publicSummary", "changeClass", "signature"], "policy attestation");
-  const policyRevision = positiveInteger(policy, "revision");
-  const policyDigest = digestField(policy, "policyDigest")!;
-  const previousPolicyDigest = digestField(policy, "previousPolicyDigest", true);
+  const capabilityDigest = await sha256Hex(canonicalJson(bundle.signedCapability));
+  const policy = signedDocument(bundle.signedPolicyAttestation, "policy");
+  const policyClaims = policy.claims;
+  if (policy.keyId !== helperKeyId || policyClaims.installationId !== installationId || policyClaims.deviceId !== frame.deviceId || policyClaims.uid !== expectedUid || policyClaims.origin !== origin) throw new PublicError("privileged_helper_policy_mismatch", 409, "Signed root policy identity differs from the registration bundle");
+  if (!await verifyEd25519(receiptJwk, policy.signature, canonicalJson(policyClaims))) throw new PublicError("privilege_ticket_invalid", 403, "Root policy attestation signature is invalid");
+  const policyRevision = positiveInteger(policyClaims, "revision");
+  const policyDigest = await sha256Hex(canonicalJson(policyClaims));
+  if (bundle.policyRevision !== policyRevision || bundle.policyDigest !== policyDigest) throw new PublicError("privileged_helper_policy_mismatch", 409, "Signed root policy digest differs from the registration bundle");
   if (claims.policyRevision !== policyRevision || claims.policyDigest !== policyDigest) throw new PublicError("privileged_helper_policy_mismatch", 409, "Capability and root policy attestations differ");
-  const publicSummary = record(policy.publicSummary, "policy.publicSummary");
+  const publicSummary = rootPolicySummary(policyClaims);
   if (Object.keys(publicSummary).length > 32 || new TextEncoder().encode(canonicalJson(publicSummary)).byteLength > 4096) throw new TypeError("policy public summary is too large");
-  const changeClass = stringField(policy, "changeClass", 16);
-  if (!["initial", "same", "narrowed", "broadened"].includes(changeClass)) throw new TypeError("policy change class is invalid");
-  if (!await verifyEd25519(receiptJwk, stringField(policy, "signature", 512), canonicalJson({ installationId, revision: policyRevision, policyDigest, previousPolicyDigest, publicSummary, changeClass }))) throw new PublicError("privilege_ticket_invalid", 403, "Root policy attestation signature is invalid");
   const devicePolicy = record(payload.devicePolicy, "devicePolicy");
   exactKeys(devicePolicy, ["revision", "policyDigest", "previousPolicyDigest", "publicSummary", "signature"], "Device policy attestation");
   const devicePolicyRevision = positiveInteger(devicePolicy, "revision");
@@ -262,6 +300,7 @@ async function projectInstallation(env: ControlPlaneEnv, frame: PrivilegeTranspo
   const devicePolicySummary = record(devicePolicy.publicSummary, "devicePolicy.publicSummary");
   if (Object.keys(devicePolicySummary).length > 32 || new TextEncoder().encode(canonicalJson(devicePolicySummary)).byteLength > 4096) throw new TypeError("Device policy public summary is too large");
   const deviceKeyId = await verifyDeviceSignedPayload(env, frame, payload);
+  if (bundle.deviceKeyId !== deviceKeyId) throw new PublicError("device_key_invalid", 403, "Root-owned Device key binding differs from the signing Device key");
   const deviceJwk = await deviceKey(env, frame.deviceId, deviceKeyId);
   if (!await verifyEd25519(deviceJwk, stringField(devicePolicy, "signature", 512), canonicalJson({ deviceId: frame.deviceId, revision: devicePolicyRevision, policyDigest: devicePolicyDigest, previousPolicyDigest: previousDevicePolicyDigest, publicSummary: devicePolicySummary }))) throw new PublicError("device_key_invalid", 403, "Device policy signature is invalid");
   const now = nowIso();
@@ -276,9 +315,9 @@ async function projectInstallation(env: ControlPlaneEnv, frame: PrivilegeTranspo
   const existing = await env.DB.prepare("SELECT device_id,expected_uid,public_origin,active_key_id,active_policy_revision,active_policy_digest,status,device_attestation_digest FROM device_privilege_installations WHERE installation_id=?1 LIMIT 1")
     .bind(installationId).first<{ device_id: string; expected_uid: number; public_origin: string; active_key_id: string | null; active_policy_revision: number | null; active_policy_digest: string | null; status: string; device_attestation_digest: string }>();
   if (existing !== null && (existing.device_id !== frame.deviceId || existing.expected_uid !== expectedUid || existing.public_origin !== origin)) throw new PublicError("privilege_ticket_conflict", 409, "Helper installation identity is already bound");
+  const previousPolicyDigest = existing?.active_policy_digest ?? null;
   const currentRootPolicy = existing?.active_policy_revision === null || existing?.active_policy_revision === undefined ? null : await env.DB.prepare("SELECT public_summary_json FROM privilege_policy_attestations WHERE installation_id=?1 AND revision=?2 AND status='active' LIMIT 1").bind(installationId, existing.active_policy_revision).first<{ public_summary_json: string }>();
   const actualChangeClass = existing === null || existing.active_policy_digest === null ? "initial" : existing.active_policy_digest === policyDigest ? "same" : currentRootPolicy !== null && isPolicyNarrower(JSON.parse(currentRootPolicy.public_summary_json) as Record<string, unknown>, publicSummary) ? "narrowed" : "broadened";
-  if (changeClass !== actualChangeClass) throw new PublicError("privileged_helper_policy_mismatch", 409, "Root policy change classification is invalid");
   const policyStatus = actualChangeClass === "same" || actualChangeClass === "narrowed" && existing?.active_key_id === helperKeyId ? "active" : "pending_owner";
   const policyInsertStatus = actualChangeClass === "narrowed" ? "pending_owner" : policyStatus;
   const currentDevicePolicy = await env.DB.prepare("SELECT revision,policy_digest,public_summary_json FROM device_user_policy_attestations WHERE device_id=?1 AND status='active' ORDER BY revision DESC LIMIT 1").bind(frame.deviceId).first<{ revision: number; policy_digest: string; public_summary_json: string }>();
@@ -290,7 +329,7 @@ async function projectInstallation(env: ControlPlaneEnv, frame: PrivilegeTranspo
     env.DB.prepare("INSERT OR IGNORE INTO privilege_installation_keys(installation_id,key_id,public_jwk_json,fingerprint,status,valid_from,self_signature,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8)")
       .bind(installationId, helperKeyId, canonicalJson(receiptJwk), fingerprint, existing?.active_key_id === helperKeyId ? "active" : "pending_owner", observedAt, capability.signature, now),
     env.DB.prepare("INSERT OR IGNORE INTO privilege_policy_attestations(installation_id,revision,policy_digest,previous_policy_digest,public_summary_json,change_class,helper_key_id,helper_signature,attestation_digest,status,observed_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)")
-      .bind(installationId, policyRevision, policyDigest, previousPolicyDigest, canonicalJson(publicSummary), changeClass, helperKeyId, String(policy.signature), await sha256Hex(canonicalJson(policy)), policyInsertStatus, observedAt, now),
+      .bind(installationId, policyRevision, policyDigest, previousPolicyDigest, canonicalJson(publicSummary), actualChangeClass, helperKeyId, policy.signature, await sha256Hex(canonicalJson(bundle.signedPolicyAttestation)), policyInsertStatus, observedAt, now),
     env.DB.prepare("INSERT OR IGNORE INTO device_user_policy_attestations(device_id,revision,policy_digest,previous_policy_digest,public_summary_json,device_key_id,device_signature,attestation_digest,status,observed_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)")
       .bind(frame.deviceId, devicePolicyRevision, devicePolicyDigest, previousDevicePolicyDigest, canonicalJson(devicePolicySummary), deviceKeyId, String(devicePolicy.signature), await sha256Hex(canonicalJson(devicePolicy)), devicePolicyStatus, observedAt, now),
     env.DB.prepare("INSERT OR IGNORE INTO privilege_registration_attestations(request_id,device_id,installation_id,attestation_kind,request_digest,device_key_id,device_signature,observed_at,created_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9)")
@@ -390,8 +429,11 @@ function summaryAllows(summaryJson: string, request: Record<string, unknown>, ca
   if (!operations.includes(operation)) throw new PublicError("privileged_helper_policy_mismatch", 409, "Root policy does not allow this operation");
   const adapters = Array.isArray(policy.allowedAdapters) ? policy.allowedAdapters : [];
   if (adapterId !== null && !adapters.includes(adapterId)) throw new PublicError("privileged_helper_policy_mismatch", 409, "Root policy does not allow this Adapter");
-  const enforcements = Array.isArray(policy.approvalEnforcements) ? policy.approvalEnforcements : [];
-  if (!enforcements.includes(request.approvalEnforcement)) throw new PublicError("full_device_approval_enforcement_unavailable", 409, "Local policy does not allow this approval enforcement");
+  // The canonical root policy has no free-form enforcement allowlist. Exact
+  // command enforcement is the only independently verifiable mode in v1;
+  // adapter-mediated authority is fail-closed until a signed policy field is
+  // added to the helper protocol.
+  if (request.approvalEnforcement !== "exact_command") throw new PublicError("full_device_approval_enforcement_unavailable", 409, "Local policy cannot attest this approval enforcement");
   if (approvalMode === "never" && (policy.allowNever !== true || capability.neverOptIn !== true)) throw new PublicError("full_device_never_local_opt_in_required", 409, "Never approval requires both root-policy and effective helper opt-in");
 }
 
@@ -525,8 +567,7 @@ async function issueTicket(env: ControlPlaneEnv, frame: PrivilegeTransportFrame)
   }
   const canonicalTicket = canonicalJson(ticket);
   const ticketDigest = await sha256Hex(canonicalTicket);
-  const redactedSummary = record(payload.redactedSummary, "redactedSummary");
-  if (Object.keys(redactedSummary).length > 16 || new TextEncoder().encode(canonicalJson(redactedSummary)).byteLength > 2048) throw new TypeError("redacted summary is too large");
+  const redactedSummary = safeRedactedSummary(payload.redactedSummary);
   await env.DB.batch([
     env.DB.prepare("INSERT OR IGNORE INTO privilege_ticket_requests(request_id,device_id,device_key_id,connection_epoch,idempotency_key,idempotency_key_digest,installation_id,operation_id,assignment_id,run_id,runtime_id,runtime_spec_digest,launch_plan_digest,local_execution_plan_digest,control_request_digest,operation_request_digest,run_manifest_digest,helper_policy_revision,helper_policy_digest,device_policy_revision,connector_policy_id,connector_policy_revision,project_revision,project_agent_id,project_agent_revision,device_revision,runtime_configuration_revision,approval_receipt_digest,approval_enforcement,allowed_operation,resource_ceilings_json,redacted_summary_json,request_digest,device_signature,status,requested_at,expires_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23,?24,?25,?26,?27,?28,?29,?30,?31,?32,?33,?34,'issued',?35,?36)")
       .bind(requestId, frame.deviceId, deviceKeyId, frame.connectionEpoch, idempotencyKey, idempotencyKeyDigest, installationId, operationId, authority.assignment_id, runId, runtimeId, claims.runtimeSpecDigest, claims.launchPlanDigest, claims.localExecutionPlanDigest, controlDigest, operationRequestDigest, runManifestDigest, installation.active_policy_revision, installation.active_policy_digest, installation.device_policy_revision, authority.connector_policy_id, authority.connector_policy_revision, authority.binding_project_revision, authority.project_agent_id, authority.project_agent_revision, authority.current_device_revision, runtimeConfigurationRevision, approvalDigest, approvalEnforcement, claims.allowedOperation, canonicalJson(resourceCeilings), canonicalJson(redactedSummary), requestDigest, String(payload.deviceSignature), issuedAt, ticketExpiresAt),

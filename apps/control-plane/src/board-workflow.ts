@@ -317,7 +317,7 @@ export async function scheduleBoardAssignment(
       };
       const manifestJson = canonicalJson(manifest);
       const manifestDigest = await digest("conduit.run-manifest.v1", manifest);
-      return [
+      return { runManifestDigest: manifestDigest, statements: [
         env.DB.prepare("INSERT INTO messages(id,session_id,author_principal_id,origin,body,revision,attachments_json,created_at) VALUES (?1,?2,?3,?4,?5,1,'[]',?6)").bind(messageId, sessionId, actor.principalId, actor.clientId, boardBody, createdAt),
         env.DB.prepare("INSERT INTO message_revisions(message_id,revision,body,editor_principal_id,created_at) VALUES (?1,1,?2,?3,?4)").bind(messageId, boardBody, actor.principalId, createdAt),
         env.DB.prepare("INSERT INTO structured_mentions(id,message_id,mention_type,target_id,start_offset,end_offset,payload_json) VALUES (?1,?2,'project_agent',?3,?4,?5,?6)").bind(mentionId, messageId, mention.targetId, mention.startOffset, mention.endOffset, canonicalJson(mention.payload)),
@@ -327,7 +327,7 @@ export async function scheduleBoardAssignment(
         env.DB.prepare("INSERT INTO runs(id,assignment_id,project_id,session_id,device_id,runtime_kind,access_scope,approval_mode,state,revision,manifest_digest,manifest_json,created_at,updated_at) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,'queued',1,?9,?10,?11,?11)").bind(runId, assignmentId, session.project_id, sessionId, schedule.deviceId, schedule.runtime.kind, schedule.accessScope, schedule.approvalMode, manifestDigest, manifestJson, createdAt),
         env.DB.prepare("INSERT INTO run_transitions(id,run_id,from_state,to_state,receipt_kind,receipt_digest,created_at) VALUES (?1,?2,NULL,'queued','control_plane_schedule',?3,?4)").bind(newId("runt"), runId, request.payloadDigest, createdAt),
         env.DB.prepare("INSERT INTO context_snapshots(id,run_id,operation_id,mode,project_revision,session_revision,message_id,message_revision,compiler_version,item_manifest_json,compiled_content_digest,snapshot_digest,created_at) VALUES (?1,?2,?3,'initial',?4,?5,?6,1,'control-plane-board/v1',?7,?8,?9,?10)").bind(snapshotId, runId, operationId, session.project_revision, session.revision, messageId, canonicalJson(itemManifest), compiledContentDigest, snapshotDigest, createdAt),
-      ];
+      ] };
     },
   });
   const persistedOperationId = String(operation.operationId ?? operationId);

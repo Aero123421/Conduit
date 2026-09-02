@@ -6,6 +6,7 @@
     { "$ref": "#/$defs/PrivilegeTicket" },
     { "$ref": "#/$defs/LocalExecutionPlan" },
     { "$ref": "#/$defs/RootPolicy" },
+    { "$ref": "#/$defs/SignedRootPolicy" },
     { "$ref": "#/$defs/SignedCapability" },
     { "$ref": "#/$defs/HelperReceipt" },
     { "$ref": "#/$defs/HelperRequest" },
@@ -90,6 +91,7 @@
         "ceilings": { "$ref": "#/$defs/ResourceCeilings" }, "allowNever": { "type": "boolean" }, "allowUnrestrictedLaunch": { "type": "boolean" }, "allowPersistentSessions": { "type": "boolean" }, "allowOfflineControl": { "type": "boolean" }, "receiptRetentionSeconds": { "type": "integer", "minimum": 86400, "maximum": 31536000 }
       }
     },
+    "SignedRootPolicy": { "type": "object", "additionalProperties": false, "required": ["keyId", "claims", "signature"], "properties": { "keyId": { "$ref": "#/$defs/Id" }, "claims": { "$ref": "#/$defs/RootPolicy" }, "signature": { "$ref": "#/$defs/Base64Url" } } },
     "CapabilityClaims": {
       "type": "object", "additionalProperties": false,
       "required": ["protocol", "helperVersion", "installationId", "receiptKeyId", "policyRevision", "policyDigest", "enabled", "observedAt", "systemdSystemManager", "socketPeerCredentials", "transientUnits", "cgroupV2", "freeze", "pidfd", "openat2", "execveat", "pty", "streamReplay", "neverOptIn", "unrestrictedLaunchOptIn", "unavailableReason"],

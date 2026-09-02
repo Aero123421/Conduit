@@ -6,7 +6,14 @@
  */
 
 export type ConduitPrivilegedHelperProtocolV1 =
-  PrivilegeTicket | LocalExecutionPlan | RootPolicy | SignedCapability | HelperReceipt | HelperRequest | HelperResponse;
+  | PrivilegeTicket
+  | LocalExecutionPlan
+  | RootPolicy
+  | SignedRootPolicy
+  | SignedCapability
+  | HelperReceipt
+  | HelperRequest
+  | HelperResponse;
 export type Id = string;
 export type Protocol = "conduit.privileged/1";
 export type Sha256Hex = string;
@@ -236,6 +243,11 @@ export interface RootPolicy {
   allowPersistentSessions: boolean;
   allowOfflineControl: boolean;
   receiptRetentionSeconds: number;
+}
+export interface SignedRootPolicy {
+  keyId: Id;
+  claims: RootPolicy;
+  signature: Base64Url;
 }
 export interface SignedCapability {
   keyId: Id;

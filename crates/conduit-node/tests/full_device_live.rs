@@ -12,6 +12,7 @@ use conduit_privileged_protocol::{
 };
 use conduit_runtime::{
     NetworkMode, PrivilegedNativeProvider, ResourceLimits, RuntimeKind, RuntimeRequest,
+    RuntimeSignal,
 };
 use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
@@ -21,8 +22,6 @@ use std::{
     env, fs,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
-    thread,
-    time::Duration,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -181,7 +180,7 @@ fn run_root_uid_probe(
         io_weight: None,
         runtime_max_usec: Some(30_000_000),
     };
-    let executable = ["/usr/bin/id", "/bin/id"]
+    let executable = ["/usr/bin/sleep", "/bin/sleep"]
         .into_iter()
         .map(Path::new)
         .find(|path| path.is_file())
@@ -193,7 +192,7 @@ fn run_root_uid_probe(
         operation_id: operation_id.clone(),
         executable: capture_file_identity(executable, true).unwrap(),
         interpreter: None,
-        argv: vec!["id".into(), "-u".into()],
+        argv: vec!["sleep".into(), "30".into()],
         cwd: capture_file_identity(evidence, false).unwrap(),
         systemd_unit: format!("conduit-elevated-live-{}.service", std::process::id()),
         adapter_id: None,
@@ -241,28 +240,27 @@ fn run_root_uid_probe(
         PrivilegedOperation::Start,
         "ptkt_live_start",
     );
-    let mut managed = provider
-        .start_managed_privileged(&prepared.runtime, start_ticket, &plan)
+    let started = provider
+        .start_privileged(&prepared.runtime, start_ticket, &plan)
         .unwrap();
-    let mut terminal = None;
-    for _ in 0..200 {
-        let inspected = provider
-            .inspect_privileged(&managed.receipt.runtime.handle)
-            .unwrap();
-        if matches!(
-            inspected.runtime.state,
-            conduit_runtime::RuntimeState::Stopped | conduit_runtime::RuntimeState::Failed
-        ) {
-            terminal = Some(inspected);
-            break;
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    let terminal = terminal.expect("root UID probe did not become terminal");
-    let stdout = managed.io.read_stdout(0, 4096).unwrap();
-    assert_eq!(String::from_utf8(stdout.bytes).unwrap().trim(), "0");
+    assert_eq!(started.final_helper_receipt().claims.effective_uid, Some(0));
+    let stop_ticket = ticket(
+        issuer,
+        bundle,
+        &plan,
+        &request,
+        PrivilegedOperation::GracefulStop,
+        "ptkt_live_stop",
+    );
+    let terminal = provider
+        .control_privileged(
+            &started.runtime.handle,
+            RuntimeSignal::GracefulStop,
+            stop_ticket,
+        )
+        .unwrap();
     let prepare_digest = prepared.final_helper_receipt().digest().unwrap();
-    let start_digest = managed.receipt.final_helper_receipt().digest().unwrap();
+    let start_digest = started.final_helper_receipt().digest().unwrap();
     let terminal_digest = terminal.final_helper_receipt().digest().unwrap();
     assert_ne!(prepare_digest, start_digest);
     assert_ne!(start_digest, terminal_digest);
@@ -331,7 +329,14 @@ fn ticket(
             runtime_id: plan.runtime_id.clone(),
             runtime_spec_digest: request.spec_digest.clone(),
             launch_plan_digest: "44".repeat(32),
-            control_digest: None,
+            control_digest: if matches!(
+                operation,
+                PrivilegedOperation::Prepare | PrivilegedOperation::Start
+            ) {
+                None
+            } else {
+                Some("77".repeat(32))
+            },
             local_execution_plan_digest: plan.digest().unwrap(),
             controller_epoch: 1,
             connector_policy_id: Some("cpol_full_device_live".into()),

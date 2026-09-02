@@ -32,10 +32,10 @@ describe.sequential("control-plane contracts", () => {
 
   it("applies forward D1 migrations", async () => {
     const version = await env.DB.prepare("SELECT version FROM schema_versions WHERE component='control_plane'").first<{ version: number }>();
-    expect(version?.version).toBe(13);
+    expect(version?.version).toBe(14);
     const tables = await env.DB.prepare("SELECT name FROM sqlite_master WHERE type='table'").all<{ name: string }>();
     const names = new Set(tables.results.map((row) => row.name));
-    for (const required of ["owner_principals", "oauth_grants", "connector_policies", "devices", "projects", "collaboration_sessions", "runs", "operation_journal", "operation_dispatch_outbox", "approval_dispatch_outbox", "assignment_run_bindings", "context_snapshots", "runtime_custody", "agent_sessions", "node_projection_receipts", "realtime_projection_outbox", "realtime_delivery_receipts", "retention_cleanup_state", "change_sets", "reviews", "baseline_revisions", "artifacts", "normalized_events", "security_events"]) expect(names.has(required)).toBe(true);
+    for (const required of ["owner_principals", "oauth_grants", "connector_policies", "devices", "projects", "collaboration_sessions", "runs", "operation_journal", "operation_dispatch_outbox", "approval_dispatch_outbox", "assignment_run_bindings", "context_snapshots", "runtime_custody", "agent_sessions", "node_projection_receipts", "realtime_projection_outbox", "realtime_delivery_receipts", "retention_cleanup_state", "device_privilege_installations", "privilege_registration_attestations", "privilege_installation_keys", "privilege_policy_attestations", "device_user_policy_attestations", "privilege_ticket_requests", "privilege_ticket_issuance", "privilege_receipt_projections", "privilege_issuer_keys", "change_sets", "reviews", "baseline_revisions", "artifacts", "normalized_events", "security_events"]) expect(names.has(required)).toBe(true);
   });
 
   it("keeps security events immutable", async () => {

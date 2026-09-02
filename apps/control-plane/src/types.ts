@@ -5,6 +5,8 @@ export interface SecretBindings {
   TOKEN_PEPPER: string;
   /** HMAC key used for signed server receipts. */
   RECEIPT_SIGNING_KEY: string;
+  /** Dedicated Ed25519 private keyset for one-use privileged-helper tickets. */
+  PRIVILEGE_TICKET_SIGNING_KEYS_JSON: string;
 }
 
 export type ControlPlaneEnv = Env & SecretBindings;

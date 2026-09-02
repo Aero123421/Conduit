@@ -14,6 +14,7 @@ import { createConduitMcpServer } from "./mcp/server.ts";
 import { handlePolicyAdmin } from "./policy.ts";
 import type { ControlPlaneEnv } from "./types.ts";
 import { reconcileRetryScheduler } from "./retry-scheduler-client.ts";
+import { handlePrivilegeAdmin, renderPrivilegePage } from "./privilege.ts";
 
 export { BoardRoom, ConnectorLimiter, DeviceRoom, RetryScheduler };
 
@@ -39,12 +40,15 @@ async function fetchHandler(request: Request, env: ControlPlaneEnv, ctx: Executi
     if (url.pathname === "/healthz" && request.method === "GET") return withSecurityHeaders(Response.json({ status: "ok", version: 1 }), requestId);
     if ((url.pathname === "/setup" || url.pathname === "/login") && request.method === "GET") return withSecurityHeaders(await renderAuthPage(request, env), requestId);
     if (url.pathname === "/device" && request.method === "GET") return withSecurityHeaders(await renderDevicePage(), requestId);
+    if (url.pathname === "/privileged" && request.method === "GET") return withSecurityHeaders(await renderPrivilegePage(), requestId);
     const oauth = await handleOAuth(request, env, routePath);
     if (oauth !== null) return withSecurityHeaders(oauth, requestId);
     const browser = await handleBrowserAuth(request, env, routePath);
     if (browser !== null) return withSecurityHeaders(browser, requestId);
     const device = await handleDeviceIdentity(request, env, routePath);
     if (device !== null) return withSecurityHeaders(device, requestId);
+    const privilege = await handlePrivilegeAdmin(request, env, routePath);
+    if (privilege !== null) return withSecurityHeaders(privilege, requestId);
     const policy = await handlePolicyAdmin(request, env, routePath);
     if (policy !== null) return withSecurityHeaders(policy, requestId);
     if (url.pathname === "/mcp") {

@@ -29,7 +29,7 @@ describe.sequential("Free profile retention", () => {
     expect(first.deletedRows).toBeGreaterThanOrEqual(2);
     expect(first.compactedRealtimeRows).toBe(1);
     assertFreeD1Ceilings(measured.snapshot());
-    expect(measured.snapshot()).toMatchObject({ statements: 16, maxBoundParameters: 3 });
+    expect(measured.snapshot()).toMatchObject({ statements: 17, maxBoundParameters: 3 });
     const compacted = await env.DB.prepare("SELECT event_id,session_id,record_id,revision FROM realtime_delivery_receipts WHERE event_id=?1").bind(eventId).first();
     expect(compacted).toMatchObject({ event_id: eventId, session_id: sessionId, record_id: "run_retention", revision: 1 });
     expect(await env.DB.prepare("SELECT COUNT(*) AS count FROM realtime_projection_outbox WHERE event_id=?1").bind(eventId).first<{ count: number }>()).toEqual({ count: 0 });

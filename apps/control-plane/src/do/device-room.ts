@@ -12,6 +12,9 @@ import { planReconciliationSets } from "../reconciliation-set.ts";
 import { usageProfileForEnv } from "../usage-profile.ts";
 import { instrumentD1, type InstrumentedD1 } from "../usage-instrumentation.ts";
 import type { ControlPlaneEnv } from "../types.ts";
+import { isPrivilegeFrameType, parsePrivilegeTransportFrame, privilegeDenialResult, privilegeRegistrationResultType, privilegeResultType, projectPrivilegeFrame, requireVerifiedPrivilegeReceipt, type PrivilegeTransportFrame } from "../privilege.ts";
+
+type ProjectableDeviceFrame = NodeV1PostAuthFrame | PrivilegeTransportFrame;
 
 interface SocketAttachment {
   deviceId: string;
@@ -133,12 +136,14 @@ const RECEIPT_RETENTION_MS = 7 * 24 * 60 * 60_000;
 // digest/sequence proof long enough for reconnect/replay, but do not make a
 // five-minute ACK expiry turn every heartbeat into a retention alarm.
 const ACK_RETENTION_MS = HOT_RETENTION_MS;
-const EFFECTFUL_CONTROL_TYPES = new Set<NodeV1PostAuthFrame["type"]>([
+const EFFECTFUL_CONTROL_TYPES = new Set<string>([
   "operation.offer",
   "operation.input",
   "operation.cancel",
   "runtime.control",
   "operation.approval",
+  privilegeResultType(),
+  privilegeRegistrationResultType(),
 ]);
 const ACK_IMMEDIATE_TYPES = new Set<NodeV1PostAuthFrame["type"]>([
   "reconcile.summary",
@@ -383,6 +388,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       activeCommands: payload.activeCommands ?? 0,
       activeAgentRuns: payload.activeAgentRuns ?? 0,
       activeRuntimes: payload.activeRuntimes ?? 0,
+      privilegedHelper: (payload as unknown as Record<string, unknown>).privilegedHelper ?? null,
     });
   }
 
@@ -511,7 +517,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     if (scheduled === null || minDueAt < scheduled) await this.ctx.storage.setAlarm(Math.max(Date.now() + minimumAlarmDelayMs, minDueAt));
   }
 
-  private async projectAndSync(frame: NodeV1PostAuthFrame): Promise<void> {
+  private async projectAndSync(frame: ProjectableDeviceFrame): Promise<void> {
     // Projection can cross the D1 boundary and may yield while publishing a
     // realtime event. Claim the durable inbox row first so an alarm waking at
     // the same time as the websocket handler cannot project the same terminal
@@ -803,13 +809,21 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       ws.close(1009, "frame_too_large");
       return;
     }
-    let value: unknown;
-    try { value = parseWireDocumentText(schemaIds.nodeV1, message); } catch { ws.close(1007, "frame_malformed"); return; }
-    const body = value as unknown as Record<string, unknown>;
     const attachment = ws.deserializeAttachment() as SocketAttachment | null;
     if (attachment === null) { ws.close(1011, "connection_state_missing"); return; }
+    let value: unknown;
+    try { value = parseWireDocumentText(schemaIds.nodeV1, message); }
+    catch { ws.close(1007, "frame_malformed"); return; }
+    const body = value as unknown as Record<string, unknown>;
     if (attachment.stage === "new") { await this.hello(ws, attachment, body); return; }
     if (attachment.stage === "challenged") { await this.authenticate(ws, attachment, body); return; }
+    if (isPrivilegeFrameType(body.type)) {
+      let privilegeFrame: PrivilegeTransportFrame;
+      try { privilegeFrame = parsePrivilegeTransportFrame(value); }
+      catch { ws.close(1007, "frame_malformed"); return; }
+      await this.acceptPrivilegeFrame(ws, attachment, privilegeFrame);
+      return;
+    }
     let idleHealthProject: boolean | undefined;
     if (this.idleProbe !== null) {
       this.idleProbe.incomingMessages += 1;
@@ -830,6 +844,46 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     // sending its checkpoint burst. This is not a transport ACK and creates no
     // durable row.
     if (this.idleProbe !== null && this.idleProbeNowMs !== null && body.type === "device.health") ws.send('{"type":"idle_e2e.settled"}');
+  }
+
+  private async acceptPrivilegeFrame(ws: WebSocket, attachment: SocketAttachment, frame: PrivilegeTransportFrame): Promise<void> {
+    if (frame.deviceId !== attachment.deviceId || frame.connectionEpoch !== attachment.epoch) { ws.close(1008, "frame_malformed"); return; }
+    if (attachment.reconciling && frame.type === "privilege.ticket_request") {
+      await this.enqueueControlFrame("transport.error", { code: "reconciliation_required", retryable: true }, frame.correlationId, new Date(Date.now() + 300_000).toISOString(), ws);
+      return;
+    }
+    const digest = await sha256Hex(canonicalJson(frame.payload));
+    if (digest !== frame.payloadDigest) { ws.close(1008, "payload_digest_mismatch"); return; }
+    const sequence = BigInt(frame.sequence);
+    if (sequence < 1n || sequence > BigInt(Number.MAX_SAFE_INTEGER)) { ws.close(1008, "sequence_out_of_range"); return; }
+    const position = this.ctx.storage.sql.exec<{ durable_sequence: number }>("SELECT durable_sequence FROM transport_positions WHERE direction='node_to_control'").one().durable_sequence;
+    if (sequence <= BigInt(position)) {
+      const prior = this.ctx.storage.sql.exec<{ message_id: string; payload_digest: string; frame_json: string; projected: number }>("SELECT message_id,payload_digest,frame_json,projected FROM inbound_frames WHERE sequence=?", Number(sequence)).toArray()[0];
+      if (prior?.message_id !== frame.messageId || prior.payload_digest !== frame.payloadDigest) { ws.close(1008, "sequence_conflict"); return; }
+      if (prior.projected === 0 || prior.projected === 3) {
+        this.notePending(Date.now());
+        await this.projectAndSync(parsePrivilegeTransportFrame(parseWireDocumentText(schemaIds.nodeV1, prior.frame_json)));
+      }
+      this.noteAckPending(Number(sequence), true);
+      await this.flushPendingAck(ws, true);
+      await this.dispatchQueuedFrames();
+      await this.syncWorkMarker();
+      return;
+    }
+    if (sequence !== BigInt(position) + 1n) {
+      await this.enqueueControlFrame("transport.replay_required", { direction: "node_to_control", expectedSequence: String(position + 1), receivedSequence: String(sequence) }, frame.correlationId, new Date(Date.now() + 300_000).toISOString(), ws);
+      await this.syncWorkMarker();
+      return;
+    }
+    this.ctx.storage.transactionSync(() => {
+      this.ctx.storage.sql.exec("INSERT INTO inbound_frames(sequence,message_id,correlation_id,payload_digest,frame_json,projected,kind,created_at) VALUES (?,?,?,?,?,0,'app',?)", Number(sequence), frame.messageId, frame.correlationId ?? null, frame.payloadDigest, JSON.stringify(frame), nowIso());
+      this.ctx.storage.sql.exec("UPDATE transport_positions SET durable_sequence=? WHERE direction='node_to_control'", Number(sequence));
+      this.notePending(Date.now());
+      this.noteAckPending(Number(sequence), true);
+    });
+    await this.projectAndSync(frame);
+    await this.flushPendingAck(ws, true);
+    await this.syncWorkMarker();
   }
 
   override async webSocketClose(): Promise<void> {
@@ -1171,7 +1225,20 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     ws.serializeAttachment(attachment);
   }
 
-  private async project(frame: NodeV1PostAuthFrame): Promise<void> {
+  private async project(frame: ProjectableDeviceFrame): Promise<void> {
+    if (isPrivilegeFrameType(frame.type)) {
+      let result: Record<string, unknown>;
+      try { result = await projectPrivilegeFrame(this.env, frame as PrivilegeTransportFrame); }
+      catch (error) {
+        if (!(error instanceof PublicError) && !(error instanceof TypeError)) throw error;
+        result = privilegeDenialResult((frame as PrivilegeTransportFrame).payload.requestId, error);
+      }
+      if (frame.type === "privilege.ticket_request") {
+        const requestId = typeof frame.payload.requestId === "string" ? frame.payload.requestId : frame.messageId;
+        await this.enqueueControlFrame(privilegeResultType(), result, requestId, new Date(Date.now() + 300_000).toISOString(), undefined, `cmsg_${requestId}`, frame.deviceId);
+      }
+      return;
+    }
     if (frame.type === "operation.admission" || frame.type === "operation.status" || frame.type === "runtime.control_result" || frame.type === "device.health") {
       const events = await projectNodeState(this.env, frame);
       for (const event of events) await this.publishProjection(frame.deviceId, event);
@@ -1245,6 +1312,8 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
         await this.env.DB.prepare("INSERT INTO security_events(id,event_type,device_id,reason_code,metadata_json,created_at) VALUES (?1,'device_terminal.conflicting_terminal',?2,'terminal_already_committed',?3,?4)")
           .bind(newId("sevt"), frame.deviceId, JSON.stringify({ operationId: frame.payload.operationId, committedState: operation.state, receivedState: frame.payload.state, receiptDigest: frame.payload.receiptDigest }), nowIso()).run();
       } else {
+        const terminalPayload = frame.payload as unknown as Record<string, unknown>;
+        await requireVerifiedPrivilegeReceipt(this.env, { operationId: frame.payload.operationId, deviceId: frame.deviceId, runId: operation.run_id, requestDigest: operation.payload_digest, receiptDigest: terminalPayload.privilegeReceiptDigest, transition: "terminal", runtimeId: terminalPayload.targetRuntimeId, controllerEpoch: terminalPayload.controllerEpoch });
         const projectedState = frame.payload.state === "completed" ? "completed" : frame.payload.state === "cancelled" ? "cancelled" : frame.payload.state === "rejected" || frame.payload.state === "expired" ? frame.payload.state : frame.payload.state === "uncertain" || frame.payload.state === "lost" || frame.payload.state === "recovery_required" ? "uncertain" : "failed";
         let runProjectionState = projectedState;
         const terminalAt = nowIso();
@@ -1395,7 +1464,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     }
   }
 
-  private async enqueueControlFrame(type: NodeV1PostAuthFrame["type"], payload: Record<string, unknown>, correlationId: string | undefined, expiresAt: string, preferredSocket?: WebSocket, suppliedMessageId?: string, targetDeviceId?: string): Promise<{ sequence: string; delivered: boolean }> {
+  private async enqueueControlFrame(type: NodeV1PostAuthFrame["type"] | string, payload: Record<string, unknown>, correlationId: string | undefined, expiresAt: string, preferredSocket?: WebSocket, suppliedMessageId?: string, targetDeviceId?: string): Promise<{ sequence: string; delivered: boolean }> {
     const messageId = suppliedMessageId ?? newId("cmsg");
     const payloadDigest = await sha256Hex(canonicalJson(payload));
     const prior = suppliedMessageId === undefined ? undefined : this.ctx.storage.sql.exec<StoredOutboundFrame>("SELECT * FROM outbound_frames WHERE message_id=?", suppliedMessageId).toArray()[0];
@@ -1432,6 +1501,12 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       ? String((payload.operation as Record<string, unknown>).deviceId)
       : undefined;
     const wire = { protocol: "conduit.node/1", messageId, deviceId: state?.device_id ?? payloadDeviceId ?? targetDeviceId ?? "unconnected", connectionEpoch: String(state?.epoch ?? 0), direction: "control_to_node", sequence: String(sequence), type, ...(correlationId === undefined ? {} : { correlationId }), payloadDigest, payload };
+    if (type === privilegeResultType()) {
+      if (payload.status !== "issued" && payload.status !== "denied") throw new TypeError("privilege ticket result is invalid");
+      if (typeof payload.requestId !== "string" || payload.requestId !== correlationId) throw new TypeError("privilege ticket result correlation is invalid");
+    } else if (type === privilegeRegistrationResultType()) {
+      if (payload.status !== "active" || typeof payload.installationId !== "string" || payload.installationId !== correlationId || !Array.isArray(payload.issuerKeys) || payload.issuerKeys.length > 4) throw new TypeError("privilege registration result is invalid");
+    }
     parseWireDocumentText(schemaIds.nodeV1, JSON.stringify(wire));
     const createdAt = nowIso();
     const kind = type === "transport.ack" ? "ack" : "control";
@@ -1450,7 +1525,7 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     const wire = JSON.parse(frame.frame_json) as { type?: unknown };
     return this.ctx.getWebSockets().find((candidate) => {
       const item = candidate.deserializeAttachment() as SocketAttachment | null;
-      const ready = !EFFECTFUL_CONTROL_TYPES.has(wire.type as NodeV1PostAuthFrame["type"]) || connection?.reconciliation_state === "complete" && !item?.reconciling;
+      const ready = !EFFECTFUL_CONTROL_TYPES.has(String(wire.type)) || connection?.reconciliation_state === "complete" && !item?.reconciling;
       return item?.stage === "authenticated" && item.epoch === String(connection?.epoch) && ready;
     });
   }
@@ -1593,8 +1668,18 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
       }
       const projectionStaleAt = new Date(now - PROJECTION_LEASE_MS).toISOString();
       const unprojected = this.ctx.storage.sql.exec<{ frame_json: string }>("SELECT frame_json FROM inbound_frames WHERE projected=0 OR (projected=3 AND (projection_claimed_at IS NULL OR projection_claimed_at<=?)) ORDER BY sequence LIMIT ?", projectionStaleAt, MAX_D1_PROJECTIONS_PER_ALARM).toArray();
-      for (const row of unprojected) {
-        const frame = JSON.parse(row.frame_json) as NodeV1PostAuthFrame;
+      const parsedFrames = unprojected.map((row) => {
+        const validated = parseWireDocumentText(schemaIds.nodeV1, row.frame_json);
+        const raw = validated as unknown as Record<string, unknown>;
+        return isPrivilegeFrameType(raw.type) ? parsePrivilegeTransportFrame(validated) : validated as NodeV1PostAuthFrame;
+      });
+      // Ticket authority and root-receipt verification perform a larger D1
+      // join than ordinary event projection. If one is present in the page,
+      // reserve the whole outer invocation for the oldest row and re-arm for
+      // the remainder. This keeps the measured <=40 statement/binding ceiling
+      // without reordering the Device sequence.
+      const projectionPage = parsedFrames.some((frame) => isPrivilegeFrameType(frame.type)) ? parsedFrames.slice(0, 1) : parsedFrames;
+      for (const frame of projectionPage) {
         await this.projectAndSync(frame);
       }
       const afterProjection = this.workMarker();
@@ -1637,6 +1722,15 @@ export class DeviceRoom extends DurableObject<ControlPlaneEnv> {
     const persistedDevice = this.ctx.storage.sql.exec<{ device_id: string }>("SELECT device_id FROM connection_state WHERE singleton=1").toArray()[0]?.device_id;
     if (persistedDevice !== undefined && persistedDevice !== frame.deviceId) throw new TypeError("approval device target conflicts with room identity");
     return this.enqueueControlFrame("operation.approval", frame.payload, frame.correlationId, frame.expiresAt, undefined, frame.messageId);
+  }
+
+  async deliverPrivilegeRegistration(payload: Record<string, unknown>): Promise<{ sequence: string; delivered: boolean }> {
+    const installationId = typeof payload.installationId === "string" ? payload.installationId : "";
+    if (installationId === "") throw new TypeError("privilege registration identity is missing");
+    const persistedDevice = this.ctx.storage.sql.exec<{ device_id: string }>("SELECT device_id FROM connection_state WHERE singleton=1").toArray()[0]?.device_id;
+    const targetDevice = await this.env.DB.prepare("SELECT device_id FROM device_privilege_installations WHERE installation_id=?1 AND status='active' LIMIT 1").bind(installationId).first<{ device_id: string }>();
+    if (targetDevice === null || (persistedDevice !== undefined && persistedDevice !== targetDevice.device_id)) throw new TypeError("privilege registration target conflicts with room identity");
+    return this.enqueueControlFrame(privilegeRegistrationResultType(), payload, installationId, new Date(Date.now() + 300_000).toISOString(), undefined, `cmsg_preg_${installationId}`, targetDevice.device_id);
   }
 
   async revoke(reason: string): Promise<void> {

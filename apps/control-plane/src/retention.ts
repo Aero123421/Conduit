@@ -22,7 +22,7 @@ export async function cleanupHotData(env: ControlPlaneEnv, options: { now?: Date
   const dayAgo = new Date(now.getTime() - 86_400_000).toISOString();
   const weekAgo = new Date(now.getTime() - 7 * 86_400_000).toISOString();
   const realtimeReceiptExpiry = new Date(now.getTime() + 7 * 86_400_000).toISOString();
-  const [realtimeReceipts, realtimeRows, projectionReceipts, challenges, codes, tokens, consent, clients, enrollments, effects, idempotency, deltas, deliveryReceipts, dispatchRows, approvalDispatchRows] = await env.DB.batch([
+  const [realtimeReceipts, realtimeRows, projectionReceipts, challenges, codes, tokens, consent, clients, enrollments, effects, idempotency, deltas, deliveryReceipts, dispatchRows, approvalDispatchRows, privilegeRequests] = await env.DB.batch([
     env.DB.prepare("INSERT OR IGNORE INTO realtime_delivery_receipts(event_id,session_id,record_id,revision,published_at,expires_at) SELECT event_id,session_id,record_id,revision,published_at,?1 FROM realtime_projection_outbox WHERE state='published' AND published_at<=?2 ORDER BY published_at,event_id LIMIT ?3").bind(realtimeReceiptExpiry, dayAgo, limit),
     env.DB.prepare("DELETE FROM realtime_projection_outbox WHERE event_id IN (SELECT outbox.event_id FROM realtime_projection_outbox AS outbox JOIN realtime_delivery_receipts AS receipt ON receipt.event_id=outbox.event_id WHERE outbox.state='published' AND outbox.published_at<=?1 ORDER BY outbox.published_at,outbox.event_id LIMIT ?2)").bind(dayAgo, limit),
     env.DB.prepare("DELETE FROM node_projection_receipts WHERE message_id IN (SELECT message_id FROM node_projection_receipts WHERE frame_type='device.health' AND created_at<=?1 ORDER BY created_at,message_id LIMIT ?2)").bind(dayAgo, limit),
@@ -38,12 +38,12 @@ export async function cleanupHotData(env: ControlPlaneEnv, options: { now?: Date
     env.DB.prepare("DELETE FROM realtime_delivery_receipts WHERE event_id IN (SELECT event_id FROM realtime_delivery_receipts WHERE expires_at<=?1 ORDER BY expires_at,event_id LIMIT ?2)").bind(at, limit),
     env.DB.prepare("DELETE FROM operation_dispatch_outbox WHERE operation_id IN (SELECT operation_id FROM operation_dispatch_outbox WHERE state='expired' AND expires_at<=?1 ORDER BY expires_at,operation_id LIMIT ?2) AND EXISTS (SELECT 1 FROM operation_journal WHERE id=operation_dispatch_outbox.operation_id AND state='expired' AND concurrency_released_at IS NOT NULL)").bind(weekAgo, limit),
     env.DB.prepare("DELETE FROM approval_dispatch_outbox WHERE approval_id IN (SELECT approval_id FROM approval_dispatch_outbox WHERE state IN ('offered','expired') AND expires_at<=?1 ORDER BY expires_at,approval_id LIMIT ?2) AND EXISTS (SELECT 1 FROM approvals WHERE id=approval_dispatch_outbox.approval_id AND decision IS NOT NULL)").bind(weekAgo, limit),
+    env.DB.prepare("DELETE FROM privilege_ticket_requests WHERE request_id IN (SELECT request.request_id FROM privilege_ticket_requests AS request LEFT JOIN privilege_ticket_issuance AS ticket ON ticket.request_id=request.request_id WHERE request.status IN ('denied','expired','conflict') AND COALESCE(request.terminal_at,request.expires_at)<=?1 AND ticket.request_id IS NULL ORDER BY COALESCE(request.terminal_at,request.expires_at),request.request_id LIMIT ?2)").bind(weekAgo, limit),
   ]);
   const compactedRealtimeRows = changes(realtimeReceipts);
-  const deletedRows = [realtimeRows, projectionReceipts, challenges, codes, tokens, consent, clients, enrollments, effects, idempotency, deltas, deliveryReceipts, dispatchRows, approvalDispatchRows].reduce((sum, result) => sum + changes(result), 0);
-  const hasMore = [realtimeRows, projectionReceipts, challenges, codes, tokens, consent, clients, enrollments, effects, idempotency, deltas, deliveryReceipts, dispatchRows, approvalDispatchRows].some((result) => changes(result) >= limit);
+  const deletedRows = [realtimeRows, projectionReceipts, challenges, codes, tokens, consent, clients, enrollments, effects, idempotency, deltas, deliveryReceipts, dispatchRows, approvalDispatchRows, privilegeRequests].reduce((sum, result) => sum + changes(result), 0);
+  const hasMore = [realtimeRows, projectionReceipts, challenges, codes, tokens, consent, clients, enrollments, effects, idempotency, deltas, deliveryReceipts, dispatchRows, approvalDispatchRows, privilegeRequests].some((result) => changes(result) >= limit);
   const nextDueAt = hasMore ? new Date(now.getTime() + 1_000).toISOString() : null;
   await env.DB.prepare("UPDATE retention_cleanup_state SET continuation_due_at=?1,last_started_at=?2,last_completed_at=?2,last_deleted_rows=?3 WHERE singleton=1").bind(nextDueAt, nowIso(), deletedRows).run();
   return { deletedRows, compactedRealtimeRows, hasMore, nextDueAt };
 }
-

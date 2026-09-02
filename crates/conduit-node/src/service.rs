@@ -4374,17 +4374,98 @@ mod tests {
         }
     }
 
+    fn http_response_complete(response: &[u8]) -> Result<bool, String> {
+        let Some(header_end) = response.windows(4).position(|window| window == b"\r\n\r\n") else {
+            return Ok(false);
+        };
+        let headers =
+            std::str::from_utf8(&response[..header_end]).map_err(|error| error.to_string())?;
+        let mut content_length = None;
+        let mut chunked = false;
+        for line in headers.lines().skip(1) {
+            let Some((name, value)) = line.split_once(':') else {
+                continue;
+            };
+            if name.eq_ignore_ascii_case("content-length") {
+                content_length = Some(
+                    value
+                        .trim()
+                        .parse::<usize>()
+                        .map_err(|error| error.to_string())?,
+                );
+            } else if name.eq_ignore_ascii_case("transfer-encoding")
+                && value
+                    .split(',')
+                    .any(|encoding| encoding.trim().eq_ignore_ascii_case("chunked"))
+            {
+                chunked = true;
+            }
+        }
+        let body = &response[header_end + 4..];
+        if chunked {
+            let mut cursor = body;
+            loop {
+                let Some(line_end) = cursor.windows(2).position(|window| window == b"\r\n") else {
+                    return Ok(false);
+                };
+                let size_text = std::str::from_utf8(&cursor[..line_end])
+                    .map_err(|error| error.to_string())?
+                    .split(';')
+                    .next()
+                    .unwrap_or("");
+                let size =
+                    usize::from_str_radix(size_text, 16).map_err(|error| error.to_string())?;
+                cursor = &cursor[line_end + 2..];
+                if size == 0 {
+                    return Ok(true);
+                }
+                if cursor.len() < size + 2 {
+                    return Ok(false);
+                }
+                if &cursor[size..size + 2] != b"\r\n" {
+                    return Err("HTTP chunk body is malformed".into());
+                }
+                cursor = &cursor[size + 2..];
+            }
+        }
+        Ok(content_length.is_some_and(|length| body.len() >= length))
+    }
+
+    #[test]
+    fn loopback_http_completion_does_not_require_connection_close() {
+        assert!(
+            http_response_complete(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nok"
+            )
+            .unwrap()
+        );
+        assert!(
+            !http_response_complete(
+                b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nConnection: keep-alive\r\n\r\nok"
+            )
+            .unwrap()
+        );
+        assert!(http_response_complete(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n2\r\nok\r\n0\r\n\r\n"
+        )
+        .unwrap());
+    }
+
     fn loopback_http(
         port: u16,
         method: &str,
         path: &str,
         body: Option<&str>,
+        timeout: Duration,
     ) -> Result<(u16, String), String> {
         let body = body.unwrap_or("");
         let mut stream =
             TcpStream::connect(("127.0.0.1", port)).map_err(|error| error.to_string())?;
         stream
-            .set_read_timeout(Some(Duration::from_secs(10)))
+            .set_read_timeout(Some(timeout))
+            .map_err(|error| error.to_string())?;
+        stream
+            .set_write_timeout(Some(timeout))
             .map_err(|error| error.to_string())?;
         let request = format!(
             "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: Bearer local-synthetic-idle-e2e-token\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -4394,9 +4475,22 @@ mod tests {
             .write_all(request.as_bytes())
             .map_err(|error| error.to_string())?;
         let mut response = Vec::new();
-        stream
-            .read_to_end(&mut response)
-            .map_err(|error| error.to_string())?;
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let read = stream
+                .read(&mut buffer)
+                .map_err(|error| error.to_string())?;
+            if read == 0 {
+                break;
+            }
+            response.extend_from_slice(&buffer[..read]);
+            if response.len() > 1024 * 1024 {
+                return Err("HTTP response exceeds test bound".into());
+            }
+            if http_response_complete(&response)? {
+                break;
+            }
+        }
         let header_end = response
             .windows(4)
             .position(|window| window == b"\r\n\r\n")
@@ -4894,14 +4988,17 @@ mod tests {
             .current_dir(&app)
             .env("CI", "true")
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("Wrangler dev must start");
         let _worker = ChildGuard(child);
         let mut ready = false;
-        for _ in 0..300 {
-            if loopback_http(port, "GET", "/healthz", None).is_ok_and(|(status, _)| status == 200) {
+        let ready_deadline = Instant::now() + Duration::from_secs(60);
+        while Instant::now() < ready_deadline {
+            if loopback_http(port, "GET", "/healthz", None, Duration::from_millis(250))
+                .is_ok_and(|(status, _)| status == 200)
+            {
                 ready = true;
                 break;
             }
@@ -5007,6 +5104,7 @@ mod tests {
             "POST",
             &reset_path,
             Some(&format!("{{\"nowMs\":{simulated_start}}}")),
+            Duration::from_secs(10),
         )
         .unwrap();
         assert_eq!(status, 200);
@@ -5064,7 +5162,8 @@ mod tests {
         client.await_idle_e2e_settled(144).unwrap();
         stage("device_room_settled");
         let inspect_path = format!("/__idle-e2e/devices/{device_id}/inspect");
-        let (status, body) = loopback_http(port, "GET", &inspect_path, None).unwrap();
+        let (status, body) =
+            loopback_http(port, "GET", &inspect_path, None, Duration::from_secs(10)).unwrap();
         assert_eq!(status, 200);
         stage("probe_inspected");
         let probe: Value = serde_json::from_str(&body).unwrap();

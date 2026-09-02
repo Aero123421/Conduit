@@ -277,16 +277,47 @@ impl HelperClient {
         }
     }
     pub fn receipt(&self, request: &HelperRequest, descriptors: &[RawFd]) -> Result<HelperReceipt> {
+        self.receipt_chain(request, descriptors)?
+            .pop()
+            .ok_or_else(|| HelperError::RecoveryRequired("empty receipt chain".into()))
+    }
+    pub fn receipt_chain(
+        &self,
+        request: &HelperRequest,
+        descriptors: &[RawFd],
+    ) -> Result<Vec<HelperReceipt>> {
         match self.call(request, descriptors)? {
-            HelperResponse::Receipt(v) => Ok(v),
-            HelperResponse::Receipts(mut values) => values
-                .pop()
-                .ok_or_else(|| HelperError::RecoveryRequired("empty receipt chain".into())),
+            HelperResponse::Receipt(v) => Ok(vec![v]),
+            HelperResponse::Receipts(values) if !values.is_empty() => Ok(values),
+            HelperResponse::Receipts(_) => {
+                Err(HelperError::RecoveryRequired("empty receipt chain".into()))
+            }
             HelperResponse::Error { code, .. } => Err(HelperError::Denied(code)),
             _ => Err(HelperError::Protocol(
                 conduit_privileged_protocol::ProtocolError::Invalid("receipt response".into()),
             )),
         }
+    }
+    pub fn prepare_chain(
+        &self,
+        ticket: conduit_privileged_protocol::PrivilegeTicket,
+        plan: conduit_privileged_protocol::LocalExecutionPlan,
+        descriptors: &[RawFd],
+    ) -> Result<Vec<HelperReceipt>> {
+        self.receipt_chain(&HelperRequest::Prepare { ticket, plan }, descriptors)
+    }
+    pub fn start_chain(
+        &self,
+        ticket: conduit_privileged_protocol::PrivilegeTicket,
+        plan_digest: String,
+    ) -> Result<Vec<HelperReceipt>> {
+        self.receipt_chain(
+            &HelperRequest::Start {
+                ticket,
+                plan_digest,
+            },
+            &[],
+        )
     }
     pub fn prepare(
         &self,

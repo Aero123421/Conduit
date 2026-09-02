@@ -30,12 +30,26 @@ pub trait PrivilegedTicketSource: Send + Sync {
 #[derive(Debug, Clone)]
 pub struct PrivilegedRuntimeReceipt {
     pub runtime: RuntimeStateReceipt,
-    pub helper_receipt: HelperReceipt,
+    pub helper_receipts: Vec<HelperReceipt>,
+}
+impl PrivilegedRuntimeReceipt {
+    pub fn final_helper_receipt(&self) -> &HelperReceipt {
+        self.helper_receipts
+            .last()
+            .expect("privileged receipt chains are validated as non-empty")
+    }
 }
 #[derive(Debug, Clone)]
 pub struct PrivilegedPreparedRuntime {
     pub runtime: PreparedRuntime,
-    pub helper_receipt: HelperReceipt,
+    pub helper_receipts: Vec<HelperReceipt>,
+}
+impl PrivilegedPreparedRuntime {
+    pub fn final_helper_receipt(&self) -> &HelperReceipt {
+        self.helper_receipts
+            .last()
+            .expect("privileged receipt chains are validated as non-empty")
+    }
 }
 pub struct PrivilegedManagedRuntime {
     pub io: Box<dyn ManagedProcessIo>,
@@ -84,13 +98,17 @@ impl PrivilegedNativeProvider {
                 "privileged prepare authority mismatch".into(),
             ));
         }
-        let receipt = self
+        let receipts = self
             .client
             .lock()
             .map_err(lock)?
-            .prepare(ticket, plan.clone())
+            .prepare_chain(ticket, plan.clone(), &[])
             .map_err(helper)?;
-        self.verify(&receipt)?;
+        self.verify_chain(&receipts, None, &["admitted", "prepared"])?;
+        let receipt = receipts
+            .last()
+            .expect("verified receipt chain is non-empty")
+            .clone();
         let runtime = PreparedRuntime {
             runtime_id: request.runtime_id.clone(),
             provider_id: "privileged-native".into(),
@@ -109,7 +127,7 @@ impl PrivilegedNativeProvider {
         );
         Ok(PrivilegedPreparedRuntime {
             runtime,
-            helper_receipt: receipt,
+            helper_receipts: receipts,
         })
     }
     pub fn start_privileged(
@@ -128,19 +146,27 @@ impl PrivilegedNativeProvider {
         if &entry.plan != plan || entry.spec_digest != prepared.spec_digest {
             return Err(RuntimeError::IdentityMismatch);
         }
-        let receipt = self
+        let receipts = self
             .client
             .lock()
             .map_err(lock)?
-            .start(
+            .start_chain(
                 ticket,
                 plan.digest()
                     .map_err(|e| RuntimeError::Record(e.to_string()))?,
             )
             .map_err(helper)?;
-        self.verify(&receipt)?;
+        self.verify_chain(
+            &receipts,
+            Some(&entry.receipt),
+            &["unit_created", "running"],
+        )?;
+        let receipt = receipts
+            .last()
+            .expect("verified receipt chain is non-empty")
+            .clone();
         entry.receipt = receipt.clone();
-        Ok(privileged_receipt(prepared, &receipt))
+        Ok(privileged_receipt(prepared, receipts))
     }
     pub fn inspect_privileged(
         &self,
@@ -157,9 +183,9 @@ impl PrivilegedNativeProvider {
             .map_err(lock)?
             .inspect(target)
             .map_err(helper)?;
-        self.verify(&receipt)?;
+        self.verify_chain(std::slice::from_ref(&receipt), Some(&entry.receipt), &[])?;
         entry.receipt = receipt.clone();
-        Ok(privileged_receipt_from_handle(handle, &receipt))
+        Ok(privileged_receipt_from_handle(handle, vec![receipt]))
     }
     pub fn control_privileged(
         &self,
@@ -183,9 +209,9 @@ impl PrivilegedNativeProvider {
             .map_err(lock)?
             .control(ticket, target(handle, &entry.receipt)?, operation)
             .map_err(helper)?;
-        self.verify(&receipt)?;
+        self.verify_chain(std::slice::from_ref(&receipt), Some(&entry.receipt), &[])?;
         entry.receipt = receipt.clone();
-        Ok(privileged_receipt_from_handle(handle, &receipt))
+        Ok(privileged_receipt_from_handle(handle, vec![receipt]))
     }
     pub fn input_authorized(
         &self,
@@ -214,9 +240,13 @@ impl PrivilegedNativeProvider {
             .map_err(lock)?
             .send_input(ticket, target(handle, &entry.receipt)?, file.as_raw_fd())
             .map_err(helper)?;
-        self.verify(&receipt)?;
+        self.verify_chain(
+            std::slice::from_ref(&receipt),
+            Some(&entry.receipt),
+            &["input_applied"],
+        )?;
         entry.receipt = receipt.clone();
-        Ok(privileged_receipt_from_handle(handle, &receipt))
+        Ok(privileged_receipt_from_handle(handle, vec![receipt]))
     }
     pub fn resize_authorized(
         &self,
@@ -238,9 +268,13 @@ impl PrivilegedNativeProvider {
             .map_err(lock)?
             .resize_pty(ticket, target(handle, &entry.receipt)?, rows, columns)
             .map_err(helper)?;
-        self.verify(&receipt)?;
+        self.verify_chain(
+            std::slice::from_ref(&receipt),
+            Some(&entry.receipt),
+            &["pty_resized"],
+        )?;
         entry.receipt = receipt.clone();
-        Ok(privileged_receipt_from_handle(handle, &receipt))
+        Ok(privileged_receipt_from_handle(handle, vec![receipt]))
     }
     pub fn start_managed_privileged(
         &self,
@@ -266,6 +300,16 @@ impl PrivilegedNativeProvider {
     }
     fn verify(&self, receipt: &HelperReceipt) -> Result<(), RuntimeError> {
         HelperClient::verify_receipt(receipt, &self.receipt_key).map_err(helper)
+    }
+    fn verify_chain(
+        &self,
+        receipts: &[HelperReceipt],
+        previous: Option<&HelperReceipt>,
+        expected_transitions: &[&str],
+    ) -> Result<(), RuntimeError> {
+        verify_receipt_chain(receipts, previous, expected_transitions, |receipt| {
+            self.verify(receipt)
+        })
     }
 }
 
@@ -317,13 +361,13 @@ impl RuntimeProvider for PrivilegedNativeProvider {
     }
     fn collect(&self, handle: &RuntimeHandle) -> Result<CollectionReceipt, RuntimeError> {
         let receipt = self.inspect_privileged(handle)?;
+        let helper_receipt = receipt.final_helper_receipt();
         Ok(CollectionReceipt {
             runtime_id: handle.runtime_id.clone(),
-            collection_id: receipt.helper_receipt.claims.receipt_id.clone(),
-            custody_complete: receipt.helper_receipt.claims.stdout_cursor
-                == receipt.helper_receipt.claims.stderr_cursor,
-            digest: receipt
-                .helper_receipt
+            collection_id: helper_receipt.claims.receipt_id.clone(),
+            custody_complete: helper_receipt.claims.stdout_cursor
+                == helper_receipt.claims.stderr_cursor,
+            digest: helper_receipt
                 .digest()
                 .map_err(|e| RuntimeError::Record(e.to_string()))?,
         })
@@ -344,13 +388,15 @@ impl RuntimeProvider for PrivilegedNativeProvider {
         records
             .iter()
             .map(|expected| {
-                self.inspect_privileged(&expected.handle)
-                    .map(|receipt| ReconciliationReceipt {
+                self.inspect_privileged(&expected.handle).map(|receipt| {
+                    let helper_receipt = receipt.final_helper_receipt();
+                    ReconciliationReceipt {
                         runtime_id: expected.handle.runtime_id.clone(),
                         state: receipt.runtime.state,
-                        reason_code: receipt.helper_receipt.claims.transition,
-                        observed_identity: receipt.helper_receipt.claims.invocation_id,
-                    })
+                        reason_code: helper_receipt.claims.transition.clone(),
+                        observed_identity: helper_receipt.claims.invocation_id.clone(),
+                    }
+                })
             })
             .collect()
     }
@@ -573,17 +619,23 @@ fn handle(runtime_id: &str, spec_digest: &str, receipt: &HelperReceipt) -> Runti
 }
 fn privileged_receipt(
     prepared: &PreparedRuntime,
-    receipt: &HelperReceipt,
+    helper_receipts: Vec<HelperReceipt>,
 ) -> PrivilegedRuntimeReceipt {
+    let receipt = helper_receipts
+        .last()
+        .expect("privileged receipt chains are validated as non-empty");
     privileged_receipt_from_handle(
         &handle(&prepared.runtime_id, &prepared.spec_digest, receipt),
-        receipt,
+        helper_receipts,
     )
 }
 fn privileged_receipt_from_handle(
     handle: &RuntimeHandle,
-    receipt: &HelperReceipt,
+    helper_receipts: Vec<HelperReceipt>,
 ) -> PrivilegedRuntimeReceipt {
+    let receipt = helper_receipts
+        .last()
+        .expect("privileged receipt chains are validated as non-empty");
     PrivilegedRuntimeReceipt {
         runtime: RuntimeStateReceipt {
             handle: handle.clone(),
@@ -591,8 +643,66 @@ fn privileged_receipt_from_handle(
             exit_code: receipt.claims.exit_code,
             evidence: evidence(),
         },
-        helper_receipt: receipt.clone(),
+        helper_receipts,
     }
+}
+fn verify_receipt_chain(
+    receipts: &[HelperReceipt],
+    previous: Option<&HelperReceipt>,
+    expected_transitions: &[&str],
+    mut verify: impl FnMut(&HelperReceipt) -> Result<(), RuntimeError>,
+) -> Result<(), RuntimeError> {
+    if receipts.is_empty() {
+        return Err(RuntimeError::Uncertain(
+            "helper returned an empty receipt chain".into(),
+        ));
+    }
+    if !expected_transitions.is_empty()
+        && (receipts.len() != expected_transitions.len()
+            || receipts
+                .iter()
+                .zip(expected_transitions)
+                .any(|(receipt, transition)| receipt.claims.transition != *transition))
+    {
+        return Err(RuntimeError::Uncertain(
+            "helper returned an incomplete custody boundary chain".into(),
+        ));
+    }
+    for receipt in receipts {
+        verify(receipt)?;
+    }
+    let first = &receipts[0];
+    if let Some(previous) = previous {
+        let previous_digest = previous
+            .digest()
+            .map_err(|error| RuntimeError::Record(error.to_string()))?;
+        if first.claims.previous_receipt_digest.as_deref() != Some(previous_digest.as_str())
+            || first.claims.state_revision != previous.claims.state_revision.saturating_add(1)
+        {
+            return Err(RuntimeError::Uncertain(
+                "helper receipt chain does not extend local custody".into(),
+            ));
+        }
+    } else if first.claims.previous_receipt_digest.is_some() {
+        return Err(RuntimeError::Uncertain(
+            "initial helper receipt unexpectedly extends unknown custody".into(),
+        ));
+    }
+    for pair in receipts.windows(2) {
+        let previous_digest = pair[0]
+            .digest()
+            .map_err(|error| RuntimeError::Record(error.to_string()))?;
+        if pair[1].claims.previous_receipt_digest.as_deref() != Some(previous_digest.as_str())
+            || pair[1].claims.state_revision != pair[0].claims.state_revision.saturating_add(1)
+            || pair[1].claims.runtime_id != pair[0].claims.runtime_id
+            || pair[1].claims.operation_id != pair[0].claims.operation_id
+        {
+            return Err(RuntimeError::Uncertain(
+                "helper receipt chain linkage is invalid".into(),
+            ));
+        }
+    }
+    Ok(())
 }
 fn target(handle: &RuntimeHandle, receipt: &HelperReceipt) -> Result<ControlTarget, RuntimeError> {
     let invocation = receipt
@@ -611,4 +721,112 @@ fn target(handle: &RuntimeHandle, receipt: &HelperReceipt) -> Result<ControlTarg
     target.runtime_handle_digest =
         conduit_privileged_helper::control_target_digest(&target).map_err(helper)?;
     Ok(target)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use conduit_privileged_protocol::{PROTOCOL, ReceiptClaims, SignedClaims};
+    use ed25519_dalek::SigningKey;
+
+    fn signed_receipt(
+        key: &SigningKey,
+        revision: u64,
+        transition: &str,
+        operation_id: &str,
+        previous_receipt_digest: Option<String>,
+    ) -> HelperReceipt {
+        SignedClaims::sign(
+            "hkey_test",
+            ReceiptClaims {
+                protocol: PROTOCOL.into(),
+                receipt_id: format!("receipt-{revision}"),
+                installation_id: "installation-test".into(),
+                receipt_key_id: "hkey_test".into(),
+                helper_version: "test".into(),
+                policy_revision: 1,
+                policy_digest: "11".repeat(32),
+                ticket_id: format!("ticket-{operation_id}"),
+                ticket_digest: "22".repeat(32),
+                operation_id: operation_id.into(),
+                request_digest: "33".repeat(32),
+                run_id: "run-test".into(),
+                runtime_id: "runtime-test".into(),
+                runtime_spec_digest: "44".repeat(32),
+                launch_plan_digest: "55".repeat(32),
+                local_execution_plan_digest: "66".repeat(32),
+                control_request_digest: None,
+                controller_epoch: 1,
+                state_revision: revision,
+                transition: transition.into(),
+                unit_name: "conduit-elevated-test.service".into(),
+                invocation_id: (revision >= 3).then(|| "invocation-test".into()),
+                cgroup: None,
+                main_pid: None,
+                process_birth: None,
+                effective_uid: None,
+                effective_gid: None,
+                stdout_cursor: 0,
+                stderr_cursor: 0,
+                exit_code: None,
+                signal: None,
+                observed_at: "2026-01-01T00:00:00Z".into(),
+                previous_receipt_digest,
+            },
+            key,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn provider_exposes_all_four_prepare_and_start_custody_boundaries() {
+        let key = SigningKey::from_bytes(&[73; 32]);
+        let admitted = signed_receipt(&key, 1, "admitted", "prepare", None);
+        let prepared = signed_receipt(
+            &key,
+            2,
+            "prepared",
+            "prepare",
+            Some(admitted.digest().unwrap()),
+        );
+        let unit_created = signed_receipt(
+            &key,
+            3,
+            "unit_created",
+            "start",
+            Some(prepared.digest().unwrap()),
+        );
+        let running = signed_receipt(
+            &key,
+            4,
+            "running",
+            "start",
+            Some(unit_created.digest().unwrap()),
+        );
+        let prepared_chain = vec![admitted, prepared];
+        let started_chain = vec![unit_created, running];
+        verify_receipt_chain(
+            &prepared_chain,
+            None,
+            &["admitted", "prepared"],
+            |receipt| HelperClient::verify_receipt(receipt, &key.verifying_key()).map_err(helper),
+        )
+        .unwrap();
+        verify_receipt_chain(
+            &started_chain,
+            prepared_chain.last(),
+            &["unit_created", "running"],
+            |receipt| HelperClient::verify_receipt(receipt, &key.verifying_key()).map_err(helper),
+        )
+        .unwrap();
+        let exposed = prepared_chain
+            .iter()
+            .chain(&started_chain)
+            .map(|receipt| receipt.claims.transition.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            exposed,
+            vec!["admitted", "prepared", "unit_created", "running"]
+        );
+    }
 }

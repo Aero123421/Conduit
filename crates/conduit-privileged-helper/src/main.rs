@@ -4,7 +4,8 @@ use conduit_privileged_helper::{
     SeqpacketServer, SystemdBackend, SystemdManager, load_receipt_key_root_owned, run_exec_worker,
 };
 use conduit_privileged_protocol::{
-    HelperRequest, HelperResponse, PrivilegedOperation, ResourceCeilings, RootPolicy, key_id,
+    CapabilityClaims, HelperRequest, HelperResponse, PrivilegedOperation, ResourceCeilings,
+    RootPolicy, SignedClaims, key_id,
 };
 use ed25519_dalek::VerifyingKey;
 use serde_json::json;
@@ -241,12 +242,10 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             };
             let policy_bytes = serde_jcs::to_vec(&policy)?;
             atomic(&state.join("privileged-policy.json"), &policy_bytes, 0o600)?;
-            let receipt_public = fs::read(state.join("receipt.public"))?;
-            let bundle = serde_jcs::to_vec(
-                &json!({"installationId":installation_id,"policyDigest":policy.digest()?,"receiptKeyFingerprint":hex::encode(Sha256::digest(receipt_public))}),
-            )?;
+            let registration = registration_bundle(&state)?;
+            let bundle_digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&registration)?));
             output(
-                json!({"prepared":true,"enabled":false,"installationId":installation_id,"bundleDigest":hex::encode(Sha256::digest(bundle)),"deviceKeyId":key_id("dkey",&node_raw)}),
+                json!({"prepared":true,"enabled":false,"installationId":installation_id,"bundleDigest":bundle_digest,"deviceKeyId":key_id("dkey",&node_raw),"registrationBundle":registration}),
             );
             Ok(())
         }
@@ -272,9 +271,7 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
                 ));
             }
             let public = fs::read(&source)?;
-            let raw: [u8; 32] = public.try_into().map_err(|_| {
-                conduit_privileged_helper::HelperError::Policy("issuer public key length".into())
-            })?;
+            let raw = decode_public_key(&public)?;
             VerifyingKey::from_bytes(&raw).map_err(|_| {
                 conduit_privileged_helper::HelperError::Policy("issuer public key invalid".into())
             })?;
@@ -347,7 +344,7 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             })?;
             atomic(&path, &serde_jcs::to_vec(&policy)?, 0o600)?;
             output(
-                json!({"enabled":true,"policyRevision":policy.revision,"installationId":policy.installation_id}),
+                json!({"enabled":true,"policyRevision":policy.revision,"policyDigest":policy.digest()?,"installationId":policy.installation_id,"registrationBundle":registration_bundle(&state)?}),
             );
             Ok(())
         }
@@ -385,8 +382,13 @@ fn admin(args: &[String]) -> conduit_privileged_helper::Result<()> {
             let digest = policy.digest()?;
             atomic(&path, &serde_jcs::to_vec(&policy)?, 0o600)?;
             output(
-                json!({"updated":true,"policyRevision":policy.revision,"policyDigest":digest,"allowNever":policy.allow_never,"allowUnrestrictedLaunch":policy.allow_unrestricted_launch,"allowedAdapters":policy.allowed_adapters,"allowedLaunchProfiles":policy.allowed_launch_profiles}),
+                json!({"updated":true,"policyRevision":policy.revision,"policyDigest":digest,"allowNever":policy.allow_never,"allowUnrestrictedLaunch":policy.allow_unrestricted_launch,"allowedAdapters":policy.allowed_adapters,"allowedLaunchProfiles":policy.allowed_launch_profiles,"registrationBundle":registration_bundle(&state)?}),
             );
+            Ok(())
+        }
+        "registration-bundle" => {
+            require_root()?;
+            output(registration_bundle(&state)?);
             Ok(())
         }
         "package-status" => {
@@ -563,6 +565,77 @@ fn parse_csv(value: &str) -> conduit_privileged_helper::Result<Vec<String>> {
     values.sort();
     values.dedup();
     Ok(values)
+}
+fn decode_public_key(bytes: &[u8]) -> conduit_privileged_helper::Result<[u8; 32]> {
+    if bytes.len() == 32 {
+        return Ok(bytes.try_into().unwrap());
+    }
+    #[derive(serde::Deserialize)]
+    struct Jwk {
+        kty: String,
+        crv: String,
+        x: String,
+    }
+    let jwk: Jwk = serde_json::from_slice(bytes)?;
+    if jwk.kty != "OKP" || jwk.crv != "Ed25519" {
+        return Err(conduit_privileged_helper::HelperError::Policy(
+            "issuer JWK type".into(),
+        ));
+    }
+    URL_SAFE_NO_PAD
+        .decode(jwk.x)
+        .map_err(|_| conduit_privileged_helper::HelperError::Policy("issuer JWK x".into()))?
+        .try_into()
+        .map_err(|_| {
+            conduit_privileged_helper::HelperError::Policy("issuer public key length".into())
+        })
+}
+fn registration_bundle(state: &Path) -> conduit_privileged_helper::Result<serde_json::Value> {
+    let policy: RootPolicy =
+        serde_json::from_slice(&fs::read(state.join("privileged-policy.json"))?)?;
+    let signing = load_receipt_key_root_owned(&state.join("receipt.key"))?;
+    let receipt_id = key_id("hkey", signing.verifying_key().as_bytes());
+    let policy_digest = policy.digest()?;
+    let observed = time::OffsetDateTime::now_utc()
+        .format(&time::format_description::well_known::Rfc3339)
+        .map_err(|e| conduit_privileged_helper::HelperError::Policy(e.to_string()))?;
+    let systemd = SystemdBackend::connect_system()
+        .and_then(|v| v.available())
+        .unwrap_or(false);
+    let capability = CapabilityClaims {
+        protocol: conduit_privileged_protocol::PROTOCOL.into(),
+        helper_version: env!("CARGO_PKG_VERSION").into(),
+        installation_id: policy.installation_id.clone(),
+        receipt_key_id: receipt_id.clone(),
+        policy_revision: policy.revision,
+        policy_digest: policy_digest.clone(),
+        enabled: policy.enabled,
+        observed_at: observed,
+        systemd_system_manager: systemd,
+        socket_peer_credentials: true,
+        transient_units: systemd,
+        cgroup_v2: Path::new("/sys/fs/cgroup/cgroup.controllers").exists(),
+        freeze: systemd,
+        pidfd: true,
+        openat2: true,
+        execveat: true,
+        pty: true,
+        stream_replay: true,
+        never_opt_in: policy.allow_never,
+        unrestricted_launch_opt_in: policy.allow_unrestricted_launch,
+        unavailable_reason: if policy.enabled && systemd {
+            None
+        } else {
+            Some("policy_or_systemd_unavailable".into())
+        },
+    };
+    let node = fs::read(state.join("node-public.key"))?;
+    let node: [u8; 32] = node.try_into().map_err(|_| {
+        conduit_privileged_helper::HelperError::Policy("node public key length".into())
+    })?;
+    Ok(
+        json!({"protocol":conduit_privileged_protocol::PROTOCOL,"installationId":policy.installation_id,"deviceId":policy.device_id,"deviceKeyId":key_id("dkey",&node),"uid":policy.uid,"origin":policy.origin,"policyRevision":policy.revision,"policyDigest":policy_digest,"receiptPublicJwk":{"kty":"OKP","crv":"Ed25519","x":URL_SAFE_NO_PAD.encode(signing.verifying_key().as_bytes()),"kid":receipt_id},"signedPolicyAttestation":SignedClaims::sign(&receipt_id,policy,&signing)?,"signedCapability":SignedClaims::sign(&receipt_id,capability,&signing)?}),
+    )
 }
 fn validate_managed_state(state: &Path) -> conduit_privileged_helper::Result<()> {
     if !state.is_absolute() || state == Path::new("/") || state.components().count() < 3 {

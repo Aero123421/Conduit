@@ -400,6 +400,33 @@ fn node_prepare() {
             }
         }),
     );
+    // The earlier browser-registration phase represents a prior successful
+    // Node connection. Restore only the exact accepted public policy chain
+    // into the new Node journal, then require production NodeService to replay
+    // and re-activate it over the real socket below.
+    let approval = read_json(&evidence.join("registration-approval.json"));
+    let policy = read_json(&evidence.join("node-launch-profiles.json"))["localPolicy"].clone();
+    let policy_digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&policy).unwrap()));
+    assert_eq!(approval["devicePolicyRevision"], policy["revision"]);
+    assert_eq!(approval["devicePolicyDigest"], policy_digest);
+    let previous = approval["devicePolicyPreviousDigest"].as_str();
+    let store = NodeStore::open(&data).unwrap();
+    if let Some(previous_digest) = previous {
+        store
+            .commit_privilege_registration_state(
+                approval["devicePolicyRevision"].as_u64().unwrap() - 1,
+                previous_digest,
+                None,
+            )
+            .unwrap();
+    }
+    store
+        .commit_privilege_registration_state(
+            approval["devicePolicyRevision"].as_u64().unwrap(),
+            &policy_digest,
+            previous,
+        )
+        .unwrap();
     let manifest_digest = hex::encode(Sha256::digest(b"node-service-live-manifest-v1"));
     let now = OffsetDateTime::now_utc();
     let mut operation = json!({

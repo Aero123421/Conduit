@@ -7049,6 +7049,7 @@ mod tests {
     };
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
+    use std::os::unix::process::CommandExt;
     use std::process::{Child, Command, Stdio};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -7056,6 +7057,12 @@ mod tests {
 
     impl Drop for ChildGuard {
         fn drop(&mut self) {
+            // Wrangler may leave its workerd child running after the CLI
+            // process exits.  The test owns a dedicated process group so its
+            // complete local Worker tree is bounded by this guard.
+            unsafe {
+                libc::kill(-(self.0.id() as i32), libc::SIGTERM);
+            }
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
@@ -7750,6 +7757,7 @@ mod tests {
             .stdin(Stdio::null())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
+            .process_group(0)
             .spawn()
             .expect("Wrangler dev must start");
         let _worker = ChildGuard(child);

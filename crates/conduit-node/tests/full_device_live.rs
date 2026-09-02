@@ -1,18 +1,17 @@
-//! Opt-in Linux root/systemd exercise used only by scripts/e2e-full-device-live.sh.
-//! It uses an isolated in-process cryptographic issuer in place of a production
-//! Control Plane when the script is not supplied production test credentials.
+//! Opt-in root/systemd test used only by scripts/e2e-full-device-live.sh.
+//! Public evidence contains bounded booleans and digests, never host paths.
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use conduit_node::privileged::PrivilegedNodeRuntime;
 use conduit_node_store::DeviceIdentity;
-use conduit_privileged_helper::capture_file_identity;
+use conduit_privileged_helper::{HelperClient, capture_file_identity};
 use conduit_privileged_protocol::{
     ApprovalEnforcement, LocalExecutionPlan, PrivilegeTicket, PrivilegeTicketClaims,
     PrivilegedOperation, ResourceCeilings, SignedClaims, StdioMode, key_id,
 };
 use conduit_runtime::{
-    NetworkMode, PrivilegedNativeProvider, ResourceLimits, RuntimeKind, RuntimeRequest,
-    RuntimeSignal,
+    IoMode, LaunchPlan, NativeProvider, NetworkMode, PrivilegedNativeProvider, ProcessSupervisor,
+    ResourceLimits, RuntimeKind, RuntimeProvider, RuntimeRequest, RuntimeSignal, RuntimeState,
 };
 use ed25519_dalek::SigningKey;
 use serde_json::{Value, json};
@@ -22,6 +21,8 @@ use std::{
     env, fs,
     os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
@@ -32,7 +33,9 @@ fn full_device_live_systemd_root_e2e() {
     match required("CONDUIT_FULL_DEVICE_E2E_PHASE").as_str() {
         "bootstrap" => bootstrap(),
         "registration" => registration(),
+        "full_user" => full_user(),
         "exercise" => exercise(),
+        "recover" => recover(),
         phase => panic!("unknown Full Device E2E phase {phase}"),
     }
 }
@@ -93,21 +96,13 @@ fn registration() {
     };
     let issuer_id = key_id("pkey", issuer.verifying_key().as_bytes());
     let fingerprint = hex::encode(Sha256::digest(issuer.verifying_key().as_bytes()));
-    let public_jwk = json!({
-        "kty":"OKP",
-        "crv":"Ed25519",
-        "x":URL_SAFE_NO_PAD.encode(issuer.verifying_key().as_bytes())
-    });
+    let public_jwk = json!({"kty":"OKP","crv":"Ed25519","x":URL_SAFE_NO_PAD.encode(issuer.verifying_key().as_bytes())});
     write_json(&evidence.join("issuer-public-jwk.json"), &public_jwk);
     write_json(
         &evidence.join("issuer-public-key.json"),
         &json!({
-            "schemaVersion":1,
-            "keyId":issuer_id,
-            "fingerprint":fingerprint,
-            "publicJwk":public_jwk,
-            "status":"active",
-            "ownerActivated":true
+            "schemaVersion":1,"keyId":issuer_id,"fingerprint":fingerprint,
+            "publicJwk":public_jwk,"status":"active","ownerActivated":true
         }),
     );
     let bundle_digest = hex::encode(Sha256::digest(serde_jcs::to_vec(&bundle).unwrap()));
@@ -117,101 +112,714 @@ fn registration() {
     write_json(
         &evidence.join("registration-approval.json"),
         &json!({
-            "schemaVersion":1,
-            "status":"active",
-            "freshPasskey":true,
-            "deviceId":object["deviceId"],
-            "installationId":object["installationId"],
+            "schemaVersion":1,"status":"active","freshPasskey":true,
+            "deviceId":object["deviceId"],"installationId":object["installationId"],
             "helperKeyId":capability.claims.receipt_key_id,
             "helperPolicyRevision":capability.claims.policy_revision,
             "helperPolicyDigest":capability.claims.policy_digest,
-            "registrationBundleDigest":bundle_digest,
-            "ownerDecisionDigest":owner_decision_digest,
-            "issuerKeys":[{
-                "keyId":issuer_id,
-                "fingerprint":fingerprint,
-                "publicJwk":public_jwk,
-                "status":"active"
-            }]
+            "registrationBundleDigest":bundle_digest,"ownerDecisionDigest":owner_decision_digest,
+            "issuerKeys":[{"keyId":issuer_id,"fingerprint":fingerprint,"publicJwk":public_jwk,"status":"active"}]
+        }),
+    );
+}
+
+/// Runs while the system helper socket is still disabled. This makes helper
+/// non-contact an externally enforced precondition rather than an assertion.
+fn full_user() {
+    let evidence = evidence_dir();
+    let supervisor_root = evidence.join("full-user-supervisor");
+    let provider = NativeProvider::new(ProcessSupervisor::open(&supervisor_root).unwrap());
+    let runtime_id = "rt_live_full_user_0001";
+    let request = RuntimeRequest {
+        runtime_id: runtime_id.into(),
+        run_id: "run_live_full_user_0001".into(),
+        kind: RuntimeKind::Native,
+        provider_selector: "native".into(),
+        spec_digest: "10".repeat(32),
+        image: None,
+        resources: limits(),
+        network: NetworkMode::Open,
+        workspaces: vec![],
+    };
+    let prepared = provider.prepare(&request).unwrap();
+    let started = provider
+        .start(
+            &prepared,
+            &LaunchPlan {
+                executable: existing(&["/usr/bin/id", "/bin/id"]),
+                argv: vec!["-u".into()],
+                cwd: evidence.clone(),
+                environment: BTreeMap::new(),
+                io_mode: IoMode::Pipes,
+                timeout_ms: Some(5_000),
+            },
+        )
+        .unwrap();
+    for _ in 0..100 {
+        if provider.inspect(&started.handle).unwrap().state == RuntimeState::Stopped {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let output = fs::read_to_string(supervisor_root.join(format!("{runtime_id}.stream"))).unwrap();
+    assert_eq!(output.trim(), unsafe { libc::geteuid() }.to_string());
+    write_json(
+        &evidence.join("full-user-summary.json"),
+        &json!({
+            "schemaVersion":1,"ordinaryProvider":"native","deviceUidObserved":true,
+            "helperSocketUnavailableDuringRun":true,"helperContacted":false
         }),
     );
 }
 
 fn exercise() {
     let evidence = evidence_dir();
+    let (runtime, bundle, issuer) = connect("full-device-live-node-boot-1");
+    let provider = runtime.provider();
+    let mut cases = serde_json::Map::new();
+    cases.insert(
+        "rootExactArgv".into(),
+        root_exact_and_replay(&runtime, &provider, &issuer, &bundle, &evidence),
+    );
+    cases.insert(
+        "ptyInputResize".into(),
+        pty_input_resize(&provider, &issuer, &bundle, &evidence),
+    );
+    cases.insert(
+        "pauseResume".into(),
+        pause_resume(&provider, &issuer, &bundle, &evidence),
+    );
+    cases.insert(
+        "forceStop".into(),
+        force_stop(&provider, &issuer, &bundle, &evidence),
+    );
+    cases.insert(
+        "deadline".into(),
+        deadline(&runtime, &provider, &issuer, &bundle, &evidence),
+    );
+    cases.insert(
+        "invalidTicket".into(),
+        invalid_ticket(&provider, &bundle, &evidence),
+    );
+    cases.insert(
+        "rootMarker".into(),
+        root_marker(&provider, &issuer, &bundle, &evidence),
+    );
+    let (plan, request, started) = leave_active(&provider, &issuer, &bundle, &evidence);
+    write_json(
+        &evidence.join("active-runtime.json"),
+        &json!({
+            "plan":plan,"request":request,"handle":started.runtime.handle,
+            "invocationId":started.final_helper_receipt().claims.invocation_id,
+            "startReceiptDigest":started.final_helper_receipt().digest().unwrap()
+        }),
+    );
+    write_json(&evidence.join("live-cases.json"), &Value::Object(cases));
+}
+
+/// Runs as a new Node process after update and helper restart. Reconciliation
+/// must attach the same invocation; no start ticket is issued on this path.
+fn recover() {
+    let evidence = evidence_dir();
+    let active = read_json(&evidence.join("active-runtime.json"));
+    let plan: LocalExecutionPlan = serde_json::from_value(active["plan"].clone()).unwrap();
+    let request: RuntimeRequest = serde_json::from_value(active["request"].clone()).unwrap();
+    let expected_invocation = active["invocationId"].as_str().unwrap();
+    let (runtime, bundle, issuer) = connect("full-device-live-node-boot-2");
+    let provider = runtime.provider();
+    let attached = provider
+        .attach_reconciled_privileged(plan.clone(), request.spec_digest.clone())
+        .unwrap();
+    assert_eq!(attached.runtime.state, RuntimeState::Running);
+    assert_eq!(
+        attached
+            .final_helper_receipt()
+            .claims
+            .invocation_id
+            .as_deref(),
+        Some(expected_invocation)
+    );
+    let stopped = stop(
+        &provider,
+        &issuer,
+        &bundle,
+        &plan,
+        &request,
+        &attached.runtime.handle,
+        RuntimeSignal::GracefulStop,
+        "ptkt_live_recovered_stop",
+    );
+    let full_user = read_json(&evidence.join("full-user-summary.json"));
+    let cases = read_json(&evidence.join("live-cases.json"));
+    let packaging = read_json(&evidence.join("packaging-live-summary.json"));
+    write_json(
+        &evidence.join("driver-summary.json"),
+        &json!({
+            "schemaVersion":2,"isolatedCryptographicControlPlane":true,
+            "registrationActivated":runtime.active(),"ordinaryFullUser":full_user,"cases":cases,
+            "packageLifecycle":packaging,
+            "nodeRestart":{"newNodeBootIdentity":true,"durableAttach":true,"duplicateStart":false,"invocationPreserved":true},
+            "helperRestart":{"durableAttach":true,"processCustodyPreserved":true,"invocationPreserved":true},
+            "terminalState":"stopped","recoveredTerminalReceiptDigest":stopped.final_helper_receipt().digest().unwrap()
+        }),
+    );
+}
+
+fn connect(boot: &str) -> (std::sync::Arc<PrivilegedNodeRuntime>, Value, SigningKey) {
+    let evidence = evidence_dir();
     let identity = DeviceIdentity::load_or_create(evidence.join("device.ed25519")).unwrap();
     let bundle_path = PathBuf::from(required("CONDUIT_FULL_DEVICE_E2E_REGISTRATION_BUNDLE"));
     let bundle = read_json(&bundle_path);
-    let approval = read_json(&evidence.join("registration-approval.json"));
-    let socket = PathBuf::from(required("CONDUIT_FULL_DEVICE_E2E_SOCKET"));
     let runtime = PrivilegedNodeRuntime::connect(
-        &socket,
+        Path::new(&required("CONDUIT_FULL_DEVICE_E2E_SOCKET")),
         &bundle_path,
         &required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),
-        "full-device-live-node-boot",
+        boot,
         &identity,
     )
     .unwrap();
-    runtime.activate_registration(&approval).unwrap();
+    runtime
+        .activate_registration(&read_json(&evidence.join("registration-approval.json")))
+        .unwrap();
     assert!(runtime.active());
     let issuer_raw: [u8; 32] = fs::read(evidence.join("issuer.ed25519"))
         .unwrap()
         .try_into()
         .unwrap();
-    let issuer = SigningKey::from_bytes(&issuer_raw);
-    let provider = runtime.provider();
-    run_root_uid_probe(&runtime, &provider, &issuer, &bundle, &evidence);
+    (runtime, bundle, SigningKey::from_bytes(&issuer_raw))
 }
 
-fn run_root_uid_probe(
+fn root_exact_and_replay(
     runtime: &PrivilegedNodeRuntime,
     provider: &PrivilegedNativeProvider,
     issuer: &SigningKey,
     bundle: &Value,
     evidence: &Path,
+) -> Value {
+    let (plan, request) = case_plan(
+        "exact",
+        existing(&["/usr/bin/sleep", "/bin/sleep"]),
+        vec!["sleep".into(), "30".into()],
+        StdioMode::Pipes,
+        30_000_000,
+        evidence,
+    );
+    let prepare_ticket = ticket(
+        issuer,
+        bundle,
+        &plan,
+        &request,
+        PrivilegedOperation::Prepare,
+        "ptkt_live_exact_prepare",
+    );
+    let prepared = provider
+        .prepare_privileged(&request, prepare_ticket.clone(), plan.clone())
+        .unwrap();
+    let prepare_replay = provider
+        .prepare_privileged(&request, prepare_ticket, plan.clone())
+        .unwrap();
+    assert_eq!(
+        prepared.final_helper_receipt().digest().unwrap(),
+        prepare_replay.final_helper_receipt().digest().unwrap()
+    );
+    let start_ticket = ticket(
+        issuer,
+        bundle,
+        &plan,
+        &request,
+        PrivilegedOperation::Start,
+        "ptkt_live_exact_start",
+    );
+    let started = provider
+        .start_privileged(&prepared.runtime, start_ticket.clone(), &plan)
+        .unwrap();
+    assert_eq!(started.final_helper_receipt().claims.effective_uid, Some(0));
+    let identity = DeviceIdentity::load_or_create(evidence.join("device.ed25519")).unwrap();
+    let replay_client = HelperClient::connect_and_authenticate_with(
+        Path::new(&required("CONDUIT_FULL_DEVICE_E2E_SOCKET")),
+        &required("CONDUIT_FULL_DEVICE_E2E_DEVICE_ID"),
+        "full-device-live-lost-response",
+        |challenge| Ok(identity.sign_bytes(challenge)),
+    )
+    .unwrap();
+    let replay = replay_client
+        .start_chain(start_ticket, plan.digest().unwrap())
+        .unwrap();
+    for receipt in &replay {
+        receipt.verify(runtime.receipt_key()).unwrap();
+    }
+    let replay_final = replay.last().unwrap();
+    assert_eq!(
+        replay_final.digest().unwrap(),
+        started.final_helper_receipt().digest().unwrap()
+    );
+    assert_eq!(
+        replay_final.claims.invocation_id,
+        started.final_helper_receipt().claims.invocation_id
+    );
+    let stopped = stop(
+        provider,
+        issuer,
+        bundle,
+        &plan,
+        &request,
+        &started.runtime.handle,
+        RuntimeSignal::GracefulStop,
+        "ptkt_live_exact_stop",
+    );
+    json!({"passed":true,"effectiveUid":0,"exactArgv":true,"prepareReplaySameReceipt":true,
+        "lostStartResponseReplaySameReceipt":true,"duplicateStart":false,"invocationPreserved":true,
+        "terminalState":state_name(stopped.runtime.state)})
+}
+
+fn pty_input_resize(
+    provider: &PrivilegedNativeProvider,
+    issuer: &SigningKey,
+    bundle: &Value,
+    evidence: &Path,
+) -> Value {
+    let (plan, request) = case_plan(
+        "pty",
+        existing(&["/usr/bin/cat", "/bin/cat"]),
+        vec!["cat".into()],
+        StdioMode::Pty,
+        30_000_000,
+        evidence,
+    );
+    let prepared = provider
+        .prepare_privileged(
+            &request,
+            ticket(
+                issuer,
+                bundle,
+                &plan,
+                &request,
+                PrivilegedOperation::Prepare,
+                "ptkt_live_pty_prepare",
+            ),
+            plan.clone(),
+        )
+        .unwrap();
+    let mut managed = provider
+        .start_managed_privileged(
+            &prepared.runtime,
+            ticket(
+                issuer,
+                bundle,
+                &plan,
+                &request,
+                PrivilegedOperation::Start,
+                "ptkt_live_pty_start",
+            ),
+            &plan,
+        )
+        .unwrap();
+    let input = provider
+        .input_authorized(
+            &managed.receipt.runtime.handle,
+            b"conduit-pty-live-marker\n",
+            ticket(
+                issuer,
+                bundle,
+                &plan,
+                &request,
+                PrivilegedOperation::Input,
+                "ptkt_live_pty_input",
+            ),
+        )
+        .unwrap();
+    let resized = provider
+        .resize_authorized(
+            &input.runtime.handle,
+            40,
+            100,
+            ticket(
+                issuer,
+                bundle,
+                &plan,
+                &request,
+                PrivilegedOperation::ResizePty,
+                "ptkt_live_pty_resize",
+            ),
+        )
+        .unwrap();
+    let mut observed = false;
+    for _ in 0..100 {
+        let page = managed.io.read_stdout(0, 16 * 1024).unwrap();
+        if String::from_utf8_lossy(&page.bytes).contains("conduit-pty-live-marker") {
+            observed = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    assert!(observed);
+    let stopped = stop(
+        provider,
+        issuer,
+        bundle,
+        &plan,
+        &request,
+        &resized.runtime.handle,
+        RuntimeSignal::GracefulStop,
+        "ptkt_live_pty_stop",
+    );
+    json!({"passed":true,"stdin":true,"stdout":true,"pty":true,"resize":{"rows":40,"columns":100},"terminalState":state_name(stopped.runtime.state)})
+}
+
+fn pause_resume(
+    provider: &PrivilegedNativeProvider,
+    issuer: &SigningKey,
+    bundle: &Value,
+    evidence: &Path,
+) -> Value {
+    let (plan, request, started) =
+        start_sleep("pause", provider, issuer, bundle, evidence, 30_000_000);
+    let paused = provider
+        .control_privileged(
+            &started.runtime.handle,
+            RuntimeSignal::Pause,
+            ticket(
+                issuer,
+                bundle,
+                &plan,
+                &request,
+                PrivilegedOperation::Pause,
+                "ptkt_live_pause",
+            ),
+        )
+        .unwrap();
+    assert_eq!(paused.runtime.state, RuntimeState::Paused);
+    let resumed = provider
+        .control_privileged(
+            &paused.runtime.handle,
+            RuntimeSignal::Resume,
+            ticket(
+                issuer,
+                bundle,
+                &plan,
+                &request,
+                PrivilegedOperation::Resume,
+                "ptkt_live_resume",
+            ),
+        )
+        .unwrap();
+    assert_eq!(resumed.runtime.state, RuntimeState::Running);
+    let stopped = stop(
+        provider,
+        issuer,
+        bundle,
+        &plan,
+        &request,
+        &resumed.runtime.handle,
+        RuntimeSignal::GracefulStop,
+        "ptkt_live_pause_stop",
+    );
+    json!({"passed":true,"paused":true,"resumed":true,"terminalState":state_name(stopped.runtime.state)})
+}
+
+fn force_stop(
+    provider: &PrivilegedNativeProvider,
+    issuer: &SigningKey,
+    bundle: &Value,
+    evidence: &Path,
+) -> Value {
+    let (plan, request, started) =
+        start_sleep("force", provider, issuer, bundle, evidence, 30_000_000);
+    let stopped = stop(
+        provider,
+        issuer,
+        bundle,
+        &plan,
+        &request,
+        &started.runtime.handle,
+        RuntimeSignal::ForceStop,
+        "ptkt_live_force_stop",
+    );
+    json!({"passed":true,"forceStop":true,"terminalState":state_name(stopped.runtime.state)})
+}
+
+fn deadline(
+    runtime: &PrivilegedNodeRuntime,
+    provider: &PrivilegedNativeProvider,
+    issuer: &SigningKey,
+    bundle: &Value,
+    evidence: &Path,
+) -> Value {
+    let (plan, request, started) =
+        start_sleep("deadline", provider, issuer, bundle, evidence, 500_000);
+    thread::sleep(Duration::from_millis(1_200));
+    let reconciled = provider
+        .attach_reconciled_privileged(plan, request.spec_digest)
+        .unwrap();
+    assert!(matches!(
+        reconciled.runtime.state,
+        RuntimeState::Stopped | RuntimeState::RecoveryRequired
+    ));
+    for receipt in &reconciled.helper_receipts {
+        receipt.verify(runtime.receipt_key()).unwrap();
+    }
+    json!({"passed":true,"runtimeMaxUsec":500000,
+        "startedInvocationObserved":started.final_helper_receipt().claims.invocation_id.is_some(),
+        "convergedState":state_name(reconciled.runtime.state),"duplicateStart":false})
+}
+
+fn invalid_ticket(provider: &PrivilegedNativeProvider, bundle: &Value, evidence: &Path) -> Value {
+    let (plan, request) = case_plan(
+        "invalid",
+        existing(&["/usr/bin/sleep", "/bin/sleep"]),
+        vec!["sleep".into(), "30".into()],
+        StdioMode::Pipes,
+        30_000_000,
+        evidence,
+    );
+    let rogue = SigningKey::from_bytes(&[0x93; 32]);
+    let denied = provider
+        .prepare_privileged(
+            &request,
+            ticket(
+                &rogue,
+                bundle,
+                &plan,
+                &request,
+                PrivilegedOperation::Prepare,
+                "ptkt_live_invalid_prepare",
+            ),
+            plan,
+        )
+        .unwrap_err();
+    assert!(denied.to_string().contains("privilege_ticket"));
+    json!({"passed":true,"untrustedIssuerDenied":true,"runtimeStarted":false})
+}
+
+fn root_marker(
+    provider: &PrivilegedNativeProvider,
+    issuer: &SigningKey,
+    bundle: &Value,
+    evidence: &Path,
+) -> Value {
+    let marker = PathBuf::from(required("CONDUIT_FULL_DEVICE_E2E_ROOT_STAGE")).join("root-marker");
+    let (create_plan, create_request) = case_plan(
+        "marker_create",
+        existing(&["/usr/bin/touch", "/bin/touch"]),
+        vec![marker.to_string_lossy().into()],
+        StdioMode::Pipes,
+        10_000_000,
+        evidence,
+    );
+    let prepared = provider
+        .prepare_privileged(
+            &create_request,
+            ticket(
+                issuer,
+                bundle,
+                &create_plan,
+                &create_request,
+                PrivilegedOperation::Prepare,
+                "ptkt_live_marker_create_prepare",
+            ),
+            create_plan.clone(),
+        )
+        .unwrap();
+    let created = provider
+        .start_privileged(
+            &prepared.runtime,
+            ticket(
+                issuer,
+                bundle,
+                &create_plan,
+                &create_request,
+                PrivilegedOperation::Start,
+                "ptkt_live_marker_create_start",
+            ),
+            &create_plan,
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    let _ = provider
+        .attach_reconciled_privileged(create_plan, create_request.spec_digest)
+        .unwrap();
+    let (remove_plan, remove_request) = case_plan(
+        "marker_remove",
+        existing(&["/usr/bin/rm", "/bin/rm"]),
+        vec!["--".into(), marker.to_string_lossy().into()],
+        StdioMode::Pipes,
+        10_000_000,
+        evidence,
+    );
+    let prepared = provider
+        .prepare_privileged(
+            &remove_request,
+            ticket(
+                issuer,
+                bundle,
+                &remove_plan,
+                &remove_request,
+                PrivilegedOperation::Prepare,
+                "ptkt_live_marker_remove_prepare",
+            ),
+            remove_plan.clone(),
+        )
+        .unwrap();
+    let removed = provider
+        .start_privileged(
+            &prepared.runtime,
+            ticket(
+                issuer,
+                bundle,
+                &remove_plan,
+                &remove_request,
+                PrivilegedOperation::Start,
+                "ptkt_live_marker_remove_start",
+            ),
+            &remove_plan,
+        )
+        .unwrap();
+    thread::sleep(Duration::from_millis(300));
+    let _ = provider
+        .attach_reconciled_privileged(remove_plan, remove_request.spec_digest)
+        .unwrap();
+    json!({"passed":true,"createdByUid":created.final_helper_receipt().claims.effective_uid,
+        "independentSignedCleanup":true,"cleanupLaunchUid":removed.final_helper_receipt().claims.effective_uid})
+}
+
+fn leave_active(
+    provider: &PrivilegedNativeProvider,
+    issuer: &SigningKey,
+    bundle: &Value,
+    evidence: &Path,
+) -> (
+    LocalExecutionPlan,
+    RuntimeRequest,
+    conduit_runtime::PrivilegedRuntimeReceipt,
 ) {
-    let runtime_id = format!("rt_live_{}", std::process::id());
-    let run_id = format!("run_live_{}", std::process::id());
-    let operation_id = format!("op_live_{}", std::process::id());
+    start_sleep("custody", provider, issuer, bundle, evidence, 120_000_000)
+}
+
+fn start_sleep(
+    label: &str,
+    provider: &PrivilegedNativeProvider,
+    issuer: &SigningKey,
+    bundle: &Value,
+    evidence: &Path,
+    max_usec: u64,
+) -> (
+    LocalExecutionPlan,
+    RuntimeRequest,
+    conduit_runtime::PrivilegedRuntimeReceipt,
+) {
+    let (plan, request) = case_plan(
+        label,
+        existing(&["/usr/bin/sleep", "/bin/sleep"]),
+        vec!["sleep".into(), "120".into()],
+        StdioMode::Pipes,
+        max_usec,
+        evidence,
+    );
+    let prepared = provider
+        .prepare_privileged(
+            &request,
+            ticket(
+                issuer,
+                bundle,
+                &plan,
+                &request,
+                PrivilegedOperation::Prepare,
+                &format!("ptkt_live_{label}_prepare"),
+            ),
+            plan.clone(),
+        )
+        .unwrap();
+    let started = provider
+        .start_privileged(
+            &prepared.runtime,
+            ticket(
+                issuer,
+                bundle,
+                &plan,
+                &request,
+                PrivilegedOperation::Start,
+                &format!("ptkt_live_{label}_start"),
+            ),
+            &plan,
+        )
+        .unwrap();
+    assert_eq!(started.runtime.state, RuntimeState::Running);
+    (plan, request, started)
+}
+
+fn stop(
+    provider: &PrivilegedNativeProvider,
+    issuer: &SigningKey,
+    bundle: &Value,
+    plan: &LocalExecutionPlan,
+    request: &RuntimeRequest,
+    handle: &conduit_runtime::RuntimeHandle,
+    signal: RuntimeSignal,
+    ticket_id: &str,
+) -> conduit_runtime::PrivilegedRuntimeReceipt {
+    let operation = match signal {
+        RuntimeSignal::GracefulStop => PrivilegedOperation::GracefulStop,
+        RuntimeSignal::ForceStop => PrivilegedOperation::ForceStop,
+        _ => unreachable!(),
+    };
+    let stopped = provider
+        .control_privileged(
+            handle,
+            signal,
+            ticket(issuer, bundle, plan, request, operation, ticket_id),
+        )
+        .unwrap();
+    assert_eq!(stopped.runtime.state, RuntimeState::Stopped);
+    stopped
+}
+
+fn case_plan(
+    label: &str,
+    executable: PathBuf,
+    argv: Vec<String>,
+    stdio: StdioMode,
+    runtime_max_usec: u64,
+    evidence: &Path,
+) -> (LocalExecutionPlan, RuntimeRequest) {
+    let runtime_id = format!("rt_live_{label}_{}", std::process::id());
+    let run_id = format!("run_live_{label}_{}", std::process::id());
     let resources = ResourceCeilings {
         cpu_quota_per_sec_usec: None,
         memory_max_bytes: Some(64 * 1024 * 1024),
         tasks_max: Some(16),
         io_weight: None,
-        runtime_max_usec: Some(30_000_000),
+        runtime_max_usec: Some(runtime_max_usec),
     };
-    let executable = ["/usr/bin/sleep", "/bin/sleep"]
-        .into_iter()
-        .map(Path::new)
-        .find(|path| path.is_file())
-        .unwrap();
     let plan = LocalExecutionPlan {
         plan_version: 1,
         runtime_id: runtime_id.clone(),
         run_id: run_id.clone(),
-        operation_id: operation_id.clone(),
-        executable: capture_file_identity(executable, true).unwrap(),
+        operation_id: format!("op_live_{label}_{}", std::process::id()),
+        executable: capture_file_identity(&executable, true).unwrap(),
         interpreter: None,
-        argv: vec!["sleep".into(), "30".into()],
+        argv,
         cwd: capture_file_identity(evidence, false).unwrap(),
-        systemd_unit: format!("conduit-elevated-live-{}.service", std::process::id()),
+        systemd_unit: format!(
+            "conduit-elevated-live-{label}-{}.service",
+            std::process::id()
+        ),
         adapter_id: None,
         launch_profile_id: Some("full-device-live".into()),
         environment: BTreeMap::new(),
         environment_value_digests: BTreeMap::new(),
         workspaces: vec![],
         credentials: vec![],
-        stdio: StdioMode::Pipes,
+        stdio,
         resources: resources.clone(),
         helper_protocol: conduit_privileged_protocol::PROTOCOL.into(),
         helper_min_version: env!("CARGO_PKG_VERSION").into(),
     };
     let request = RuntimeRequest {
-        runtime_id: runtime_id.clone(),
-        run_id: run_id.clone(),
+        runtime_id,
+        run_id,
         kind: RuntimeKind::Native,
         provider_selector: "privileged-native".into(),
-        spec_digest: "33".repeat(32),
+        spec_digest: hex::encode(Sha256::digest(format!("live-spec:{label}").as_bytes())),
         image: None,
         resources: ResourceLimits {
             cpu: None,
@@ -222,67 +830,7 @@ fn run_root_uid_probe(
         network: NetworkMode::Open,
         workspaces: vec![],
     };
-    let prepare_ticket = ticket(
-        issuer,
-        bundle,
-        &plan,
-        &request,
-        PrivilegedOperation::Prepare,
-        "ptkt_live_prepare",
-    );
-    let prepared = provider
-        .prepare_privileged(&request, prepare_ticket, plan.clone())
-        .unwrap();
-    let start_ticket = ticket(
-        issuer,
-        bundle,
-        &plan,
-        &request,
-        PrivilegedOperation::Start,
-        "ptkt_live_start",
-    );
-    let started = provider
-        .start_privileged(&prepared.runtime, start_ticket, &plan)
-        .unwrap();
-    assert_eq!(started.final_helper_receipt().claims.effective_uid, Some(0));
-    let stop_ticket = ticket(
-        issuer,
-        bundle,
-        &plan,
-        &request,
-        PrivilegedOperation::GracefulStop,
-        "ptkt_live_stop",
-    );
-    let terminal = provider
-        .control_privileged(
-            &started.runtime.handle,
-            RuntimeSignal::GracefulStop,
-            stop_ticket,
-        )
-        .unwrap();
-    let prepare_digest = prepared.final_helper_receipt().digest().unwrap();
-    let start_digest = started.final_helper_receipt().digest().unwrap();
-    let terminal_digest = terminal.final_helper_receipt().digest().unwrap();
-    assert_ne!(prepare_digest, start_digest);
-    assert_ne!(start_digest, terminal_digest);
-    write_json(
-        &evidence.join("driver-summary.json"),
-        &json!({
-            "schemaVersion":1,
-            "isolatedCryptographicControlPlane":true,
-            "registrationActivated":runtime.active(),
-            "rootUidObserved":true,
-            "exactArgvObserved":true,
-            "systemdCustodyObserved":true,
-            "signedReceiptChainVerified":true,
-            "terminalState":format!("{:?}",terminal.runtime.state).to_ascii_lowercase(),
-            "receiptDigests":{
-                "prepared":prepare_digest,
-                "started":start_digest,
-                "terminal":terminal_digest
-            }
-        }),
-    );
+    (plan, request)
 }
 
 fn ticket(
@@ -298,6 +846,7 @@ fn ticket(
         serde_json::from_value(bundle["signedCapability"].clone()).unwrap();
     let now = OffsetDateTime::now_utc();
     let issued = (now - time::Duration::seconds(2)).format(&Rfc3339).unwrap();
+    let digest = hex::encode(Sha256::digest(ticket_id.as_bytes()));
     SignedClaims::sign(
         issuer_id.clone(),
         PrivilegeTicketClaims {
@@ -306,12 +855,9 @@ fn ticket(
             ticket_id: ticket_id.into(),
             issuer_kind: "control_plane".into(),
             issuer_key_id: issuer_id,
-            issuer: bundle["origin"].as_str().unwrap().into(),
             audience: "conduit-privileged-helper".into(),
             public_origin: bundle["origin"].as_str().unwrap().into(),
-            origin: bundle["origin"].as_str().unwrap().into(),
             helper_installation_id: bundle["installationId"].as_str().unwrap().into(),
-            installation_id: bundle["installationId"].as_str().unwrap().into(),
             helper_key_id: capability.claims.receipt_key_id,
             helper_policy_revision: capability.claims.policy_revision,
             helper_policy_digest: capability.claims.policy_digest,
@@ -320,11 +866,9 @@ fn ticket(
             device_policy_revision: 1,
             device_revision: 1,
             expected_uid: bundle["uid"].as_u64().unwrap() as u32,
-            uid: bundle["uid"].as_u64().unwrap() as u32,
             operation_id: plan.operation_id.clone(),
-            idempotency_key_digest: "11".repeat(32),
-            operation_request_digest: "22".repeat(32),
-            request_digest: "22".repeat(32),
+            idempotency_key_digest: digest.clone(),
+            operation_request_digest: digest,
             run_manifest_digest: "66".repeat(32),
             run_id: plan.run_id.clone(),
             runtime_id: plan.runtime_id.clone(),
@@ -353,11 +897,9 @@ fn ticket(
             approval_receipt_digest: Some("55".repeat(32)),
             approval_enforcement: ApprovalEnforcement::ExactCommand,
             required_approval_risk_classes: vec![],
-            required_risk_classes: vec![],
             allowed_operation: operation,
             resource_ceilings: plan.resources.clone(),
-            issued_at: issued.clone(),
-            not_before: issued,
+            issued_at: issued,
             expires_at: (now + time::Duration::minutes(5)).format(&Rfc3339).unwrap(),
             nonce: format!("nonce-{ticket_id}"),
             max_use_count: 1,
@@ -367,22 +909,40 @@ fn ticket(
     .unwrap()
 }
 
+fn limits() -> ResourceLimits {
+    ResourceLimits {
+        cpu: None,
+        memory_bytes: Some(64 * 1024 * 1024),
+        pid_limit: Some(16),
+        storage_bytes: None,
+    }
+}
+fn existing(candidates: &[&str]) -> PathBuf {
+    candidates
+        .iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .unwrap()
+}
+fn state_name(state: RuntimeState) -> String {
+    serde_json::to_value(state)
+        .unwrap()
+        .as_str()
+        .unwrap()
+        .into()
+}
 fn required(name: &str) -> String {
     env::var(name).unwrap_or_else(|_| panic!("{name} is required"))
 }
-
 fn evidence_dir() -> PathBuf {
     PathBuf::from(required("CONDUIT_FULL_DEVICE_E2E_EVIDENCE_DIR"))
 }
-
 fn read_json(path: &Path) -> Value {
     serde_json::from_slice(&fs::read(path).unwrap()).unwrap()
 }
-
 fn write_json(path: &Path, value: &Value) {
     write_private(path, &serde_jcs::to_vec(value).unwrap())
 }
-
 fn write_private(path: &Path, bytes: &[u8]) {
     let mut options = fs::OpenOptions::new();
     options.write(true).create(true).truncate(true).mode(0o600);

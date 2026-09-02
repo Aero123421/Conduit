@@ -191,6 +191,7 @@ export CONDUIT_FULL_DEVICE_E2E_INSTALLER="$conduit_package_root/installers/insta
 export CONDUIT_FULL_DEVICE_E2E_UPDATER="$conduit_package_root/installers/update-privileged.sh"
 export CONDUIT_FULL_DEVICE_E2E_UNINSTALLER="$conduit_package_root/installers/uninstall-privileged.sh"
 export CONDUIT_FULL_DEVICE_E2E_EVIDENCE_DIR="$conduit_user_evidence"
+export CONDUIT_FULL_DEVICE_E2E_ROOT_STAGE="$conduit_root_stage"
 
 # Create the Device identity as the unprivileged Device user. Only the public
 # key is handed to the root helper; the private key remains mode 0600 locally.
@@ -356,6 +357,20 @@ grep -Eq "\"helperPolicyDigest\"[[:space:]]*:[[:space:]]*\"$conduit_enabled_poli
   exit 4
 }
 
+# Full User must remain an ordinary Device-user path. Run it while the system
+# helper socket is externally proven inactive so a hidden helper dependency or
+# contact cannot produce a false pass.
+if systemctl is-active --quiet "conduit-privileged-helper@$(id -u).socket"; then
+  echo "privileged helper socket was unexpectedly active before Full User probe" >&2
+  exit 4
+else
+  conduit_socket_status=$?
+  [[ $conduit_socket_status -eq 3 || $conduit_socket_status -eq 4 ]] || exit "$conduit_socket_status"
+fi
+export CONDUIT_FULL_DEVICE_E2E_PHASE=full_user
+cargo test --locked -p conduit-node --test full_device_live \
+  -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+
 sudo -n systemctl enable --now "conduit-privileged-helper@$(id -u).socket"
 for _ in $(seq 1 100); do
   sudo -n test -S "/run/conduit/privileged/$(id -u).sock" && break
@@ -367,6 +382,53 @@ test "$(sudo -n stat -c '%u:%a' "/run/conduit/privileged/$(id -u).sock")" = "$(i
 export CONDUIT_FULL_DEVICE_E2E_PHASE=exercise
 cargo test --locked -p conduit-node --test full_device_live \
   -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+
+# The exercise deliberately leaves one exact elevated Runtime alive. Update
+# package files without service activation, prove uninstall fails closed, then
+# restart the helper while systemd retains target-process custody. A new Node
+# process performs durable attach below.
+sudo -n "$conduit_helper" admin package-status --uid "$(id -u)" --output json \
+  > "$conduit_user_evidence/active-before-update.json"
+grep -Eq '"activeRuntimeCount"[[:space:]]*:[[:space:]]*1' \
+  "$conduit_user_evidence/active-before-update.json" || {
+  echo "live driver did not retain exactly one active elevated Runtime" >&2
+  exit 4
+}
+sudo -n env CONDUIT_BUILD_DIR="$conduit_package_root/bin" \
+  "$conduit_package_root/installers/update-privileged.sh" \
+  > "$conduit_user_evidence/active-update.txt"
+sudo -n "$conduit_helper" admin package-status --uid "$(id -u)" --output json \
+  > "$conduit_user_evidence/active-after-update.json"
+grep -Eq '"activeRuntimeCount"[[:space:]]*:[[:space:]]*1' \
+  "$conduit_user_evidence/active-after-update.json" || {
+  echo "package update lost active elevated Runtime custody" >&2
+  exit 4
+}
+set +e
+sudo -n "$conduit_package_root/installers/uninstall-privileged.sh" \
+  > "$conduit_user_evidence/active-uninstall.txt" 2>&1
+conduit_active_uninstall_status=$?
+set -e
+[[ $conduit_active_uninstall_status -eq 3 ]] || {
+  echo "uninstall did not fail closed with active elevated Runtime custody" >&2
+  exit 4
+}
+sudo -n systemctl restart "conduit-privileged-helper@$(id -u).service"
+sudo -n "$conduit_helper" admin package-status --uid "$(id -u)" --output json \
+  > "$conduit_user_evidence/active-after-helper-restart.json"
+grep -Eq '"activeRuntimeCount"[[:space:]]*:[[:space:]]*1' \
+  "$conduit_user_evidence/active-after-helper-restart.json" || {
+  echo "helper restart did not preserve active elevated Runtime custody" >&2
+  exit 4
+}
+printf '%s\n' '{"schemaVersion":1,"activeUpdate":{"passed":true,"custodyBefore":1,"custodyAfter":1,"activationRestarted":false},"activeUninstall":{"passed":true,"refused":true,"exitStatus":3},"helperServiceRestart":{"passed":true,"custodyBefore":1,"custodyAfter":1}}' \
+  > "$conduit_user_evidence/packaging-live-summary.json"
+chmod 0600 "$conduit_user_evidence/packaging-live-summary.json"
+
+export CONDUIT_FULL_DEVICE_E2E_PHASE=recover
+cargo test --locked -p conduit-node --test full_device_live \
+  -- --ignored --exact full_device_live_systemd_root_e2e --nocapture
+sudo -n test ! -e "$conduit_root_stage/root-marker"
 
 conduit_driver_summary="$conduit_user_evidence/driver-summary.json"
 [[ -f "$conduit_driver_summary" && ! -L "$conduit_driver_summary" ]] || {
@@ -383,7 +445,7 @@ if grep -Eiq '(/home/|machine.?id|boot.?id|hardware.?serial|ip.?address|private.
   exit 4
 fi
 
-sudo -n "$conduit_helper" admin package-status --output json \
+sudo -n "$conduit_helper" admin package-status --uid "$(id -u)" --output json \
   > "$conduit_user_evidence/final-package-status.json"
 grep -Eq '"activeRuntimeCount"[[:space:]]*:[[:space:]]*0' \
   "$conduit_user_evidence/final-package-status.json"
@@ -395,8 +457,9 @@ sudo -n systemd-analyze security --no-pager \
   exit 4
 }
 
-# The live driver proves active-custody refusal and update/rollback. Finish by
-# exercising preservation followed by an explicit destructive test purge.
+# Finish by exercising default state preservation followed by an explicit
+# destructive test purge. Transaction rollback is covered by the deterministic
+# package test; this live run uses only exact release artifacts from this head.
 sudo -n "$conduit_package_root/installers/uninstall-privileged.sh"
 sudo -n test -d /var/lib/conduit/privileged-helper
 sudo -n test -d /etc/conduit/privileged-helper.d

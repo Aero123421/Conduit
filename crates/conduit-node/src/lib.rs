@@ -11,8 +11,8 @@ pub mod transport;
 
 use conduit_node_store::{AdmissionResult, NodeStore, OperationState, StoreError};
 use conduit_privileged_protocol::{
-    ApprovalEnforcement, LocalExecutionPlan, PROTOCOL, PrivilegeTicket, PrivilegedOperation,
-    SignedCapability,
+    ApprovalEnforcement, HelperReceipt, LocalExecutionPlan, PROTOCOL, PrivilegeTicket,
+    PrivilegedOperation, SignedCapability,
 };
 use conduit_runtime::{
     InteractiveRuntime, LaunchPlan, PreparedRuntime, RuntimeError, RuntimeHandle, RuntimeProvider,
@@ -291,6 +291,118 @@ impl Node {
             ticket.claims.controller_epoch,
         )?;
         Ok(())
+    }
+
+    pub fn verify_and_record_privileged_receipt(
+        &self,
+        offer: &OperationOffer,
+        receipt: &HelperReceipt,
+        receipt_verification_key: &[u8; 32],
+        ticket_verification_key: &[u8; 32],
+    ) -> Result<String, NodeError> {
+        receipt
+            .verify(receipt_verification_key)
+            .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
+        let binding = self
+            .store
+            .privileged_binding(&offer.idempotency_key)?
+            .ok_or_else(|| NodeError::Rejected("privilege_ticket_required".into()))?;
+        let claims = &receipt.claims;
+        let ticket_record = self
+            .store
+            .privilege_ticket_for_operation(&offer.idempotency_key, &claims.ticket_id)?
+            .ok_or_else(|| NodeError::Rejected("privilege_ticket_required".into()))?;
+        let signed_ticket = ticket_record
+            .signed_ticket
+            .as_deref()
+            .ok_or_else(|| NodeError::Rejected("privilege_ticket_required".into()))?;
+        let ticket: PrivilegeTicket = serde_json::from_slice(signed_ticket)
+            .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
+        ticket
+            .verify(ticket_verification_key)
+            .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
+        let ticket_digest = ticket
+            .digest()
+            .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
+        let ticket_operation_allows_transition = match ticket.claims.allowed_operation {
+            PrivilegedOperation::Prepare => {
+                matches!(claims.transition.as_str(), "admitted" | "prepared")
+            }
+            PrivilegedOperation::Start => matches!(
+                claims.transition.as_str(),
+                "unit_created"
+                    | "running"
+                    | "completed"
+                    | "failed"
+                    | "timed_out"
+                    | "uncertain"
+                    | "recovery_required"
+            ),
+            PrivilegedOperation::Input => claims.transition == "input_applied",
+            PrivilegedOperation::ResizePty => claims.transition == "pty_resized",
+            PrivilegedOperation::Pause => claims.transition == "paused",
+            PrivilegedOperation::Resume => {
+                matches!(claims.transition.as_str(), "resumed" | "running")
+            }
+            PrivilegedOperation::GracefulStop | PrivilegedOperation::ForceStop => matches!(
+                claims.transition.as_str(),
+                "stopping" | "completed" | "failed" | "cancelled" | "timed_out"
+            ),
+            PrivilegedOperation::Inspect | PrivilegedOperation::Reconcile => matches!(
+                claims.transition.as_str(),
+                "running"
+                    | "paused"
+                    | "completed"
+                    | "failed"
+                    | "cancelled"
+                    | "timed_out"
+                    | "uncertain"
+                    | "recovery_required"
+            ),
+        };
+        let exact = receipt.key_id == binding.helper_key_id
+            && claims.protocol == PROTOCOL
+            && claims.installation_id == binding.installation_id
+            && claims.receipt_key_id == binding.helper_key_id
+            && claims.policy_revision == binding.policy_revision
+            && claims.policy_digest == binding.policy_digest
+            && claims.ticket_id == ticket.claims.ticket_id
+            && claims.ticket_digest == ticket_digest
+            && ticket_record.ticket_digest.as_deref() == Some(ticket_digest.as_str())
+            && claims.operation_id == offer.operation_id
+            && claims.request_digest == offer.request_digest
+            && claims.run_id == offer.runtime.run_id
+            && claims.runtime_id == offer.runtime.runtime_id
+            && claims.runtime_spec_digest == binding.runtime_spec_digest
+            && claims.launch_plan_digest == binding.launch_plan_digest
+            && claims.local_execution_plan_digest == binding.local_plan_digest
+            && claims.controller_epoch == binding.controller_epoch
+            && ticket_operation_allows_transition
+            && claims.unit_name.starts_with("conduit-elevated-")
+            && claims.unit_name.ends_with(".service");
+        if !exact
+            || (matches!(claims.transition.as_str(), "running" | "resumed")
+                && (claims.effective_uid != Some(0) || claims.effective_gid != Some(0)))
+        {
+            return Err(NodeError::Rejected("privilege_ticket_invalid".into()));
+        }
+        let receipt_digest = receipt
+            .digest()
+            .map_err(|_| NodeError::Rejected("privilege_ticket_invalid".into()))?;
+        let encoded =
+            serde_jcs::to_vec(receipt).map_err(|error| NodeError::Rejected(error.to_string()))?;
+        self.store.append_privileged_receipt(
+            &offer.idempotency_key,
+            &receipt_digest,
+            &claims.ticket_id,
+            &ticket_digest,
+            &claims.runtime_id,
+            claims.state_revision,
+            &claims.transition,
+            claims.previous_receipt_digest.as_deref(),
+            &encoded,
+        )?;
+        Ok(receipt_digest)
     }
 
     fn admit_inner(

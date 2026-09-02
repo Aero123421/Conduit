@@ -1452,6 +1452,25 @@ impl NodeStore {
         query_privilege_ticket_request(&connection, request_id)
     }
 
+    pub fn privilege_ticket_for_operation(
+        &self,
+        operation_idempotency_key: &str,
+        ticket_id: &str,
+    ) -> Result<Option<PrivilegeTicketRequestRecord>, StoreError> {
+        let connection = self.conn()?;
+        connection
+            .query_row(
+                "SELECT request_id FROM privilege_ticket_requests WHERE operation_idempotency_key=?1 AND ticket_id=?2 AND state='issued' LIMIT 1",
+                params![operation_idempotency_key,ticket_id],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(map_sql)?
+            .map(|request_id| query_privilege_ticket_request(&connection, &request_id))
+            .transpose()
+            .map(Option::flatten)
+    }
+
     pub fn privileged_binding(
         &self,
         idempotency_key: &str,

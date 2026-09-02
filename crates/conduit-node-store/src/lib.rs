@@ -26,7 +26,7 @@ use thiserror::Error;
 pub const MAX_MANIFEST_BYTES: usize = 256 * 1024;
 pub const MAX_FRAME_BYTES: usize = 65_536;
 pub const MAX_EVENT_BYTES: usize = 60_000;
-const STORE_SCHEMA_VERSION: u32 = 9;
+const STORE_SCHEMA_VERSION: u32 = 10;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -273,6 +273,55 @@ pub enum ControlEffectResult {
     Reserved(ControlEffectRecord),
     Replay(ControlEffectRecord),
     Uncertain(ControlEffectRecord),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivilegeTicketRequestRecord {
+    pub request_id: String,
+    pub idempotency_key: String,
+    pub request_digest: String,
+    pub request_payload: Vec<u8>,
+    pub state: String,
+    pub ticket_id: Option<String>,
+    pub ticket_digest: Option<String>,
+    pub signed_ticket: Option<Vec<u8>>,
+    pub error_code: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrivilegeTicketRequestResult {
+    Reserved(PrivilegeTicketRequestRecord),
+    Replay(PrivilegeTicketRequestRecord),
+    Uncertain(PrivilegeTicketRequestRecord),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivilegedOperationBinding {
+    pub idempotency_key: String,
+    pub installation_id: String,
+    pub policy_revision: u64,
+    pub policy_digest: String,
+    pub helper_key_id: String,
+    pub ticket_id: String,
+    pub ticket_digest: String,
+    pub signed_ticket: Vec<u8>,
+    pub runtime_spec_digest: String,
+    pub launch_plan_digest: String,
+    pub local_plan_digest: String,
+    pub local_plan: Vec<u8>,
+    pub controller_epoch: u64,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrivilegedReceiptRecord {
+    pub receipt_digest: String,
+    pub idempotency_key: String,
+    pub runtime_id: String,
+    pub state_revision: u64,
+    pub transition: String,
+    pub previous_receipt_digest: Option<String>,
+    pub signed_receipt: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1079,6 +1128,327 @@ impl NodeStore {
         query_control_effect(&connection, idempotency_key)
     }
 
+    pub fn reserve_privilege_ticket_request(
+        &self,
+        request_id: &str,
+        idempotency_key: &str,
+        request_digest: &str,
+        request_payload: &[u8],
+    ) -> Result<PrivilegeTicketRequestResult, StoreError> {
+        validate_digest(request_digest)?;
+        if request_id.is_empty()
+            || request_id.len() > 128
+            || request_payload.is_empty()
+            || request_payload.len() > MAX_EVENT_BYTES
+        {
+            return Err(StoreError::Invalid(
+                "invalid privilege ticket request fields".into(),
+            ));
+        }
+        let mut connection = self.conn()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        if query_operation(&transaction, idempotency_key)?.is_none() {
+            return Err(StoreError::NotFound);
+        }
+        if let Some(existing) = query_privilege_ticket_request(&transaction, request_id)? {
+            if existing.idempotency_key != idempotency_key
+                || existing.request_digest != request_digest
+                || existing.request_payload != request_payload
+            {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            transaction.commit().map_err(map_sql)?;
+            return Ok(if existing.state == "pending" {
+                PrivilegeTicketRequestResult::Uncertain(existing)
+            } else {
+                PrivilegeTicketRequestResult::Replay(existing)
+            });
+        }
+        let conflicting = transaction
+            .query_row(
+                "SELECT 1 FROM privilege_ticket_requests WHERE idempotency_key=?1 LIMIT 1",
+                [idempotency_key],
+                |_| Ok(()),
+            )
+            .optional()
+            .map_err(map_sql)?
+            .is_some();
+        if conflicting {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        transaction.execute(
+            "INSERT INTO privilege_ticket_requests(request_id,idempotency_key,request_digest,request_payload,state) VALUES(?1,?2,?3,?4,'pending')",
+            params![request_id,idempotency_key,request_digest,request_payload],
+        ).map_err(map_sql)?;
+        let record = query_privilege_ticket_request(&transaction, request_id)?
+            .ok_or_else(|| StoreError::Corrupt("privilege ticket request missing".into()))?;
+        transaction.commit().map_err(map_sql)?;
+        Ok(PrivilegeTicketRequestResult::Reserved(record))
+    }
+
+    pub fn complete_privilege_ticket_request(
+        &self,
+        request_id: &str,
+        ticket: Option<(&str, &str, &[u8])>,
+        error_code: Option<&str>,
+    ) -> Result<PrivilegeTicketRequestRecord, StoreError> {
+        if ticket.is_some() == error_code.is_some() {
+            return Err(StoreError::Invalid(
+                "ticket result must contain exactly one outcome".into(),
+            ));
+        }
+        if let Some((ticket_id, ticket_digest, signed_ticket)) = ticket {
+            validate_digest(ticket_digest)?;
+            if ticket_id.is_empty()
+                || ticket_id.len() > 128
+                || signed_ticket.is_empty()
+                || signed_ticket.len() > MAX_EVENT_BYTES
+            {
+                return Err(StoreError::Invalid("invalid signed ticket".into()));
+            }
+        }
+        if error_code.is_some_and(|code| code.is_empty() || code.len() > 128) {
+            return Err(StoreError::Invalid("invalid ticket error code".into()));
+        }
+        let mut connection = self.conn()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        let existing = query_privilege_ticket_request(&transaction, request_id)?
+            .ok_or(StoreError::NotFound)?;
+        let expected_state = if ticket.is_some() {
+            "issued"
+        } else {
+            "rejected"
+        };
+        if existing.state == "pending" {
+            let (ticket_id, ticket_digest, signed_ticket) = ticket
+                .map(|(id, digest, signed)| (Some(id), Some(digest), Some(signed)))
+                .unwrap_or((None, None, None));
+            transaction.execute(
+                "UPDATE privilege_ticket_requests SET state=?2,ticket_id=?3,ticket_digest=?4,signed_ticket=?5,error_code=?6,updated_at=unixepoch() WHERE request_id=?1 AND state='pending'",
+                params![request_id,expected_state,ticket_id,ticket_digest,signed_ticket,error_code],
+            ).map_err(map_sql)?;
+        } else {
+            let exact = existing.state == expected_state
+                && match ticket {
+                    Some((id, digest, signed)) => {
+                        existing.ticket_id.as_deref() == Some(id)
+                            && existing.ticket_digest.as_deref() == Some(digest)
+                            && existing.signed_ticket.as_deref() == Some(signed)
+                            && existing.error_code.is_none()
+                    }
+                    None => existing.error_code.as_deref() == error_code,
+                };
+            if !exact {
+                return Err(StoreError::IdempotencyConflict);
+            }
+        }
+        let record = query_privilege_ticket_request(&transaction, request_id)?
+            .ok_or(StoreError::NotFound)?;
+        transaction.commit().map_err(map_sql)?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn bind_privileged_operation(
+        &self,
+        idempotency_key: &str,
+        installation_id: &str,
+        policy_revision: u64,
+        policy_digest: &str,
+        helper_key_id: &str,
+        ticket_id: &str,
+        ticket_digest: &str,
+        signed_ticket: &[u8],
+        runtime_spec_digest: &str,
+        launch_plan_digest: &str,
+        local_plan_digest: &str,
+        local_plan: &[u8],
+        controller_epoch: u64,
+    ) -> Result<PrivilegedOperationBinding, StoreError> {
+        for digest in [
+            policy_digest,
+            ticket_digest,
+            runtime_spec_digest,
+            launch_plan_digest,
+            local_plan_digest,
+        ] {
+            validate_digest(digest)?;
+        }
+        if installation_id.is_empty()
+            || installation_id.len() > 128
+            || helper_key_id.is_empty()
+            || helper_key_id.len() > 128
+            || ticket_id.is_empty()
+            || ticket_id.len() > 128
+            || policy_revision == 0
+            || controller_epoch == 0
+            || signed_ticket.is_empty()
+            || signed_ticket.len() > MAX_EVENT_BYTES
+            || local_plan.is_empty()
+            || local_plan.len() > MAX_MANIFEST_BYTES
+        {
+            return Err(StoreError::Invalid(
+                "invalid privileged operation binding".into(),
+            ));
+        }
+        let mut connection = self.conn()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        if query_operation(&transaction, idempotency_key)?.is_none() {
+            return Err(StoreError::NotFound);
+        }
+        let issued_ticket = transaction
+            .query_row(
+                "SELECT ticket_id,ticket_digest,signed_ticket FROM privilege_ticket_requests WHERE idempotency_key=?1 AND state='issued'",
+                [idempotency_key],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?)),
+            )
+            .optional()
+            .map_err(map_sql)?
+            .ok_or(StoreError::NotFound)?;
+        if issued_ticket.0 != ticket_id
+            || issued_ticket.1 != ticket_digest
+            || issued_ticket.2 != signed_ticket
+        {
+            return Err(StoreError::IdempotencyConflict);
+        }
+        if let Some(existing) = query_privileged_binding(&transaction, idempotency_key)? {
+            let proposed = PrivilegedOperationBinding {
+                idempotency_key: idempotency_key.into(),
+                installation_id: installation_id.into(),
+                policy_revision,
+                policy_digest: policy_digest.into(),
+                helper_key_id: helper_key_id.into(),
+                ticket_id: ticket_id.into(),
+                ticket_digest: ticket_digest.into(),
+                signed_ticket: signed_ticket.to_vec(),
+                runtime_spec_digest: runtime_spec_digest.into(),
+                launch_plan_digest: launch_plan_digest.into(),
+                local_plan_digest: local_plan_digest.into(),
+                local_plan: local_plan.to_vec(),
+                controller_epoch,
+                state: existing.state.clone(),
+            };
+            if existing != proposed {
+                return Err(StoreError::IdempotencyConflict);
+            }
+            transaction.commit().map_err(map_sql)?;
+            return Ok(existing);
+        }
+        transaction.execute(
+            "INSERT INTO privileged_operation_bindings(idempotency_key,installation_id,policy_revision,policy_digest,helper_key_id,ticket_id,ticket_digest,signed_ticket,runtime_spec_digest,launch_plan_digest,local_plan_digest,local_plan,controller_epoch,state) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,'ticketed')",
+            params![idempotency_key,installation_id,policy_revision,policy_digest,helper_key_id,ticket_id,ticket_digest,signed_ticket,runtime_spec_digest,launch_plan_digest,local_plan_digest,local_plan,controller_epoch],
+        ).map_err(map_sql)?;
+        let record = query_privileged_binding(&transaction, idempotency_key)?
+            .ok_or_else(|| StoreError::Corrupt("privileged binding missing".into()))?;
+        transaction.commit().map_err(map_sql)?;
+        Ok(record)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_privileged_receipt(
+        &self,
+        idempotency_key: &str,
+        receipt_digest: &str,
+        runtime_id: &str,
+        state_revision: u64,
+        transition: &str,
+        previous_receipt_digest: Option<&str>,
+        signed_receipt: &[u8],
+    ) -> Result<PrivilegedReceiptRecord, StoreError> {
+        validate_digest(receipt_digest)?;
+        if let Some(digest) = previous_receipt_digest {
+            validate_digest(digest)?;
+        }
+        if runtime_id.is_empty()
+            || runtime_id.len() > 128
+            || state_revision == 0
+            || transition.is_empty()
+            || transition.len() > 64
+            || signed_receipt.is_empty()
+            || signed_receipt.len() > MAX_EVENT_BYTES
+        {
+            return Err(StoreError::Invalid("invalid privileged receipt".into()));
+        }
+        let mut connection = self.conn()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(map_sql)?;
+        let binding =
+            query_privileged_binding(&transaction, idempotency_key)?.ok_or(StoreError::NotFound)?;
+        let last = query_last_privileged_receipt(&transaction, idempotency_key)?;
+        let expected_revision = last
+            .as_ref()
+            .map_or(1, |receipt| receipt.state_revision + 1);
+        let expected_previous = last.as_ref().map(|receipt| receipt.receipt_digest.as_str());
+        if state_revision != expected_revision || previous_receipt_digest != expected_previous {
+            if let Some(existing) = query_privileged_receipt(&transaction, receipt_digest)? {
+                if existing.idempotency_key == idempotency_key
+                    && existing.runtime_id == runtime_id
+                    && existing.state_revision == state_revision
+                    && existing.transition == transition
+                    && existing.previous_receipt_digest.as_deref() == previous_receipt_digest
+                    && existing.signed_receipt == signed_receipt
+                {
+                    transaction.commit().map_err(map_sql)?;
+                    return Ok(existing);
+                }
+            }
+            return Err(StoreError::SequenceConflict);
+        }
+        transaction.execute(
+            "INSERT INTO privileged_receipt_chain(receipt_digest,idempotency_key,runtime_id,state_revision,transition,previous_receipt_digest,signed_receipt) VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            params![receipt_digest,idempotency_key,runtime_id,state_revision,transition,previous_receipt_digest,signed_receipt],
+        ).map_err(|error| match map_sql(error) {
+            StoreError::Unavailable(_) => StoreError::IdempotencyConflict,
+            other => other,
+        })?;
+        transaction.execute(
+            "UPDATE privileged_operation_bindings SET state=?2,updated_at=unixepoch() WHERE idempotency_key=?1 AND ticket_id=?3",
+            params![idempotency_key,transition,binding.ticket_id],
+        ).map_err(map_sql)?;
+        let record = query_privileged_receipt(&transaction, receipt_digest)?
+            .ok_or_else(|| StoreError::Corrupt("privileged receipt missing".into()))?;
+        transaction.commit().map_err(map_sql)?;
+        Ok(record)
+    }
+
+    pub fn privilege_ticket_request(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<PrivilegeTicketRequestRecord>, StoreError> {
+        let connection = self.conn()?;
+        query_privilege_ticket_request(&connection, request_id)
+    }
+
+    pub fn privileged_binding(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<PrivilegedOperationBinding>, StoreError> {
+        let connection = self.conn()?;
+        query_privileged_binding(&connection, idempotency_key)
+    }
+
+    pub fn privileged_receipts(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Vec<PrivilegedReceiptRecord>, StoreError> {
+        let connection = self.conn()?;
+        let mut statement = connection.prepare(
+            "SELECT receipt_digest,idempotency_key,runtime_id,state_revision,transition,previous_receipt_digest,signed_receipt FROM privileged_receipt_chain WHERE idempotency_key=?1 ORDER BY state_revision",
+        ).map_err(map_sql)?;
+        statement
+            .query_map([idempotency_key], row_to_privileged_receipt)
+            .map_err(map_sql)?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(map_sql)
+    }
+
     pub fn record_agent_session(
         &self,
         idempotency_key: &str,
@@ -1664,6 +2034,103 @@ fn query_control_effect(
     ).optional().map_err(map_sql)
 }
 
+fn query_privilege_ticket_request(
+    connection: &Connection,
+    request_id: &str,
+) -> Result<Option<PrivilegeTicketRequestRecord>, StoreError> {
+    connection
+        .query_row(
+            "SELECT request_id,idempotency_key,request_digest,request_payload,state,ticket_id,ticket_digest,signed_ticket,error_code FROM privilege_ticket_requests WHERE request_id=?1",
+            [request_id],
+            |row| {
+                Ok(PrivilegeTicketRequestRecord {
+                    request_id: row.get(0)?,
+                    idempotency_key: row.get(1)?,
+                    request_digest: row.get(2)?,
+                    request_payload: row.get(3)?,
+                    state: row.get(4)?,
+                    ticket_id: row.get(5)?,
+                    ticket_digest: row.get(6)?,
+                    signed_ticket: row.get(7)?,
+                    error_code: row.get(8)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_sql)
+}
+
+fn query_privileged_binding(
+    connection: &Connection,
+    idempotency_key: &str,
+) -> Result<Option<PrivilegedOperationBinding>, StoreError> {
+    connection
+        .query_row(
+            "SELECT idempotency_key,installation_id,policy_revision,policy_digest,helper_key_id,ticket_id,ticket_digest,signed_ticket,runtime_spec_digest,launch_plan_digest,local_plan_digest,local_plan,controller_epoch,state FROM privileged_operation_bindings WHERE idempotency_key=?1",
+            [idempotency_key],
+            |row| {
+                Ok(PrivilegedOperationBinding {
+                    idempotency_key: row.get(0)?,
+                    installation_id: row.get(1)?,
+                    policy_revision: row.get(2)?,
+                    policy_digest: row.get(3)?,
+                    helper_key_id: row.get(4)?,
+                    ticket_id: row.get(5)?,
+                    ticket_digest: row.get(6)?,
+                    signed_ticket: row.get(7)?,
+                    runtime_spec_digest: row.get(8)?,
+                    launch_plan_digest: row.get(9)?,
+                    local_plan_digest: row.get(10)?,
+                    local_plan: row.get(11)?,
+                    controller_epoch: row.get(12)?,
+                    state: row.get(13)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(map_sql)
+}
+
+fn row_to_privileged_receipt(row: &rusqlite::Row<'_>) -> rusqlite::Result<PrivilegedReceiptRecord> {
+    Ok(PrivilegedReceiptRecord {
+        receipt_digest: row.get(0)?,
+        idempotency_key: row.get(1)?,
+        runtime_id: row.get(2)?,
+        state_revision: row.get(3)?,
+        transition: row.get(4)?,
+        previous_receipt_digest: row.get(5)?,
+        signed_receipt: row.get(6)?,
+    })
+}
+
+fn query_privileged_receipt(
+    connection: &Connection,
+    receipt_digest: &str,
+) -> Result<Option<PrivilegedReceiptRecord>, StoreError> {
+    connection
+        .query_row(
+            "SELECT receipt_digest,idempotency_key,runtime_id,state_revision,transition,previous_receipt_digest,signed_receipt FROM privileged_receipt_chain WHERE receipt_digest=?1",
+            [receipt_digest],
+            row_to_privileged_receipt,
+        )
+        .optional()
+        .map_err(map_sql)
+}
+
+fn query_last_privileged_receipt(
+    connection: &Connection,
+    idempotency_key: &str,
+) -> Result<Option<PrivilegedReceiptRecord>, StoreError> {
+    connection
+        .query_row(
+            "SELECT receipt_digest,idempotency_key,runtime_id,state_revision,transition,previous_receipt_digest,signed_receipt FROM privileged_receipt_chain WHERE idempotency_key=?1 ORDER BY state_revision DESC LIMIT 1",
+            [idempotency_key],
+            row_to_privileged_receipt,
+        )
+        .optional()
+        .map_err(map_sql)
+}
+
 fn query_agent_session(
     connection: &Connection,
     idempotency_key: &str,
@@ -1824,6 +2291,43 @@ CREATE TABLE IF NOT EXISTS control_effect_journal(
  created_at INTEGER NOT NULL DEFAULT(unixepoch()), updated_at INTEGER NOT NULL DEFAULT(unixepoch()),
  CHECK(length(request_digest)=64), CHECK(length(target_digest)=64), CHECK(length(command) BETWEEN 1 AND 64),
  CHECK(controller_epoch>0), CHECK(expected_revision>0), CHECK(receipt IS NULL OR length(receipt)<=60000));
+CREATE TABLE IF NOT EXISTS privilege_ticket_requests(
+ request_id TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL UNIQUE REFERENCES operations(idempotency_key) ON DELETE RESTRICT,
+ request_digest TEXT NOT NULL, request_payload BLOB NOT NULL,
+ state TEXT NOT NULL CHECK(state IN ('pending','issued','rejected')),
+ ticket_id TEXT UNIQUE, ticket_digest TEXT UNIQUE, signed_ticket BLOB, error_code TEXT,
+ created_at INTEGER NOT NULL DEFAULT(unixepoch()), updated_at INTEGER NOT NULL DEFAULT(unixepoch()),
+ CHECK(length(request_id) BETWEEN 1 AND 128), CHECK(length(request_digest)=64),
+ CHECK(length(request_payload) BETWEEN 1 AND 60000),
+ CHECK(ticket_id IS NULL OR length(ticket_id) BETWEEN 1 AND 128),
+ CHECK(ticket_digest IS NULL OR length(ticket_digest)=64),
+ CHECK(signed_ticket IS NULL OR length(signed_ticket) BETWEEN 1 AND 60000),
+ CHECK(error_code IS NULL OR length(error_code) BETWEEN 1 AND 128),
+ CHECK((state='pending' AND ticket_id IS NULL AND signed_ticket IS NULL AND error_code IS NULL)
+    OR (state='issued' AND ticket_id IS NOT NULL AND ticket_digest IS NOT NULL AND signed_ticket IS NOT NULL AND error_code IS NULL)
+    OR (state='rejected' AND ticket_id IS NULL AND ticket_digest IS NULL AND signed_ticket IS NULL AND error_code IS NOT NULL)));
+CREATE TABLE IF NOT EXISTS privileged_operation_bindings(
+ idempotency_key TEXT PRIMARY KEY REFERENCES operations(idempotency_key) ON DELETE RESTRICT,
+ installation_id TEXT NOT NULL, policy_revision INTEGER NOT NULL, policy_digest TEXT NOT NULL,
+ helper_key_id TEXT NOT NULL, ticket_id TEXT NOT NULL UNIQUE, ticket_digest TEXT NOT NULL UNIQUE,
+ signed_ticket BLOB NOT NULL, runtime_spec_digest TEXT NOT NULL, launch_plan_digest TEXT NOT NULL,
+ local_plan_digest TEXT NOT NULL, local_plan BLOB NOT NULL, controller_epoch INTEGER NOT NULL, state TEXT NOT NULL,
+ created_at INTEGER NOT NULL DEFAULT(unixepoch()), updated_at INTEGER NOT NULL DEFAULT(unixepoch()),
+ CHECK(policy_revision>0), CHECK(controller_epoch>0), CHECK(length(policy_digest)=64),
+ CHECK(length(ticket_digest)=64), CHECK(length(runtime_spec_digest)=64),
+ CHECK(length(launch_plan_digest)=64), CHECK(length(local_plan_digest)=64),
+ CHECK(length(local_plan) BETWEEN 1 AND 262144),
+ CHECK(length(signed_ticket) BETWEEN 1 AND 60000));
+CREATE TABLE IF NOT EXISTS privileged_receipt_chain(
+ receipt_digest TEXT PRIMARY KEY, idempotency_key TEXT NOT NULL REFERENCES privileged_operation_bindings(idempotency_key) ON DELETE RESTRICT,
+ runtime_id TEXT NOT NULL, state_revision INTEGER NOT NULL, transition TEXT NOT NULL,
+ previous_receipt_digest TEXT, signed_receipt BLOB NOT NULL,
+ created_at INTEGER NOT NULL DEFAULT(unixepoch()),
+ UNIQUE(idempotency_key,state_revision),
+ CHECK(length(receipt_digest)=64), CHECK(state_revision>0),
+ CHECK(length(transition) BETWEEN 1 AND 64),
+ CHECK(previous_receipt_digest IS NULL OR length(previous_receipt_digest)=64),
+ CHECK(length(signed_receipt) BETWEEN 1 AND 60000));
 CREATE TABLE IF NOT EXISTS agent_sessions(
  idempotency_key TEXT PRIMARY KEY REFERENCES operations(idempotency_key) ON DELETE RESTRICT,
  policy TEXT NOT NULL CHECK(policy IN ('close_on_settle','persistent')),
@@ -1852,7 +2356,7 @@ CREATE TABLE IF NOT EXISTS agent_approval_journal(
  CHECK(resolution_authority IS NULL OR (length(resolution_authority)>=1 AND length(resolution_authority)<=256)));
 CREATE INDEX IF NOT EXISTS agent_approval_pending_idx ON agent_approval_journal(state,expires_at_unix_ms);
 CREATE UNIQUE INDEX IF NOT EXISTS agent_approval_provider_request_unique_idx ON agent_approval_journal(idempotency_key,provider_request_id);
-INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9);
+INSERT OR IGNORE INTO schema_migrations(version) VALUES(1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
 COMMIT;"#).map_err(map_sql)
 }
 
@@ -2589,6 +3093,135 @@ INSERT INTO agent_approval_journal(approval_id,idempotency_key,operation_digest,
         assert_eq!(saved.launch_plan, b"launch-v1");
         assert_eq!(saved.admission_receipt, b"receipt-v1");
     }
+
+    #[test]
+    fn privilege_ticket_and_receipt_chain_survive_restart_and_reject_conflicts() {
+        let directory = tempdir().unwrap();
+        let store = NodeStore::open(directory.path()).unwrap();
+        let key = "privileged-idempotency-key-0001";
+        store
+            .reserve_operation("op_privileged_0001", key, &digest(1), b"{}", 7)
+            .unwrap();
+        assert!(matches!(
+            store
+                .reserve_privilege_ticket_request("ptreq_0001", key, &digest(2), b"ticket-request")
+                .unwrap(),
+            PrivilegeTicketRequestResult::Reserved(_)
+        ));
+        assert!(matches!(
+            store
+                .reserve_privilege_ticket_request("ptreq_0001", key, &digest(2), b"ticket-request")
+                .unwrap(),
+            PrivilegeTicketRequestResult::Uncertain(_)
+        ));
+        assert!(matches!(
+            store.reserve_privilege_ticket_request("ptreq_0001", key, &digest(3), b"changed"),
+            Err(StoreError::IdempotencyConflict)
+        ));
+        store
+            .complete_privilege_ticket_request(
+                "ptreq_0001",
+                Some(("ptkt_0001", &digest(3), b"signed-ticket")),
+                None,
+            )
+            .unwrap();
+        store
+            .bind_privileged_operation(
+                key,
+                "install_0001",
+                3,
+                &digest(4),
+                "receipt-key-0001",
+                "ptkt_0001",
+                &digest(3),
+                b"signed-ticket",
+                &digest(5),
+                &digest(6),
+                &digest(7),
+                b"local-plan",
+                2,
+            )
+            .unwrap();
+        let first = store
+            .append_privileged_receipt(
+                key,
+                &digest(8),
+                "runtime_0001",
+                1,
+                "prepared",
+                None,
+                b"signed-receipt-1",
+            )
+            .unwrap();
+        assert_eq!(first.state_revision, 1);
+        drop(store);
+
+        let reopened = NodeStore::open(directory.path()).unwrap();
+        let second = reopened
+            .append_privileged_receipt(
+                key,
+                &digest(9),
+                "runtime_0001",
+                2,
+                "running",
+                Some(&digest(8)),
+                b"signed-receipt-2",
+            )
+            .unwrap();
+        assert_eq!(second.previous_receipt_digest.as_deref(), Some(&*digest(8)));
+        assert_eq!(reopened.privileged_receipts(key).unwrap().len(), 2);
+        assert!(matches!(
+            reopened.append_privileged_receipt(
+                key,
+                &digest(10),
+                "runtime_0001",
+                3,
+                "completed",
+                Some(&digest(7)),
+                b"bad-chain",
+            ),
+            Err(StoreError::SequenceConflict)
+        ));
+    }
+
+    #[test]
+    fn rejected_privilege_ticket_cannot_be_bound() {
+        let directory = tempdir().unwrap();
+        let store = NodeStore::open(directory.path()).unwrap();
+        let key = "privileged-idempotency-key-0002";
+        store
+            .reserve_operation("op_privileged_0002", key, &digest(1), b"{}", 7)
+            .unwrap();
+        store
+            .reserve_privilege_ticket_request("ptreq_0002", key, &digest(2), b"request")
+            .unwrap();
+        store
+            .complete_privilege_ticket_request(
+                "ptreq_0002",
+                None,
+                Some("full_device_helper_disabled"),
+            )
+            .unwrap();
+        assert!(matches!(
+            store.bind_privileged_operation(
+                key,
+                "install_0001",
+                1,
+                &digest(3),
+                "receipt-key-0001",
+                "ptkt_0002",
+                &digest(4),
+                b"forged",
+                &digest(5),
+                &digest(6),
+                &digest(7),
+                b"local-plan",
+                1,
+            ),
+            Err(StoreError::NotFound)
+        ));
+    }
+
     #[test]
     fn future_schema_version_is_rejected() {
         let d = tempdir().unwrap();
